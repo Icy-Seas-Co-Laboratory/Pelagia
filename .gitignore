@@ -1,0 +1,90 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# Office temporary files
+~$*.doc*
+~$*.xls*
+~$*.ppt*
+
+# Excel backup / temp
+*.xlk
+*.tmp
+
+# Word temp files
+*.wbk
+
+# RStudio project files
+.Rproj.user/
+
+# R session & history
+.Rhistory
+.Rapp.history
+
+# R CMD build artifacts
+.Rcheck/
+*.tar.gz
+
+# R cache directories
+.Rcache/
+.Rtmp/
+
+# knitr / rmarkdown intermediates
+*_cache/
+*_files/
+.knit.md
+.knit.html
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Temporary or scratch data
+tmp/
+temp/
+scratch/
+*.log
+
+# VS Code
+.vscode/
+
+# IntelliJ / PyCharm
+.idea/
+
+# renv
+renv/library/
+renv/python/
+renv/staging/
+
+# packrat (older R dependency system)
+packrat/lib/
+packrat/src/
+
+*.zip
+*.7z
+*.tar
+*.gz
+
+.env
+.env.*
+*.key
+*.pem
