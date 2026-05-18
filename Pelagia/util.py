@@ -11,6 +11,11 @@ import shutil
 import os
 import logging.config
 import logging
+
+from .utils.serialization import json_ready
+from .utils.validation import validate_schema_name
+
+
 def calcThreshold(gray,
                   runCanny=True,
                   cannyParams=(30, 80),
@@ -78,6 +83,8 @@ def loadModel(config, logger):
         os.path.sep + config['classification']['model_name'] + ".json"
     logger.info(f"Loading model from {model_path}.")
     logger.info(f"Loading model sidecar from {label_path}.")
+    import tensorflow as tf
+
     model = tf.keras.models.load_model(model_path)
 
     if config['classification']['feature_space']:
