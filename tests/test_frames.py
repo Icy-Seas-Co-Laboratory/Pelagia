@@ -124,6 +124,82 @@ def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
 
 
+def test_frame_infers_full_frame_geometry_from_data():
+    data = np.arange(12, dtype=np.uint8).reshape(3, 4)
+
+    frame = Frame(
+        sourcePath="/tmp/",
+        destPath="/tmp/out",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+    )
+
+    assert frame.width == 4
+    assert frame.height == 3
+    assert frame.bbox_x == 0
+    assert frame.bbox_y == 0
+    assert frame.get_size() == (4, 3)
+    assert frame.get_bbox() == (0, 0, 4, 3)
+    assert frame.bounds == (0, 0, 4, 3)
+
+
+def test_frame_preserves_roi_geometry():
+    data = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    mask = np.full((2, 3), 255, dtype=np.uint8)
+
+    frame = Frame(
+        sourcePath="/tmp/",
+        destPath="/tmp/out",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        mask=mask,
+        width=3,
+        height=2,
+        bbox_x=10,
+        bbox_y=20,
+        parent_frame_id=42,
+    )
+
+    assert frame.get_size() == (3, 2)
+    assert frame.get_bbox() == (10, 20, 3, 2)
+    assert frame.get_bounds() == (10, 20, 13, 22)
+    assert frame.parent_frame_id == 42
+    np.testing.assert_array_equal(frame.get_mask(), mask)
+
+
+def test_frame_validate_mask_rejects_mismatched_dimensions():
+    data = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    mask = np.full((2, 4), 255, dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="mask width"):
+        Frame(
+            sourcePath="/tmp/",
+            destPath="/tmp/out",
+            filename="frame.png",
+            frameNumber=7,
+            data=data,
+            mask=mask,
+        )
+
+
+def test_frame_validate_geometry_rejects_mismatched_dimensions():
+    data = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    frame = Frame(
+        sourcePath="/tmp/",
+        destPath="/tmp/out",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        width=4,
+        height=2,
+    )
+
+    with pytest.raises(ValueError, match="width"):
+        frame.validate_geometry()
+
+
 def test_store_frame_writes_numpy_payload_and_metadata():
     ctx = FakeContext()
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
@@ -137,6 +213,7 @@ def test_store_frame_writes_numpy_payload_and_metadata():
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
             "asset_id": "00000000-0000-0000-0000-000000000002",
+            "kvstore_encoding": "png",
         },
     )
 
@@ -154,6 +231,45 @@ def test_store_frame_writes_numpy_payload_and_metadata():
     metadata = json.loads(params[9])
     assert metadata["kvstore_encoding"] == "png"
     assert metadata["kvstore_format"] == "png"
+    assert metadata["width"] == 4
+    assert metadata["height"] == 3
+    assert metadata["bbox_x"] == 0
+    assert metadata["bbox_y"] == 0
+
+
+def test_store_frame_writes_roi_geometry_metadata():
+    ctx = FakeContext()
+    data = np.arange(6, dtype=np.uint8).reshape(2, 3)
+
+    frame = Frame(
+        sourcePath="/tmp/",
+        destPath="/tmp/out",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        width=3,
+        height=2,
+        bbox_x=10,
+        bbox_y=20,
+        parent_frame_id=42,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+        },
+    )
+
+    store_frame(frame, context=ctx)
+
+    params = ctx.repository.cursor_obj.params
+    assert params[4] == 3
+    assert params[5] == 2
+
+    metadata = json.loads(params[9])
+    assert metadata["width"] == 3
+    assert metadata["height"] == 2
+    assert metadata["bbox_x"] == 10
+    assert metadata["bbox_y"] == 20
+    assert metadata["parent_frame_id"] == 42
 
 
 def test_store_frame_can_write_raw_numpy_payload():
@@ -301,6 +417,9 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
         sourceFrameEnd=7,
         frameType="line",
         channel=2,
+        bbox_x=10,
+        bbox_y=20,
+        parent_frame_id=99,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
             "asset_id": "00000000-0000-0000-0000-000000000002",
@@ -315,6 +434,8 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
         "asset_id": "00000000-0000-0000-0000-000000000002",
         "frame_index": 3,
         "captured_at": None,
+        "width": 4,
+        "height": 3,
         "source_ref": "/tmp/source/frame.png",
         "frame_hash": "fake-kv-key",
         "metadata": metadata,
@@ -328,6 +449,10 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     assert retrieved.sourceFrameEnd == 7
     assert retrieved.frameType == "line"
     assert retrieved.channel == 2
+    assert retrieved.width == 4
+    assert retrieved.height == 3
+    assert retrieved.get_bbox() == (10, 20, 4, 3)
+    assert retrieved.parent_frame_id == 99
     assert retrieved.sourcePath == "/tmp/source"
     assert retrieved.destPath == "/tmp/out"
     assert retrieved.filename == "frame.png"

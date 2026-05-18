@@ -9,6 +9,7 @@ import pytest
 from Pelagia.config import CoreConfig
 from Pelagia.domain import (
     AssetKind,
+    DetectionRecord,
     FrameRecord,
     PlannedRun,
     PipelineStage,
@@ -22,7 +23,7 @@ from Pelagia.storage.postgres import PostgresRepository
 
 POSTGRES_TEST_DSN = os.getenv(
     "PELAGIA_TEST_DATABASE_DSN",
-    "postgresql://postgres:postgres@localhost:5432/postgres",
+    "postgresql://postgres:postgres@localhost:5432/pelagia",
 )
 
 
@@ -136,6 +137,53 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert len(frames) == 1
     assert frames[0]["frame_index"] == 1
     assert frames[0]["metadata"]["kvstore_key"] == "kvstore-key-1"
+
+    inserted_detections = postgres_repo.replace_detections(
+        run_id,
+        asset_id,
+        [
+            DetectionRecord(
+                run_id=run_id,
+                frame_id=inserted_frames[0]["id"],
+                roi_index=1,
+                bbox_x=1,
+                bbox_y=2,
+                bbox_w=3,
+                bbox_h=4,
+                area=12.0,
+                perimeter=14.0,
+                major_axis_length=4.0,
+                minor_axis_length=3.0,
+                min_gray_value=5,
+                mean_gray_value=6.5,
+                roi_payload=b"roi-bytes",
+                mask_payload=b"mask-bytes",
+                crop_bbox_x=0,
+                crop_bbox_y=1,
+                crop_bbox_w=5,
+                crop_bbox_h=6,
+                roi_encoding="raw",
+                roi_format="raw_ndarray_c_order",
+                roi_dtype="uint8",
+                roi_shape=[4, 5],
+                mask_encoding="raw",
+                mask_format="raw_ndarray_c_order",
+                mask_dtype="uint8",
+                mask_shape=[4, 5],
+                metadata={"kind": "roi"},
+            )
+        ],
+    )
+    assert len(inserted_detections) == 1
+    assert inserted_detections[0]["roi_payload"] == b"roi-bytes"
+    assert inserted_detections[0]["mask_payload"] == b"mask-bytes"
+    assert inserted_detections[0]["crop_bbox_w"] == 5
+    assert inserted_detections[0]["roi_encoding"] == "raw"
+    assert inserted_detections[0]["mask_shape"] == [4, 5]
+
+    detections = postgres_repo.list_detections(asset_id)
+    assert len(detections) == 1
+    assert detections[0]["mask_payload"] == b"mask-bytes"
 
     queued = postgres_repo.get_job(job_id)
     assert queued is not None

@@ -3,8 +3,8 @@ import pytest
 from Pelagia.config import CoreConfig, ImageDataStorageConfig
 
 
-def test_image_data_storage_config_defaults_to_png():
-    assert ImageDataStorageConfig().encoding == "png"
+def test_image_data_storage_config_defaults_to_zstd():
+    assert ImageDataStorageConfig().encoding == "zstd"
 
 
 def test_image_data_storage_config_rejects_unknown_encoding():

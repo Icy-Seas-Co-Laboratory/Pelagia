@@ -106,17 +106,137 @@ CREATE TABLE IF NOT EXISTS {schema}.detections (
     bbox_y integer NOT NULL,
     bbox_w integer NOT NULL,
     bbox_h integer NOT NULL,
+    crop_bbox_x integer,
+    crop_bbox_y integer,
+    crop_bbox_w integer,
+    crop_bbox_h integer,
     area double precision,
     perimeter double precision,
     major_axis_length double precision,
     minor_axis_length double precision,
     min_gray_value integer,
     mean_gray_value double precision,
-    crop_png bytea,
+    roi_payload bytea,
+    mask_payload bytea,
+    roi_encoding text,
+    roi_format text,
+    roi_dtype text,
+    roi_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    mask_encoding text,
+    mask_format text,
+    mask_dtype text,
+    mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT detections_bbox_positive CHECK (bbox_w > 0 AND bbox_h > 0),
+    CONSTRAINT detections_crop_bbox_positive CHECK (
+        (
+            crop_bbox_x IS NULL AND crop_bbox_y IS NULL
+            AND crop_bbox_w IS NULL AND crop_bbox_h IS NULL
+        )
+        OR (
+            crop_bbox_x IS NOT NULL AND crop_bbox_y IS NOT NULL
+            AND crop_bbox_w > 0 AND crop_bbox_h > 0
+        )
+    ),
     UNIQUE (frame_id, roi_index)
 );
+
+ALTER TABLE {schema}.detections
+    ADD COLUMN IF NOT EXISTS crop_bbox_x integer,
+    ADD COLUMN IF NOT EXISTS crop_bbox_y integer,
+    ADD COLUMN IF NOT EXISTS crop_bbox_w integer,
+    ADD COLUMN IF NOT EXISTS crop_bbox_h integer,
+    ADD COLUMN IF NOT EXISTS roi_payload bytea,
+    ADD COLUMN IF NOT EXISTS mask_payload bytea,
+    ADD COLUMN IF NOT EXISTS roi_encoding text,
+    ADD COLUMN IF NOT EXISTS roi_format text,
+    ADD COLUMN IF NOT EXISTS roi_dtype text,
+    ADD COLUMN IF NOT EXISTS roi_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS mask_encoding text,
+    ADD COLUMN IF NOT EXISTS mask_format text,
+    ADD COLUMN IF NOT EXISTS mask_dtype text,
+    ADD COLUMN IF NOT EXISTS mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name = 'detections'
+          AND column_name = 'crop_png'
+    ) THEN
+        EXECUTE 'UPDATE {schema}.detections SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name = 'detections'
+          AND column_name = 'mask_png'
+    ) THEN
+        EXECUTE 'UPDATE {schema}.detections SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'detections_bbox_positive'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.detections
+            ADD CONSTRAINT detections_bbox_positive CHECK (bbox_w > 0 AND bbox_h > 0);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'detections_crop_bbox_positive'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.detections
+            ADD CONSTRAINT detections_crop_bbox_positive CHECK (
+                (
+                    crop_bbox_x IS NULL AND crop_bbox_y IS NULL
+                    AND crop_bbox_w IS NULL AND crop_bbox_h IS NULL
+                )
+                OR (
+                    crop_bbox_x IS NOT NULL AND crop_bbox_y IS NOT NULL
+                    AND crop_bbox_w > 0 AND crop_bbox_h > 0
+                )
+            );
+    END IF;
+END $$;
+
+UPDATE {schema}.detections
+SET
+    roi_encoding = COALESCE(roi_encoding, metadata->>'roi_encoding', metadata->>'array_encoding'),
+    roi_format = COALESCE(roi_format, metadata->>'roi_format'),
+    roi_dtype = COALESCE(roi_dtype, metadata->>'dtype'),
+    roi_shape = CASE
+        WHEN roi_shape = '[]'::jsonb AND metadata ? 'shape' THEN metadata->'shape'
+        ELSE roi_shape
+    END,
+    mask_encoding = COALESCE(mask_encoding, metadata->>'mask_encoding'),
+    mask_format = COALESCE(mask_format, metadata->>'mask_format'),
+    mask_dtype = COALESCE(mask_dtype, metadata->>'mask_dtype'),
+    mask_shape = CASE
+        WHEN mask_shape = '[]'::jsonb AND metadata ? 'mask_shape' THEN metadata->'mask_shape'
+        ELSE mask_shape
+    END,
+    crop_bbox_x = COALESCE(
+        crop_bbox_x,
+        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>0)::integer END
+    ),
+    crop_bbox_y = COALESCE(
+        crop_bbox_y,
+        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>1)::integer END
+    ),
+    crop_bbox_w = COALESCE(
+        crop_bbox_w,
+        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>2)::integer END
+    ),
+    crop_bbox_h = COALESCE(
+        crop_bbox_h,
+        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>3)::integer END
+    );
 
 CREATE TABLE IF NOT EXISTS {schema}.models (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -517,9 +637,15 @@ class PostgresRepository:
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.detections
-                        (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h, area, perimeter,
-                         major_axis_length, minor_axis_length, min_gray_value, mean_gray_value, crop_png, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                         crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
+                         area, perimeter, major_axis_length, minor_axis_length,
+                         min_gray_value, mean_gray_value, roi_payload, mask_payload,
+                         roi_encoding, roi_format, roi_dtype, roi_shape,
+                         mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                                %s::jsonb, %s::jsonb)
                         RETURNING *;
                         """,
                         (
@@ -530,13 +656,26 @@ class PostgresRepository:
                             detection.bbox_y,
                             detection.bbox_w,
                             detection.bbox_h,
+                            detection.crop_bbox_x,
+                            detection.crop_bbox_y,
+                            detection.crop_bbox_w,
+                            detection.crop_bbox_h,
                             detection.area,
                             detection.perimeter,
                             detection.major_axis_length,
                             detection.minor_axis_length,
                             detection.min_gray_value,
                             detection.mean_gray_value,
-                            detection.crop_png,
+                            detection.roi_payload,
+                            detection.mask_payload,
+                            detection.roi_encoding,
+                            detection.roi_format,
+                            detection.roi_dtype,
+                            json.dumps(json_ready(detection.roi_shape)),
+                            detection.mask_encoding,
+                            detection.mask_format,
+                            detection.mask_dtype,
+                            json.dumps(json_ready(detection.mask_shape)),
                             json.dumps(json_ready(detection.metadata)),
                         ),
                     )

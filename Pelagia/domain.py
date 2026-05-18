@@ -106,7 +106,20 @@ class DetectionRecord:
     minor_axis_length: float
     min_gray_value: int
     mean_gray_value: float
-    crop_png: bytes | None
+    roi_payload: bytes | None
+    mask_payload: bytes | None = None
+    crop_bbox_x: int | None = None
+    crop_bbox_y: int | None = None
+    crop_bbox_w: int | None = None
+    crop_bbox_h: int | None = None
+    roi_encoding: str | None = None
+    roi_format: str | None = None
+    roi_dtype: str | None = None
+    roi_shape: list[int] = field(default_factory=list)
+    mask_encoding: str | None = None
+    mask_format: str | None = None
+    mask_dtype: str | None = None
+    mask_shape: list[int] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

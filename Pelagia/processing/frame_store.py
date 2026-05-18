@@ -53,6 +53,7 @@ def store_frame(frame: Frame, context: AppContext | None = None) -> dict[str, An
     array = np.ascontiguousarray(data)
     if array.ndim < 2:
         raise ValueError("Frame data must have at least two dimensions.")
+    frame.validate_geometry(array)
 
     ctx = context or default_context()
     if ctx.kvstore is None:
@@ -71,7 +72,7 @@ def store_frame(frame: Frame, context: AppContext | None = None) -> dict[str, An
     )
     payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
     kvstore_key = ctx.kvstore.put_store(payload)
-    height, width = int(array.shape[0]), int(array.shape[1])
+    width, height = frame.get_size()
     source_frame_start, source_frame_end = frame.get_source_frame_range()
     captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None
 
@@ -92,6 +93,11 @@ def store_frame(frame: Frame, context: AppContext | None = None) -> dict[str, An
                 "kvstore_format": kvstore_format,
                 "dtype": str(array.dtype),
                 "shape": list(array.shape),
+                "width": width,
+                "height": height,
+                "bbox_x": frame.bbox_x,
+                "bbox_y": frame.bbox_y,
+                "parent_frame_id": frame.parent_frame_id,
                 "source_path": frame.sourcePath,
                 "dest_path": frame.destPath,
                 "filename": frame.filename,
@@ -176,6 +182,11 @@ def retrieve_frame(id: int, context: AppContext | None = None) -> Frame:
         filename=filename,
         frameNumber=metadata.get("frame_number") or row["frame_index"],
         data=array,
+        width=row.get("width") or metadata.get("width"),
+        height=row.get("height") or metadata.get("height"),
+        bbox_x=metadata.get("bbox_x", 0),
+        bbox_y=metadata.get("bbox_y", 0),
+        parent_frame_id=metadata.get("parent_frame_id"),
         tileNumber=metadata.get("tile_number"),
         sourceFrameStart=metadata.get("source_frame_start"),
         sourceFrameEnd=metadata.get("source_frame_end"),
