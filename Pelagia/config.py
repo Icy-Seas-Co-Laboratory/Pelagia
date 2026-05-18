@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+
+ImageDataStorageEncoding = Literal["png", "raw", "zstd"]
+IMAGE_DATA_STORAGE_ENCODINGS = {"png", "raw", "zstd"}
 
 
 @dataclass(slots=True)
@@ -32,9 +37,23 @@ class KVStoreConfig:
 
     root_path: Path = Path("./data/kvstore")
     hash_algorithm: str = "sha256"
-    prefix_length: int = 2
+    prefix_length: int = 1
     max_db_bytes: int = 4 * 1024 * 1024 * 1024
     max_rows: int = 1_000_000
+
+
+@dataclass(slots=True)
+class ImageDataStorageConfig:
+    """Frame image payload storage settings."""
+
+    encoding: ImageDataStorageEncoding = "zstd"
+
+    def __post_init__(self) -> None:
+        self.encoding = str(self.encoding).lower()
+        if self.encoding not in IMAGE_DATA_STORAGE_ENCODINGS:
+            raise ValueError(
+                "image data storage encoding must be one of: png, raw, zstd."
+            )
 
 
 @dataclass(slots=True)
@@ -52,6 +71,7 @@ class CoreConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     kvstore: KVStoreConfig = field(default_factory=KVStoreConfig)
+    image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
 
     @classmethod
@@ -60,6 +80,7 @@ class CoreConfig:
         database_defaults = DatabaseConfig()
         queue_defaults = QueueConfig()
         kvstore_defaults = KVStoreConfig()
+        image_data_storage_defaults = ImageDataStorageConfig()
         api_defaults = APIConfig()
         return cls(
             database=DatabaseConfig(
@@ -81,6 +102,12 @@ class CoreConfig:
                 prefix_length=int(os.getenv("PELAGIA_KVSTORE_PREFIX_LENGTH", str(kvstore_defaults.prefix_length))),
                 max_db_bytes=int(os.getenv("PELAGIA_KVSTORE_MAX_DB_BYTES", str(kvstore_defaults.max_db_bytes))),
                 max_rows=int(os.getenv("PELAGIA_KVSTORE_MAX_ROWS", str(kvstore_defaults.max_rows))),
+            ),
+            image_data_storage=ImageDataStorageConfig(
+                encoding=os.getenv(
+                    "PELAGIA_IMAGE_DATA_STORAGE_ENCODING",
+                    image_data_storage_defaults.encoding,
+                ),
             ),
             api=APIConfig(
                 host=os.getenv("PELAGIA_API_HOST", api_defaults.host),

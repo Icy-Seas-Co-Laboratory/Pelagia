@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import sqlite3
 
 import pytest
@@ -11,6 +12,7 @@ from Pelagia.storage.kvstore import (
     KVStoreAlreadyInitializedError,
     KVStoreConfigError,
     KVStoreIntegrityError,
+    KVStoreLockError,
 )
 
 
@@ -33,6 +35,31 @@ def test_creating_new_store_leaves_uninitialized(tmp_path):
     store = KVStore(tmp_path / "store")
 
     assert store.initialized is False
+
+
+def test_root_path_expands_user_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    store = KVStore("~/store")
+
+    assert store.root_path == (tmp_path / "store").resolve()
+
+
+def test_root_path_expands_environment_variables(monkeypatch, tmp_path):
+    monkeypatch.setenv("PELAGIA_TEST_STORE_ROOT", str(tmp_path))
+
+    store = KVStore("$PELAGIA_TEST_STORE_ROOT/nested")
+
+    assert store.root_path == (tmp_path / "nested").resolve()
+
+
+def test_root_path_resolves_relative_paths(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    store = KVStore("relative-store")
+
+    assert store.root_path == (tmp_path / "relative-store").resolve()
 
 
 def test_top_level_kvstore_import_remains_compatible():
@@ -121,6 +148,26 @@ def test_key_exists_true_and_false(tmp_path):
     assert store.key_exists(sha256_key(b"missing")) is False
 
 
+def test_key_delete_removes_existing_key(tmp_path):
+    store = KVStore(tmp_path / "store")
+    store.initialize(prefix_length=1)
+
+    key = store.put_store(b"present")
+    store.key_delete(key)
+
+    assert store.key_exists(key) is False
+    with pytest.raises(KeyError):
+        store.get_store(key)
+
+
+def test_key_delete_missing_raises_key_error(tmp_path):
+    store = KVStore(tmp_path / "store")
+    store.initialize(prefix_length=1)
+
+    with pytest.raises(KeyError):
+        store.key_delete(sha256_key(b"missing"))
+
+
 def test_get_store_missing_raises_key_error(tmp_path):
     store = KVStore(tmp_path / "store")
     store.initialize(prefix_length=1)
@@ -138,6 +185,31 @@ def test_idempotent_writes_of_same_payload(tmp_path):
 
     assert first == second
     assert store.status()["total_stored_blobs"] == 1
+
+
+def test_prefix_write_lock_timeout(tmp_path):
+    store = KVStore(tmp_path / "store", lock_timeout_s=0.01, lock_poll_interval_s=0.001, stale_lock_seconds=None)
+    store.initialize(prefix_length=1)
+    payload = b"locked payload"
+    lock_path = store.root_path / sha256_key(payload)[:1] / ".kvstore.lock"
+    lock_path.write_text("held by test", encoding="utf-8")
+
+    with pytest.raises(KVStoreLockError):
+        store.put_store(payload)
+
+
+def test_stale_prefix_lock_is_removed(tmp_path):
+    store = KVStore(tmp_path / "store", lock_timeout_s=0.5, lock_poll_interval_s=0.001, stale_lock_seconds=0)
+    store.initialize(prefix_length=1)
+    payload = b"stale lock payload"
+    lock_path = store.root_path / sha256_key(payload)[:1] / ".kvstore.lock"
+    lock_path.write_text("stale", encoding="utf-8")
+    os.utime(lock_path, (0, 0))
+
+    key = store.put_store(payload)
+
+    assert store.get_store(key) == payload
+    assert not lock_path.exists()
 
 
 def test_integrity_error_on_same_key_with_different_payload_via_existing_row(tmp_path):
@@ -257,6 +329,19 @@ def test_key_exists_finds_keys_in_older_rotated_files(tmp_path):
     store.put_store(second_payload)
 
     assert store.key_exists(first) is True
+
+
+def test_key_delete_removes_keys_from_older_rotated_files(tmp_path):
+    store = KVStore(tmp_path / "store")
+    store.initialize(prefix_length=1, max_rows=1)
+    first_payload, second_payload = payloads_with_same_prefix(2)
+
+    first = store.put_store(first_payload)
+    second = store.put_store(second_payload)
+    store.key_delete(first)
+
+    assert store.key_exists(first) is False
+    assert store.get_store(second) == second_payload
 
 
 def test_idempotent_writes_detect_existing_keys_across_rotated_files(tmp_path):

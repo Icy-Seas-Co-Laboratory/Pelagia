@@ -86,4 +86,8 @@ Rotation is per prefix, never global. Existing blobs are not moved during rotati
 
 ## Concurrency
 
-The current implementation uses one SQLite connection per operation and enables WAL mode with `synchronous=NORMAL`. This is intended for simple single-process usage. Multi-process concurrent writes should use external locking or a future lock manager.
+The current implementation uses one SQLite connection per operation and enables WAL mode with `synchronous=NORMAL`. Writes and rotation are guarded by a small standard-library file lock per prefix directory, so unrelated prefixes can still progress independently. Initialization also takes a root-level lock.
+
+This lock is intentionally simple. It is suitable for local multi-process usage on a normal filesystem, but it is not a distributed lock manager. For network filesystems or clustered workers, add an external coordinator or move locking into the catalog database.
+
+Root paths are normalized with `pathlib` after expanding `~` and environment variables, so paths such as `~/pelagia-store`, `$PELAGIA_STORE_ROOT/data`, and relative paths work consistently across supported operating systems.

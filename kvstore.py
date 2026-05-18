@@ -6,6 +6,7 @@ from Pelagia.storage.kvstore import (
     KVStoreConfigError,
     KVStoreError,
     KVStoreIntegrityError,
+    KVStoreLockError,
     KVStoreNotInitializedError,
     KVStoreRotationError,
 )
@@ -17,5 +18,6 @@ __all__ = [
     "KVStoreAlreadyInitializedError",
     "KVStoreConfigError",
     "KVStoreIntegrityError",
+    "KVStoreLockError",
     "KVStoreRotationError",
 ]

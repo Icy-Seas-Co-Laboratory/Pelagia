@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import re
 import shutil
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,6 +16,7 @@ from typing import Any, Iterable
 DEFAULT_MAX_DB_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_MAX_ROWS = 1_000_000
 CONFIG_FILENAME = "config.json"
+LOCK_FILENAME = ".kvstore.lock"
 SCHEMA_VERSION = 1
 SUPPORTED_HASHES = {"sha256": 64, "blake3": 64}
 HEX_RE = re.compile(r"^[0-9a-f]+$")
@@ -43,19 +46,113 @@ class KVStoreRotationError(KVStoreError):
     """Raised when a rotated SQLite file cannot be selected or created."""
 
 
+class KVStoreLockError(KVStoreError):
+    """Raised when a store lock cannot be acquired."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_root_path(root_path: str | Path) -> Path:
+    raw_path = os.fspath(root_path)
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    return Path(expanded).resolve(strict=False)
+
+
+class _FileLock:
+    """Small cross-platform lock based on atomic lock-file creation."""
+
+    def __init__(
+        self,
+        lock_path: Path,
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+        stale_after_s: float | None,
+    ):
+        self.lock_path = lock_path
+        self.timeout_s = timeout_s
+        self.poll_interval_s = poll_interval_s
+        self.stale_after_s = stale_after_s
+        self._acquired = False
+
+    def __enter__(self) -> "_FileLock":
+        deadline = time.monotonic() + self.timeout_s
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        while True:
+            try:
+                fd = os.open(
+                    self.lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o644,
+                )
+            except FileExistsError:
+                self._remove_if_stale()
+                if time.monotonic() >= deadline:
+                    raise KVStoreLockError(f"Timed out waiting for lock: {self.lock_path}")
+                time.sleep(self.poll_interval_s)
+                continue
+
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "created_at": _utc_now(),
+                        "lock_path": str(self.lock_path),
+                    },
+                    lock_file,
+                    sort_keys=True,
+                )
+                lock_file.write("\n")
+            self._acquired = True
+            return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if not self._acquired:
+            return
+        try:
+            self.lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            self._acquired = False
+
+    def _remove_if_stale(self) -> None:
+        if self.stale_after_s is None:
+            return
+        try:
+            age_s = time.time() - self.lock_path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if age_s < self.stale_after_s:
+            return
+        try:
+            self.lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class KVStore:
     """A content-addressed key-value store backed by rotated SQLite files."""
 
-    def __init__(self, root_path: str | Path):
+    def __init__(
+        self,
+        root_path: str | Path,
+        *,
+        lock_timeout_s: float = 30.0,
+        lock_poll_interval_s: float = 0.05,
+        stale_lock_seconds: float | None = 60 * 60,
+    ):
         """Create a store handle for ``root_path`` without implicitly initializing it."""
-        self.root_path = Path(root_path)
+        self.root_path = _normalize_root_path(root_path)
         self.config_path = self.root_path / CONFIG_FILENAME
         self.config: dict[str, Any] | None = None
         self.initialized = False
+        self.lock_timeout_s = lock_timeout_s
+        self.lock_poll_interval_s = lock_poll_interval_s
+        self.stale_lock_seconds = stale_lock_seconds
 
         if self.config_path.exists():
             self.config = self._load_config()
@@ -78,42 +175,51 @@ class KVStore:
         if not sqlite_basename:
             raise KVStoreConfigError("sqlite_basename must be a non-empty string.")
 
-        if self.root_path.exists() and any(self.root_path.iterdir()):
-            if not overwrite:
-                raise KVStoreAlreadyInitializedError(
-                    f"Store path is not empty: {self.root_path}"
-                )
-            shutil.rmtree(self.root_path)
-
-        created_at = _utc_now()
-        config = {
-            "version": 1,
-            "hash_algorithm": hash_algorithm,
-            "prefix_length": prefix_length,
-            "sqlite_basename": sqlite_basename,
-            "sqlite_extension": ".sqlite",
-            "sqlite_filename_pattern": f"{sqlite_basename}_{{index:06d}}.sqlite",
-            "manifest_filename": "manifest.json",
-            "created_at": created_at,
-            "key_length": SUPPORTED_HASHES[hash_algorithm],
-            "rotation": {
-                "max_db_bytes": max_db_bytes,
-                "max_rows": max_rows,
-            },
-        }
-
         self.root_path.mkdir(parents=True, exist_ok=True)
-        self.config = config
-        self.initialized = True
-        self.config_path = self.root_path / CONFIG_FILENAME
+        with self._lock_for_path(self.root_path / LOCK_FILENAME):
+            content_paths = [
+                path for path in self.root_path.iterdir()
+                if path.name != LOCK_FILENAME
+            ]
+            if content_paths:
+                if not overwrite:
+                    raise KVStoreAlreadyInitializedError(
+                        f"Store path is not empty: {self.root_path}"
+                    )
+                for path in content_paths:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
 
-        self._write_config()
-        self._write_manifest(created_at=created_at)
+            created_at = _utc_now()
+            config = {
+                "version": 1,
+                "hash_algorithm": hash_algorithm,
+                "prefix_length": prefix_length,
+                "sqlite_basename": sqlite_basename,
+                "sqlite_extension": ".sqlite",
+                "sqlite_filename_pattern": f"{sqlite_basename}_{{index:06d}}.sqlite",
+                "manifest_filename": "manifest.json",
+                "created_at": created_at,
+                "key_length": SUPPORTED_HASHES[hash_algorithm],
+                "rotation": {
+                    "max_db_bytes": max_db_bytes,
+                    "max_rows": max_rows,
+                },
+            }
 
-        for prefix in self._expected_prefixes():
-            prefix_dir = self._prefix_dir_for_prefix(prefix)
-            prefix_dir.mkdir(parents=True, exist_ok=True)
-            self._create_schema(prefix_dir / self._sqlite_filename(1))
+            self.config = config
+            self.initialized = True
+            self.config_path = self.root_path / CONFIG_FILENAME
+
+            self._write_config()
+            self._write_manifest(created_at=created_at)
+
+            for prefix in self._expected_prefixes():
+                prefix_dir = self._prefix_dir_for_prefix(prefix)
+                prefix_dir.mkdir(parents=True, exist_ok=True)
+                self._create_schema(prefix_dir / self._sqlite_filename(1))
 
     def get_store(self, key: str) -> bytes:
         """Return payload bytes for ``key`` or raise ``KeyError`` if it is missing."""
@@ -124,6 +230,22 @@ class KVStore:
         if found is None:
             raise KeyError(key)
         return found[1]
+
+    def key_delete(self, key: str) -> None:
+        """Delete ``key`` from the store or raise ``KeyError`` if it is missing."""
+        self._require_initialized()
+        self._validate_key(key)
+        prefix = self._prefix_for_key(key)
+        deleted = False
+
+        with self._lock_for_prefix(prefix):
+            for db_path in reversed(self._sqlite_files_for_prefix(prefix)):
+                with self._connect(db_path) as connection:
+                    cursor = connection.execute("DELETE FROM blobs WHERE key = ?", (key,))
+                deleted = deleted or cursor.rowcount > 0
+
+        if not deleted:
+            raise KeyError(key)
 
     def put_store(self, key: str | bytes | bytearray | None = None, payload: bytes | bytearray | str | None = None) -> str:
         """Store ``payload`` and return its content-addressed key.
@@ -156,24 +278,25 @@ class KVStore:
             key_to_store = computed_key
 
         prefix = self._prefix_for_key(key_to_store)
-        found = self._find_key_in_prefix(key_to_store, prefix)
-        if found is not None:
-            _, existing_payload = found
-            if existing_payload != payload_bytes:
-                raise KVStoreIntegrityError(
-                    f"Key {key_to_store} already exists with different payload bytes."
-                )
-            return key_to_store
+        with self._lock_for_prefix(prefix):
+            found = self._find_key_in_prefix(key_to_store, prefix)
+            if found is not None:
+                _, existing_payload = found
+                if existing_payload != payload_bytes:
+                    raise KVStoreIntegrityError(
+                        f"Key {key_to_store} already exists with different payload bytes."
+                    )
+                return key_to_store
 
-        db_path = self._active_db_path_for_prefix(prefix)
-        with self._connect(db_path) as connection:
-            connection.execute(
-                """
-                INSERT INTO blobs (key, payload, size, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (key_to_store, payload_bytes, len(payload_bytes), _utc_now()),
-            )
+            db_path = self._active_db_path_for_prefix(prefix)
+            with self._connect(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO blobs (key, payload, size, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (key_to_store, payload_bytes, len(payload_bytes), _utc_now()),
+                )
         return key_to_store
 
     def key_exists(self, key: str) -> bool:
@@ -381,6 +504,17 @@ class KVStore:
 
     def _prefix_dir_for_prefix(self, prefix: str) -> Path:
         return self.root_path / prefix
+
+    def _lock_for_prefix(self, prefix: str) -> _FileLock:
+        return self._lock_for_path(self._prefix_dir_for_prefix(prefix) / LOCK_FILENAME)
+
+    def _lock_for_path(self, lock_path: Path) -> _FileLock:
+        return _FileLock(
+            lock_path,
+            timeout_s=self.lock_timeout_s,
+            poll_interval_s=self.lock_poll_interval_s,
+            stale_after_s=self.stale_lock_seconds,
+        )
 
     def _sqlite_filename(self, index: int) -> str:
         self._require_config()

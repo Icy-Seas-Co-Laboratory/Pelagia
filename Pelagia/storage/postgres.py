@@ -264,7 +264,10 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 if self.config.database.statement_timeout_ms > 0:
-                    cursor.execute("SET statement_timeout = %s", (self.config.database.statement_timeout_ms,))
+                    cursor.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (str(self.config.database.statement_timeout_ms),),
+                    )
                 cursor.execute(render_schema(self.schema))
             connection.commit()
 
