@@ -4,37 +4,92 @@
 
 # Pelagia
 
-Pelagia is an image-processing, storage, and worker system for video-frame extraction, ROI segmentation, and downstream analysis. Large full-frame image payloads are stored in a cold `KVStore`, while smaller ROI payloads and masks are stored directly with Postgres metadata for easier analysis.
+Pelagia is a scalable image-analysis system for extracting, segmenting, organizing, labeling, and training models on biological image data. It is built around video-frame ingestion, ROI-first processing, durable metadata, background workers, and reproducible data products.
 
 <p align="center">
   <img src="docs/assets/pelagia_icon.png" alt="Pelagia icon" width="96">
 </p>
 
-## Project Layout
+Pelagia is designed for workflows where full source frames are large and mostly cold, while segmented ROIs are the primary unit of analysis. Full-frame payloads can live in external cold storage, while ROI crops, masks, measurements, classifications, and curation state remain close to the database-backed analysis workflow.
 
-Pelagia is organized so the API, CLI, and workers share the same core services instead of each growing separate business logic.
+## System Architecture
+
+Pelagia keeps interface code thin and moves reusable behavior into shared services and processing modules.
+
+```text
+API / CLI / Workers
+        |
+        v
+     Services
+        |
+        +--> Storage adapters
+        |      - Postgres metadata, queue, worker sessions, events
+        |      - Cold payload storage for large frame data
+        |
+        +--> Processing routines
+               - frame extraction
+               - segmentation
+               - ROI storage
+               - correction, encoding, and analysis helpers
+```
+
+The repository layout follows that split:
 
 ```text
 Pelagia/
-  config.py              shared typed configuration
-  domain.py              stable domain records and enums
-  storage/               persistence adapters for Postgres and KVStore
-  processing/            data-in/data-out processing routines
-  services/              application operations shared by all interfaces
+  config.py              typed config loaded from TOML/env/CLI overrides
+  domain.py              stable records, enums, and row models
+  storage/               persistence adapters and SQL schema resources
+  processing/            image and model processing routines
+  services/              application workflows shared by interfaces
   workers/               job claiming, dispatch, heartbeat, and execution
-  api/                   FastAPI app and route modules
+  api/                   FastAPI application and route modules
   cli/                   command-line entrypoint and commands
   utils/                 small shared helpers
 docs/assets/             documentation images and branding assets
 ```
 
-The intended dependency direction is:
+## Core Capabilities
+
+Current and planned capabilities are organized around an ROI-centered pipeline:
+
+- **Video and image ingestion**: register source assets, extract frames, store full-frame payloads in cold storage, and record searchable metadata.
+- **Frame correction**: apply image normalization such as flatfield correction before storage or analysis.
+- **Segmentation**: detect candidate ROIs from extracted frames, store ROI crops, masks, geometry, and image statistics.
+- **Segmentation refinement**: support learned mask refinement models such as U-Net-style models for better ROI boundaries.
+- **Labeling and classification**: attach model predictions and human labels to ROIs using CNN-style classifiers or related image models.
+- **Clustering and exploration**: support unsupervised grouping with embeddings, PCA, k-means, and related tools for dataset discovery.
+- **Training set curation**: refine labels, identify uncertain examples, manage balanced training sets, and track curation decisions.
+- **Model training and evaluation**: train, register, compare, and archive segmentation and classification models.
+- **Export**: produce robust exports for ROIs, masks, labels, measurements, embeddings, model outputs, and curated datasets.
+- **Scalability**: run independent worker processes per job type, scale across CPU cores or machines, and keep a durable job/event history.
+
+## Data Model
+
+Pelagia separates runtime image data from persistent row models:
+
+- `FrameData` is the runtime container for image arrays, masks, geometry, and source metadata while processing.
+- `FrameRecord` is the database row model for a stored frame, including geometry and a payload reference for large frame data.
+- `DetectionRecord` is the database row model for an ROI, including object bounds, padded crop bounds, ROI payload, mask payload, and measurements.
+
+This keeps the boundary clear: large source frames can remain cold and only be fetched when needed, while compact ROI-centered data stays available for analysis and curation.
+
+## Jobs And Workers
+
+Pelagia uses Postgres-backed jobs to coordinate long-running processing. Workers are independent processes that claim jobs for specific stages, heartbeat while active, write job events, and can be stopped through worker-session state.
+
+Example worker roles:
 
 ```text
-API / CLI / Workers -> Services -> Storage + Processing
+extract_frames workers     video/image frame extraction
+segment workers            ROI detection and mask generation
+classify workers           ROI labeling with trained models
+curation workers           embedding, clustering, and dataset refinement tasks
+export workers             dataset/model/result export tasks
+training workers           model training and evaluation jobs
 ```
 
-Keep FastAPI routes, CLI commands, and worker loops thin. When logic is useful in more than one interface, put it in `services/`. When logic transforms data without caring who called it, put it in `processing/`.
+This architecture allows the system to grow from one local process to many specialized background daemons without changing the shape of the pipeline.
 
 ## Configuration
 
@@ -46,69 +101,23 @@ Pelagia/default.config.toml < ./config.toml < environment variables < explicit C
 
 The packaged [default.config.toml](Pelagia/default.config.toml) contains development-friendly defaults. Create a local `config.toml` in the repository root for machine-specific overrides; it is ignored by git.
 
-## Basic Usage
+## Storage Strategy
 
-### KVStore
+Pelagia treats storage as a replaceable adapter layer.
 
-`KVStore` is a content-addressed cold-storage pool for large frame payloads. Payloads are stored as bytes in SQLite databases, and each payload's hash digest is its canonical key. The key prefix determines the shard directory, and each shard can rotate through multiple SQLite files as size or row-count limits are reached.
+- Postgres stores durable metadata, jobs, worker sessions, events, frame records, ROI records, model records, and classification results.
+- Large full-frame payloads are stored by a cold payload store adapter because they are expensive and usually read infrequently.
+- ROI crops and masks are small enough to store directly with ROI records, making downstream analysis and export simpler.
 
-```python
-from Pelagia.storage.kvstore import KVStore
+`KVStore` is currently the cold payload store used by Pelagia during development. It is intentionally separable and is expected to become an external dependency rather than a core Pelagia subsystem.
 
-store = KVStore("./my_store")
-store.initialize(
-    hash_algorithm="sha256",
-    prefix_length=2,
-    max_db_bytes=4 * 1024 * 1024 * 1024,
-    max_rows=1_000_000,
-)
+## Development Direction
 
-payload = b"hello world"
-key = store.put_store(payload)
+The near-term goal is to keep Pelagia small at the interfaces and strong in the pipeline core:
 
-assert store.key_exists(key)
-assert store.get_store(key) == payload
-
-print(store.status())
-print(store.check_health())
-```
-
-## Layout
-
-With `prefix_length=2`, a key beginning with `aa` is routed to `root/aa/`:
-
-```text
-root/
-  config.json
-  manifest.json
-  00/
-    store_000001.sqlite
-  aa/
-    store_000001.sqlite
-    store_000002.sqlite
-```
-
-Prefix length controls shard fanout:
-
-- `1` creates 16 directories.
-- `2` creates 256 directories.
-- `3` creates 4096 directories.
-- `4` creates 65536 directories and may be excessive for many filesystems.
-
-## Rotation
-
-Each prefix directory starts with `store_000001.sqlite`. Before a new blob is inserted, the store checks the highest-numbered SQLite file for that prefix. If the file is at or above `max_db_bytes` or `max_rows`, the store creates the next file, such as `store_000002.sqlite`, and writes the new blob there.
-
-Rotation is per prefix, never global. Existing blobs are not moved during rotation, so reads search all SQLite files for the relevant prefix, newest first.
-
-## Hash Algorithms
-
-`sha256` uses Python's standard `hashlib.sha256`. `blake3` is supported when the third-party `blake3` package is installed. If `blake3` is requested without that dependency, `KVStoreConfigError` is raised with a clear message.
-
-## Concurrency
-
-The current implementation uses one SQLite connection per operation and enables WAL mode with `synchronous=NORMAL`. Writes and rotation are guarded by a small standard-library file lock per prefix directory, so unrelated prefixes can still progress independently. Initialization also takes a root-level lock.
-
-This lock is intentionally simple. It is suitable for local multi-process usage on a normal filesystem, but it is not a distributed lock manager. For network filesystems or clustered workers, add an external coordinator or move locking into the catalog database.
-
-Root paths are normalized with `pathlib` after expanding `~` and environment variables, so paths such as `~/pelagia-store`, `$PELAGIA_STORE_ROOT/data`, and relative paths work consistently across supported operating systems.
+- keep API, CLI, and worker entrypoints thin;
+- keep processing routines focused and testable;
+- keep row models aligned one-to-one with database records;
+- keep storage adapters replaceable;
+- keep job history explicit through `job_events`;
+- build curation, training, and export features on top of the same ROI-centered data model.
