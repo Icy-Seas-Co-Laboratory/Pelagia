@@ -88,3 +88,6 @@ packrat/src/
 .env.*
 *.key
 *.pem
+
+# Local Pelagia overrides
+config.toml
