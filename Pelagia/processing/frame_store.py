@@ -99,7 +99,6 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                 "bbox_y": frame.bbox_y,
                 "parent_frame_id": frame.parent_frame_id,
                 "source_path": frame.sourcePath,
-                "dest_path": frame.destPath,
                 "filename": frame.filename,
                 "frame_number": frame.frameNumber,
                 "tile_number": frame.tileNumber,

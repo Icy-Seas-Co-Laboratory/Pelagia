@@ -97,6 +97,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
                     kind=AssetKind.VIDEO,
                     size_bytes=123,
                     checksum="sha256:test",
+                    collections=["skq202510S-T1", "test"],
                     media_count=1,
                     metadata={"kind": "fixture"},
                 )
@@ -122,6 +123,12 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert len(assets) == 1
     assert str(assets[0]["id"]) == asset_id
     assert assets[0]["asset_key"] == "example.avi"
+    assert assets[0]["collections"] == ["skq202510S-T1", "test"]
+    assert postgres_repo.list_collections() == [
+        {"collection": "skq202510S-T1", "asset_count": 1},
+        {"collection": "test", "asset_count": 1},
+    ]
+    assert postgres_repo.list_assets(collection="test")[0]["asset_key"] == "example.avi"
 
     inserted_frames = postgres_repo.replace_frames(
         run_id,

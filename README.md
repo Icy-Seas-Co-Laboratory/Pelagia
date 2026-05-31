@@ -71,6 +71,7 @@ Pelagia separates runtime image data from persistent row models:
 - `FrameData` is the runtime container for image arrays, masks, geometry, and source metadata while processing.
 - `FrameRecord` is the database row model for a stored frame, including geometry and a payload reference for large frame data.
 - `DetectionRecord` is the database row model for an ROI, including object bounds, padded crop bounds, ROI payload, mask payload, and measurements.
+- `raw_assets.collections` is a first-class grouping field assigned at ingestion. Values can be provided as a comma-separated string or list, are normalized into a non-empty array, and default to `none` when unspecified.
 
 This keeps the boundary clear: large source frames can remain cold and only be fetched when needed, while compact ROI-centered data stays available for analysis and curation.
 
@@ -90,6 +91,37 @@ training workers           model training and evaluation jobs
 ```
 
 This architecture allows the system to grow from one local process to many specialized background daemons without changing the shape of the pipeline.
+
+## FastAPI Interface
+
+The v0 API exposes the same core workflows as the CLI and workers:
+
+```bash
+uvicorn Pelagia.api.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Useful endpoint groups:
+
+- `GET /health`, `/health/postgres`, `/health/kvstore`
+- `GET /system`, `/system/status`, `/system/use`
+- `POST /system/initialize`
+- `POST /ingestion/videos`
+- `POST /segmentation/frames/{frame_id}`
+- `GET /jobs`, `POST /jobs`, `GET /jobs/events`
+- `POST /jobs/{job_id}/pause`, `/resume`, `/retry`, `/priority`
+- `GET /workers`, `POST /workers/{worker_id}/shutdown`
+- `GET /runs`, `/assets`, `/models`, `/kvstore/status`
+- `GET /collections`, `GET /assets?collection=test`, `GET /runs?collection=test`
+
+General list endpoints are intentionally shaped as limited searches. For example,
+`GET /assets` does not require a run id and can be narrowed with filters such as
+`collection`, `kind`, `asset_key`, `path`, `checksum`, size bounds, and `limit`.
+Frame metadata can be searched by range with
+`GET /assets/{asset_id}/frames?start_frame=1&end_frame=100`, and frame image data
+can be loaded with `GET /assets/{asset_id}/framedata/{frame_num}?format=png`.
+Supported frame data formats are `png`, `jpg`/`jpeg`, `matrix`, and `preview`.
+Preview requests return a small PNG placeholder and accept `preview_max_dim`, for example
+`GET /assets/{asset_id}/framedata/{frame_num}?format=preview&preview_max_dim=128`.
 
 ## Configuration
 

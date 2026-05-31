@@ -50,11 +50,36 @@ CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
     kind {schema}.asset_kind NOT NULL,
     checksum text NOT NULL,
     size_bytes bigint NOT NULL,
+    collections text[] NOT NULL DEFAULT ARRAY['none']::text[],
     media_count integer NOT NULL DEFAULT 1,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
+    CONSTRAINT raw_assets_collections_nonempty CHECK (cardinality(collections) > 0),
     UNIQUE (run_id, asset_key)
 );
+
+ALTER TABLE {schema}.raw_assets
+    ADD COLUMN IF NOT EXISTS collections text[] NOT NULL DEFAULT ARRAY['none']::text[];
+
+UPDATE {schema}.raw_assets
+SET collections = ARRAY['none']::text[]
+WHERE collections IS NULL OR cardinality(collections) = 0;
+
+ALTER TABLE {schema}.raw_assets
+    ALTER COLUMN collections SET DEFAULT ARRAY['none']::text[],
+    ALTER COLUMN collections SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'raw_assets_collections_nonempty'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.raw_assets
+            ADD CONSTRAINT raw_assets_collections_nonempty CHECK (cardinality(collections) > 0);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS {schema}.frames (
     id bigserial PRIMARY KEY,
@@ -325,6 +350,7 @@ CREATE TABLE IF NOT EXISTS {schema}.job_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_run_id ON {schema}.raw_assets (run_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_assets USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_frame_id ON {schema}.detections (frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);

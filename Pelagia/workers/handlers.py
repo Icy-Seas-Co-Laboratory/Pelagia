@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..domain import PipelineStage
+from ..domain import normalize_collections
 from ..processing import video_ingest as video_ingest_module
 from ..services.context import AppContext
 
@@ -61,6 +62,8 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         raise ValueError(f"Raw asset {asset_id!r} does not include a source path.")
 
     metadata = dict(payload.get("metadata") or {})
+    collections = normalize_collections(payload.get("collections") or asset.get("collections"))
+    metadata.setdefault("collections", collections)
     metadata.setdefault("worker_job_id", str(job.get("id")))
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
 
@@ -70,7 +73,6 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         context=context,
         run_id=run_id,
         asset_id=asset_id,
-        dest_path=payload.get("dest_path"),
         metadata=metadata,
         flatfield_correction=bool(payload.get("flatfield_correction", True)),
         flatfield_q=float(payload.get("flatfield_q", 0.9)),
@@ -95,6 +97,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 "frame_ids": result["frame_ids"],
                 "padding": payload.get("segmentation_padding", payload.get("padding", 0)),
                 "roi_encoding": payload.get("roi_encoding", "zstd"),
+                "collections": collections,
             },
             depends_on=[str(job["id"])],
             summary=f"segment queued for {len(frame_rows)} extracted frames",

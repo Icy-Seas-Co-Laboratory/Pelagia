@@ -35,7 +35,6 @@ def ingest_video_file(
     context: AppContext | None = None,
     run_id: str | None = None,
     asset_id: str | None = None,
-    dest_path=None,
     metadata: dict[str, Any] | None = None,
     flatfield_correction: bool = True,
     flatfield_q: float = 0.9,
@@ -47,7 +46,6 @@ def ingest_video_file(
     input_path = os.fspath(input_path)
     source_path = os.path.dirname(os.path.abspath(input_path))
     filename = os.path.basename(input_path)
-    dest_path = os.fspath(dest_path) if dest_path is not None else source_path
     frame_metadata = dict(metadata or {})
     if run_id is not None:
         frame_metadata["run_id"] = run_id
@@ -88,7 +86,6 @@ def ingest_video_file(
                         store_frame(
                             FrameData(
                                 sourcePath=source_path,
-                                destPath=dest_path,
                                 filename=filename,
                                 frameNumber=n,
                                 data=tiled,
@@ -112,7 +109,6 @@ def ingest_video_file(
                 store_frame(
                     FrameData(
                         sourcePath=source_path,
-                        destPath=dest_path,
                         filename=filename,
                         frameNumber=n - 1,
                         data=tiled,

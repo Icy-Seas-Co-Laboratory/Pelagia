@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import CoreConfig
-from ..domain import AssetKind, PipelineStage, PlannedRun, RawAssetManifest, RunManifest
+from ..domain import AssetKind, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
 from ..services.context import AppContext
 from ..services.stores import StoreService
 from ..utils.serialization import json_ready
@@ -64,6 +64,7 @@ if typer is not None:
         asset_id: Optional[str],
         run_key: Optional[str],
         instrument: str,
+        collections: Optional[str],
     ) -> tuple[str, str, str]:
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to register video ingestion.")
@@ -73,6 +74,7 @@ if typer is not None:
         resolved_asset_id = asset_id or str(uuid.uuid4())
         resolved_run_key = run_key or f"video:{resolved.stem}:{uuid.uuid4().hex[:12]}"
         asset_key = resolved.name
+        normalized_collections = normalize_collections(collections)
 
         planned_run = PlannedRun(
             manifest=RunManifest(
@@ -91,6 +93,7 @@ if typer is not None:
                         kind=AssetKind.VIDEO,
                         size_bytes=resolved.stat().st_size,
                         checksum=_sha256_file(resolved),
+                        collections=normalized_collections,
                     )
                 ],
             )
@@ -101,7 +104,6 @@ if typer is not None:
     def _ingest_video_common(
         input_path: Path,
         n_tile: int,
-        dest_path: Optional[Path],
         kvstore_root: Optional[Path],
         database_dsn: Optional[str],
         schema: Optional[str],
@@ -109,6 +111,7 @@ if typer is not None:
         asset_id: Optional[str],
         run_key: Optional[str],
         instrument: str,
+        collections: Optional[str],
     ) -> tuple[AppContext, dict]:
         from ..processing.video_ingest import ingest_video_file
 
@@ -121,21 +124,23 @@ if typer is not None:
             asset_id,
             run_key,
             instrument,
+            collections,
         )
+        normalized_collections = normalize_collections(collections)
         frame_rows = ingest_video_file(
             resolved,
             n_tile=n_tile,
             context=context,
             run_id=resolved_run_id,
             asset_id=resolved_asset_id,
-            dest_path=dest_path,
-            metadata={"cli_command": "ingest_video"},
+            metadata={"cli_command": "ingest_video", "collections": normalized_collections},
         )
         return context, {
             "run_id": resolved_run_id,
             "asset_id": resolved_asset_id,
             "run_key": resolved_run_key,
             "source_path": str(resolved),
+            "collections": normalized_collections,
             "frame_count": len(frame_rows),
             "frame_ids": [row["id"] for row in frame_rows],
         }
@@ -153,7 +158,6 @@ if typer is not None:
     def ingest_video(
         input_path: Path,
         n_tile: int = 1,
-        dest_path: Optional[Path] = None,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
@@ -161,11 +165,11 @@ if typer is not None:
         asset_id: Optional[str] = None,
         run_key: Optional[str] = None,
         instrument: str = "cli",
+        collections: Optional[str] = None,
     ) -> None:
         _, result = _ingest_video_common(
             input_path,
             n_tile,
-            dest_path,
             kvstore_root,
             database_dsn,
             schema,
@@ -173,6 +177,7 @@ if typer is not None:
             asset_id,
             run_key,
             instrument,
+            collections,
         )
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
 
@@ -180,7 +185,6 @@ if typer is not None:
     def ingest_video_to_queue(
         input_path: Path,
         n_tile: int = 1,
-        dest_path: Optional[Path] = None,
         queue_stage: str = PipelineStage.SEGMENT.value,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -189,11 +193,11 @@ if typer is not None:
         asset_id: Optional[str] = None,
         run_key: Optional[str] = None,
         instrument: str = "cli",
+        collections: Optional[str] = None,
     ) -> None:
         context, result = _ingest_video_common(
             input_path,
             n_tile,
-            dest_path,
             kvstore_root,
             database_dsn,
             schema,
@@ -201,6 +205,7 @@ if typer is not None:
             asset_id,
             run_key,
             instrument,
+            collections,
         )
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to enqueue video ingestion.")
@@ -214,6 +219,7 @@ if typer is not None:
                 "frame_count": result["frame_count"],
                 "frame_ids": result["frame_ids"],
                 "n_tile": n_tile,
+                "collections": result["collections"],
             },
             summary=f"{stage.value} queued for {result['frame_count']} ingested frames",
         )
@@ -225,7 +231,6 @@ if typer is not None:
     def queue_extract_frames(
         input_path: Path,
         n_tile: int = 1,
-        dest_path: Optional[Path] = None,
         enqueue_segment: bool = False,
         segmentation_padding: int = 0,
         roi_encoding: str = "zstd",
@@ -236,9 +241,11 @@ if typer is not None:
         asset_id: Optional[str] = None,
         run_key: Optional[str] = None,
         instrument: str = "cli",
+        collections: Optional[str] = None,
     ) -> None:
         resolved = input_path.expanduser().resolve()
         context = _context_from_options(kvstore_root, database_dsn, schema)
+        normalized_collections = normalize_collections(collections)
         resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
             context,
             resolved,
@@ -246,6 +253,7 @@ if typer is not None:
             asset_id,
             run_key,
             instrument,
+            collections,
         )
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue frame extraction.")
@@ -256,10 +264,10 @@ if typer is not None:
             payload={
                 "source_path": str(resolved),
                 "n_tile": n_tile,
-                "dest_path": None if dest_path is None else str(dest_path),
                 "enqueue_segment": enqueue_segment,
                 "segmentation_padding": segmentation_padding,
                 "roi_encoding": roi_encoding,
+                "collections": normalized_collections,
             },
             summary=f"extract_frames queued for {resolved.name}",
         )
@@ -270,6 +278,7 @@ if typer is not None:
             "job_id": job["id"],
             "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
             "source_path": str(resolved),
+            "collections": normalized_collections,
         }
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
 

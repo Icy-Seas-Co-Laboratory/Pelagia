@@ -127,7 +127,6 @@ def test_frame_infers_full_frame_geometry_from_data():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -148,7 +147,6 @@ def test_frame_preserves_roi_geometry():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -174,7 +172,6 @@ def test_frame_validate_mask_rejects_mismatched_dimensions():
     with pytest.raises(ValueError, match="mask width"):
         FrameData(
             sourcePath="/tmp/",
-            destPath="/tmp/out",
             filename="frame.png",
             frameNumber=7,
             data=data,
@@ -186,7 +183,6 @@ def test_frame_validate_geometry_rejects_mismatched_dimensions():
     data = np.arange(6, dtype=np.uint8).reshape(2, 3)
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -204,7 +200,6 @@ def test_store_frame_writes_numpy_payload_and_metadata():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -243,7 +238,6 @@ def test_store_frame_writes_roi_geometry_metadata():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -281,7 +275,6 @@ def test_store_frame_can_write_raw_numpy_payload():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -307,7 +300,6 @@ def test_store_frame_uses_configured_default_image_data_storage_encoding():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -331,7 +323,6 @@ def test_store_frame_applies_flatfield_correction_when_requested():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -386,7 +377,6 @@ def test_store_frame_can_write_zstd_numpy_payload():
 
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -411,7 +401,6 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
 
     stored = FrameData(
         sourcePath="/tmp/source",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -457,7 +446,6 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     assert retrieved.get_bbox() == (10, 20, 4, 3)
     assert retrieved.parent_frame_id == 99
     assert retrieved.sourcePath == "/tmp/source"
-    assert retrieved.destPath == "/tmp/out"
     assert retrieved.filename == "frame.png"
     np.testing.assert_array_equal(retrieved.data, data)
     assert retrieved.metadata["frame_id"] == 42
@@ -484,7 +472,6 @@ def test_frame_data_from_record_maps_row_model_to_runtime_container():
         payload_dtype="uint8",
         payload_shape=[3, 4],
         metadata={
-            "dest_path": "/tmp/out",
             "frame_number": 7,
             "tile_number": 3,
             "source_frame_start": 5,
@@ -506,7 +493,6 @@ def test_frame_data_from_record_maps_row_model_to_runtime_container():
     assert frame_data.get_bbox() == (10, 20, 4, 3)
     assert frame_data.parent_frame_id == 99
     assert frame_data.sourcePath == "/tmp/source"
-    assert frame_data.destPath == "/tmp/out"
     assert frame_data.filename == "frame.png"
     assert frame_data.metadata["frame_id"] == 42
     assert frame_data.metadata["kvstore_encoding"] == "raw"

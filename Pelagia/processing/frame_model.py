@@ -18,7 +18,6 @@ class FrameData:
     segmentation calls remain compatible.
     """
     sourcePath: str
-    destPath: str
     filename: str
     frameNumber: int
     data: object = None
@@ -72,7 +71,6 @@ class FrameData:
 
         return cls(
             sourcePath=source_path,
-            destPath=resolved_metadata.get("dest_path") or source_path,
             filename=filename,
             frameNumber=resolved_metadata.get("frame_number") or record.frame_index,
             data=data,
@@ -93,7 +91,6 @@ class FrameData:
 
     def __post_init__(self):
         self.sourcePath = os.fspath(self.sourcePath)
-        self.destPath = os.fspath(self.destPath)
         self.filename = os.fspath(self.filename)
         self.bbox_x = 0 if self.bbox_x is None else int(self.bbox_x)
         self.bbox_y = 0 if self.bbox_y is None else int(self.bbox_y)
@@ -189,9 +186,6 @@ class FrameData:
     def get_source_path(self):
         return self.sourcePath
 
-    def get_dest_path(self):
-        return self.destPath
-
     def get_filename(self):
         return self.filename
 
@@ -280,10 +274,6 @@ class FrameData:
     @property
     def source_path(self):
         return self.sourcePath
-
-    @property
-    def dest_path(self):
-        return self.destPath
 
     @property
     def frame_number(self):

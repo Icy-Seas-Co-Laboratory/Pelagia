@@ -10,7 +10,6 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     data[2:5, 3:7] = 50
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -64,7 +63,6 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
     data[2:5, 3:7] = 50
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -118,7 +116,6 @@ def test_segment_frame_filters_by_bbox_perimeter():
     data[2:5, 3:7] = 50
     frame = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=data,
@@ -134,7 +131,6 @@ def test_segment_frame_filters_by_bbox_perimeter():
 def test_store_roi_auto_uses_png_for_small_roi_payloads():
     source = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=np.full((4, 4), 10, dtype=np.uint8),
@@ -145,7 +141,6 @@ def test_store_roi_auto_uses_png_for_small_roi_payloads():
     )
     roi = FrameData(
         sourcePath="/tmp/",
-        destPath="/tmp/out",
         filename="frame.png",
         frameNumber=7,
         data=np.full((2, 2), 255, dtype=np.uint8),

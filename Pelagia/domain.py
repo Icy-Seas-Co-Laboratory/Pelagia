@@ -6,8 +6,33 @@ from enum import Enum
 from typing import Any
 
 
+DEFAULT_COLLECTION = "none"
+
+
 def _row_dict(row: Any) -> dict[str, Any]:
     return dict(row or {})
+
+
+def normalize_collections(value: Any = None) -> list[str]:
+    """Normalize user-supplied collection names into a stable non-empty list."""
+    if value is None:
+        return [DEFAULT_COLLECTION]
+    if isinstance(value, str):
+        raw_values = value.split(",")
+    else:
+        raw_values = list(value)
+
+    collections: list[str] = []
+    seen: set[str] = set()
+    for item in raw_values:
+        collection = str(item).strip()
+        if not collection:
+            continue
+        if collection in seen:
+            continue
+        collections.append(collection)
+        seen.add(collection)
+    return collections or [DEFAULT_COLLECTION]
 
 
 class AssetKind(str, Enum):
@@ -47,8 +72,12 @@ class RawAssetManifest:
     kind: AssetKind
     size_bytes: int
     checksum: str
+    collections: list[str] = field(default_factory=lambda: [DEFAULT_COLLECTION])
     media_count: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.collections = normalize_collections(self.collections)
 
 
 @dataclass(slots=True)

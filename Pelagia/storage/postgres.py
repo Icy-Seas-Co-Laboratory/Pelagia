@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from typing import Any, Sequence
 
 from ..config import CoreConfig
-from ..domain import ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun
+from ..domain import ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
 from ..utils.serialization import json_ready
 from ..utils.validation import validate_schema_name
 
@@ -93,12 +93,51 @@ class PostgresRepository:
         admin_fields["dbname"] = admin_fields.get("maintenance_db") or "postgres"
         return conninfo.make_conninfo(**admin_fields)
 
-    def list_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        limit: int = 100,
+        collection: str | None = None,
+        run_key: str | None = None,
+        instrument: str | None = None,
+        source_type: str | None = None,
+        status: str | None = None,
+        source_path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if collection:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM {self.schema}.raw_assets assets
+                    WHERE assets.run_id = runs.id AND %s = ANY(assets.collections)
+                )
+                """
+            )
+            params.append(collection)
+        if run_key:
+            clauses.append("run_key ILIKE %s")
+            params.append(f"%{run_key}%")
+        if instrument:
+            clauses.append("instrument = %s")
+            params.append(instrument)
+        if source_type:
+            clauses.append("source_type = %s")
+            params.append(source_type)
+        if status:
+            clauses.append("status = %s")
+            params.append(status)
+        if source_path:
+            clauses.append("source_path ILIKE %s")
+            params.append(f"%{source_path}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.runs ORDER BY created_at DESC LIMIT %s",
-                    (limit,),
+                    f"SELECT * FROM {self.schema}.runs {where} ORDER BY created_at DESC LIMIT %s",
+                    tuple(params),
                 )
                 return cursor.fetchall()
 
@@ -119,8 +158,10 @@ class PostgresRepository:
     def list_jobs(
         self,
         run_id: str | None = None,
+        asset_id: str | None = None,
         status: str | None = None,
         stage: str | None = None,
+        worker_id: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -129,12 +170,18 @@ class PostgresRepository:
         if run_id:
             clauses.append("run_id = %s")
             params.append(run_id)
+        if asset_id:
+            clauses.append("asset_id = %s")
+            params.append(asset_id)
         if status:
             clauses.append("status = %s")
             params.append(status)
         if stage:
             clauses.append("stage = %s")
             params.append(stage)
+        if worker_id:
+            clauses.append("worker_id = %s")
+            params.append(worker_id)
         if cursor:
             try:
                 cursor_created_at, cursor_id = cursor.split("|", 1)
@@ -162,10 +209,32 @@ class PostgresRepository:
                 cursor.execute(f"SELECT * FROM {self.schema}.processing_jobs WHERE id = %s", (job_id,))
                 return cursor.fetchone()
 
-    def list_worker_sessions(self) -> list[dict[str, Any]]:
+    def list_worker_sessions(
+        self,
+        status: str | None = None,
+        capability: str | None = None,
+        shutdown_requested: bool | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = %s")
+            params.append(status)
+        if capability:
+            clauses.append("capabilities ? %s")
+            params.append(capability)
+        if shutdown_requested is not None:
+            clauses.append("shutdown_requested = %s")
+            params.append(shutdown_requested)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.worker_sessions ORDER BY worker_id ASC")
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.worker_sessions {where} ORDER BY worker_id ASC LIMIT %s",
+                    tuple(params),
+                )
                 return cursor.fetchall()
 
     def register_planned_run(self, planned_run: PlannedRun) -> dict[str, Any]:
@@ -194,8 +263,8 @@ class PostgresRepository:
                 cursor.executemany(
                     f"""
                     INSERT INTO {schema}.raw_assets
-                    (id, run_id, asset_key, path, kind, checksum, size_bytes, media_count, metadata)
-                    VALUES (%s, %s, %s, %s, %s::{schema}.asset_kind, %s, %s, %s, %s::jsonb)
+                    (id, run_id, asset_key, path, kind, checksum, size_bytes, collections, media_count, metadata)
+                    VALUES (%s, %s, %s, %s, %s::{schema}.asset_kind, %s, %s, %s, %s, %s::jsonb)
                     """,
                     [
                         (
@@ -206,6 +275,7 @@ class PostgresRepository:
                             asset.kind.value,
                             asset.checksum,
                             asset.size_bytes,
+                            normalize_collections(asset.collections),
                             asset.media_count,
                             json.dumps(json_ready(asset.metadata)),
                         )
@@ -267,12 +337,82 @@ class PostgresRepository:
 
         return {"run": run_row, "asset_count": len(manifest.assets), "job_count": len(planned_run.jobs)}
 
-    def list_assets(self, run_id: str) -> list[dict[str, Any]]:
+    def list_assets(
+        self,
+        run_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        asset_key: str | None = None,
+        path: str | None = None,
+        checksum: str | None = None,
+        min_size_bytes: int | None = None,
+        max_size_bytes: int | None = None,
+        media_count: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        if collection:
+            clauses.append("%s = ANY(collections)")
+            params.append(collection)
+        if kind:
+            clauses.append("kind = %s")
+            params.append(kind)
+        if asset_key:
+            clauses.append("asset_key ILIKE %s")
+            params.append(f"%{asset_key}%")
+        if path:
+            clauses.append("path ILIKE %s")
+            params.append(f"%{path}%")
+        if checksum:
+            clauses.append("checksum = %s")
+            params.append(checksum)
+        if min_size_bytes is not None:
+            clauses.append("size_bytes >= %s")
+            params.append(min_size_bytes)
+        if max_size_bytes is not None:
+            clauses.append("size_bytes <= %s")
+            params.append(max_size_bytes)
+        if media_count is not None:
+            clauses.append("media_count = %s")
+            params.append(media_count)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.raw_assets WHERE run_id = %s ORDER BY asset_key ASC",
-                    (run_id,),
+                    f"SELECT * FROM {self.schema}.raw_assets {where} ORDER BY created_at DESC, asset_key ASC LIMIT %s",
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def list_collections(self, collection: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        having = ""
+        params: list[Any] = []
+        if collection:
+            having = "WHERE collection ILIKE %s"
+            params.append(f"%{collection}%")
+        params.append(limit)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM (
+                        SELECT collection, COUNT(*) AS asset_count
+                        FROM {self.schema}.raw_assets assets
+                        CROSS JOIN LATERAL unnest(assets.collections) AS collection
+                        GROUP BY collection
+                    ) collections
+                    {having}
+                    ORDER BY collection ASC
+                    LIMIT %s
+                    """
+                    ,
+                    tuple(params),
                 )
                 return cursor.fetchall()
 
@@ -325,12 +465,35 @@ class PostgresRepository:
             connection.commit()
         return inserted
 
-    def list_frames(self, asset_id: str) -> list[dict[str, Any]]:
+    def list_frames(
+        self,
+        asset_id: str,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["asset_id = %s"]
+        params: list[Any] = [asset_id]
+        if start_frame is not None:
+            clauses.append("frame_index >= %s")
+            params.append(start_frame)
+        if end_frame is not None:
+            clauses.append("frame_index <= %s")
+            params.append(end_frame)
+        limit_sql = "LIMIT %s" if limit is not None else ""
+        if limit is not None:
+            params.append(limit)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.frames WHERE asset_id = %s ORDER BY frame_index ASC",
-                    (asset_id,),
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.frames
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY frame_index ASC
+                    {limit_sql}
+                    """,
+                    tuple(params),
                 )
                 return cursor.fetchall()
 
@@ -340,8 +503,35 @@ class PostgresRepository:
                 cursor.execute(f"SELECT * FROM {self.schema}.frames WHERE id = %s", (frame_id,))
                 return cursor.fetchone()
 
-    def list_frame_records(self, asset_id: str) -> list[FrameRecord]:
-        return [FrameRecord.from_row(row) for row in self.list_frames(asset_id)]
+    def get_frame_by_asset_index(self, asset_id: str, frame_index: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.frames
+                    WHERE asset_id = %s AND frame_index = %s
+                    """,
+                    (asset_id, frame_index),
+                )
+                return cursor.fetchone()
+
+    def list_frame_records(
+        self,
+        asset_id: str,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int | None = None,
+    ) -> list[FrameRecord]:
+        return [
+            FrameRecord.from_row(row)
+            for row in self.list_frames(
+                asset_id,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                limit=limit,
+            )
+        ]
 
     def get_frame_record(self, frame_id: int) -> FrameRecord | None:
         row = self.get_frame(frame_id)
@@ -459,10 +649,40 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def list_models(self) -> list[dict[str, Any]]:
+    def list_models(
+        self,
+        model_key: str | None = None,
+        model_name: str | None = None,
+        version: str | None = None,
+        task: str | None = None,
+        artifact_uri: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if model_key:
+            clauses.append("model_key ILIKE %s")
+            params.append(f"%{model_key}%")
+        if model_name:
+            clauses.append("model_name ILIKE %s")
+            params.append(f"%{model_name}%")
+        if version:
+            clauses.append("version = %s")
+            params.append(version)
+        if task:
+            clauses.append("task = %s")
+            params.append(task)
+        if artifact_uri:
+            clauses.append("artifact_uri ILIKE %s")
+            params.append(f"%{artifact_uri}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.models ORDER BY created_at DESC")
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.models {where} ORDER BY created_at DESC LIMIT %s",
+                    tuple(params),
+                )
                 return cursor.fetchall()
 
     def get_model(self, model_id: str) -> dict[str, Any] | None:

@@ -7,7 +7,13 @@ from Pelagia.workers.worker import Worker
 
 class FakeRepository:
     def __init__(self):
-        self.assets = {"asset-1": {"id": "asset-1", "path": "/tmp/source.avi"}}
+        self.assets = {
+            "asset-1": {
+                "id": "asset-1",
+                "path": "/tmp/source.avi",
+                "collections": ["test"],
+            }
+        }
         self.claimed_jobs = []
         self.completed = []
         self.failures = []
@@ -73,7 +79,6 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
         "asset_id": "asset-1",
         "payload": {
             "n_tile": 2,
-            "dest_path": "/tmp/out",
             "flatfield_correction": False,
             "metadata": {"source": "test"},
         },
@@ -96,9 +101,9 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["context"] is context
     assert kwargs["run_id"] == "run-1"
     assert kwargs["asset_id"] == "asset-1"
-    assert kwargs["dest_path"] == "/tmp/out"
     assert kwargs["flatfield_correction"] is False
     assert kwargs["metadata"]["source"] == "test"
+    assert kwargs["metadata"]["collections"] == ["test"]
     assert kwargs["metadata"]["worker_job_id"] == "job-1"
 
 
@@ -132,6 +137,7 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
         "frame_ids": [10],
         "padding": 4,
         "roi_encoding": "raw",
+        "collections": ["test"],
     }
     assert repo.created_jobs[0]["depends_on"] == ["job-1"]
 

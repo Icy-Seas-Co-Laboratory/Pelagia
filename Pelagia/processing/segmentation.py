@@ -5,7 +5,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from ..domain import DetectionRecord
+from ..domain import DetectionRecord, normalize_collections
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 
@@ -157,6 +157,7 @@ def store_roi(
 
     metadata.update(
         {
+            "collections": normalize_collections(source_frame.metadata.get("collections")),
             "source_frame_number": source_frame.frameNumber,
             "parent_frame_id": frame_id,
         }
@@ -247,7 +248,6 @@ def segment_frame(
 
         roi_frame = FrameData(
             sourcePath=frame.sourcePath,
-            destPath=frame.destPath,
             filename=frame.filename,
             frameNumber=frame.frameNumber,
             data=padded_crop,
