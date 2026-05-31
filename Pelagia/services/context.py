@@ -18,7 +18,7 @@ class AppContext:
     @classmethod
     def from_config(cls, config: CoreConfig | None = None) -> "AppContext":
         """Create a context with configured storage adapters."""
-        resolved = config or CoreConfig.from_env()
+        resolved = config or CoreConfig.load()
         kvstore = KVStore(resolved.kvstore.root_path)
         repository = PostgresRepository(resolved)
         return cls(config=resolved, repository=repository, kvstore=kvstore)

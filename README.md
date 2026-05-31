@@ -1,6 +1,14 @@
-# KVStore
+<p align="center">
+  <img src="docs/assets/pelagia_logo.jpeg" alt="Pelagia" width="520">
+</p>
 
-`KVStore` is a small Python content-addressed key-value store. Payloads are stored as bytes in SQLite databases, and each payload's hash digest is its canonical key. The key prefix determines the shard directory, and each shard can rotate through multiple SQLite files as size or row-count limits are reached.
+# Pelagia
+
+Pelagia is an image-processing, storage, and worker system for video-frame extraction, ROI segmentation, and downstream analysis. Large full-frame image payloads are stored in a cold `KVStore`, while smaller ROI payloads and masks are stored directly with Postgres metadata for easier analysis.
+
+<p align="center">
+  <img src="docs/assets/pelagia_icon.png" alt="Pelagia icon" width="96">
+</p>
 
 ## Project Layout
 
@@ -17,6 +25,7 @@ Pelagia/
   api/                   FastAPI app and route modules
   cli/                   command-line entrypoint and commands
   utils/                 small shared helpers
+docs/assets/             documentation images and branding assets
 ```
 
 The intended dependency direction is:
@@ -27,7 +36,21 @@ API / CLI / Workers -> Services -> Storage + Processing
 
 Keep FastAPI routes, CLI commands, and worker loops thin. When logic is useful in more than one interface, put it in `services/`. When logic transforms data without caring who called it, put it in `processing/`.
 
+## Configuration
+
+Pelagia loads configuration in this order:
+
+```text
+Pelagia/default.config.toml < ./config.toml < environment variables < explicit CLI options
+```
+
+The packaged [default.config.toml](Pelagia/default.config.toml) contains development-friendly defaults. Create a local `config.toml` in the repository root for machine-specific overrides; it is ignored by git.
+
 ## Basic Usage
+
+### KVStore
+
+`KVStore` is a content-addressed cold-storage pool for large frame payloads. Payloads are stored as bytes in SQLite databases, and each payload's hash digest is its canonical key. The key prefix determines the shard directory, and each shard can rotate through multiple SQLite files as size or row-count limits are reached.
 
 ```python
 from Pelagia.storage.kvstore import KVStore
@@ -41,7 +64,7 @@ store.initialize(
 )
 
 payload = b"hello world"
-key = store.put_store(None, payload)
+key = store.put_store(payload)
 
 assert store.key_exists(key)
 assert store.get_store(key) == payload
@@ -49,8 +72,6 @@ assert store.get_store(key) == payload
 print(store.status())
 print(store.check_health())
 ```
-
-For compatibility with earlier examples, `from kvstore import KVStore` still works. You can also call `put_store(payload)` when you want the store to compute the key automatically. If you call `put_store(key, payload)`, the explicit key must match the configured hash of the payload.
 
 ## Layout
 

@@ -1,13 +1,14 @@
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 
 
 @dataclass
-class Frame:
+class FrameData:
     """
-    Container for one image-like object plus source/output metadata.
+    Runtime container for one image-like object plus source/output metadata.
 
     ``width`` and ``height`` describe this object's own image data. ``bbox_x``
     and ``bbox_y`` describe its origin in a parent image coordinate system, so
@@ -37,6 +38,58 @@ class Frame:
     metadata: dict = field(default_factory=dict)
     imageReadFlag: int = cv2.IMREAD_GRAYSCALE
     cacheRead: bool = True
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Any,
+        *,
+        data: object = None,
+        mask: object = None,
+        metadata: dict | None = None,
+    ) -> "FrameData":
+        """Build runtime frame data from a stored frame row model."""
+        resolved_metadata = dict(getattr(record, "metadata", {}) or {})
+        resolved_metadata.update(metadata or {})
+
+        if getattr(record, "payload_encoding", None) is not None:
+            resolved_metadata.setdefault("kvstore_encoding", record.payload_encoding)
+        if getattr(record, "payload_format", None) is not None:
+            resolved_metadata.setdefault("kvstore_format", record.payload_format)
+        if getattr(record, "payload_dtype", None) is not None:
+            resolved_metadata.setdefault("dtype", record.payload_dtype)
+        if getattr(record, "payload_shape", None):
+            resolved_metadata.setdefault("shape", list(record.payload_shape))
+
+        resolved_metadata.setdefault("frame_id", getattr(record, "id", None))
+        resolved_metadata.setdefault("run_id", getattr(record, "run_id", None))
+        resolved_metadata.setdefault("asset_id", getattr(record, "asset_id", None))
+        resolved_metadata.setdefault("frame_index", getattr(record, "frame_index", None))
+
+        source_ref = getattr(record, "source_ref", None) or ""
+        source_path = resolved_metadata.get("source_path") or os.path.dirname(source_ref)
+        filename = resolved_metadata.get("filename") or os.path.basename(source_ref)
+
+        return cls(
+            sourcePath=source_path,
+            destPath=resolved_metadata.get("dest_path") or source_path,
+            filename=filename,
+            frameNumber=resolved_metadata.get("frame_number") or record.frame_index,
+            data=data,
+            mask=mask,
+            width=record.width,
+            height=record.height,
+            bbox_x=record.bbox_x,
+            bbox_y=record.bbox_y,
+            parent_frame_id=record.parent_frame_id,
+            tileNumber=resolved_metadata.get("tile_number"),
+            sourceFrameStart=resolved_metadata.get("source_frame_start"),
+            sourceFrameEnd=resolved_metadata.get("source_frame_end"),
+            frameType=resolved_metadata.get("frame_type"),
+            channel=resolved_metadata.get("channel"),
+            timestamp=getattr(record, "captured_at", None) or resolved_metadata.get("timestamp"),
+            metadata=resolved_metadata,
+        )
 
     def __post_init__(self):
         self.sourcePath = os.fspath(self.sourcePath)

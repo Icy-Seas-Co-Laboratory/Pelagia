@@ -61,7 +61,3 @@ def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray
     if dtype is None or shape is None:
         raise ValueError("Raw and zstd frame payloads require dtype and shape metadata.")
     return np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(tuple(shape)).copy(order="C")
-
-
-_encode_array_payload = encode_array_payload
-_decode_array_payload = decode_array_payload

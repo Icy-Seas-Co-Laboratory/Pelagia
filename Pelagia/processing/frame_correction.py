@@ -59,7 +59,3 @@ def flatfield_global_correction_for_framedata(
         corrected = np.clip(corrected, info.min, info.max).astype(array.dtype)
 
     return np.ascontiguousarray(corrected)
-
-
-_metadata_bool = metadata_bool
-_flatfield_correction_for_framedata = flatfield_correction_for_framedata

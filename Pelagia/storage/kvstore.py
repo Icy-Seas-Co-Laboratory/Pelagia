@@ -247,35 +247,13 @@ class KVStore:
         if not deleted:
             raise KeyError(key)
 
-    def put_store(self, key: str | bytes | bytearray | None = None, payload: bytes | bytearray | str | None = None) -> str:
-        """Store ``payload`` and return its content-addressed key.
-
-        Call as ``put_store(payload)`` to compute the key automatically, or as
-        ``put_store(key, payload)`` / ``put_store(None, payload)`` for explicit
-        compatibility with older two-argument call sites.
-        """
+    def put_store(self, payload: bytes | bytearray | str) -> str:
+        """Store ``payload`` and return its content-addressed key."""
         self._require_initialized()
 
-        explicit_key: str | None
-        if payload is None:
-            explicit_key = None
-            payload_value = key
-        else:
-            explicit_key = key if isinstance(key, str) else None
-            payload_value = payload
-
-        payload_bytes = self._normalize_payload(payload_value)
+        payload_bytes = self._normalize_payload(payload)
         computed_key = self._hash_payload(payload_bytes)
-
-        if explicit_key is not None:
-            self._validate_key(explicit_key)
-            if explicit_key != computed_key:
-                raise KVStoreIntegrityError(
-                    "Explicit key does not match the configured hash of the payload."
-                )
-            key_to_store = explicit_key
-        else:
-            key_to_store = computed_key
+        key_to_store = computed_key
 
         prefix = self._prefix_for_key(key_to_store)
         with self._lock_for_prefix(prefix):

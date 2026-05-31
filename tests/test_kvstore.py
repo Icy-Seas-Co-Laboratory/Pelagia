@@ -62,12 +62,6 @@ def test_root_path_resolves_relative_paths(monkeypatch, tmp_path):
     assert store.root_path == (tmp_path / "relative-store").resolve()
 
 
-def test_top_level_kvstore_import_remains_compatible():
-    from kvstore import KVStore as CompatibilityKVStore
-
-    assert CompatibilityKVStore is KVStore
-
-
 def test_initialize_creates_config_manifest_prefixes_and_initial_dbs(tmp_path):
     store = KVStore(tmp_path / "store")
     store.initialize(prefix_length=1)
@@ -117,25 +111,6 @@ def test_store_and_retrieve_string_as_utf8_bytes(tmp_path):
     key = store.put_store("hello snow")
 
     assert store.get_store(key) == "hello snow".encode("utf-8")
-
-
-def test_put_store_accepts_none_key_and_payload(tmp_path):
-    store = KVStore(tmp_path / "store")
-    store.initialize(prefix_length=1)
-
-    payload = b"auto key"
-    key = store.put_store(None, payload)
-
-    assert key == sha256_key(payload)
-
-
-def test_rejects_explicit_key_that_does_not_match_payload(tmp_path):
-    store = KVStore(tmp_path / "store")
-    store.initialize(prefix_length=1)
-
-    wrong_key = sha256_key(b"other")
-    with pytest.raises(KVStoreIntegrityError):
-        store.put_store(wrong_key, b"payload")
 
 
 def test_key_exists_true_and_false(tmp_path):
@@ -223,7 +198,7 @@ def test_integrity_error_on_same_key_with_different_payload_via_existing_row(tmp
         connection.execute("UPDATE blobs SET payload = ?, size = ? WHERE key = ?", (b"changed", 7, key))
 
     with pytest.raises(KVStoreIntegrityError):
-        store.put_store(key, b"original")
+        store.put_store(b"original")
 
 
 def test_status_reports_accurate_counts(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.resources import files
 from urllib.parse import urlparse
 from typing import Any, Sequence
 
@@ -22,322 +23,8 @@ except ImportError:  # pragma: no cover - exercised only when postgres extras ar
 
 def render_schema(schema: str = "seasight") -> str:
     schema = validate_schema_name(schema)
-    return f"""
-CREATE SCHEMA IF NOT EXISTS {schema};
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'asset_kind' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence');
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'segment', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
-    END IF;
-END $$;
-
-ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'train_model';
-ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_import';
-ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_export';
-ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
-ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_download';
-
-ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'paused';
-
-CREATE OR REPLACE FUNCTION {schema}.set_updated_at()
-RETURNS trigger AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TABLE IF NOT EXISTS {schema}.runs (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_key text NOT NULL UNIQUE,
-    instrument text NOT NULL,
-    source_path text NOT NULL,
-    source_type text NOT NULL,
-    status text NOT NULL DEFAULT 'registered',
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    updated_at timestamptz NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    asset_key text NOT NULL,
-    path text NOT NULL,
-    kind {schema}.asset_kind NOT NULL,
-    checksum text NOT NULL,
-    size_bytes bigint NOT NULL,
-    media_count integer NOT NULL DEFAULT 1,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    UNIQUE (run_id, asset_key)
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.frames (
-    id bigserial PRIMARY KEY,
-    run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    asset_id uuid NOT NULL REFERENCES {schema}.raw_assets(id) ON DELETE CASCADE,
-    frame_index integer NOT NULL,
-    captured_at timestamptz,
-    width integer NOT NULL,
-    height integer NOT NULL,
-    source_ref text,
-    frame_hash text NOT NULL,
-    frame_png bytea NOT NULL,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    UNIQUE (asset_id, frame_index)
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.detections (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    frame_id bigint NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
-    roi_index integer NOT NULL,
-    bbox_x integer NOT NULL,
-    bbox_y integer NOT NULL,
-    bbox_w integer NOT NULL,
-    bbox_h integer NOT NULL,
-    crop_bbox_x integer,
-    crop_bbox_y integer,
-    crop_bbox_w integer,
-    crop_bbox_h integer,
-    area double precision,
-    perimeter double precision,
-    major_axis_length double precision,
-    minor_axis_length double precision,
-    min_gray_value integer,
-    mean_gray_value double precision,
-    roi_payload bytea,
-    mask_payload bytea,
-    roi_encoding text,
-    roi_format text,
-    roi_dtype text,
-    roi_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
-    mask_encoding text,
-    mask_format text,
-    mask_dtype text,
-    mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    CONSTRAINT detections_bbox_positive CHECK (bbox_w > 0 AND bbox_h > 0),
-    CONSTRAINT detections_crop_bbox_positive CHECK (
-        (
-            crop_bbox_x IS NULL AND crop_bbox_y IS NULL
-            AND crop_bbox_w IS NULL AND crop_bbox_h IS NULL
-        )
-        OR (
-            crop_bbox_x IS NOT NULL AND crop_bbox_y IS NOT NULL
-            AND crop_bbox_w > 0 AND crop_bbox_h > 0
-        )
-    ),
-    UNIQUE (frame_id, roi_index)
-);
-
-ALTER TABLE {schema}.detections
-    ADD COLUMN IF NOT EXISTS crop_bbox_x integer,
-    ADD COLUMN IF NOT EXISTS crop_bbox_y integer,
-    ADD COLUMN IF NOT EXISTS crop_bbox_w integer,
-    ADD COLUMN IF NOT EXISTS crop_bbox_h integer,
-    ADD COLUMN IF NOT EXISTS roi_payload bytea,
-    ADD COLUMN IF NOT EXISTS mask_payload bytea,
-    ADD COLUMN IF NOT EXISTS roi_encoding text,
-    ADD COLUMN IF NOT EXISTS roi_format text,
-    ADD COLUMN IF NOT EXISTS roi_dtype text,
-    ADD COLUMN IF NOT EXISTS roi_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS mask_encoding text,
-    ADD COLUMN IF NOT EXISTS mask_format text,
-    ADD COLUMN IF NOT EXISTS mask_dtype text,
-    ADD COLUMN IF NOT EXISTS mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb;
-
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = '{schema}'
-          AND table_name = 'detections'
-          AND column_name = 'crop_png'
-    ) THEN
-        EXECUTE 'UPDATE {schema}.detections SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL';
-    END IF;
-    IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = '{schema}'
-          AND table_name = 'detections'
-          AND column_name = 'mask_png'
-    ) THEN
-        EXECUTE 'UPDATE {schema}.detections SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'detections_bbox_positive'
-          AND connamespace = '{schema}'::regnamespace
-    ) THEN
-        ALTER TABLE {schema}.detections
-            ADD CONSTRAINT detections_bbox_positive CHECK (bbox_w > 0 AND bbox_h > 0);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'detections_crop_bbox_positive'
-          AND connamespace = '{schema}'::regnamespace
-    ) THEN
-        ALTER TABLE {schema}.detections
-            ADD CONSTRAINT detections_crop_bbox_positive CHECK (
-                (
-                    crop_bbox_x IS NULL AND crop_bbox_y IS NULL
-                    AND crop_bbox_w IS NULL AND crop_bbox_h IS NULL
-                )
-                OR (
-                    crop_bbox_x IS NOT NULL AND crop_bbox_y IS NOT NULL
-                    AND crop_bbox_w > 0 AND crop_bbox_h > 0
-                )
-            );
-    END IF;
-END $$;
-
-UPDATE {schema}.detections
-SET
-    roi_encoding = COALESCE(roi_encoding, metadata->>'roi_encoding', metadata->>'array_encoding'),
-    roi_format = COALESCE(roi_format, metadata->>'roi_format'),
-    roi_dtype = COALESCE(roi_dtype, metadata->>'dtype'),
-    roi_shape = CASE
-        WHEN roi_shape = '[]'::jsonb AND metadata ? 'shape' THEN metadata->'shape'
-        ELSE roi_shape
-    END,
-    mask_encoding = COALESCE(mask_encoding, metadata->>'mask_encoding'),
-    mask_format = COALESCE(mask_format, metadata->>'mask_format'),
-    mask_dtype = COALESCE(mask_dtype, metadata->>'mask_dtype'),
-    mask_shape = CASE
-        WHEN mask_shape = '[]'::jsonb AND metadata ? 'mask_shape' THEN metadata->'mask_shape'
-        ELSE mask_shape
-    END,
-    crop_bbox_x = COALESCE(
-        crop_bbox_x,
-        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>0)::integer END
-    ),
-    crop_bbox_y = COALESCE(
-        crop_bbox_y,
-        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>1)::integer END
-    ),
-    crop_bbox_w = COALESCE(
-        crop_bbox_w,
-        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>2)::integer END
-    ),
-    crop_bbox_h = COALESCE(
-        crop_bbox_h,
-        CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>3)::integer END
-    );
-
-CREATE TABLE IF NOT EXISTS {schema}.models (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    model_key text NOT NULL UNIQUE,
-    model_name text NOT NULL,
-    version text NOT NULL,
-    task text NOT NULL DEFAULT 'classification',
-    artifact_uri text,
-    labels jsonb NOT NULL DEFAULT '[]'::jsonb,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.classification_results (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    detection_id uuid NOT NULL REFERENCES {schema}.detections(id) ON DELETE CASCADE,
-    model_id uuid NOT NULL REFERENCES {schema}.models(id) ON DELETE CASCADE,
-    label text,
-    score double precision,
-    scores jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    embedding jsonb,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    UNIQUE (detection_id, model_id)
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_id uuid REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    asset_id uuid REFERENCES {schema}.raw_assets(id) ON DELETE CASCADE,
-    stage {schema}.stage_name NOT NULL,
-    status {schema}.job_status NOT NULL DEFAULT 'queued',
-    priority integer NOT NULL DEFAULT 100,
-    attempt_count integer NOT NULL DEFAULT 0,
-    max_attempts integer NOT NULL DEFAULT 3,
-    lease_expires_at timestamptz,
-    worker_id text,
-    payload jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    result jsonb,
-    progress jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    logs_tail jsonb NOT NULL DEFAULT '[]'::jsonb,
-    summary text,
-    control_reason text,
-    error_message text,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    updated_at timestamptz NOT NULL DEFAULT NOW(),
-    started_at timestamptz,
-    finished_at timestamptz
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.processing_job_dependencies (
-    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
-    depends_on_job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
-    PRIMARY KEY (job_id, depends_on_job_id)
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.worker_sessions (
-    worker_id text PRIMARY KEY,
-    status text NOT NULL DEFAULT 'idle',
-    leased_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
-    capabilities jsonb NOT NULL DEFAULT '[]'::jsonb,
-    metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    last_heartbeat timestamptz NOT NULL DEFAULT NOW(),
-    updated_at timestamptz NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.job_events (
-    id bigserial PRIMARY KEY,
-    job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
-    event_type text NOT NULL,
-    payload jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_run_id ON {schema}.raw_assets (run_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
-CREATE INDEX IF NOT EXISTS idx_{schema}_detections_frame_id ON {schema}.detections (frame_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);
-CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dependencies_depends_on ON {schema}.processing_job_dependencies (depends_on_job_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
-
-DROP TRIGGER IF EXISTS trg_runs_updated_at ON {schema}.runs;
-CREATE TRIGGER trg_runs_updated_at
-BEFORE UPDATE ON {schema}.runs
-FOR EACH ROW
-EXECUTE FUNCTION {schema}.set_updated_at();
-
-DROP TRIGGER IF EXISTS trg_processing_jobs_updated_at ON {schema}.processing_jobs;
-CREATE TRIGGER trg_processing_jobs_updated_at
-BEFORE UPDATE ON {schema}.processing_jobs
-FOR EACH ROW
-EXECUTE FUNCTION {schema}.set_updated_at();
-
-DROP TRIGGER IF EXISTS trg_worker_sessions_updated_at ON {schema}.worker_sessions;
-CREATE TRIGGER trg_worker_sessions_updated_at
-BEFORE UPDATE ON {schema}.worker_sessions
-FOR EACH ROW
-EXECUTE FUNCTION {schema}.set_updated_at();
-""".strip()
+    template = files(__package__).joinpath("sql", "schema.sql").read_text(encoding="utf-8")
+    return template.replace("{schema}", schema).strip()
 
 
 def _require_psycopg() -> None:
@@ -561,6 +248,21 @@ class PostgresRepository:
                         dependency_rows,
                     )
 
+                for job in planned_run.jobs:
+                    self._append_job_event(
+                        cursor,
+                        job.job_id,
+                        "job.created",
+                        {
+                            "stage": job.stage.value,
+                            "status": job.status.value,
+                            "run_id": job.run_id,
+                            "asset_id": job.asset_id,
+                            "priority": job.priority,
+                            "depends_on": list(job.depends_on),
+                        },
+                    )
+
             connection.commit()
 
         return {"run": run_row, "asset_count": len(manifest.assets), "job_count": len(planned_run.jobs)}
@@ -592,20 +294,30 @@ class PostgresRepository:
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.frames
-                        (run_id, asset_id, frame_index, captured_at, width, height, source_ref, frame_hash, frame_png, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        (run_id, asset_id, frame_index, captured_at, width, height,
+                         bbox_x, bbox_y, parent_frame_id, source_ref, frame_hash, frame_png,
+                         payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                         RETURNING *;
                         """,
                         (
-                            run_id,
+                            frame.run_id or run_id,
                             frame.asset_id,
                             frame.frame_index,
                             frame.captured_at,
                             frame.width,
                             frame.height,
+                            frame.bbox_x,
+                            frame.bbox_y,
+                            frame.parent_frame_id,
                             frame.source_ref,
                             frame.frame_hash,
                             frame.frame_png,
+                            frame.payload_ref or frame.metadata.get("kvstore_key") or frame.frame_hash,
+                            frame.payload_encoding or frame.metadata.get("kvstore_encoding"),
+                            frame.payload_format or frame.metadata.get("kvstore_format"),
+                            frame.payload_dtype or frame.metadata.get("dtype"),
+                            json.dumps(json_ready(frame.payload_shape or frame.metadata.get("shape") or [])),
                             json.dumps(json_ready(frame.metadata)),
                         ),
                     )
@@ -621,6 +333,21 @@ class PostgresRepository:
                     (asset_id,),
                 )
                 return cursor.fetchall()
+
+    def get_frame(self, frame_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {self.schema}.frames WHERE id = %s", (frame_id,))
+                return cursor.fetchone()
+
+    def list_frame_records(self, asset_id: str) -> list[FrameRecord]:
+        return [FrameRecord.from_row(row) for row in self.list_frames(asset_id)]
+
+    def get_frame_record(self, frame_id: int) -> FrameRecord | None:
+        row = self.get_frame(frame_id)
+        if row is None:
+            return None
+        return FrameRecord.from_row(row)
 
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -697,6 +424,9 @@ class PostgresRepository:
                     (asset_id,),
                 )
                 return cursor.fetchall()
+
+    def list_detection_records(self, asset_id: str) -> list[DetectionRecord]:
+        return [DetectionRecord.from_row(row) for row in self.list_detections(asset_id)]
 
     def register_model(self, model: ModelRecord) -> dict[str, Any]:
         with self.connect() as connection:
@@ -830,6 +560,19 @@ class PostgresRepository:
                         """,
                         (row["id"], dependency),
                     )
+                self._append_job_event(
+                    cursor,
+                    row["id"],
+                    "job.created",
+                    {
+                        "stage": row["stage"],
+                        "status": row["status"],
+                        "run_id": row.get("run_id"),
+                        "asset_id": row.get("asset_id"),
+                        "priority": row.get("priority"),
+                        "depends_on": [str(dependency) for dependency in depends_on or []],
+                    },
+                )
             connection.commit()
         return row
 
@@ -848,6 +591,13 @@ class PostgresRepository:
                     (json.dumps(json_ready(payload)), summary, job_id),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        "job.payload_updated",
+                        {"summary": summary, "payload": payload},
+                    )
             connection.commit()
         return row
 
@@ -886,23 +636,54 @@ class PostgresRepository:
                     ),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        "job.progress_updated",
+                        {
+                            "progress": progress,
+                            "summary": summary,
+                            "log_message": log_message,
+                        },
+                    )
             connection.commit()
         return row
 
     def append_job_event(self, job_id: str | None, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {self.schema}.job_events (job_id, event_type, payload)
-                    VALUES (%s, %s, %s::jsonb)
-                    RETURNING *;
-                    """,
-                    (job_id, event_type, json.dumps(json_ready(payload or {}))),
-                )
-                row = cursor.fetchone()
+                row = self._append_job_event(cursor, job_id, event_type, payload)
             connection.commit()
         return row
+
+    def _append_job_event(
+        self,
+        cursor,
+        job_id: str | None,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.job_events (job_id, event_type, payload)
+            VALUES (%s, %s, %s::jsonb)
+            RETURNING *;
+            """,
+            (job_id, event_type, json.dumps(json_ready(payload or {}))),
+        )
+        return cursor.fetchone()
+
+    def _append_worker_event(
+        self,
+        cursor,
+        event_type: str,
+        worker_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_payload = {"worker_id": worker_id}
+        resolved_payload.update(payload or {})
+        return self._append_job_event(cursor, None, event_type, resolved_payload)
 
     def list_job_events(
         self,
@@ -957,6 +738,13 @@ class PostgresRepository:
                     (priority, reason, job_id),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        "job.priority_updated",
+                        {"priority": priority, "reason": reason},
+                    )
             connection.commit()
         return row
 
@@ -992,6 +780,21 @@ class PostgresRepository:
                 else:
                     cursor.execute(f"SELECT * FROM {self.schema}.processing_jobs WHERE id = %s", (job_id,))
                 row = cursor.fetchone()
+                if row is not None:
+                    if current["status"] == JobStatus.QUEUED.value:
+                        self._append_job_event(
+                            cursor,
+                            job_id,
+                            "job.paused",
+                            {"reason": reason, "previous_status": current["status"]},
+                        )
+                    elif current["status"] == JobStatus.LEASED.value:
+                        self._append_job_event(
+                            cursor,
+                            job_id,
+                            "job.pause_requested",
+                            {"reason": reason, "previous_status": current["status"]},
+                        )
             connection.commit()
         return row
 
@@ -1011,6 +814,8 @@ class PostgresRepository:
                     (job_id,),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(cursor, job_id, "job.paused", {"finalized": True})
             connection.commit()
         return row
 
@@ -1032,6 +837,8 @@ class PostgresRepository:
                     (reason, job_id),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(cursor, job_id, "job.resumed", {"reason": reason})
             connection.commit()
         return row
 
@@ -1081,31 +888,90 @@ class PostgresRepository:
         leased_job_id: str | None = None,
         capabilities: Sequence[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        pid: int | None = None,
+        shutdown_requested: bool | None = None,
     ) -> dict[str, Any]:
+        shutdown_sql = (
+            "COALESCE(EXCLUDED.shutdown_requested, worker_sessions.shutdown_requested)"
+            if shutdown_requested is None
+            else "EXCLUDED.shutdown_requested"
+        )
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.worker_sessions
-                    (worker_id, status, leased_job_id, capabilities, metadata, last_heartbeat)
-                    VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, NOW())
+                    (worker_id, pid, status, leased_job_id, capabilities, metadata, shutdown_requested, last_heartbeat)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, NOW())
                     ON CONFLICT (worker_id) DO UPDATE SET
+                        pid = COALESCE(EXCLUDED.pid, worker_sessions.pid),
                         status = EXCLUDED.status,
                         leased_job_id = EXCLUDED.leased_job_id,
                         capabilities = EXCLUDED.capabilities,
                         metadata = EXCLUDED.metadata,
+                        shutdown_requested = {shutdown_sql},
                         last_heartbeat = NOW()
                     RETURNING *;
                     """,
                     (
                         worker_id,
+                        pid,
                         status,
                         leased_job_id,
                         json.dumps(list(capabilities or [])),
                         json.dumps(json_ready(metadata or {})),
+                        False if shutdown_requested is None else shutdown_requested,
                     ),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_worker_event(
+                        cursor,
+                        "worker.touched",
+                        worker_id,
+                        {
+                            "pid": row.get("pid"),
+                            "status": row.get("status"),
+                            "leased_job_id": row.get("leased_job_id"),
+                            "capabilities": row.get("capabilities"),
+                            "shutdown_requested": row.get("shutdown_requested"),
+                        },
+                    )
+            connection.commit()
+        return row
+
+    def get_worker_session(self, worker_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.worker_sessions WHERE worker_id = %s",
+                    (worker_id,),
+                )
+                return cursor.fetchone()
+
+    def request_worker_shutdown(self, worker_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        metadata = {"shutdown_reason": reason} if reason else {}
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.worker_sessions
+                    SET shutdown_requested = true,
+                        metadata = metadata || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE worker_id = %s
+                    RETURNING *;
+                    """,
+                    (json.dumps(json_ready(metadata)), worker_id),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    self._append_worker_event(
+                        cursor,
+                        "worker.shutdown_requested",
+                        worker_id,
+                        {"reason": reason, "pid": row.get("pid"), "status": row.get("status")},
+                    )
             connection.commit()
         return row
 
@@ -1134,6 +1000,19 @@ class PostgresRepository:
                     """,
                     (job_id, worker_id),
                 )
+                if job_row is not None:
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        "job.heartbeat",
+                        {"worker_id": worker_id},
+                    )
+                    self._append_worker_event(
+                        cursor,
+                        "worker.heartbeat",
+                        worker_id,
+                        {"job_id": job_id},
+                    )
             connection.commit()
         return job_row
 
@@ -1161,10 +1040,26 @@ class PostgresRepository:
                         updated_at = NOW()
                     FROM expired
                     WHERE jobs.id = expired.id
-                    RETURNING jobs.status;
+                    RETURNING jobs.id, jobs.status, jobs.attempt_count, jobs.max_attempts;
                     """
                 )
                 rows = cursor.fetchall()
+                for row in rows:
+                    event_type = (
+                        "job.dead_lettered"
+                        if row["status"] == JobStatus.DEAD_LETTERED.value
+                        else "job.requeued"
+                    )
+                    self._append_job_event(
+                        cursor,
+                        row["id"],
+                        event_type,
+                        {
+                            "reason": "lease_expired",
+                            "attempt_count": row.get("attempt_count"),
+                            "max_attempts": row.get("max_attempts"),
+                        },
+                    )
             connection.commit()
         queued = sum(1 for row in rows if row["status"] == "queued")
         dead_lettered = sum(1 for row in rows if row["status"] == "dead_lettered")
@@ -1222,6 +1117,18 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(query, tuple(params))
                 rows = cursor.fetchall()
+                for row in rows:
+                    self._append_job_event(
+                        cursor,
+                        row["id"],
+                        "job.leased",
+                        {
+                            "worker_id": worker_id,
+                            "stage": row.get("stage"),
+                            "attempt_count": row.get("attempt_count"),
+                            "lease_expires_at": row.get("lease_expires_at"),
+                        },
+                    )
             connection.commit()
 
         return rows
@@ -1247,6 +1154,13 @@ class PostgresRepository:
                     (json.dumps(json_ready(result or {})), job_id),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        "job.completed",
+                        {"result": result or {}},
+                    )
             connection.commit()
         return row
 
@@ -1293,6 +1207,24 @@ class PostgresRepository:
                     ),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    if next_status == JobStatus.QUEUED.value:
+                        event_type = "job.failed_retryable"
+                    elif next_status == JobStatus.DEAD_LETTERED.value:
+                        event_type = "job.dead_lettered"
+                    else:
+                        event_type = "job.failed"
+                    self._append_job_event(
+                        cursor,
+                        job_id,
+                        event_type,
+                        {
+                            "error_message": error_message,
+                            "retryable": retryable,
+                            "next_status": next_status,
+                            "result": result or {},
+                        },
+                    )
             connection.commit()
         return row
 
@@ -1319,6 +1251,8 @@ class PostgresRepository:
                     (job_id,),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(cursor, job_id, "job.retried", {})
             connection.commit()
         return row
 
@@ -1335,9 +1269,18 @@ class PostgresRepository:
                         finished_at = NOW(),
                         updated_at = NOW()
                     WHERE run_id = %s AND status IN ('queued', 'leased', 'paused')
+                    RETURNING id, status
                     """,
                     (run_id,),
                 )
+                job_rows = cursor.fetchall()
+                for job_row in job_rows:
+                    self._append_job_event(
+                        cursor,
+                        job_row["id"],
+                        "job.cancelled",
+                        {"run_id": run_id},
+                    )
                 cursor.execute(
                     f"""
                     UPDATE {self.schema}.runs

@@ -1,0 +1,30 @@
+# Packaged Pelagia defaults. Copy values into ./config.toml to override them
+# for a local checkout. Environment variables and CLI flags still take
+# precedence over these settings.
+
+[database]
+dsn = "postgresql://postgres:postgres@localhost:5432/pelagia"
+schema_name = "pelagia"
+connect_timeout_s = 5
+statement_timeout_ms = 30000
+
+[queue]
+default_priority = 100
+max_attempts = 3
+max_claim_count = 1
+lease_seconds = 300
+heartbeat_interval_seconds = 30
+
+[kvstore]
+root_path = "./data/kvstore"
+hash_algorithm = "sha256"
+prefix_length = 1
+max_db_bytes = 4294967296
+max_rows = 1000000
+
+[image_data_storage]
+encoding = "zstd"
+
+[api]
+host = "127.0.0.1"
+port = 8000

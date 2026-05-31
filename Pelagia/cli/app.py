@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +37,7 @@ if typer is not None:
         database_dsn: Optional[str],
         schema: Optional[str],
     ) -> AppContext:
-        config = CoreConfig.from_env()
+        config = CoreConfig.load()
         if kvstore_root is not None:
             config.kvstore.root_path = kvstore_root
         if database_dsn is not None:
@@ -108,7 +110,7 @@ if typer is not None:
         run_key: Optional[str],
         instrument: str,
     ) -> tuple[AppContext, dict]:
-        from ..processing.frames import ingest_video_file
+        from ..processing.video_ingest import ingest_video_file
 
         resolved = input_path.expanduser().resolve()
         context = _context_from_options(kvstore_root, database_dsn, schema)
@@ -140,7 +142,7 @@ if typer is not None:
 
     @app.command("init-kvstore")
     def init_kvstore(root: Optional[Path] = None) -> None:
-        config = CoreConfig.from_env()
+        config = CoreConfig.load()
         if root is not None:
             config.kvstore.root_path = root
         service = StoreService.from_config(config.kvstore)
@@ -219,6 +221,146 @@ if typer is not None:
         result["queue_stage"] = stage.value
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
 
+    @app.command("queue_extract_frames")
+    def queue_extract_frames(
+        input_path: Path,
+        n_tile: int = 1,
+        dest_path: Optional[Path] = None,
+        enqueue_segment: bool = False,
+        segmentation_padding: int = 0,
+        roi_encoding: str = "zstd",
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        run_id: Optional[str] = None,
+        asset_id: Optional[str] = None,
+        run_key: Optional[str] = None,
+        instrument: str = "cli",
+    ) -> None:
+        resolved = input_path.expanduser().resolve()
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
+            context,
+            resolved,
+            run_id,
+            asset_id,
+            run_key,
+            instrument,
+        )
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to queue frame extraction.")
+        job = context.repository.create_job(
+            PipelineStage.EXTRACT_FRAMES,
+            run_id=resolved_run_id,
+            asset_id=resolved_asset_id,
+            payload={
+                "source_path": str(resolved),
+                "n_tile": n_tile,
+                "dest_path": None if dest_path is None else str(dest_path),
+                "enqueue_segment": enqueue_segment,
+                "segmentation_padding": segmentation_padding,
+                "roi_encoding": roi_encoding,
+            },
+            summary=f"extract_frames queued for {resolved.name}",
+        )
+        result = {
+            "run_id": resolved_run_id,
+            "asset_id": resolved_asset_id,
+            "run_key": resolved_run_key,
+            "job_id": job["id"],
+            "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
+            "source_path": str(resolved),
+        }
+        typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
+
+    @app.command("worker_run_once")
+    def worker_run_once(
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        stages: Optional[str] = None,
+    ) -> None:
+        from ..workers import Worker, default_handler_registry
+
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        selected_stages = None
+        if stages:
+            selected_stages = [
+                PipelineStage(stage.strip())
+                for stage in stages.split(",")
+                if stage.strip()
+            ]
+        handlers = default_handler_registry()
+        if worker_id:
+            worker = Worker(context=context, handlers=handlers, worker_id=worker_id)
+        else:
+            worker = Worker(context=context, handlers=handlers)
+        claimed = worker.run_once(stages=selected_stages)
+        typer.echo(json.dumps({"worker_id": worker.worker_id, "claimed": claimed}, sort_keys=True))
+
+    @app.command("worker_run")
+    def worker_run(
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        stages: Optional[str] = None,
+        idle_sleep_seconds: float = 2.0,
+        requeue_interval_seconds: float = 30.0,
+    ) -> None:
+        from ..workers import Worker, default_handler_registry
+
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        selected_stages = None
+        if stages:
+            selected_stages = [
+                PipelineStage(stage.strip())
+                for stage in stages.split(",")
+                if stage.strip()
+            ]
+        handlers = default_handler_registry()
+        if worker_id:
+            worker = Worker(context=context, handlers=handlers, worker_id=worker_id)
+        else:
+            worker = Worker(context=context, handlers=handlers)
+
+        stop_event = threading.Event()
+
+        def stop_worker(signum, _frame):
+            typer.echo(f"Worker {worker.worker_id} received signal {signum}; stopping after current job.")
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, stop_worker)
+        signal.signal(signal.SIGTERM, stop_worker)
+
+        typer.echo(json.dumps({"worker_id": worker.worker_id, "status": "starting"}, sort_keys=True))
+        worker.run_forever(
+            stages=selected_stages,
+            idle_sleep_seconds=idle_sleep_seconds,
+            requeue_interval_seconds=requeue_interval_seconds,
+            stop_event=stop_event,
+        )
+        typer.echo(json.dumps({"worker_id": worker.worker_id, "status": "stopped"}, sort_keys=True))
+
+    @app.command("worker_shutdown")
+    def worker_shutdown(
+        worker_id: str,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        config = CoreConfig.load()
+        if database_dsn is not None:
+            config.database.dsn = database_dsn
+        if schema is not None:
+            config.database.schema_name = schema
+        context = AppContext.from_config(config)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to request worker shutdown.")
+        row = context.repository.request_worker_shutdown(worker_id, reason=reason)
+        typer.echo(json.dumps(json_ready(row or {"worker_id": worker_id, "found": False}), indent=2, sort_keys=True))
+
     def main() -> None:
         app()
 else:
@@ -226,3 +368,7 @@ else:
 
     def main() -> None:
         raise RuntimeError("Install typer to run the Pelagia CLI.")
+
+
+if __name__ == "__main__":
+    main()

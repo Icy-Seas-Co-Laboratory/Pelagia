@@ -5,16 +5,14 @@ import numpy as np
 import pytest
 
 from Pelagia.config import CoreConfig, ImageDataStorageConfig
+from Pelagia.domain import FrameRecord
 from Pelagia.processing import video_ingest as video_ingest_module
-from Pelagia.processing.frame_correction import _flatfield_correction_for_framedata
-from Pelagia.processing.frame_time import _parse_filename_timestamp_utc
+from Pelagia.processing.frame_correction import flatfield_correction_for_framedata
+from Pelagia.processing.frame_model import FrameData
+from Pelagia.processing.frame_store import retrieve_frame, store_frame
+from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.video_ingest import convert_frame_to_grayscale
-from Pelagia.processing.frames import (
-    Frame,
-    ingest_video_file,
-    retrieve_frame,
-    store_frame,
-)
+from Pelagia.processing.video_ingest import ingest_video_file
 
 
 class FakeKVStore:
@@ -113,13 +111,13 @@ class FakeContext:
     ],
 )
 def test_parse_filename_timestamp_utc_handles_camera_names(filename, expected):
-    assert _parse_filename_timestamp_utc(filename) == expected
+    assert parse_filename_timestamp_utc(filename) == expected
 
 
 def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
-    corrected = _flatfield_correction_for_framedata(data, q=0.5)
+    corrected = flatfield_correction_for_framedata(data, q=0.5)
 
     np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
 
@@ -127,7 +125,7 @@ def test_flatfield_correction_uses_column_profile_for_grayscale_data():
 def test_frame_infers_full_frame_geometry_from_data():
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -148,7 +146,7 @@ def test_frame_preserves_roi_geometry():
     data = np.arange(6, dtype=np.uint8).reshape(2, 3)
     mask = np.full((2, 3), 255, dtype=np.uint8)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -174,7 +172,7 @@ def test_frame_validate_mask_rejects_mismatched_dimensions():
     mask = np.full((2, 4), 255, dtype=np.uint8)
 
     with pytest.raises(ValueError, match="mask width"):
-        Frame(
+        FrameData(
             sourcePath="/tmp/",
             destPath="/tmp/out",
             filename="frame.png",
@@ -186,7 +184,7 @@ def test_frame_validate_mask_rejects_mismatched_dimensions():
 
 def test_frame_validate_geometry_rejects_mismatched_dimensions():
     data = np.arange(6, dtype=np.uint8).reshape(2, 3)
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -204,7 +202,7 @@ def test_store_frame_writes_numpy_payload_and_metadata():
     ctx = FakeContext()
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -226,9 +224,11 @@ def test_store_frame_writes_numpy_payload_and_metadata():
     assert params[2] == 7          # frame_index
     assert params[4] == 4          # width
     assert params[5] == 3          # height
-    assert params[7] == "fake-kv-key"
+    assert params[10] == "fake-kv-key"
+    assert params[12] == "fake-kv-key"
+    assert params[13] == "png"
 
-    metadata = json.loads(params[9])
+    metadata = json.loads(params[17])
     assert metadata["kvstore_encoding"] == "png"
     assert metadata["kvstore_format"] == "png"
     assert metadata["width"] == 4
@@ -241,7 +241,7 @@ def test_store_frame_writes_roi_geometry_metadata():
     ctx = FakeContext()
     data = np.arange(6, dtype=np.uint8).reshape(2, 3)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -263,8 +263,11 @@ def test_store_frame_writes_roi_geometry_metadata():
     params = ctx.repository.cursor_obj.params
     assert params[4] == 3
     assert params[5] == 2
+    assert params[6] == 10
+    assert params[7] == 20
+    assert params[8] == 42
 
-    metadata = json.loads(params[9])
+    metadata = json.loads(params[17])
     assert metadata["width"] == 3
     assert metadata["height"] == 2
     assert metadata["bbox_x"] == 10
@@ -276,7 +279,7 @@ def test_store_frame_can_write_raw_numpy_payload():
     ctx = FakeContext()
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -292,7 +295,7 @@ def test_store_frame_can_write_raw_numpy_payload():
     store_frame(frame, context=ctx)
 
     assert ctx.kvstore.payload == data.tobytes(order="C")
-    metadata = json.loads(ctx.repository.cursor_obj.params[9])
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "raw"
     assert metadata["kvstore_format"] == "raw_ndarray_c_order"
 
@@ -302,7 +305,7 @@ def test_store_frame_uses_configured_default_image_data_storage_encoding():
     ctx.config.image_data_storage = ImageDataStorageConfig(encoding="raw")
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -317,7 +320,7 @@ def test_store_frame_uses_configured_default_image_data_storage_encoding():
     store_frame(frame, context=ctx)
 
     assert ctx.kvstore.payload == data.tobytes(order="C")
-    metadata = json.loads(ctx.repository.cursor_obj.params[9])
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "raw"
     assert metadata["kvstore_format"] == "raw_ndarray_c_order"
 
@@ -326,7 +329,7 @@ def test_store_frame_applies_flatfield_correction_when_requested():
     ctx = FakeContext()
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -347,7 +350,7 @@ def test_store_frame_applies_flatfield_correction_when_requested():
         np.frombuffer(ctx.kvstore.payload, dtype=np.uint8).reshape(2, 2),
         np.array([[127, 102], [255, 255]], dtype=np.uint8),
     )
-    metadata = json.loads(ctx.repository.cursor_obj.params[9])
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["flatfield_correction"] is True
     assert metadata["flatfield_q"] == 0.5
 
@@ -381,7 +384,7 @@ def test_store_frame_can_write_zstd_numpy_payload():
     ctx = FakeContext()
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -397,7 +400,7 @@ def test_store_frame_can_write_zstd_numpy_payload():
     store_frame(frame, context=ctx)
 
     assert zstd.ZstdDecompressor().decompress(ctx.kvstore.payload) == data.tobytes(order="C")
-    metadata = json.loads(ctx.repository.cursor_obj.params[9])
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "zstd"
     assert metadata["kvstore_format"] == "zstd_ndarray_c_order"
 
@@ -406,7 +409,7 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     ctx = FakeContext()
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
-    stored = Frame(
+    stored = FrameData(
         sourcePath="/tmp/source",
         destPath="/tmp/out",
         filename="frame.png",
@@ -427,7 +430,7 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
         },
     )
     store_frame(stored, context=ctx)
-    metadata = json.loads(ctx.repository.cursor_obj.params[9])
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
     ctx.repository.cursor_obj.row = {
         "id": 42,
         "run_id": "00000000-0000-0000-0000-000000000001",
@@ -458,6 +461,57 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     assert retrieved.filename == "frame.png"
     np.testing.assert_array_equal(retrieved.data, data)
     assert retrieved.metadata["frame_id"] == 42
+
+
+def test_frame_data_from_record_maps_row_model_to_runtime_container():
+    record = FrameRecord(
+        id=42,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        frame_index=3,
+        captured_at=None,
+        width=4,
+        height=3,
+        bbox_x=10,
+        bbox_y=20,
+        parent_frame_id=99,
+        source_ref="/tmp/source/frame.png",
+        frame_hash="fake-kv-key",
+        frame_png=b"",
+        payload_ref="fake-kv-key",
+        payload_encoding="raw",
+        payload_format="raw_ndarray_c_order",
+        payload_dtype="uint8",
+        payload_shape=[3, 4],
+        metadata={
+            "dest_path": "/tmp/out",
+            "frame_number": 7,
+            "tile_number": 3,
+            "source_frame_start": 5,
+            "source_frame_end": 7,
+            "frame_type": "line",
+            "channel": 2,
+        },
+    )
+    data = np.arange(12, dtype=np.uint8).reshape(3, 4)
+
+    frame_data = FrameData.from_record(record, data=data)
+
+    assert frame_data.frameNumber == 7
+    assert frame_data.tileNumber == 3
+    assert frame_data.sourceFrameStart == 5
+    assert frame_data.sourceFrameEnd == 7
+    assert frame_data.frameType == "line"
+    assert frame_data.channel == 2
+    assert frame_data.get_bbox() == (10, 20, 4, 3)
+    assert frame_data.parent_frame_id == 99
+    assert frame_data.sourcePath == "/tmp/source"
+    assert frame_data.destPath == "/tmp/out"
+    assert frame_data.filename == "frame.png"
+    assert frame_data.metadata["frame_id"] == 42
+    assert frame_data.metadata["kvstore_encoding"] == "raw"
+    assert frame_data.metadata["shape"] == [3, 4]
+    np.testing.assert_array_equal(frame_data.data, data)
 
 
 def test_ingest_video_file_timestamps_frames_from_filename_and_fps(monkeypatch):
@@ -504,7 +558,7 @@ def test_ingest_video_file_timestamps_frames_from_filename_and_fps(monkeypatch):
     assert first_params[3] == start
     assert second_params[3] == start + timedelta(seconds=0.05)
 
-    first_metadata = json.loads(first_params[9])
+    first_metadata = json.loads(first_params[17])
     assert first_metadata["source_timestamp_utc"] == "2025-11-10T02:21:32.482000+00:00"
     assert first_metadata["fps"] == 20.0
     assert first_metadata["frame_interval_seconds"] == 0.05

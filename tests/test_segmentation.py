@@ -1,14 +1,14 @@
 import numpy as np
 
 from Pelagia.processing.frame_codec import decode_array_payload
-from Pelagia.processing.frames import Frame
+from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.segmentation import segment_frame, store_roi
 
 
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -62,7 +62,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
 def test_segment_frame_stores_padded_roi_context_and_mask():
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -116,7 +116,7 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
 def test_segment_frame_filters_by_bbox_perimeter():
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
-    frame = Frame(
+    frame = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -132,7 +132,7 @@ def test_segment_frame_filters_by_bbox_perimeter():
 
 
 def test_store_roi_auto_uses_png_for_small_roi_payloads():
-    source = Frame(
+    source = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",
@@ -143,7 +143,7 @@ def test_store_roi_auto_uses_png_for_small_roi_payloads():
             "frame_id": 42,
         },
     )
-    roi = Frame(
+    roi = FrameData(
         sourcePath="/tmp/",
         destPath="/tmp/out",
         filename="frame.png",

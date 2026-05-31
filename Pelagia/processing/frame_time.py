@@ -30,7 +30,3 @@ def timestamp_for_frame(start: datetime | None, fps: float, frame_number: int) -
     if start is None or fps <= 0:
         return None
     return start + timedelta(seconds=(frame_number - 1) / fps)
-
-
-_parse_filename_timestamp_utc = parse_filename_timestamp_utc
-_timestamp_for_frame = timestamp_for_frame

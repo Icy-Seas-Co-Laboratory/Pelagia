@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 from ..services.context import AppContext
-from .frame_model import Frame
+from .frame_model import FrameData
 from .frame_store import store_frame
 from .frame_time import parse_filename_timestamp_utc, timestamp_for_frame
 
@@ -86,7 +86,7 @@ def ingest_video_file(
                     tiled = np.vstack(frame_buffer)
                     stored_frames.append(
                         store_frame(
-                            Frame(
+                            FrameData(
                                 sourcePath=source_path,
                                 destPath=dest_path,
                                 filename=filename,
@@ -110,7 +110,7 @@ def ingest_video_file(
             tiled = np.vstack(frame_buffer)
             stored_frames.append(
                 store_frame(
-                    Frame(
+                    FrameData(
                         sourcePath=source_path,
                         destPath=dest_path,
                         filename=filename,

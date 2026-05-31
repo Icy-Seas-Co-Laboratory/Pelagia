@@ -7,13 +7,13 @@ import numpy as np
 
 from ..domain import DetectionRecord
 from .frame_codec import encode_array_payload
-from .frames import Frame
+from .frame_model import FrameData
 
 
 ThresholdFn = Callable[[np.ndarray], np.ndarray]
 
 
-def _frame_metadata_value(frame: Frame, key: str, default: Any = None) -> Any:
+def _frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
     if hasattr(frame, key):
         value = getattr(frame, key)
         if value is not None:
@@ -21,7 +21,7 @@ def _frame_metadata_value(frame: Frame, key: str, default: Any = None) -> Any:
     return frame.metadata.get(key, default)
 
 
-def _as_grayscale_array(frame: Frame) -> np.ndarray:
+def _as_grayscale_array(frame: FrameData) -> np.ndarray:
     data = frame.read()
     if data is None:
         raise ValueError("Frame has no image data to segment.")
@@ -107,9 +107,9 @@ def _padded_bounds(
 
 
 def store_roi(
-    roi_frame: Frame,
+    roi_frame: FrameData,
     *,
-    source_frame: Frame,
+    source_frame: FrameData,
     roi_index: int,
     contour: np.ndarray,
     area: float,
@@ -195,7 +195,7 @@ def store_roi(
 
 
 def segment_frame(
-    frame: Frame,
+    frame: FrameData,
     *,
     threshold: int | float | ThresholdFn | None = None,
     min_perimeter: int | float = 0,
@@ -245,7 +245,7 @@ def segment_frame(
         contour[:, 0, 0] += int(x) + frame.bbox_x
         contour[:, 0, 1] += int(y) + frame.bbox_y
 
-        roi_frame = Frame(
+        roi_frame = FrameData(
             sourcePath=frame.sourcePath,
             destPath=frame.destPath,
             filename=frame.filename,
@@ -302,6 +302,3 @@ def segment_frame(
         )
 
     return roi_records
-
-
-calcThreshold = calc_threshold

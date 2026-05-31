@@ -7,7 +7,9 @@ name = "pelagia"
 version = "0.0.1"
 description = "Integrated image processing, storage, API, CLI, and worker tools."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "tomli; python_version < '3.11'",
+]
 
 [project.optional-dependencies]
 api = ["fastapi", "uvicorn"]
@@ -21,3 +23,7 @@ pelagia = "Pelagia.cli.app:main"
 
 [tool.setuptools.packages.find]
 include = ["Pelagia*"]
+
+[tool.setuptools.package-data]
+"Pelagia" = ["default.config.toml"]
+"Pelagia.storage" = ["sql/*.sql"]
