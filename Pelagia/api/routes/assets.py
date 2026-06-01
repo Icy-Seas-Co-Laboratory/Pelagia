@@ -68,7 +68,7 @@ if APIRouter is not None:
         run_id: str | None = None,
         collection: str | None = None,
         kind: str | None = None,
-        asset_key: str | None = None,
+        filename: str | None = None,
         path: str | None = None,
         checksum: str | None = None,
         min_size_bytes: int | None = None,
@@ -82,7 +82,7 @@ if APIRouter is not None:
                     run_id=run_id,
                     collection=collection,
                     kind=kind,
-                    asset_key=asset_key,
+                    filename=filename,
                     path=path,
                     checksum=checksum,
                     min_size_bytes=min_size_bytes,
@@ -132,7 +132,7 @@ if APIRouter is not None:
                 detail=f"Frame {frame_num!r} was not found for asset {asset_id!r}.",
             )
 
-        frame = retrieve_frame(int(row["id"]), context=get_context(request))
+        frame = retrieve_frame(str(row["id"]), context=get_context(request))
         array = frame.read()
         if array is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_num!r} has no image data.")

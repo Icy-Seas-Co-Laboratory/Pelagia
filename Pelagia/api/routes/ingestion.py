@@ -74,7 +74,7 @@ if APIRouter is not None:
                 assets=[
                     RawAssetManifest(
                         asset_id=asset_id,
-                        asset_key=source_path.name,
+                        filename=source_path.name,
                         path=str(source_path),
                         kind=AssetKind.VIDEO,
                         size_bytes=source_path.stat().st_size,

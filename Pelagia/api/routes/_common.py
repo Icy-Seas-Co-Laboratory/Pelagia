@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+from ...processing.thumbhash import thumbhash_to_base64
 from ...services.context import AppContext
 from ...utils.serialization import json_ready
 
@@ -52,7 +53,12 @@ def without_payload_bytes(row: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 
 
 def frame_summary(row: Any) -> dict[str, Any]:
-    return without_payload_bytes(row, ("frame_png",))
+    item = _as_dict(row)
+    preview_thumbhash = item.pop("preview_thumbhash", item.pop("frame_png", None))
+    if preview_thumbhash is not None:
+        item["preview_thumbhash_bytes"] = len(preview_thumbhash)
+        item["preview_thumbhash_base64"] = thumbhash_to_base64(preview_thumbhash)
+    return as_response(item)
 
 
 def detection_summary(row: Any) -> dict[str, Any]:

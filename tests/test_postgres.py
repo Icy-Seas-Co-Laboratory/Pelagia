@@ -11,6 +11,7 @@ from Pelagia.domain import (
     AssetKind,
     DetectionRecord,
     FrameRecord,
+    ModelRecord,
     PlannedRun,
     PipelineStage,
     RawAssetManifest,
@@ -92,7 +93,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
             assets=[
                 RawAssetManifest(
                     asset_id=asset_id,
-                    asset_key="example.avi",
+                    filename="example.avi",
                     path="/tmp/example.avi",
                     kind=AssetKind.VIDEO,
                     size_bytes=123,
@@ -122,13 +123,13 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assets = postgres_repo.list_assets(run_id)
     assert len(assets) == 1
     assert str(assets[0]["id"]) == asset_id
-    assert assets[0]["asset_key"] == "example.avi"
+    assert assets[0]["filename"] == "example.avi"
     assert assets[0]["collections"] == ["skq202510S-T1", "test"]
     assert postgres_repo.list_collections() == [
         {"collection": "skq202510S-T1", "asset_count": 1},
         {"collection": "test", "asset_count": 1},
     ]
-    assert postgres_repo.list_assets(collection="test")[0]["asset_key"] == "example.avi"
+    assert postgres_repo.list_assets(collection="test")[0]["filename"] == "example.avi"
 
     inserted_frames = postgres_repo.replace_frames(
         run_id,
@@ -138,8 +139,8 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
                 frame_index=1,
                 width=4,
                 height=3,
-                frame_png=frame_payload,
-                frame_hash="kvstore-key-1",
+                preview_thumbhash=frame_payload,
+                kvstore_hash="kvstore-key-1",
                 source_ref="/tmp/example.avi",
                 bbox_x=7,
                 bbox_y=8,
@@ -153,7 +154,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         ],
     )
     assert len(inserted_frames) == 1
-    assert inserted_frames[0]["frame_hash"] == "kvstore-key-1"
+    assert inserted_frames[0]["kvstore_hash"] == "kvstore-key-1"
     assert inserted_frames[0]["payload_ref"] == "kvstore-key-1"
     assert inserted_frames[0]["payload_encoding"] == "zstd"
     assert inserted_frames[0]["payload_shape"] == [3, 4]
@@ -266,3 +267,69 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     ]
     assert "worker.touched" in [event["event_type"] for event in worker_events]
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
+
+
+def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    planned_run = PlannedRun(
+        manifest=RunManifest(
+            run_id=run_id,
+            run_key=f"purge-test-{uuid.uuid4().hex}",
+            instrument="pytest",
+            source_path="/tmp/purge.avi",
+            source_type=AssetKind.VIDEO.value,
+            created_at=datetime.now(timezone.utc),
+            assets=[
+                RawAssetManifest(
+                    asset_id=asset_id,
+                    filename="purge.avi",
+                    path="/tmp/purge.avi",
+                    kind=AssetKind.VIDEO,
+                    size_bytes=456,
+                    checksum="sha256:purge",
+                    collections=["purge"],
+                )
+            ],
+        ),
+        jobs=[
+            WorkItem(
+                job_id=job_id,
+                run_id=run_id,
+                stage=PipelineStage.EXTRACT_FRAMES,
+                asset_id=asset_id,
+                payload={"source_path": "/tmp/purge.avi"},
+            )
+        ],
+    )
+    postgres_repo.register_planned_run(planned_run)
+    postgres_repo.touch_worker(
+        "purge-worker",
+        status="idle",
+        capabilities=[PipelineStage.EXTRACT_FRAMES.value],
+        pid=23456,
+    )
+    postgres_repo.register_model(
+        ModelRecord(
+            model_key=f"purge-model-{uuid.uuid4().hex}",
+            model_name="Purge Model",
+            version="0",
+        )
+    )
+
+    result = postgres_repo.purge_all()
+
+    assert result["tables"]["runs"] == 1
+    assert result["tables"]["raw_assets"] == 1
+    assert result["tables"]["processing_jobs"] == 1
+    assert result["tables"]["worker_sessions"] == 1
+    assert result["tables"]["models"] == 1
+    assert result["tables"]["job_events"] >= 2
+    assert postgres_repo.list_runs() == []
+    assert postgres_repo.list_assets() == []
+    assert postgres_repo.list_jobs() == []
+    assert postgres_repo.list_worker_sessions() == []
+    assert postgres_repo.list_collections() == []
+    assert postgres_repo.list_models() == []
+    assert postgres_repo.list_job_events() == []

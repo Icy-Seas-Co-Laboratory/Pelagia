@@ -30,6 +30,28 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION {schema}.uuidv7()
+RETURNS uuid AS $$
+DECLARE
+    unix_ts_ms bigint;
+    hex_ts text;
+    rand_a integer;
+    rand_b text;
+BEGIN
+    unix_ts_ms := floor(extract(epoch from clock_timestamp()) * 1000)::bigint;
+    hex_ts := lpad(to_hex(unix_ts_ms), 12, '0');
+    rand_a := floor(random() * 4096)::integer;
+    rand_b := encode(gen_random_bytes(8), 'hex');
+    RETURN (
+        substr(hex_ts, 1, 8) || '-' ||
+        substr(hex_ts, 9, 4) || '-' ||
+        '7' || lpad(to_hex(rand_a), 3, '0') || '-' ||
+        substr('89ab', floor(random() * 4)::integer + 1, 1) || substr(rand_b, 1, 3) || '-' ||
+        substr(rand_b, 4, 12)
+    )::uuid;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+
 CREATE TABLE IF NOT EXISTS {schema}.runs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     run_key text NOT NULL UNIQUE,
@@ -45,7 +67,7 @@ CREATE TABLE IF NOT EXISTS {schema}.runs (
 CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    asset_key text NOT NULL,
+    filename text NOT NULL,
     path text NOT NULL,
     kind {schema}.asset_kind NOT NULL,
     checksum text NOT NULL,
@@ -55,8 +77,31 @@ CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     CONSTRAINT raw_assets_collections_nonempty CHECK (cardinality(collections) > 0),
-    UNIQUE (run_id, asset_key)
+    UNIQUE (run_id, filename)
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = '{schema}' AND table_name = 'raw_assets' AND column_name = 'asset_key'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = '{schema}' AND table_name = 'raw_assets' AND column_name = 'filename'
+    ) THEN
+        ALTER TABLE {schema}.raw_assets RENAME COLUMN asset_key TO filename;
+    END IF;
+END $$;
+
+ALTER TABLE {schema}.raw_assets
+    ADD COLUMN IF NOT EXISTS filename text;
+
+UPDATE {schema}.raw_assets
+SET filename = COALESCE(filename, metadata->>'filename', path)
+WHERE filename IS NULL;
+
+ALTER TABLE {schema}.raw_assets
+    ALTER COLUMN filename SET NOT NULL;
 
 ALTER TABLE {schema}.raw_assets
     ADD COLUMN IF NOT EXISTS collections text[] NOT NULL DEFAULT ARRAY['none']::text[];
@@ -81,8 +126,27 @@ BEGIN
     END IF;
 END $$;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'raw_assets_run_id_asset_key_key'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.raw_assets DROP CONSTRAINT raw_assets_run_id_asset_key_key;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'raw_assets_run_id_filename_key'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.raw_assets
+            ADD CONSTRAINT raw_assets_run_id_filename_key UNIQUE (run_id, filename);
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS {schema}.frames (
-    id bigserial PRIMARY KEY,
+    id uuid PRIMARY KEY DEFAULT {schema}.uuidv7(),
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     asset_id uuid NOT NULL REFERENCES {schema}.raw_assets(id) ON DELETE CASCADE,
     frame_index integer NOT NULL,
@@ -91,10 +155,10 @@ CREATE TABLE IF NOT EXISTS {schema}.frames (
     height integer NOT NULL,
     bbox_x integer NOT NULL DEFAULT 0,
     bbox_y integer NOT NULL DEFAULT 0,
-    parent_frame_id bigint REFERENCES {schema}.frames(id) ON DELETE SET NULL,
+    parent_frame_id uuid REFERENCES {schema}.frames(id) ON DELETE SET NULL,
     source_ref text,
-    frame_hash text NOT NULL,
-    frame_png bytea NOT NULL,
+    kvstore_hash text NOT NULL,
+    preview_thumbhash bytea NOT NULL,
     payload_ref text,
     payload_encoding text,
     payload_format text,
@@ -108,7 +172,9 @@ CREATE TABLE IF NOT EXISTS {schema}.frames (
 ALTER TABLE {schema}.frames
     ADD COLUMN IF NOT EXISTS bbox_x integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS bbox_y integer NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS parent_frame_id bigint REFERENCES {schema}.frames(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS parent_frame_id uuid REFERENCES {schema}.frames(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS kvstore_hash text,
+    ADD COLUMN IF NOT EXISTS preview_thumbhash bytea,
     ADD COLUMN IF NOT EXISTS payload_ref text,
     ADD COLUMN IF NOT EXISTS payload_encoding text,
     ADD COLUMN IF NOT EXISTS payload_format text,
@@ -119,8 +185,8 @@ UPDATE {schema}.frames
 SET
     bbox_x = COALESCE((metadata->>'bbox_x')::integer, bbox_x, 0),
     bbox_y = COALESCE((metadata->>'bbox_y')::integer, bbox_y, 0),
-    parent_frame_id = COALESCE((metadata->>'parent_frame_id')::bigint, parent_frame_id),
-    payload_ref = COALESCE(payload_ref, metadata->>'kvstore_key', frame_hash),
+    kvstore_hash = COALESCE(kvstore_hash, metadata->>'kvstore_key', metadata->>'kvstore_hash'),
+    payload_ref = COALESCE(payload_ref, metadata->>'kvstore_key', kvstore_hash),
     payload_encoding = COALESCE(payload_encoding, metadata->>'kvstore_encoding', metadata->>'array_encoding'),
     payload_format = COALESCE(payload_format, metadata->>'kvstore_format'),
     payload_dtype = COALESCE(payload_dtype, metadata->>'dtype'),
@@ -129,10 +195,50 @@ SET
         ELSE payload_shape
     END;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}' AND table_name = 'frames' AND column_name = 'frame_hash'
+    ) THEN
+        EXECUTE 'UPDATE {schema}.frames SET kvstore_hash = COALESCE(kvstore_hash, frame_hash) WHERE kvstore_hash IS NULL';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}' AND table_name = 'frames' AND column_name = 'frame_png'
+    ) THEN
+        EXECUTE 'UPDATE {schema}.frames SET preview_thumbhash = COALESCE(preview_thumbhash, frame_png) WHERE preview_thumbhash IS NULL';
+    END IF;
+END $$;
+
+UPDATE {schema}.frames
+SET preview_thumbhash = ''::bytea
+WHERE preview_thumbhash IS NULL;
+
+ALTER TABLE {schema}.frames
+    ALTER COLUMN kvstore_hash SET NOT NULL,
+    ALTER COLUMN preview_thumbhash SET NOT NULL;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name = 'frames'
+          AND column_name = 'id'
+          AND udt_name = 'uuid'
+    ) THEN
+        ALTER TABLE {schema}.frames ALTER COLUMN id SET DEFAULT {schema}.uuidv7();
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS {schema}.detections (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
-    frame_id bigint NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
+    frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
     roi_index integer NOT NULL,
     bbox_x integer NOT NULL,
     bbox_y integer NOT NULL,

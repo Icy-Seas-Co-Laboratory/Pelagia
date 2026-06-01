@@ -26,7 +26,7 @@ class FrameData:
     height: int | None = None
     bbox_x: int = 0
     bbox_y: int = 0
-    parent_frame_id: int | None = None
+    parent_frame_id: str | None = None
     bkg: object = None
     tileNumber: int = None
     sourceFrameStart: int = None
@@ -98,8 +98,6 @@ class FrameData:
             self.width = int(self.width)
         if self.height is not None:
             self.height = int(self.height)
-        if self.parent_frame_id is not None:
-            self.parent_frame_id = int(self.parent_frame_id)
         self.infer_geometry()
         self.validate_mask()
 

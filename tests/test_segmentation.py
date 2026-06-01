@@ -5,6 +5,9 @@ from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.segmentation import segment_frame, store_roi
 
 
+FRAME_ID = "00000000-0000-7000-8000-000000000042"
+
+
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
@@ -17,7 +20,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
         bbox_y=200,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
-            "frame_id": 42,
+            "frame_id": FRAME_ID,
         },
     )
 
@@ -26,7 +29,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     assert len(detections) == 1
     detection = detections[0]
     assert detection.run_id == "00000000-0000-0000-0000-000000000001"
-    assert detection.frame_id == 42
+    assert detection.frame_id == FRAME_ID
     assert detection.roi_index == 1
     assert detection.bbox_x == 103
     assert detection.bbox_y == 202
@@ -70,7 +73,7 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
         bbox_y=200,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
-            "frame_id": 42,
+            "frame_id": FRAME_ID,
         },
     )
 
@@ -121,7 +124,7 @@ def test_segment_frame_filters_by_bbox_perimeter():
         data=data,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
-            "frame_id": 42,
+            "frame_id": FRAME_ID,
         },
     )
 
@@ -136,7 +139,7 @@ def test_store_roi_auto_uses_png_for_small_roi_payloads():
         data=np.full((4, 4), 10, dtype=np.uint8),
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
-            "frame_id": 42,
+            "frame_id": FRAME_ID,
         },
     )
     roi = FrameData(
@@ -148,7 +151,7 @@ def test_store_roi_auto_uses_png_for_small_roi_payloads():
         height=2,
         bbox_x=1,
         bbox_y=1,
-        parent_frame_id=42,
+        parent_frame_id=FRAME_ID,
     )
     contour = np.array([[[1, 1]], [[2, 1]], [[2, 2]], [[1, 2]]], dtype=np.int32)
 

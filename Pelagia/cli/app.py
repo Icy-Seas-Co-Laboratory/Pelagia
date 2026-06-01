@@ -32,11 +32,11 @@ if typer is not None:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def _context_from_options(
+    def _config_from_options(
         kvstore_root: Optional[Path],
         database_dsn: Optional[str],
         schema: Optional[str],
-    ) -> AppContext:
+    ) -> CoreConfig:
         config = CoreConfig.load()
         if kvstore_root is not None:
             config.kvstore.root_path = kvstore_root
@@ -44,7 +44,14 @@ if typer is not None:
             config.database.dsn = database_dsn
         if schema is not None:
             config.database.schema_name = schema
+        return config
 
+    def _context_from_options(
+        kvstore_root: Optional[Path],
+        database_dsn: Optional[str],
+        schema: Optional[str],
+    ) -> AppContext:
+        config = _config_from_options(kvstore_root, database_dsn, schema)
         context = AppContext.from_config(config)
         if context.kvstore is not None and not context.kvstore.initialized:
             context.kvstore.initialize(
@@ -73,7 +80,7 @@ if typer is not None:
         resolved_run_id = run_id or str(uuid.uuid4())
         resolved_asset_id = asset_id or str(uuid.uuid4())
         resolved_run_key = run_key or f"video:{resolved.stem}:{uuid.uuid4().hex[:12]}"
-        asset_key = resolved.name
+        filename = resolved.name
         normalized_collections = normalize_collections(collections)
 
         planned_run = PlannedRun(
@@ -88,7 +95,7 @@ if typer is not None:
                 assets=[
                     RawAssetManifest(
                         asset_id=resolved_asset_id,
-                        asset_key=asset_key,
+                        filename=filename,
                         path=str(resolved),
                         kind=AssetKind.VIDEO,
                         size_bytes=resolved.stat().st_size,
@@ -153,6 +160,22 @@ if typer is not None:
         service = StoreService.from_config(config.kvstore)
         service.ensure_initialized(config.kvstore)
         typer.echo(f"KVStore ready at {service.store.root_path}")
+
+    @app.command("init-system")
+    def init_system(
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        result = {
+            "database": {
+                "schema": context.repository.schema if context.repository is not None else None,
+                "initialized": context.repository is not None,
+            },
+            "kvstore": context.kvstore.status() if context.kvstore is not None else None,
+        }
+        typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
 
     @app.command("ingest_video")
     def ingest_video(
@@ -281,6 +304,44 @@ if typer is not None:
             "collections": normalized_collections,
         }
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
+
+    @app.command("reset")
+    def reset(
+        delete: bool = False,
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        if not delete:
+            typer.echo("Refusing to reset Pelagia storage without --delete.")
+            raise typer.Exit(code=2)
+
+        config = _config_from_options(kvstore_root, database_dsn, schema)
+        context = AppContext.from_config(config)
+        if context.repository is None or context.kvstore is None:
+            raise RuntimeError("Reset requires both a PostgresRepository and KVStore.")
+
+        context.repository.initialize_schema()
+        database_result = context.repository.purge_all()
+        kvstore_result = context.kvstore.reset(
+            hash_algorithm=config.kvstore.hash_algorithm,
+            prefix_length=config.kvstore.prefix_length,
+            max_db_bytes=config.kvstore.max_db_bytes,
+            max_rows=config.kvstore.max_rows,
+        )
+        typer.echo(
+            json.dumps(
+                json_ready(
+                    {
+                        "deleted": True,
+                        "database": database_result,
+                        "kvstore": kvstore_result,
+                    }
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
     @app.command("worker_run_once")
     def worker_run_once(

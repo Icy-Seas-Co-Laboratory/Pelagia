@@ -11,8 +11,13 @@ from Pelagia.processing.frame_correction import flatfield_correction_for_frameda
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_store import retrieve_frame, store_frame
 from Pelagia.processing.frame_time import parse_filename_timestamp_utc
+from Pelagia.processing.thumbhash import compute_thumbhash
 from Pelagia.processing.video_ingest import convert_frame_to_grayscale
 from Pelagia.processing.video_ingest import ingest_video_file
+
+
+FRAME_ID = "00000000-0000-7000-8000-000000000042"
+PARENT_FRAME_ID = "00000000-0000-7000-8000-000000000099"
 
 
 class FakeKVStore:
@@ -35,7 +40,7 @@ class FakeCursor:
     def __init__(self):
         self.params = None
         self.params_history = []
-        self.row = {"id": 1, "frame_hash": "fake-kv-key"}
+        self.row = {"id": FRAME_ID, "kvstore_hash": "fake-kv-key"}
 
     def execute(self, query, params):
         self.params = params
@@ -212,7 +217,7 @@ def test_store_frame_writes_numpy_payload_and_metadata():
 
     row = store_frame(frame, context=ctx)
 
-    assert row["frame_hash"] == "fake-kv-key"
+    assert row["kvstore_hash"] == "fake-kv-key"
     assert ctx.kvstore.payload.startswith(b"\x89PNG\r\n\x1a\n")
 
     params = ctx.repository.cursor_obj.params
@@ -220,6 +225,7 @@ def test_store_frame_writes_numpy_payload_and_metadata():
     assert params[4] == 4          # width
     assert params[5] == 3          # height
     assert params[10] == "fake-kv-key"
+    assert params[11] == compute_thumbhash(data)
     assert params[12] == "fake-kv-key"
     assert params[13] == "png"
 
@@ -411,7 +417,7 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
         channel=2,
         bbox_x=10,
         bbox_y=20,
-        parent_frame_id=99,
+        parent_frame_id=PARENT_FRAME_ID,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
             "asset_id": "00000000-0000-0000-0000-000000000002",
@@ -421,7 +427,7 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     store_frame(stored, context=ctx)
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     ctx.repository.cursor_obj.row = {
-        "id": 42,
+        "id": FRAME_ID,
         "run_id": "00000000-0000-0000-0000-000000000001",
         "asset_id": "00000000-0000-0000-0000-000000000002",
         "frame_index": 3,
@@ -429,11 +435,11 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
         "width": 4,
         "height": 3,
         "source_ref": "/tmp/source/frame.png",
-        "frame_hash": "fake-kv-key",
+        "kvstore_hash": "fake-kv-key",
         "metadata": metadata,
     }
 
-    retrieved = retrieve_frame(42, context=ctx)
+    retrieved = retrieve_frame(FRAME_ID, context=ctx)
 
     assert retrieved.frameNumber == 7
     assert retrieved.tileNumber == 3
@@ -444,16 +450,16 @@ def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():
     assert retrieved.width == 4
     assert retrieved.height == 3
     assert retrieved.get_bbox() == (10, 20, 4, 3)
-    assert retrieved.parent_frame_id == 99
+    assert retrieved.parent_frame_id == PARENT_FRAME_ID
     assert retrieved.sourcePath == "/tmp/source"
     assert retrieved.filename == "frame.png"
     np.testing.assert_array_equal(retrieved.data, data)
-    assert retrieved.metadata["frame_id"] == 42
+    assert retrieved.metadata["frame_id"] == FRAME_ID
 
 
 def test_frame_data_from_record_maps_row_model_to_runtime_container():
     record = FrameRecord(
-        id=42,
+        id=FRAME_ID,
         run_id="00000000-0000-0000-0000-000000000001",
         asset_id="00000000-0000-0000-0000-000000000002",
         frame_index=3,
@@ -462,10 +468,10 @@ def test_frame_data_from_record_maps_row_model_to_runtime_container():
         height=3,
         bbox_x=10,
         bbox_y=20,
-        parent_frame_id=99,
+        parent_frame_id=PARENT_FRAME_ID,
         source_ref="/tmp/source/frame.png",
-        frame_hash="fake-kv-key",
-        frame_png=b"",
+        kvstore_hash="fake-kv-key",
+        preview_thumbhash=b"PTH1preview",
         payload_ref="fake-kv-key",
         payload_encoding="raw",
         payload_format="raw_ndarray_c_order",
@@ -491,10 +497,10 @@ def test_frame_data_from_record_maps_row_model_to_runtime_container():
     assert frame_data.frameType == "line"
     assert frame_data.channel == 2
     assert frame_data.get_bbox() == (10, 20, 4, 3)
-    assert frame_data.parent_frame_id == 99
+    assert frame_data.parent_frame_id == PARENT_FRAME_ID
     assert frame_data.sourcePath == "/tmp/source"
     assert frame_data.filename == "frame.png"
-    assert frame_data.metadata["frame_id"] == 42
+    assert frame_data.metadata["frame_id"] == FRAME_ID
     assert frame_data.metadata["kvstore_encoding"] == "raw"
     assert frame_data.metadata["shape"] == [3, 4]
     np.testing.assert_array_equal(frame_data.data, data)

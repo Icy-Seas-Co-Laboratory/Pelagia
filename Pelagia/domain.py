@@ -67,7 +67,7 @@ class JobStatus(str, Enum):
 @dataclass(slots=True)
 class RawAssetManifest:
     asset_id: str
-    asset_key: str
+    filename: str
     path: str
     kind: AssetKind
     size_bytes: int
@@ -117,16 +117,16 @@ class FrameRecord:
     frame_index: int
     width: int
     height: int
-    frame_png: bytes
-    frame_hash: str
+    preview_thumbhash: bytes
+    kvstore_hash: str
     captured_at: datetime | None = None
     source_ref: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    id: int | None = None
+    id: str | None = None
     run_id: str | None = None
     bbox_x: int = 0
     bbox_y: int = 0
-    parent_frame_id: int | None = None
+    parent_frame_id: str | None = None
     payload_ref: str | None = None
     payload_encoding: str | None = None
     payload_format: str | None = None
@@ -148,11 +148,20 @@ class FrameRecord:
             height=int(data["height"]),
             bbox_x=int(data.get("bbox_x", metadata.get("bbox_x", 0)) or 0),
             bbox_y=int(data.get("bbox_y", metadata.get("bbox_y", 0)) or 0),
-            parent_frame_id=data.get("parent_frame_id", metadata.get("parent_frame_id")),
+            parent_frame_id=(
+                None
+                if data.get("parent_frame_id", metadata.get("parent_frame_id")) is None
+                else str(data.get("parent_frame_id", metadata.get("parent_frame_id")))
+            ),
             source_ref=data.get("source_ref"),
-            frame_hash=data["frame_hash"],
-            frame_png=data.get("frame_png", b""),
-            payload_ref=data.get("payload_ref") or metadata.get("kvstore_key") or data["frame_hash"],
+            kvstore_hash=data.get("kvstore_hash") or data.get("frame_hash"),
+            preview_thumbhash=data.get("preview_thumbhash", data.get("frame_png", b"")),
+            payload_ref=(
+                data.get("payload_ref")
+                or metadata.get("kvstore_key")
+                or data.get("kvstore_hash")
+                or data.get("frame_hash")
+            ),
             payload_encoding=data.get("payload_encoding") or metadata.get("kvstore_encoding"),
             payload_format=data.get("payload_format") or metadata.get("kvstore_format"),
             payload_dtype=data.get("payload_dtype") or metadata.get("dtype"),
@@ -165,7 +174,7 @@ class FrameRecord:
 @dataclass(slots=True)
 class DetectionRecord:
     run_id: str
-    frame_id: int
+    frame_id: str
     roi_index: int
     bbox_x: int
     bbox_y: int
@@ -201,7 +210,7 @@ class DetectionRecord:
         return cls(
             id=None if data.get("id") is None else str(data["id"]),
             run_id=str(data["run_id"]),
-            frame_id=int(data["frame_id"]),
+            frame_id=str(data["frame_id"]),
             roi_index=int(data["roi_index"]),
             bbox_x=int(data["bbox_x"]),
             bbox_y=int(data["bbox_y"]),

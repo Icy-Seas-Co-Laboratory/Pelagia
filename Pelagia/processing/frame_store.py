@@ -10,6 +10,7 @@ from ..utils.serialization import json_ready
 from .frame_codec import decode_array_payload, encode_array_payload
 from .frame_correction import flatfield_correction_for_framedata, metadata_bool
 from .frame_model import FrameData
+from .thumbhash import compute_thumbhash
 
 
 _DEFAULT_CONTEXT: AppContext | None = None
@@ -72,6 +73,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
     )
     payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
     kvstore_key = ctx.kvstore.put_store(payload)
+    preview_thumbhash = compute_thumbhash(array)
     width, height = frame.get_size()
     source_frame_start, source_frame_end = frame.get_source_frame_range()
     captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None
@@ -89,6 +91,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         metadata_without_none(
             {
                 "kvstore_key": kvstore_key,
+                "kvstore_hash": kvstore_key,
                 "kvstore_encoding": kvstore_encoding,
                 "kvstore_format": kvstore_format,
                 "dtype": str(array.dtype),
@@ -121,8 +124,8 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         bbox_y=frame.bbox_y,
         parent_frame_id=frame.parent_frame_id,
         source_ref=frame.get_source_file_path(),
-        frame_hash=kvstore_key,
-        frame_png=b"",
+        kvstore_hash=kvstore_key,
+        preview_thumbhash=preview_thumbhash,
         payload_ref=kvstore_key,
         payload_encoding=kvstore_encoding,
         payload_format=kvstore_format,
@@ -137,7 +140,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                 f"""
                 INSERT INTO {ctx.repository.schema}.frames
                 (run_id, asset_id, frame_index, captured_at, width, height,
-                 bbox_x, bbox_y, parent_frame_id, source_ref, frame_hash, frame_png,
+                 bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
                  payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                 ON CONFLICT (asset_id, frame_index) DO UPDATE SET
@@ -148,8 +151,8 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                     bbox_y = EXCLUDED.bbox_y,
                     parent_frame_id = EXCLUDED.parent_frame_id,
                     source_ref = EXCLUDED.source_ref,
-                    frame_hash = EXCLUDED.frame_hash,
-                    frame_png = EXCLUDED.frame_png,
+                    kvstore_hash = EXCLUDED.kvstore_hash,
+                    preview_thumbhash = EXCLUDED.preview_thumbhash,
                     payload_ref = EXCLUDED.payload_ref,
                     payload_encoding = EXCLUDED.payload_encoding,
                     payload_format = EXCLUDED.payload_format,
@@ -169,8 +172,8 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                     frame_record.bbox_y,
                     frame_record.parent_frame_id,
                     frame_record.source_ref,
-                    frame_record.frame_hash,
-                    frame_record.frame_png,
+                    frame_record.kvstore_hash,
+                    frame_record.preview_thumbhash,
                     frame_record.payload_ref,
                     frame_record.payload_encoding,
                     frame_record.payload_format,
@@ -184,7 +187,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
     return row
 
 
-def retrieve_frame(id: int, context: AppContext | None = None) -> FrameData:
+def retrieve_frame(id: str, context: AppContext | None = None) -> FrameData:
     ctx = context or default_context()
     if ctx.kvstore is None:
         raise RuntimeError("A KVStore is required to retrieve frame data.")
@@ -200,7 +203,7 @@ def retrieve_frame(id: int, context: AppContext | None = None) -> FrameData:
 
     record = FrameRecord.from_row(row)
     metadata = dict(record.metadata or {})
-    kvstore_key = record.payload_ref or metadata.get("kvstore_key") or record.frame_hash
+    kvstore_key = record.payload_ref or metadata.get("kvstore_key") or record.kvstore_hash
     if not kvstore_key:
         raise ValueError(f"Frame {id} does not include a kvstore key.")
 

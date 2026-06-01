@@ -221,6 +221,31 @@ class KVStore:
                 prefix_dir.mkdir(parents=True, exist_ok=True)
                 self._create_schema(prefix_dir / self._sqlite_filename(1))
 
+    def reset(
+        self,
+        hash_algorithm: str = "sha256",
+        prefix_length: int = 2,
+        sqlite_basename: str = "store",
+        max_db_bytes: int = DEFAULT_MAX_DB_BYTES,
+        max_rows: int = DEFAULT_MAX_ROWS,
+    ) -> dict[str, Any]:
+        """Delete all stored payloads and reinitialize the store in place."""
+        before = self.status()
+        self.initialize(
+            hash_algorithm=hash_algorithm,
+            prefix_length=prefix_length,
+            sqlite_basename=sqlite_basename,
+            max_db_bytes=max_db_bytes,
+            max_rows=max_rows,
+            overwrite=True,
+        )
+        after = self.status()
+        return {
+            "root_path": str(self.root_path),
+            "previous": before,
+            "current": after,
+        }
+
     def get_store(self, key: str) -> bytes:
         """Return payload bytes for ``key`` or raise ``KeyError`` if it is missing."""
         self._require_initialized()

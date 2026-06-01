@@ -165,7 +165,7 @@ def store_roi(
 
     return DetectionRecord(
         run_id=str(run_id),
-        frame_id=int(frame_id),
+        frame_id=str(frame_id),
         roi_index=int(roi_index),
         bbox_x=int(bbox_x),
         bbox_y=int(bbox_y),

@@ -49,7 +49,7 @@ class FakeRepository:
         return {"id": asset_id, "run_id": "run-1", "kind": "video", "collections": ["test"]}
 
     def list_frames(self, asset_id, **kwargs):
-        return [{"id": 1, "asset_id": asset_id, "frame_index": 2, "frame_png": b"abc", **kwargs}]
+        return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 2, "preview_thumbhash": b"abc", **kwargs}]
 
     def get_frame_by_asset_index(self, asset_id, frame_index):
         if asset_id != "asset-1" or frame_index != 2:
@@ -188,6 +188,29 @@ def test_api_can_create_queue_job():
     assert repository.created_jobs[0]["run_id"] == "run-1"
 
 
+def test_api_can_queue_segmentation_job():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/segmentation/jobs",
+        json={
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "frame_ids": ["frame-1"],
+            "padding": 4,
+            "roi_encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["stage"] == "segment"
+    assert repository.created_jobs[-1]["run_id"] == "run-1"
+    assert repository.created_jobs[-1]["asset_id"] == "asset-1"
+    assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
+    assert repository.created_jobs[-1]["payload"]["padding"] == 4
+    assert repository.created_jobs[-1]["payload"]["roi_encoding"] == "raw"
+
+
 def test_api_can_request_worker_shutdown():
     client, repository, _ = make_client()
 
@@ -204,8 +227,9 @@ def test_api_asset_views_summarize_payload_bytes():
     frame_response = client.get("/assets/asset-1/frames")
     detection_response = client.get("/assets/asset-1/detections")
 
-    assert frame_response.json()["frames"][0]["frame_png_bytes"] == 3
-    assert "frame_png" not in frame_response.json()["frames"][0]
+    assert frame_response.json()["frames"][0]["preview_thumbhash_bytes"] == 3
+    assert frame_response.json()["frames"][0]["preview_thumbhash_base64"] == "YWJj"
+    assert "preview_thumbhash" not in frame_response.json()["frames"][0]
     assert detection_response.json()["detections"][0]["roi_payload_bytes"] == 3
     assert detection_response.json()["detections"][0]["mask_payload_bytes"] == 4
 
@@ -329,7 +353,7 @@ def test_api_search_endpoints_forward_optional_filters():
     client, _, _ = make_client()
 
     assets_response = client.get(
-        "/assets?collection=test&kind=video&asset_key=sample&limit=5"
+        "/assets?collection=test&kind=video&filename=sample&limit=5"
     )
     runs_response = client.get(
         "/runs?collection=test&instrument=api&source_type=video&status=registered&limit=7"
@@ -340,7 +364,7 @@ def test_api_search_endpoints_forward_optional_filters():
     asset = assets_response.json()["assets"][0]
     assert asset["collection"] == "test"
     assert asset["kind"] == "video"
-    assert asset["asset_key"] == "sample"
+    assert asset["filename"] == "sample"
     assert asset["limit"] == 5
     run = runs_response.json()["runs"][0]
     assert run["collection"] == "test"

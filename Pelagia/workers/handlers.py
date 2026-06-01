@@ -6,6 +6,8 @@ from typing import Any
 from ..domain import PipelineStage
 from ..domain import normalize_collections
 from ..processing import video_ingest as video_ingest_module
+from ..processing.frame_store import retrieve_frame
+from ..processing.segmentation import segment_frame
 from ..services.context import AppContext
 
 
@@ -40,8 +42,18 @@ def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
 def _job_identifier(job: dict[str, Any], key: str, payload: dict[str, Any]) -> str:
     value = job.get(key) or payload.get(key)
     if not value:
-        raise ValueError(f"Extract frames job requires {key}.")
+        raise ValueError(f"{job.get('stage', 'Worker')} job requires {key}.")
     return str(value)
+
+
+def _payload_frame_ids(payload: dict[str, Any]) -> list[str]:
+    frame_ids = payload.get("frame_ids")
+    if frame_ids:
+        return [str(frame_id) for frame_id in frame_ids]
+    frame_id = payload.get("frame_id")
+    if frame_id:
+        return [str(frame_id)]
+    return []
 
 
 def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
@@ -107,8 +119,90 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     return result
 
 
+def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
+    """Worker handler for segmenting stored frames into ROI detections."""
+    if context.repository is None:
+        raise RuntimeError("ROI detection handler requires a PostgresRepository.")
+
+    payload = _job_payload(job)
+    asset_id = job.get("asset_id") or payload.get("asset_id")
+    frame_ids = _payload_frame_ids(payload)
+
+    if not frame_ids:
+        if not asset_id:
+            raise ValueError("Segment job requires asset_id, frame_id, or frame_ids.")
+        frames = context.repository.list_frames(
+            str(asset_id),
+            start_frame=payload.get("start_frame"),
+            end_frame=payload.get("end_frame"),
+            limit=payload.get("limit"),
+        )
+        frame_ids = [str(frame["id"]) for frame in frames]
+
+    if not frame_ids:
+        return {
+            "stage": PipelineStage.SEGMENT.value,
+            "run_id": job.get("run_id") or payload.get("run_id"),
+            "asset_id": asset_id,
+            "frame_count": 0,
+            "detection_count": 0,
+            "frame_ids": [],
+            "detection_ids": [],
+        }
+
+    detections = []
+    resolved_asset_id = None if asset_id is None else str(asset_id)
+    resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
+    padding = payload.get("padding", payload.get("segmentation_padding", 0))
+    zstd_min_bytes = payload.get("zstd_min_bytes", 1024)
+    min_perimeter = payload.get("min_perimeter", 0)
+
+    for frame_id in frame_ids:
+        frame_record = context.repository.get_frame_record(frame_id)
+        if frame_record is None:
+            raise KeyError(f"Frame {frame_id!r} was not found.")
+        if resolved_asset_id is None:
+            resolved_asset_id = frame_record.asset_id
+        elif frame_record.asset_id != resolved_asset_id:
+            raise ValueError("Segment jobs may only process frames from one asset.")
+        if resolved_run_id is None:
+            resolved_run_id = frame_record.run_id
+
+        frame = retrieve_frame(frame_id, context=context)
+        detections.extend(
+            segment_frame(
+                frame,
+                threshold=payload.get("threshold"),
+                min_perimeter=0 if min_perimeter is None else min_perimeter,
+                max_perimeter=payload.get("max_perimeter"),
+                padding=0 if padding is None else int(padding),
+                roi_encoding=payload.get("roi_encoding", "zstd"),
+                zstd_min_bytes=1024 if zstd_min_bytes is None else int(zstd_min_bytes),
+            )
+        )
+
+    if resolved_run_id is None or resolved_asset_id is None:
+        raise ValueError("Segment job could not resolve run_id and asset_id.")
+
+    inserted = context.repository.replace_frame_detections(
+        resolved_run_id,
+        frame_ids,
+        detections,
+    )
+    return {
+        "stage": PipelineStage.SEGMENT.value,
+        "run_id": resolved_run_id,
+        "asset_id": resolved_asset_id,
+        "frame_count": len(frame_ids),
+        "detection_count": len(inserted),
+        "frame_ids": frame_ids,
+        "detection_ids": [row.get("id") for row in inserted],
+    }
+
+
 def default_handler_registry() -> HandlerRegistry:
     """Build the default worker stage registry."""
     registry = HandlerRegistry()
     registry.register(PipelineStage.EXTRACT_FRAMES, extract_frames_handler)
+    registry.register(PipelineStage.SEGMENT, roi_detection_handler)
     return registry

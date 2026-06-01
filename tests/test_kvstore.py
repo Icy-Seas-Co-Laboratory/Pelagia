@@ -162,6 +162,21 @@ def test_idempotent_writes_of_same_payload(tmp_path):
     assert store.status()["total_stored_blobs"] == 1
 
 
+def test_reset_clears_payloads_and_reinitializes_store(tmp_path):
+    store = KVStore(tmp_path / "store")
+    store.initialize(prefix_length=1)
+    key = store.put_store(b"payload")
+
+    result = store.reset(prefix_length=1)
+
+    assert result["previous"]["total_stored_blobs"] == 1
+    assert result["current"]["initialized"] is True
+    assert result["current"]["total_stored_blobs"] == 0
+    assert store.initialized is True
+    assert store.status()["prefix_directory_count"] == 16
+    assert store.key_exists(key) is False
+
+
 def test_prefix_write_lock_timeout(tmp_path):
     store = KVStore(tmp_path / "store", lock_timeout_s=0.01, lock_poll_interval_s=0.001, stale_lock_seconds=None)
     store.initialize(prefix_length=1)

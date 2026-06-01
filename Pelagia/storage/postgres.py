@@ -78,6 +78,35 @@ class PostgresRepository:
                 cursor.execute(render_schema(self.schema))
             connection.commit()
 
+    def purge_all(self) -> dict[str, Any]:
+        """Delete all Pelagia rows while preserving the schema, indexes, and functions."""
+        tables = [
+            "runs",
+            "raw_assets",
+            "frames",
+            "detections",
+            "models",
+            "classification_results",
+            "processing_jobs",
+            "processing_job_dependencies",
+            "worker_sessions",
+            "job_events",
+        ]
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                before: dict[str, int] = {}
+                for table in tables:
+                    cursor.execute(f"SELECT COUNT(*) AS count FROM {self.schema}.{table}")
+                    before[table] = cursor.fetchone()["count"]
+                table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
+                cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
+            connection.commit()
+        return {
+            "schema": self.schema,
+            "tables": before,
+            "total_rows_deleted": sum(before.values()),
+        }
+
     def _dsn_fields(self) -> dict[str, Any]:
         fields = conninfo.conninfo_to_dict(self.config.database.dsn)
         dbname = fields.get("dbname")
@@ -263,14 +292,14 @@ class PostgresRepository:
                 cursor.executemany(
                     f"""
                     INSERT INTO {schema}.raw_assets
-                    (id, run_id, asset_key, path, kind, checksum, size_bytes, collections, media_count, metadata)
+                    (id, run_id, filename, path, kind, checksum, size_bytes, collections, media_count, metadata)
                     VALUES (%s, %s, %s, %s, %s::{schema}.asset_kind, %s, %s, %s, %s, %s::jsonb)
                     """,
                     [
                         (
                             asset.asset_id,
                             manifest.run_id,
-                            asset.asset_key,
+                            asset.filename,
                             asset.path,
                             asset.kind.value,
                             asset.checksum,
@@ -342,7 +371,7 @@ class PostgresRepository:
         run_id: str | None = None,
         collection: str | None = None,
         kind: str | None = None,
-        asset_key: str | None = None,
+        filename: str | None = None,
         path: str | None = None,
         checksum: str | None = None,
         min_size_bytes: int | None = None,
@@ -361,9 +390,9 @@ class PostgresRepository:
         if kind:
             clauses.append("kind = %s")
             params.append(kind)
-        if asset_key:
-            clauses.append("asset_key ILIKE %s")
-            params.append(f"%{asset_key}%")
+        if filename:
+            clauses.append("filename ILIKE %s")
+            params.append(f"%{filename}%")
         if path:
             clauses.append("path ILIKE %s")
             params.append(f"%{path}%")
@@ -384,7 +413,7 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.raw_assets {where} ORDER BY created_at DESC, asset_key ASC LIMIT %s",
+                    f"SELECT * FROM {self.schema}.raw_assets {where} ORDER BY created_at DESC, filename ASC LIMIT %s",
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -435,7 +464,7 @@ class PostgresRepository:
                         f"""
                         INSERT INTO {self.schema}.frames
                         (run_id, asset_id, frame_index, captured_at, width, height,
-                         bbox_x, bbox_y, parent_frame_id, source_ref, frame_hash, frame_png,
+                         bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
                          payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                         RETURNING *;
@@ -451,9 +480,9 @@ class PostgresRepository:
                             frame.bbox_y,
                             frame.parent_frame_id,
                             frame.source_ref,
-                            frame.frame_hash,
-                            frame.frame_png,
-                            frame.payload_ref or frame.metadata.get("kvstore_key") or frame.frame_hash,
+                            frame.kvstore_hash,
+                            frame.preview_thumbhash,
+                            frame.payload_ref or frame.metadata.get("kvstore_key") or frame.kvstore_hash,
                             frame.payload_encoding or frame.metadata.get("kvstore_encoding"),
                             frame.payload_format or frame.metadata.get("kvstore_format"),
                             frame.payload_dtype or frame.metadata.get("dtype"),
@@ -497,7 +526,7 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_frame(self, frame_id: int) -> dict[str, Any] | None:
+    def get_frame(self, frame_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"SELECT * FROM {self.schema}.frames WHERE id = %s", (frame_id,))
@@ -533,11 +562,67 @@ class PostgresRepository:
             )
         ]
 
-    def get_frame_record(self, frame_id: int) -> FrameRecord | None:
+    def get_frame_record(self, frame_id: str) -> FrameRecord | None:
         row = self.get_frame(frame_id)
         if row is None:
             return None
         return FrameRecord.from_row(row)
+
+    def _insert_detection_rows(
+        self,
+        cursor,
+        run_id: str,
+        detections: Sequence[DetectionRecord],
+    ) -> list[dict[str, Any]]:
+        inserted: list[dict[str, Any]] = []
+        for detection in detections:
+            cursor.execute(
+                f"""
+                INSERT INTO {self.schema}.detections
+                (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                 crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
+                 area, perimeter, major_axis_length, minor_axis_length,
+                 min_gray_value, mean_gray_value, roi_payload, mask_payload,
+                 roi_encoding, roi_format, roi_dtype, roi_shape,
+                 mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                        %s::jsonb, %s::jsonb)
+                RETURNING *;
+                """,
+                (
+                    run_id,
+                    detection.frame_id,
+                    detection.roi_index,
+                    detection.bbox_x,
+                    detection.bbox_y,
+                    detection.bbox_w,
+                    detection.bbox_h,
+                    detection.crop_bbox_x,
+                    detection.crop_bbox_y,
+                    detection.crop_bbox_w,
+                    detection.crop_bbox_h,
+                    detection.area,
+                    detection.perimeter,
+                    detection.major_axis_length,
+                    detection.minor_axis_length,
+                    detection.min_gray_value,
+                    detection.mean_gray_value,
+                    detection.roi_payload,
+                    detection.mask_payload,
+                    detection.roi_encoding,
+                    detection.roi_format,
+                    detection.roi_dtype,
+                    json.dumps(json_ready(detection.roi_shape)),
+                    detection.mask_encoding,
+                    detection.mask_format,
+                    detection.mask_dtype,
+                    json.dumps(json_ready(detection.mask_shape)),
+                    json.dumps(json_ready(detection.metadata)),
+                ),
+            )
+            inserted.append(cursor.fetchone())
+        return inserted
 
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -549,54 +634,29 @@ class PostgresRepository:
                     """,
                     (asset_id,),
                 )
-                inserted: list[dict[str, Any]] = []
-                for detection in detections:
-                    cursor.execute(
-                        f"""
-                        INSERT INTO {self.schema}.detections
-                        (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
-                         crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
-                         area, perimeter, major_axis_length, minor_axis_length,
-                         min_gray_value, mean_gray_value, roi_payload, mask_payload,
-                         roi_encoding, roi_format, roi_dtype, roi_shape,
-                         mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
-                                %s::jsonb, %s::jsonb)
-                        RETURNING *;
-                        """,
-                        (
-                            run_id,
-                            detection.frame_id,
-                            detection.roi_index,
-                            detection.bbox_x,
-                            detection.bbox_y,
-                            detection.bbox_w,
-                            detection.bbox_h,
-                            detection.crop_bbox_x,
-                            detection.crop_bbox_y,
-                            detection.crop_bbox_w,
-                            detection.crop_bbox_h,
-                            detection.area,
-                            detection.perimeter,
-                            detection.major_axis_length,
-                            detection.minor_axis_length,
-                            detection.min_gray_value,
-                            detection.mean_gray_value,
-                            detection.roi_payload,
-                            detection.mask_payload,
-                            detection.roi_encoding,
-                            detection.roi_format,
-                            detection.roi_dtype,
-                            json.dumps(json_ready(detection.roi_shape)),
-                            detection.mask_encoding,
-                            detection.mask_format,
-                            detection.mask_dtype,
-                            json.dumps(json_ready(detection.mask_shape)),
-                            json.dumps(json_ready(detection.metadata)),
-                        ),
-                    )
-                    inserted.append(cursor.fetchone())
+                inserted = self._insert_detection_rows(cursor, run_id, detections)
+            connection.commit()
+        return inserted
+
+    def replace_frame_detections(
+        self,
+        run_id: str,
+        frame_ids: Sequence[str],
+        detections: Sequence[DetectionRecord],
+    ) -> list[dict[str, Any]]:
+        resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
+        if not resolved_frame_ids:
+            return []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.detections
+                    WHERE frame_id = ANY(%s)
+                    """,
+                    (resolved_frame_ids,),
+                )
+                inserted = self._insert_detection_rows(cursor, run_id, detections)
             connection.commit()
         return inserted
 

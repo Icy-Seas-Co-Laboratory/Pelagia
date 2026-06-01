@@ -100,6 +100,20 @@ The v0 API exposes the same core workflows as the CLI and workers:
 uvicorn Pelagia.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
+For local end-to-end testing, the dev stack script initializes storage, starts
+the API, and starts one worker for each currently runnable stage
+(`extract_frames` and `segment`):
+
+```bash
+./scripts/pelagia_dev_stack.sh start
+./scripts/pelagia_dev_stack.sh status
+./scripts/pelagia_dev_stack.sh stop
+```
+
+Override defaults with environment variables such as `PELAGIA_DATABASE_DSN`,
+`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`, and
+`PELAGIA_WORKER_STAGES`.
+
 Useful endpoint groups:
 
 - `GET /health`, `/health/postgres`, `/health/kvstore`
@@ -115,7 +129,7 @@ Useful endpoint groups:
 
 General list endpoints are intentionally shaped as limited searches. For example,
 `GET /assets` does not require a run id and can be narrowed with filters such as
-`collection`, `kind`, `asset_key`, `path`, `checksum`, size bounds, and `limit`.
+`collection`, `kind`, `filename`, `path`, `checksum`, size bounds, and `limit`.
 Frame metadata can be searched by range with
 `GET /assets/{asset_id}/frames?start_frame=1&end_frame=100`, and frame image data
 can be loaded with `GET /assets/{asset_id}/framedata/{frame_num}?format=png`.

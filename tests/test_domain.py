@@ -18,7 +18,7 @@ def test_normalize_collections_accepts_comma_separated_values():
 def test_raw_asset_manifest_normalizes_collections():
     asset = RawAssetManifest(
         asset_id="asset-1",
-        asset_key="sample.avi",
+        filename="sample.avi",
         path="/tmp/sample.avi",
         kind=AssetKind.VIDEO,
         size_bytes=10,
