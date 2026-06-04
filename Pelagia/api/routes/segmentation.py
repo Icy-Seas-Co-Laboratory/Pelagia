@@ -16,11 +16,11 @@ if APIRouter is not None:
 
     class SegmentFrameRequest(BaseModel):
         threshold: int | float | None = None
-        min_perimeter: int | float = 0
+        min_perimeter: int | float | None = None
         max_perimeter: int | float | None = None
-        padding: int = 0
-        roi_encoding: Literal["png", "raw", "zstd", "auto"] = "zstd"
-        zstd_min_bytes: int = 1024
+        padding: int | None = None
+        roi_encoding: Literal["png", "raw", "zstd", "auto"] | None = None
+        zstd_min_bytes: int | None = None
 
     class QueueSegmentationRequest(SegmentFrameRequest):
         run_id: str | None = None
@@ -48,15 +48,16 @@ if APIRouter is not None:
             )
 
         try:
+            defaults = context.config.processing.segmentation
             frame = retrieve_frame(frame_id, context=context)
             detections = segment_frame(
                 frame,
                 threshold=body.threshold,
-                min_perimeter=body.min_perimeter,
-                max_perimeter=body.max_perimeter,
-                padding=body.padding,
-                roi_encoding=body.roi_encoding,
-                zstd_min_bytes=body.zstd_min_bytes,
+                min_perimeter=defaults.min_perimeter if body.min_perimeter is None else body.min_perimeter,
+                max_perimeter=defaults.max_perimeter if body.max_perimeter is None else body.max_perimeter,
+                padding=defaults.padding if body.padding is None else body.padding,
+                roi_encoding=defaults.roi_encoding if body.roi_encoding is None else body.roi_encoding,
+                zstd_min_bytes=defaults.zstd_min_bytes if body.zstd_min_bytes is None else body.zstd_min_bytes,
             )
             inserted = repository.replace_frame_detections(
                 frame_record.run_id,
@@ -79,6 +80,7 @@ if APIRouter is not None:
     @router.post("/jobs")
     def queue_segmentation_job(request: Request, body: QueueSegmentationRequest) -> dict:
         repository = get_repository(request)
+        defaults = get_context(request).config.processing.segmentation
         run_id = body.run_id
         asset_id = body.asset_id
 
@@ -110,11 +112,11 @@ if APIRouter is not None:
             "end_frame": body.end_frame,
             "limit": body.limit,
             "threshold": body.threshold,
-            "min_perimeter": body.min_perimeter,
-            "max_perimeter": body.max_perimeter,
-            "padding": body.padding,
-            "roi_encoding": body.roi_encoding,
-            "zstd_min_bytes": body.zstd_min_bytes,
+            "min_perimeter": defaults.min_perimeter if body.min_perimeter is None else body.min_perimeter,
+            "max_perimeter": defaults.max_perimeter if body.max_perimeter is None else body.max_perimeter,
+            "padding": defaults.padding if body.padding is None else body.padding,
+            "roi_encoding": defaults.roi_encoding if body.roi_encoding is None else body.roi_encoding,
+            "zstd_min_bytes": defaults.zstd_min_bytes if body.zstd_min_bytes is None else body.zstd_min_bytes,
         }
         job = repository.create_job(
             "segment",

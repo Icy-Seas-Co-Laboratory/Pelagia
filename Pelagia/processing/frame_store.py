@@ -41,9 +41,14 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         raise ValueError("Frame has no numpy data to store.")
 
     metadata = dict(frame.metadata or {})
+    ctx = context or default_context()
     if metadata_bool(metadata, "flatfield_correction"):
-        flatfield_q = float(metadata.get("flatfield_q", 0.9))
-        data = flatfield_correction_for_framedata(data, q=flatfield_q)
+        ingest_defaults = ctx.config.processing.video_ingest
+        flatfield_q = float(metadata.get("flatfield_q", ingest_defaults.flatfield_q))
+        data = flatfield_correction_for_framedata(
+            data,
+            q=flatfield_q,
+        )
         metadata.update(
             {
                 "flatfield_correction": True,
@@ -56,24 +61,19 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         raise ValueError("Frame data must have at least two dimensions.")
     frame.validate_geometry(array)
 
-    ctx = context or default_context()
     if ctx.kvstore is None:
         raise RuntimeError("A KVStore is required to store frame data.")
     if ctx.repository is None:
         raise RuntimeError("A PostgresRepository is required to record frame metadata.")
 
-    default_encoding = getattr(
-        getattr(ctx.config, "image_data_storage", None),
-        "encoding",
-        "png",
-    )
+    default_encoding = ctx.config.processing.frame_storage.image_encoding
     requested_encoding = metadata.get(
         "kvstore_encoding",
         metadata.get("array_encoding", metadata.get("kvstore_format", default_encoding)),
     )
     payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
     kvstore_key = ctx.kvstore.put_store(payload)
-    preview_thumbhash = compute_thumbhash(array)
+    preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.frame_storage.thumbhash_max_dim)
     width, height = frame.get_size()
     source_frame_start, source_frame_end = frame.get_source_frame_range()
     captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None

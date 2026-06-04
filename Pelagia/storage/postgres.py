@@ -193,6 +193,7 @@ class PostgresRepository:
         worker_id: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        include_details: bool = True,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -224,10 +225,38 @@ class PostgresRepository:
         limit_sql = "LIMIT %s" if limit else ""
         if limit:
             params.append(limit)
+        select_sql = "*"
+        if not include_details:
+            select_sql = """
+                id,
+                run_id,
+                asset_id,
+                stage,
+                status,
+                priority,
+                attempt_count,
+                max_attempts,
+                lease_expires_at,
+                worker_id,
+                summary,
+                control_reason,
+                error_message,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at,
+                jsonb_typeof(payload) AS payload_type,
+                pg_column_size(payload) AS payload_bytes,
+                jsonb_typeof(result) AS result_type,
+                pg_column_size(result) AS result_bytes,
+                jsonb_typeof(progress) AS progress_type,
+                pg_column_size(progress) AS progress_bytes,
+                jsonb_array_length(logs_tail) AS logs_tail_count
+            """
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.processing_jobs {where} ORDER BY created_at DESC, id DESC {limit_sql}",
+                    f"SELECT {select_sql} FROM {self.schema}.processing_jobs {where} ORDER BY created_at DESC, id DESC {limit_sql}",
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -261,7 +290,13 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.worker_sessions {where} ORDER BY worker_id ASC LIMIT %s",
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.worker_sessions
+                    {where}
+                    ORDER BY last_heartbeat DESC, updated_at DESC, worker_id ASC
+                    LIMIT %s
+                    """,
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -451,6 +486,13 @@ class PostgresRepository:
                 cursor.execute(f"SELECT * FROM {self.schema}.raw_assets WHERE id = %s", (asset_id,))
                 return cursor.fetchone()
 
+    def count_frames(self, asset_id: str) -> int:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS frame_count FROM {self.schema}.frames WHERE asset_id = %s", (asset_id,))
+                row = cursor.fetchone()
+        return int(row["frame_count"] if row is not None else 0)
+
     def replace_frames(self, run_id: str, frames: Sequence[FrameRecord]) -> list[dict[str, Any]]:
         if not frames:
             return []
@@ -519,7 +561,7 @@ class PostgresRepository:
                     SELECT *
                     FROM {self.schema}.frames
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY frame_index ASC
+                    ORDER BY frame_index DESC
                     {limit_sql}
                     """,
                     tuple(params),
@@ -660,23 +702,215 @@ class PostgresRepository:
             connection.commit()
         return inserted
 
-    def list_detections(self, asset_id: str) -> list[dict[str, Any]]:
+    def list_detections(
+        self,
+        asset_id: str | None = None,
+        *,
+        run_id: str | None = None,
+        collection: str | None = None,
+        frame_id: str | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        roi_index: int | None = None,
+        min_bbox_x: int | None = None,
+        max_bbox_x: int | None = None,
+        min_bbox_y: int | None = None,
+        max_bbox_y: int | None = None,
+        min_bbox_w: int | None = None,
+        max_bbox_w: int | None = None,
+        min_bbox_h: int | None = None,
+        max_bbox_h: int | None = None,
+        min_area: float | None = None,
+        max_area: float | None = None,
+        min_perimeter: float | None = None,
+        max_perimeter: float | None = None,
+        roi_encoding: str | None = None,
+        roi_format: str | None = None,
+        mask_encoding: str | None = None,
+        mask_format: str | None = None,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if asset_id:
+            clauses.append("frames.asset_id = %s")
+            params.append(asset_id)
+        if run_id:
+            clauses.append("detections.run_id = %s")
+            params.append(run_id)
+        if collection:
+            clauses.append("%s = ANY(assets.collections)")
+            params.append(collection)
+        if frame_id:
+            clauses.append("detections.frame_id = %s")
+            params.append(frame_id)
+        if start_frame is not None:
+            clauses.append("frames.frame_index >= %s")
+            params.append(start_frame)
+        if end_frame is not None:
+            clauses.append("frames.frame_index <= %s")
+            params.append(end_frame)
+        if roi_index is not None:
+            clauses.append("detections.roi_index = %s")
+            params.append(roi_index)
+
+        range_filters = [
+            ("detections.bbox_x", ">=", min_bbox_x),
+            ("detections.bbox_x", "<=", max_bbox_x),
+            ("detections.bbox_y", ">=", min_bbox_y),
+            ("detections.bbox_y", "<=", max_bbox_y),
+            ("detections.bbox_w", ">=", min_bbox_w),
+            ("detections.bbox_w", "<=", max_bbox_w),
+            ("detections.bbox_h", ">=", min_bbox_h),
+            ("detections.bbox_h", "<=", max_bbox_h),
+            ("detections.area", ">=", min_area),
+            ("detections.area", "<=", max_area),
+            ("detections.perimeter", ">=", min_perimeter),
+            ("detections.perimeter", "<=", max_perimeter),
+        ]
+        for column, operator, value in range_filters:
+            if value is not None:
+                clauses.append(f"{column} {operator} %s")
+                params.append(value)
+
+        exact_filters = [
+            ("detections.roi_encoding", roi_encoding),
+            ("detections.roi_format", roi_format),
+            ("detections.mask_encoding", mask_encoding),
+            ("detections.mask_format", mask_format),
+        ]
+        for column, value in exact_filters:
+            if value:
+                clauses.append(f"{column} = %s")
+                params.append(value)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = "LIMIT %s" if limit is not None else ""
+        if limit is not None:
+            params.append(limit)
+
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    SELECT detections.*
+                    SELECT
+                        detections.*,
+                        frames.asset_id,
+                        frames.frame_index,
+                        assets.filename AS asset_filename
                     FROM {self.schema}.detections detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
-                    WHERE frames.asset_id = %s
-                    ORDER BY frames.frame_index ASC, detections.roi_index ASC
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    {where}
+                    ORDER BY frames.frame_index DESC, detections.roi_index ASC
+                    {limit_sql}
                     """,
-                    (asset_id,),
+                    tuple(params),
                 )
                 return cursor.fetchall()
 
+    def get_detection(self, detection_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        detections.*,
+                        frames.asset_id,
+                        frames.frame_index,
+                        assets.filename AS asset_filename
+                    FROM {self.schema}.detections detections
+                    JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE detections.id = %s
+                    """,
+                    (detection_id,),
+                )
+                return cursor.fetchone()
+
     def list_detection_records(self, asset_id: str) -> list[DetectionRecord]:
         return [DetectionRecord.from_row(row) for row in self.list_detections(asset_id)]
+
+    def list_asset_detection_stats(
+        self,
+        *,
+        run_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        min_detection_count: int | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        clauses = []
+        params: list[Any] = []
+        if run_id:
+            clauses.append("assets.run_id = %s")
+            params.append(run_id)
+        if collection:
+            clauses.append("%s = ANY(assets.collections)")
+            params.append(collection)
+        if kind:
+            clauses.append("assets.kind = %s")
+            params.append(kind)
+        if filename:
+            clauses.append("assets.filename ILIKE %s")
+            params.append(f"%{filename}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        having = "HAVING COUNT(detections.id) >= %s" if min_detection_count is not None else ""
+        aggregate_params = tuple(params + ([] if min_detection_count is None else [min_detection_count]))
+
+        query = f"""
+            WITH asset_detection_counts AS (
+                SELECT
+                    assets.id AS asset_id,
+                    assets.run_id,
+                    assets.filename,
+                    assets.kind,
+                    assets.collections,
+                    COUNT(DISTINCT frames.id) AS frame_count,
+                    COUNT(detections.id) AS detection_count
+                FROM {self.schema}.raw_assets assets
+                LEFT JOIN {self.schema}.frames frames ON frames.asset_id = assets.id
+                LEFT JOIN {self.schema}.detections detections ON detections.frame_id = frames.id
+                {where}
+                GROUP BY assets.id, assets.run_id, assets.filename, assets.kind, assets.collections
+                {having}
+            )
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    query
+                    + """
+                    SELECT
+                        COUNT(*) AS total_asset_count,
+                        COUNT(*) FILTER (WHERE detection_count > 0) AS identified_asset_count,
+                        COALESCE(SUM(detection_count), 0) AS total_detection_count
+                    FROM asset_detection_counts
+                    """,
+                    aggregate_params,
+                )
+                summary = cursor.fetchone()
+                cursor.execute(
+                    query
+                    + """
+                    SELECT *
+                    FROM asset_detection_counts
+                    ORDER BY detection_count DESC, filename ASC
+                    LIMIT %s
+                    """,
+                    aggregate_params + (limit,),
+                )
+                assets = cursor.fetchall()
+
+        return {
+            "summary": {
+                "total_asset_count": summary["total_asset_count"],
+                "identified_asset_count": summary["identified_asset_count"],
+                "total_detection_count": summary["total_detection_count"],
+            },
+            "assets": assets,
+        }
 
     def register_model(self, model: ModelRecord) -> dict[str, Any]:
         with self.connect() as connection:
@@ -996,7 +1230,7 @@ class PostgresRepository:
                     FROM {self.schema}.job_events events
                     {joins}
                     {where}
-                    ORDER BY events.id ASC
+                    ORDER BY events.id DESC
                     LIMIT %s
                     """,
                     tuple(params),

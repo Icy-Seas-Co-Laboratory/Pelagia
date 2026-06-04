@@ -7,60 +7,13 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    import cv2
     import numpy as np
 
     from ...processing.frame_store import retrieve_frame
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository
+    from ._images import encode_image, preview_image
 
     router = APIRouter(prefix="/assets", tags=["assets"])
-
-    def _preview_image(array, max_dim: int) -> np.ndarray:
-        if max_dim < 1:
-            raise HTTPException(status_code=422, detail="preview_max_dim must be >= 1.")
-
-        image = np.asarray(array)
-        if image.ndim < 2:
-            raise HTTPException(status_code=422, detail="Frame preview requires at least 2D image data.")
-
-        height, width = image.shape[:2]
-        if height < 1 or width < 1:
-            raise HTTPException(status_code=422, detail="Frame preview requires non-empty image data.")
-
-        scale = min(float(max_dim) / float(width), float(max_dim) / float(height), 1.0)
-        if scale >= 1.0:
-            return np.ascontiguousarray(image)
-
-        preview_width = max(1, int(round(width * scale)))
-        preview_height = max(1, int(round(height * scale)))
-        return cv2.resize(
-            np.ascontiguousarray(image),
-            (preview_width, preview_height),
-            interpolation=cv2.INTER_AREA,
-        )
-
-    def _encode_image(array, fmt: str) -> tuple[bytes, str]:
-        image = np.ascontiguousarray(array)
-        requested = fmt.lower()
-        if requested == "jpg":
-            requested = "jpeg"
-        if requested == "png":
-            ok, encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 4])
-            media_type = "image/png"
-        elif requested == "jpeg":
-            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            media_type = "image/jpeg"
-        else:
-            raise HTTPException(
-                status_code=422,
-                detail="Frame data format must be one of: png, jpg, jpeg, matrix, preview.",
-            )
-        if not ok:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Frame data could not be encoded as {requested}.",
-            )
-        return encoded.tobytes(), media_type
 
     @router.get("")
     def list_assets(
@@ -93,11 +46,34 @@ if APIRouter is not None:
             )
         }
 
+    @router.get("/detections")
+    def list_asset_detection_stats(
+        request: Request,
+        run_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        min_detection_count: int | None = None,
+        limit: int = 100,
+    ) -> dict:
+        stats = get_repository(request).list_asset_detection_stats(
+            run_id=run_id,
+            collection=collection,
+            kind=kind,
+            filename=filename,
+            min_detection_count=min_detection_count,
+            limit=limit,
+        )
+        return as_response(stats)
+
     @router.get("/{asset_id}")
     def get_asset(request: Request, asset_id: str) -> dict:
-        asset = get_repository(request).get_asset(asset_id)
+        repository = get_repository(request)
+        asset = repository.get_asset(asset_id)
         if asset is None:
             raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
+        asset = dict(asset)
+        asset["frame_count"] = repository.count_frames(asset_id)
         return {"asset": as_response(asset)}
 
     @router.get("/{asset_id}/frames")
@@ -151,7 +127,7 @@ if APIRouter is not None:
                 }
             )
         if requested == "preview":
-            payload, media_type = _encode_image(_preview_image(array, preview_max_dim), "png")
+            payload, media_type = encode_image(preview_image(array, preview_max_dim), "png")
             return Response(
                 content=payload,
                 media_type=media_type,
@@ -164,7 +140,7 @@ if APIRouter is not None:
                 },
             )
 
-        payload, media_type = _encode_image(array, requested)
+        payload, media_type = encode_image(array, requested)
         extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
         return Response(
             content=payload,
@@ -177,8 +153,55 @@ if APIRouter is not None:
         )
 
     @router.get("/{asset_id}/detections")
-    def list_detections(request: Request, asset_id: str) -> dict[str, list]:
-        detections = get_repository(request).list_detections(asset_id)
+    def list_detections(
+        request: Request,
+        asset_id: str,
+        frame_id: str | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        roi_index: int | None = None,
+        min_bbox_x: int | None = None,
+        max_bbox_x: int | None = None,
+        min_bbox_y: int | None = None,
+        max_bbox_y: int | None = None,
+        min_bbox_w: int | None = None,
+        max_bbox_w: int | None = None,
+        min_bbox_h: int | None = None,
+        max_bbox_h: int | None = None,
+        min_area: float | None = None,
+        max_area: float | None = None,
+        min_perimeter: float | None = None,
+        max_perimeter: float | None = None,
+        roi_encoding: str | None = None,
+        roi_format: str | None = None,
+        mask_encoding: str | None = None,
+        mask_format: str | None = None,
+        limit: int | None = 100,
+    ) -> dict[str, list]:
+        detections = get_repository(request).list_detections(
+            asset_id,
+            frame_id=frame_id,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            roi_index=roi_index,
+            min_bbox_x=min_bbox_x,
+            max_bbox_x=max_bbox_x,
+            min_bbox_y=min_bbox_y,
+            max_bbox_y=max_bbox_y,
+            min_bbox_w=min_bbox_w,
+            max_bbox_w=max_bbox_w,
+            min_bbox_h=min_bbox_h,
+            max_bbox_h=max_bbox_h,
+            min_area=min_area,
+            max_area=max_area,
+            min_perimeter=min_perimeter,
+            max_perimeter=max_perimeter,
+            roi_encoding=roi_encoding,
+            roi_format=roi_format,
+            mask_encoding=mask_encoding,
+            mask_format=mask_format,
+            limit=limit,
+        )
         return {"detections": [detection_summary(detection) for detection in detections]}
 else:
     router = None

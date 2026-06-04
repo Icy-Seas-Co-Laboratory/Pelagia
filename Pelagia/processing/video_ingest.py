@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from ..services.context import AppContext
+from .defaults import default_processing_config
 from .frame_model import FrameData
 from .frame_store import store_frame
 from .frame_time import parse_filename_timestamp_utc, timestamp_for_frame
@@ -30,18 +31,48 @@ def convert_frame_to_grayscale(frame: np.ndarray) -> np.ndarray:
 
 def ingest_video_file(
     input_path,
-    n_tile=1,
+    n_tile=None,
     *,
     context: AppContext | None = None,
     run_id: str | None = None,
     asset_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-    flatfield_correction: bool = True,
-    flatfield_q: float = 0.9,
-    flatfield_axis: int = 0,
+    flatfield_correction: bool | None = None,
+    flatfield_q: float | None = None,
+    flatfield_axis: int | None = None,
+    adaptive_background_subtraction: bool | None = None,
+    adaptive_background_period: int | None = None,
+    frame_mask: bool | None = None,
+    frame_mask_path: str | None = None,
 ) -> list[dict[str, Any]]:
+    defaults = (
+        context.config.processing.video_ingest
+        if context is not None
+        else default_processing_config().video_ingest
+    )
+    n_tile = defaults.n_tile if n_tile is None else n_tile
+    flatfield_correction = (
+        defaults.flatfield_correction if flatfield_correction is None else flatfield_correction
+    )
+    flatfield_q = defaults.flatfield_q if flatfield_q is None else flatfield_q
+    flatfield_axis = defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    adaptive_background_subtraction = (
+        defaults.adaptive_background_subtraction
+        if adaptive_background_subtraction is None
+        else adaptive_background_subtraction
+    )
+    adaptive_background_period = (
+        defaults.adaptive_background_period
+        if adaptive_background_period is None
+        else adaptive_background_period
+    )
+    frame_mask = defaults.frame_mask if frame_mask is None else frame_mask
+    frame_mask_path = defaults.frame_mask_path if frame_mask_path is None else frame_mask_path
+
     if n_tile < 1:
         raise ValueError("n_tile must be >= 1.")
+    if adaptive_background_period < 1:
+        raise ValueError("adaptive_background_period must be >= 1.")
 
     input_path = os.fspath(input_path)
     source_path = os.path.dirname(os.path.abspath(input_path))
@@ -54,6 +85,11 @@ def ingest_video_file(
     if flatfield_correction:
         frame_metadata["flatfield_correction"] = True
         frame_metadata["flatfield_q"] = flatfield_q
+        frame_metadata["flatfield_axis"] = flatfield_axis
+    frame_metadata["adaptive_background_subtraction"] = bool(adaptive_background_subtraction)
+    frame_metadata["adaptive_background_period"] = int(adaptive_background_period)
+    frame_metadata["frame_mask"] = bool(frame_mask)
+    frame_metadata["frame_mask_path"] = frame_mask_path
 
     video = cv2.VideoCapture(input_path)
     if not video.isOpened():

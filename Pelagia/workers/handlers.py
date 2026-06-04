@@ -78,17 +78,29 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     metadata.setdefault("collections", collections)
     metadata.setdefault("worker_job_id", str(job.get("id")))
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
+    ingest_defaults = context.config.processing.video_ingest
 
     frame_rows = video_ingest_module.ingest_video_file(
         source_path,
-        n_tile=int(payload.get("n_tile", 1)),
+        n_tile=int(payload.get("n_tile", ingest_defaults.n_tile)),
         context=context,
         run_id=run_id,
         asset_id=asset_id,
         metadata=metadata,
-        flatfield_correction=bool(payload.get("flatfield_correction", True)),
-        flatfield_q=float(payload.get("flatfield_q", 0.9)),
-        flatfield_axis=int(payload.get("flatfield_axis", 0)),
+        flatfield_correction=bool(payload.get("flatfield_correction", ingest_defaults.flatfield_correction)),
+        flatfield_q=float(payload.get("flatfield_q", ingest_defaults.flatfield_q)),
+        flatfield_axis=int(payload.get("flatfield_axis", ingest_defaults.flatfield_axis)),
+        adaptive_background_subtraction=bool(
+            payload.get(
+                "adaptive_background_subtraction",
+                ingest_defaults.adaptive_background_subtraction,
+            )
+        ),
+        adaptive_background_period=int(
+            payload.get("adaptive_background_period", ingest_defaults.adaptive_background_period)
+        ),
+        frame_mask=bool(payload.get("frame_mask", ingest_defaults.frame_mask)),
+        frame_mask_path=payload.get("frame_mask_path", ingest_defaults.frame_mask_path),
     )
 
     result: dict[str, Any] = {
@@ -101,14 +113,15 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     }
 
     if payload.get("enqueue_segment"):
+        segment_defaults = context.config.processing.segmentation
         segment_job = context.repository.create_job(
             PipelineStage.SEGMENT,
             run_id=run_id,
             asset_id=asset_id,
             payload={
                 "frame_ids": result["frame_ids"],
-                "padding": payload.get("segmentation_padding", payload.get("padding", 0)),
-                "roi_encoding": payload.get("roi_encoding", "zstd"),
+                "padding": payload.get("segmentation_padding", payload.get("padding", segment_defaults.padding)),
+                "roi_encoding": payload.get("roi_encoding", segment_defaults.roi_encoding),
                 "collections": collections,
             },
             depends_on=[str(job["id"])],
@@ -153,9 +166,11 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     detections = []
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
-    padding = payload.get("padding", payload.get("segmentation_padding", 0))
-    zstd_min_bytes = payload.get("zstd_min_bytes", 1024)
-    min_perimeter = payload.get("min_perimeter", 0)
+    segment_defaults = context.config.processing.segmentation
+    padding = payload.get("padding", payload.get("segmentation_padding", segment_defaults.padding))
+    zstd_min_bytes = payload.get("zstd_min_bytes", segment_defaults.zstd_min_bytes)
+    min_perimeter = payload.get("min_perimeter", segment_defaults.min_perimeter)
+    max_perimeter = payload.get("max_perimeter", segment_defaults.max_perimeter)
 
     for frame_id in frame_ids:
         frame_record = context.repository.get_frame_record(frame_id)
@@ -173,11 +188,11 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
             segment_frame(
                 frame,
                 threshold=payload.get("threshold"),
-                min_perimeter=0 if min_perimeter is None else min_perimeter,
-                max_perimeter=payload.get("max_perimeter"),
-                padding=0 if padding is None else int(padding),
-                roi_encoding=payload.get("roi_encoding", "zstd"),
-                zstd_min_bytes=1024 if zstd_min_bytes is None else int(zstd_min_bytes),
+                min_perimeter=min_perimeter,
+                max_perimeter=max_perimeter,
+                padding=padding,
+                roi_encoding=payload.get("roi_encoding", segment_defaults.roi_encoding),
+                zstd_min_bytes=zstd_min_bytes,
             )
         )
 

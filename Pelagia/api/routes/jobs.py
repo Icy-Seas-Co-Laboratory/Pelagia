@@ -14,6 +14,9 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ._common import as_response, get_repository
 
+    def _bounded_limit(limit: int | None) -> int:
+        return min(max(1, 100 if limit is None else limit), 1000)
+
     class CreateJobRequest(BaseModel):
         stage: PipelineStage
         run_id: str | None = None
@@ -44,16 +47,19 @@ if APIRouter is not None:
         worker_id: str | None = None,
         limit: int | None = 100,
         cursor: str | None = None,
+        include_details: bool = False,
     ) -> dict[str, list]:
         repository = get_repository(request)
+        resolved_limit = _bounded_limit(limit)
         jobs = repository.list_jobs(
             run_id=run_id,
             asset_id=asset_id,
             status=None if status is None else status.value,
             stage=None if stage is None else stage.value,
             worker_id=worker_id,
-            limit=limit,
+            limit=resolved_limit,
             cursor=cursor,
+            include_details=include_details,
         )
         return {"jobs": as_response(jobs)}
 

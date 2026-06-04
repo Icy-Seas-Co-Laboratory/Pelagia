@@ -3,12 +3,14 @@
 # precedence over these settings.
 
 [database]
+# PostgreSQL catalog and worker queue storage.
 dsn = "postgresql://postgres:postgres@localhost:5432/pelagia"
 schema_name = "pelagia"
 connect_timeout_s = 5
 statement_timeout_ms = 30000
 
 [queue]
+# Default job scheduling behavior. Lower priority values run first.
 default_priority = 100
 max_attempts = 3
 max_claim_count = 1
@@ -16,15 +18,58 @@ lease_seconds = 300
 heartbeat_interval_seconds = 30
 
 [kvstore]
+# Cold storage for large frame payloads.
 root_path = "./data/kvstore"
+# Options: sha256, blake3.
 hash_algorithm = "sha256"
+# Number of hash-prefix characters used to shard object storage paths.
 prefix_length = 1
 max_db_bytes = 4294967296
 max_rows = 1000000
 
 [image_data_storage]
+# Default image payload encoding. Options: zstd, png, jpg, raw.
 encoding = "zstd"
 
+[processing.segmentation]
+# ROI detection defaults used by API, CLI, and workers unless explicitly overridden.
+min_perimeter = 100
+padding = 100
+# Options: zstd, png, raw, auto.
+roi_encoding = "zstd"
+# Minimum ROI byte size before auto encoding prefers zstd over png.
+zstd_min_bytes = 1024
+
+[processing.video_ingest]
+# Video-to-frame extraction defaults. These are also used by frame_store
+# when it performs ingest-time frame preparation such as flatfield correction.
+n_tile = 2
+flatfield_correction = true
+# Quantile used to estimate the flatfield profile. Must be > 0 and < 1.
+flatfield_q = 0.9
+# Axis used by global flatfield correction. Options: 0, 1.
+flatfield_axis = 0
+# Future background-subtraction controls. Recorded in frame metadata today.
+adaptive_background_subtraction = false
+adaptive_background_period = 50
+# Future frame mask controls. Use null when no mask file is configured.
+frame_mask = false
+frame_mask_path = null
+
+[processing.thresholding]
+# Maximum threshold value used when default Otsu thresholding is capped.
+thresholding_maximum_value = 255
+
+[processing.frame_storage]
+# Stored frame payload encoding. Options: zstd, png, jpg, raw.
+image_encoding = "jpg"
+thumbhash_max_dim = 100
+
+[processing.thumbhash]
+# Maximum image dimension used before computing preview thumbhashes.
+max_dim = 100
+
 [api]
+# FastAPI development server defaults.
 host = "127.0.0.1"
 port = 8000

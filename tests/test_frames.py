@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
-from Pelagia.config import CoreConfig, ImageDataStorageConfig
+from Pelagia.config import CoreConfig
 from Pelagia.domain import FrameRecord
 from Pelagia.processing import video_ingest as video_ingest_module
+from Pelagia.processing.frame_codec import decode_array_payload
 from Pelagia.processing.frame_correction import flatfield_correction_for_framedata
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_store import retrieve_frame, store_frame
@@ -299,9 +300,36 @@ def test_store_frame_can_write_raw_numpy_payload():
     assert metadata["kvstore_format"] == "raw_ndarray_c_order"
 
 
+def test_store_frame_can_write_jpg_payload():
+    ctx = FakeContext()
+    data = np.arange(100, dtype=np.uint8).reshape(10, 10)
+
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+            "kvstore_encoding": "jpg",
+        },
+    )
+
+    store_frame(frame, context=ctx)
+
+    assert ctx.kvstore.payload.startswith(b"\xff\xd8")
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert metadata["kvstore_encoding"] == "jpg"
+    assert metadata["kvstore_format"] == "jpg"
+    decoded = decode_array_payload(ctx.kvstore.payload, metadata)
+    assert decoded.shape == data.shape
+    assert decoded.dtype == np.uint8
+
+
 def test_store_frame_uses_configured_default_image_data_storage_encoding():
     ctx = FakeContext()
-    ctx.config.image_data_storage = ImageDataStorageConfig(encoding="raw")
+    ctx.config.processing.frame_storage.image_encoding = "raw"
     data = np.arange(12, dtype=np.uint8).reshape(3, 4)
 
     frame = FrameData(
@@ -350,6 +378,7 @@ def test_store_frame_applies_flatfield_correction_when_requested():
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["flatfield_correction"] is True
     assert metadata["flatfield_q"] == 0.5
+    assert "flatfield_maximum_value" not in metadata
 
 
 def test_convert_frame_to_grayscale_keeps_existing_grayscale_frame():

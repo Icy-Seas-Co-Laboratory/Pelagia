@@ -129,6 +129,11 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["run_id"] == "run-1"
     assert kwargs["asset_id"] == "asset-1"
     assert kwargs["flatfield_correction"] is False
+    assert "flatfield_maximum_value" not in kwargs
+    assert kwargs["adaptive_background_subtraction"] is False
+    assert kwargs["adaptive_background_period"] == 50
+    assert kwargs["frame_mask"] is False
+    assert kwargs["frame_mask_path"] is None
     assert kwargs["metadata"]["source"] == "test"
     assert kwargs["metadata"]["collections"] == ["test"]
     assert kwargs["metadata"]["worker_job_id"] == "job-1"

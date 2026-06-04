@@ -17,6 +17,14 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
             )
         return encoded.tobytes(), "png", "png"
 
+    if requested in {"jpg", "image/jpeg"}:
+        ok, encoded = cv2.imencode(".jpg", array, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            raise ValueError(
+                f"Frame array with dtype {array.dtype} and shape {array.shape} cannot be encoded as JPG."
+            )
+        return encoded.tobytes(), "jpg", "jpg"
+
     if requested in {"zstd", "zstandard", "zstd_ndarray_c_order"}:
         try:
             import zstandard as zstd
@@ -29,7 +37,7 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
             "zstd_ndarray_c_order",
         )
 
-    raise ValueError("Frame array encoding must be one of: raw, png, zstd.")
+    raise ValueError("Frame array encoding must be one of: raw, png, jpg, zstd.")
 
 
 def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray:
@@ -46,6 +54,12 @@ def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray
             raise ValueError("Stored frame payload could not be decoded as PNG.")
         return np.ascontiguousarray(decoded)
 
+    if encoding in {"jpg", "jpeg", "image/jpeg"}:
+        decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if decoded is None:
+            raise ValueError("Stored frame payload could not be decoded as JPG.")
+        return np.ascontiguousarray(decoded)
+
     if encoding in {"zstd", "zstandard", "zstd_ndarray_c_order"}:
         try:
             import zstandard as zstd
@@ -54,7 +68,7 @@ def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray
         payload = zstd.ZstdDecompressor().decompress(payload)
 
     elif encoding not in {"raw", "raw_ndarray_c_order"}:
-        raise ValueError("Stored frame array encoding must be one of: raw, png, zstd.")
+        raise ValueError("Stored frame array encoding must be one of: raw, png, jpg, zstd.")
 
     dtype = metadata.get("dtype")
     shape = metadata.get("shape")

@@ -193,7 +193,16 @@ SET
     payload_shape = CASE
         WHEN payload_shape = '[]'::jsonb AND metadata ? 'shape' THEN metadata->'shape'
         ELSE payload_shape
-    END;
+    END
+WHERE
+    kvstore_hash IS NULL
+    OR payload_ref IS NULL
+    OR payload_encoding IS NULL
+    OR payload_format IS NULL
+    OR payload_dtype IS NULL
+    OR (payload_shape = '[]'::jsonb AND metadata ? 'shape')
+    OR (metadata ? 'bbox_x' AND bbox_x IS DISTINCT FROM (metadata->>'bbox_x')::integer)
+    OR (metadata ? 'bbox_y' AND bbox_y IS DISTINCT FROM (metadata->>'bbox_y')::integer);
 
 DO $$
 BEGIN
@@ -374,7 +383,20 @@ SET
     crop_bbox_h = COALESCE(
         crop_bbox_h,
         CASE WHEN metadata ? 'roi_bbox' THEN ((metadata->'roi_bbox')->>3)::integer END
-    );
+    )
+WHERE
+    roi_encoding IS NULL
+    OR roi_format IS NULL
+    OR roi_dtype IS NULL
+    OR mask_encoding IS NULL
+    OR mask_format IS NULL
+    OR mask_dtype IS NULL
+    OR (roi_shape = '[]'::jsonb AND metadata ? 'shape')
+    OR (mask_shape = '[]'::jsonb AND metadata ? 'mask_shape')
+    OR (crop_bbox_x IS NULL AND metadata ? 'roi_bbox')
+    OR (crop_bbox_y IS NULL AND metadata ? 'roi_bbox')
+    OR (crop_bbox_w IS NULL AND metadata ? 'roi_bbox')
+    OR (crop_bbox_h IS NULL AND metadata ? 'roi_bbox');
 
 CREATE TABLE IF NOT EXISTS {schema}.models (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -11,43 +11,56 @@ if APIRouter is not None:
 
     router = APIRouter(prefix="/kvstore", tags=["kvstore"])
 
-    def _store_status(kvstore) -> dict | None:
+    def _store_status(kvstore, *, deep: bool = False) -> dict | None:
         if kvstore is None or not hasattr(kvstore, "status"):
             return None
         try:
+            return kvstore.status(deep=deep)
+        except TypeError:
             return kvstore.status()
         except Exception as exc:
             return {"available": False, "error": str(exc)}
 
-    def _store_health(kvstore, status: dict | None) -> dict:
+    def _store_health(kvstore, status: dict | None, *, deep: bool = False) -> dict:
         if kvstore is None:
             return {"healthy": False, "errors": ["KVStore is not configured."]}
         if not hasattr(kvstore, "check_health"):
             return {"healthy": False, "errors": ["KVStore health check is not available."]}
         if status is not None and not status.get("initialized", False):
             return {"healthy": False, "errors": ["KVStore is not initialized."]}
+        if not deep:
+            return {
+                "healthy": True,
+                "errors": [],
+                "warnings": ["Deep KVStore health check was not run."],
+                "deep": False,
+            }
         try:
             return kvstore.check_health()
         except Exception as exc:
             return {"healthy": False, "errors": [str(exc)]}
 
     @router.get("")
-    def get_store(request: Request) -> dict:
+    def get_store(
+        request: Request,
+        deep_status: bool = False,
+        include_health: bool = False,
+    ) -> dict:
         context = get_context(request)
-        status = _store_status(context.kvstore)
+        status = _store_status(context.kvstore, deep=deep_status)
         return as_response(
             {
                 "root_path": context.config.kvstore.root_path,
                 "configured_hash_algorithm": context.config.kvstore.hash_algorithm,
                 "configured_prefix_length": context.config.kvstore.prefix_length,
                 "status": status,
-                "health": _store_health(context.kvstore, status),
+                "health": _store_health(context.kvstore, status, deep=include_health),
             }
         )
 
     @router.get("/status")
-    def get_store_status(request: Request) -> dict:
-        return kvstore_status(get_kvstore(request))
+    def get_store_status(request: Request, deep: bool = False) -> dict:
+        return kvstore_status(get_kvstore(request), deep=deep)
 
     @router.get("/health")
     def get_store_health(request: Request) -> dict:

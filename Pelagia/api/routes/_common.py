@@ -76,5 +76,9 @@ def postgres_ping(repository) -> dict[str, Any]:
     }
 
 
-def kvstore_status(kvstore) -> dict[str, Any]:
-    return as_response(kvstore.status())
+def kvstore_status(kvstore, *, deep: bool = False) -> dict[str, Any]:
+    try:
+        status = kvstore.status(deep=deep)
+    except TypeError:
+        status = kvstore.status()
+    return as_response(status)

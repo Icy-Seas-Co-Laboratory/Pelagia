@@ -11,7 +11,9 @@ from fastapi.testclient import TestClient
 
 from Pelagia.api import create_app
 from Pelagia.config import CoreConfig
-from Pelagia.domain import PipelineStage
+from Pelagia.domain import FrameRecord, PipelineStage
+from Pelagia.processing import frame_store
+from Pelagia.processing.frame_model import FrameData
 from Pelagia.services.context import AppContext
 
 
@@ -48,6 +50,11 @@ class FakeRepository:
             return None
         return {"id": asset_id, "run_id": "run-1", "kind": "video", "collections": ["test"]}
 
+    def count_frames(self, asset_id):
+        if asset_id != "asset-1":
+            return 0
+        return 12
+
     def list_frames(self, asset_id, **kwargs):
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 2, "preview_thumbhash": b"abc", **kwargs}]
 
@@ -56,15 +63,66 @@ class FakeRepository:
             return None
         return {"id": 1, "asset_id": asset_id, "frame_index": frame_index}
 
-    def list_detections(self, asset_id):
+    def get_frame_record(self, frame_id):
+        if frame_id != "frame-1":
+            return None
+        return FrameRecord(
+            id="frame-1",
+            run_id="run-1",
+            asset_id="asset-1",
+            frame_index=2,
+            width=10,
+            height=10,
+            kvstore_hash="fake-kv-key",
+            preview_thumbhash=b"abc",
+            metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
+        )
+
+    def _detection_row(self, **overrides):
+        row = {
+            "id": "det-1",
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "asset_filename": "sample.mkv",
+            "frame_id": "frame-1",
+            "frame_index": 2,
+            "roi_index": 1,
+            "roi_payload": np.array([[0, 128], [255, 64]], dtype=np.uint8).tobytes(order="C"),
+            "mask_payload": b"mask",
+            "roi_encoding": "raw",
+            "roi_format": "raw_ndarray_c_order",
+            "roi_dtype": "uint8",
+            "roi_shape": [2, 2],
+        }
+        row.update(overrides)
+        return row
+
+    def list_detections(self, asset_id=None, **kwargs):
         return [
-            {
-                "id": "det-1",
-                "asset_id": asset_id,
-                "roi_payload": b"roi",
-                "mask_payload": b"mask",
-            }
+            self._detection_row(asset_id=asset_id or "asset-1", **kwargs)
         ]
+
+    def get_detection(self, detection_id):
+        if detection_id != "det-1":
+            return None
+        return self._detection_row()
+
+    def list_asset_detection_stats(self, **kwargs):
+        return {
+            "summary": {
+                "total_asset_count": 2,
+                "identified_asset_count": 1,
+                "total_detection_count": 7,
+            },
+            "assets": [
+                {
+                    "asset_id": "asset-1",
+                    "filename": "sample.mkv",
+                    "detection_count": 7,
+                    **kwargs,
+                }
+            ],
+        }
 
     def list_models(self, **kwargs):
         return [{"id": "model-1", "model_key": "demo", **kwargs}]
@@ -76,7 +134,14 @@ class FakeRepository:
         return {"id": model_id, "model_key": "demo"} if model_id == "model-1" else None
 
     def list_jobs(self, **kwargs):
-        return [{"id": "job-1", "stage": PipelineStage.EXTRACT_FRAMES.value, **kwargs}]
+        row = {"id": "job-1", "stage": PipelineStage.EXTRACT_FRAMES.value, **kwargs}
+        if kwargs.get("include_details"):
+            row["payload"] = {"frame_ids": ["frame-1"]}
+            row["result"] = {"detection_ids": ["det-1"]}
+        else:
+            row["payload_bytes"] = 1024
+            row["result_bytes"] = 2048
+        return [row]
 
     def get_job(self, job_id):
         return {"id": job_id, "status": "queued"} if job_id == "job-1" else None
@@ -170,6 +235,69 @@ def test_api_kvstore_includes_status_and_health():
     assert body["health"]["healthy"] is True
 
 
+def test_api_live_files_indexes_server_directory(tmp_path):
+    visible_dir = tmp_path / "frames"
+    visible_dir.mkdir()
+    visible_file = visible_dir / "sample.mkv"
+    visible_file.write_bytes(b"video")
+    hidden_file = visible_dir / ".hidden"
+    hidden_file.write_text("secret", encoding="utf-8")
+    client, _, _ = make_client()
+
+    response = client.get("/live/files", params={"directory": str(tmp_path)})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["directory"] == str(tmp_path.resolve())
+    assert body["count"] == 1
+    assert body["entries"][0]["name"] == "frames"
+    assert body["entries"][0]["is_dir"] is True
+
+    recursive = client.get(
+        "/live/files",
+        params={"directory": str(tmp_path), "recursive": True, "include_hidden": True},
+    )
+    names = {entry["name"] for entry in recursive.json()["entries"]}
+    assert {"frames", "sample.mkv", ".hidden"}.issubset(names)
+
+
+def test_api_live_segment_returns_transient_detections(monkeypatch):
+    data = np.zeros((10, 10), dtype=np.uint8)
+    data[2:5, 3:7] = 50
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
+    )
+    monkeypatch.setattr(frame_store, "retrieve_frame", lambda frame_id, context: frame)
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/live/segment",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "min_perimeter": 0,
+            "padding": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["saved"] is False
+    assert body["detection_count"] == 1
+    detection = body["detections"][0]
+    assert detection["frame_id"] == "frame-1"
+    assert detection["bbox_x"] == 3
+    assert detection["bbox_y"] == 2
+    assert "roi_payload" not in detection
+    assert detection["roi_payload_bytes"] > 0
+    assert detection["mask_payload_bytes"] > 0
+    assert detection["roi_encoding"] == "png"
+
+
 def test_api_can_create_queue_job():
     client, repository, _ = make_client()
 
@@ -186,6 +314,32 @@ def test_api_can_create_queue_job():
     assert response.status_code == 200
     assert response.json()["job"]["stage"] == "extract_frames"
     assert repository.created_jobs[0]["run_id"] == "run-1"
+
+
+def test_api_lists_jobs_without_details_by_default():
+    client, _, _ = make_client()
+
+    response = client.get("/jobs")
+
+    assert response.status_code == 200
+    job = response.json()["jobs"][0]
+    assert job["include_details"] is False
+    assert job["payload_bytes"] == 1024
+    assert job["result_bytes"] == 2048
+    assert "payload" not in job
+    assert "result" not in job
+
+
+def test_api_lists_jobs_with_details_when_requested():
+    client, _, _ = make_client()
+
+    response = client.get("/jobs?include_details=true")
+
+    assert response.status_code == 200
+    job = response.json()["jobs"][0]
+    assert job["include_details"] is True
+    assert job["payload"]["frame_ids"] == ["frame-1"]
+    assert job["result"]["detection_ids"] == ["det-1"]
 
 
 def test_api_can_queue_segmentation_job():
@@ -230,8 +384,108 @@ def test_api_asset_views_summarize_payload_bytes():
     assert frame_response.json()["frames"][0]["preview_thumbhash_bytes"] == 3
     assert frame_response.json()["frames"][0]["preview_thumbhash_base64"] == "YWJj"
     assert "preview_thumbhash" not in frame_response.json()["frames"][0]
-    assert detection_response.json()["detections"][0]["roi_payload_bytes"] == 3
+    assert detection_response.json()["detections"][0]["roi_payload_bytes"] == 4
     assert detection_response.json()["detections"][0]["mask_payload_bytes"] == 4
+
+
+def test_api_asset_detail_includes_frame_count():
+    client, _, _ = make_client()
+
+    response = client.get("/assets/asset-1")
+
+    assert response.status_code == 200
+    assert response.json()["asset"]["id"] == "asset-1"
+    assert response.json()["asset"]["frame_count"] == 12
+
+
+def test_api_filters_asset_detections():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/assets/asset-1/detections"
+        "?frame_id=frame-1&start_frame=2&end_frame=5&roi_index=1"
+        "&min_bbox_x=1&max_bbox_x=10&min_bbox_y=2&max_bbox_y=11"
+        "&min_bbox_w=3&max_bbox_w=12&min_bbox_h=4&max_bbox_h=13"
+        "&min_area=5.5&max_area=100.5&min_perimeter=6.5&max_perimeter=80.5"
+        "&roi_encoding=raw&roi_format=raw_ndarray_c_order"
+        "&mask_encoding=raw&mask_format=raw_ndarray_c_order&limit=7"
+    )
+
+    assert response.status_code == 200
+    detection = response.json()["detections"][0]
+    assert detection["frame_id"] == "frame-1"
+    assert detection["start_frame"] == 2
+    assert detection["end_frame"] == 5
+    assert detection["roi_index"] == 1
+    assert detection["min_bbox_x"] == 1
+    assert detection["max_bbox_h"] == 13
+    assert detection["min_area"] == 5.5
+    assert detection["max_perimeter"] == 80.5
+    assert detection["roi_encoding"] == "raw"
+    assert detection["mask_format"] == "raw_ndarray_c_order"
+    assert detection["limit"] == 7
+
+
+def test_api_lists_global_detections_without_image_payloads():
+    client, _, _ = make_client()
+
+    response = client.get("/detections?asset_id=asset-1&collection=test&limit=3")
+
+    assert response.status_code == 200
+    detection = response.json()["detections"][0]
+    assert detection["asset_id"] == "asset-1"
+    assert detection["collection"] == "test"
+    assert detection["limit"] == 3
+    assert "roi_payload" not in detection
+    assert detection["roi_payload_bytes"] == 4
+    assert detection["mask_payload_bytes"] == 4
+
+
+def test_api_get_detection_includes_payload_data():
+    client, _, _ = make_client()
+
+    response = client.get("/detections/det-1")
+
+    assert response.status_code == 200
+    detection = response.json()["detection"]
+    assert detection["id"] == "det-1"
+    assert detection["roi_payload"] == "0080ff40"
+    assert detection["mask_payload"] == "6d61736b"
+
+
+def test_api_detection_framedata_returns_matrix_and_png():
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/detections/det-1/framedata?format=matrix")
+    png_response = client.get("/detections/det-1/framedata?format=png")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["shape"] == [2, 2]
+    assert matrix_response.json()["data"] == [[0, 128], [255, 64]]
+    assert png_response.status_code == 200
+    assert png_response.headers["content-type"] == "image/png"
+    assert png_response.content.startswith(b"\x89PNG")
+
+
+def test_api_reports_asset_detection_stats():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/assets/detections?collection=test&kind=video&filename=sample&min_detection_count=1&limit=5"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_asset_count"] == 2
+    assert body["summary"]["identified_asset_count"] == 1
+    assert body["summary"]["total_detection_count"] == 7
+    assert body["assets"][0]["asset_id"] == "asset-1"
+    assert body["assets"][0]["detection_count"] == 7
+    assert body["assets"][0]["collection"] == "test"
+    assert body["assets"][0]["kind"] == "video"
+    assert body["assets"][0]["filename"] == "sample"
+    assert body["assets"][0]["min_detection_count"] == 1
+    assert body["assets"][0]["limit"] == 5
 
 
 def test_api_asset_frames_accepts_range_filters():
@@ -309,6 +563,11 @@ def test_api_queues_video_ingestion(tmp_path):
     assert repository.registered_runs[0].manifest.assets[0].path == str(video_path.resolve())
     assert repository.registered_runs[0].manifest.assets[0].collections == ["none"]
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
+    assert "flatfield_maximum_value" not in repository.created_jobs[0]["payload"]
+    assert repository.created_jobs[0]["payload"]["adaptive_background_subtraction"] is False
+    assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
+    assert repository.created_jobs[0]["payload"]["frame_mask"] is False
+    assert repository.created_jobs[0]["payload"]["frame_mask_path"] is None
 
 
 def test_api_queues_video_ingestion_with_collections(tmp_path):

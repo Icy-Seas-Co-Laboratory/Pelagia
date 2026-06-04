@@ -2,6 +2,8 @@ from typing import Any
 
 import numpy as np
 
+from .defaults import default_processing_config
+
 
 def metadata_bool(metadata: dict[str, Any], key: str, default: bool = False) -> bool:
     value = metadata.get(key, default)
@@ -12,10 +14,12 @@ def metadata_bool(metadata: dict[str, Any], key: str, default: bool = False) -> 
 
 def flatfield_correction_for_framedata(
     data: np.ndarray,
-    q: float = 0.9,
-    output_max: float = 255.0,
-    min_field_value: float = 0.0,
+    q: float | None = None,
+    min_field_value: float | None = None,
 ) -> np.ndarray:
+    defaults = default_processing_config().video_ingest
+    q = defaults.flatfield_q if q is None else q
+    min_field_value = 0.0 if min_field_value is None else min_field_value
     if not 0 < q < 1:
         raise ValueError("q must be between 0 and 1.")
 
@@ -24,16 +28,19 @@ def flatfield_correction_for_framedata(
         raise ValueError(
             "flatfield correction currently expects a 2D grayscale frame.")
 
-    field = np.quantile(array, q=q, axis=0)
-    corrected = array / field.T * output_max
+    field = np.maximum(np.quantile(array, q=q, axis=0), min_field_value)
+    corrected = array / field.T * 255.0
     return np.ascontiguousarray(np.clip(corrected, 0, 255).astype(np.uint8))
 
 
 def flatfield_global_correction_for_framedata(
     data: np.ndarray,
-    q: float = 0.95,
-    axis: int = 0,
+    q: float | None = None,
+    axis: int | None = None,
 ) -> np.ndarray:
+    defaults = default_processing_config().video_ingest
+    q = defaults.flatfield_q if q is None else q
+    axis = defaults.flatfield_axis if axis is None else axis
     if not 0 < q < 1:
         raise ValueError("q must be between 0 and 1.")
 

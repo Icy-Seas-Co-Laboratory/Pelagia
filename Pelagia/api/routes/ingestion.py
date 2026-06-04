@@ -28,10 +28,17 @@ if APIRouter is not None:
 
     class QueueVideoRequest(BaseModel):
         source_path: str
-        n_tile: int = 1
+        n_tile: int | None = None
+        flatfield_correction: bool | None = None
+        flatfield_q: float | None = None
+        flatfield_axis: int | None = None
+        adaptive_background_subtraction: bool | None = None
+        adaptive_background_period: int | None = None
+        frame_mask: bool | None = None
+        frame_mask_path: str | None = None
         enqueue_segment: bool = False
-        segmentation_padding: int = 0
-        roi_encoding: str = "zstd"
+        segmentation_padding: int | None = None
+        roi_encoding: str | None = None
         collections: str | list[str] | None = None
         run_id: str | None = None
         asset_id: str | None = None
@@ -43,8 +50,42 @@ if APIRouter is not None:
 
     @router.post("/videos")
     def queue_video_ingestion(request: Request, body: QueueVideoRequest) -> dict:
-        if body.n_tile < 1:
+        defaults = request.app.state.context.config.processing
+        ingest_defaults = defaults.video_ingest
+        n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
+        flatfield_correction = (
+            ingest_defaults.flatfield_correction
+            if body.flatfield_correction is None
+            else body.flatfield_correction
+        )
+        flatfield_q = ingest_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q
+        flatfield_axis = (
+            ingest_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis
+        )
+        adaptive_background_subtraction = (
+            ingest_defaults.adaptive_background_subtraction
+            if body.adaptive_background_subtraction is None
+            else body.adaptive_background_subtraction
+        )
+        adaptive_background_period = (
+            ingest_defaults.adaptive_background_period
+            if body.adaptive_background_period is None
+            else body.adaptive_background_period
+        )
+        frame_mask = ingest_defaults.frame_mask if body.frame_mask is None else body.frame_mask
+        frame_mask_path = (
+            ingest_defaults.frame_mask_path if body.frame_mask_path is None else body.frame_mask_path
+        )
+        segmentation_padding = (
+            defaults.segmentation.padding
+            if body.segmentation_padding is None
+            else body.segmentation_padding
+        )
+        roi_encoding = defaults.segmentation.roi_encoding if body.roi_encoding is None else body.roi_encoding
+        if n_tile < 1:
             raise HTTPException(status_code=422, detail="n_tile must be >= 1.")
+        if adaptive_background_period < 1:
+            raise HTTPException(status_code=422, detail="adaptive_background_period must be >= 1.")
 
         repository = get_repository(request)
         source_path = Path(body.source_path).expanduser().resolve()
@@ -92,10 +133,17 @@ if APIRouter is not None:
             asset_id=asset_id,
             payload={
                 "source_path": str(source_path),
-                "n_tile": body.n_tile,
+                "n_tile": n_tile,
+                "flatfield_correction": flatfield_correction,
+                "flatfield_q": flatfield_q,
+                "flatfield_axis": flatfield_axis,
+                "adaptive_background_subtraction": adaptive_background_subtraction,
+                "adaptive_background_period": adaptive_background_period,
+                "frame_mask": frame_mask,
+                "frame_mask_path": frame_mask_path,
                 "enqueue_segment": body.enqueue_segment,
-                "segmentation_padding": body.segmentation_padding,
-                "roi_encoding": body.roi_encoding,
+                "segmentation_padding": segmentation_padding,
+                "roi_encoding": roi_encoding,
                 "collections": collections,
             },
             summary=f"extract_frames queued for {source_path.name}",

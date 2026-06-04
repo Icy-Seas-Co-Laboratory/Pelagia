@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..config import CoreConfig
 from ..services.context import AppContext
-from .routes import assets, collections, health, ingestion, jobs, kvstore, models, runs, segmentation, system, workers
+from .routes import assets, collections, detections, health, ingestion, jobs, kvstore, live, models, runs, segmentation, system, workers
 
 
 def create_app(config: CoreConfig | None = None):
@@ -13,11 +13,19 @@ def create_app(config: CoreConfig | None = None):
     """
     try:
         from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
     except ImportError as exc:
         raise RuntimeError("Install FastAPI to run the Pelagia API.") from exc
 
     resolved_config = config or CoreConfig.load()
     app = FastAPI(title="Pelagia", version="0.0.1")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.config = resolved_config
     app.state.context = AppContext.from_config(resolved_config)
     for route_module in (
@@ -29,7 +37,9 @@ def create_app(config: CoreConfig | None = None):
         jobs,
         workers,
         assets,
+        detections,
         collections,
+        live,
         kvstore,
         models,
     ):

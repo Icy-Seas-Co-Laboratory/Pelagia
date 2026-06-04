@@ -6,14 +6,17 @@ import cv2
 import numpy as np
 from thumbhash import rgba_to_thumb_hash
 
+from .defaults import default_processing_config
 
-def compute_thumbhash(array: np.ndarray, *, max_dim: int = 100) -> bytes:
+
+def compute_thumbhash(array: np.ndarray, *, max_dim: int | None = None) -> bytes:
     """
     Compute a standard ThumbHash payload for a frame-like image array.
 
     Color arrays are treated as OpenCV-style BGR/BGRA inputs because Pelagia's
     image ingestion stack is cv2-based. Grayscale arrays are expanded to RGBA.
     """
+    resolved_max_dim = default_processing_config().thumbhash.max_dim if max_dim is None else max_dim
     image = np.asarray(array)
     if image.ndim < 2:
         raise ValueError("ThumbHash generation requires at least 2D image data.")
@@ -38,7 +41,7 @@ def compute_thumbhash(array: np.ndarray, *, max_dim: int = 100) -> bytes:
     if height < 1 or width < 1:
         raise ValueError("ThumbHash generation requires non-empty image data.")
 
-    scale = min(float(max_dim) / float(width), float(max_dim) / float(height), 1.0)
+    scale = min(float(resolved_max_dim) / float(width), float(resolved_max_dim) / float(height), 1.0)
     preview_width = max(1, int(round(width * scale)))
     preview_height = max(1, int(round(height * scale)))
     if scale < 1.0:

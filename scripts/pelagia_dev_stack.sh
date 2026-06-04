@@ -14,6 +14,8 @@ PELAGIA_API_PORT="${PELAGIA_API_PORT:-8000}"
 PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,segment}"
 PELAGIA_IDLE_SLEEP_SECONDS="${PELAGIA_IDLE_SLEEP_SECONDS:-2.0}"
 PELAGIA_REQUEUE_INTERVAL_SECONDS="${PELAGIA_REQUEUE_INTERVAL_SECONDS:-30.0}"
+PELAGIA_INIT_ON_START="${PELAGIA_INIT_ON_START:-auto}"
+PELAGIA_INIT_STATEMENT_TIMEOUT_MS="${PELAGIA_INIT_STATEMENT_TIMEOUT_MS:-0}"
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
@@ -79,10 +81,37 @@ worker_name_for_stage() {
     echo "pelagia-${stage//_/-}-1"
 }
 
+storage_is_ready() {
+    python -m Pelagia.cli.app list_asset_ids \
+        --database-dsn "$PELAGIA_DATABASE_DSN" \
+        --schema "$PELAGIA_DATABASE_SCHEMA" \
+        --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+        --limit 1 >"$LOG_DIR/storage-check.log" 2>&1
+}
+
 initialize_system() {
     local log_file="$LOG_DIR/init-system.log"
+    case "$PELAGIA_INIT_ON_START" in
+        never)
+            echo "skipping storage initialization because PELAGIA_INIT_ON_START=never"
+            return
+            ;;
+        auto)
+            if storage_is_ready; then
+                echo "storage already initialized"
+                return
+            fi
+            ;;
+        always)
+            ;;
+        *)
+            echo "PELAGIA_INIT_ON_START must be one of: auto, always, never"
+            return 2
+            ;;
+    esac
+
     echo "initializing storage..."
-    if ! python -m Pelagia.cli.app init-system \
+    if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" python -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then

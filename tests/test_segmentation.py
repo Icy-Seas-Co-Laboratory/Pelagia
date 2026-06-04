@@ -2,10 +2,48 @@ import numpy as np
 
 from Pelagia.processing.frame_codec import decode_array_payload
 from Pelagia.processing.frame_model import FrameData
-from Pelagia.processing.segmentation import segment_frame, store_roi
+from Pelagia.processing.segmentation import calc_threshold, live_segment_wrapper, segment_frame, store_roi
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
+
+
+def test_calc_threshold_caps_default_otsu_value_at_thresholding_maximum(monkeypatch):
+    class FakeThresholdingConfig:
+        thresholding_maximum_value = 100
+
+    class FakeProcessingConfig:
+        thresholding = FakeThresholdingConfig()
+
+    monkeypatch.setattr(
+        "Pelagia.processing.segmentation.default_processing_config",
+        lambda: FakeProcessingConfig(),
+    )
+    data = np.arange(256, dtype=np.uint8).reshape(16, 16)
+
+    thresholded = calc_threshold(data)
+
+    expected = np.where(data > 100, 0, 255).astype(np.uint8)
+    np.testing.assert_array_equal(thresholded, expected)
+
+
+def test_calc_threshold_uses_explicit_threshold_without_thresholding_cap(monkeypatch):
+    class FakeThresholdingConfig:
+        thresholding_maximum_value = 100
+
+    class FakeProcessingConfig:
+        thresholding = FakeThresholdingConfig()
+
+    monkeypatch.setattr(
+        "Pelagia.processing.segmentation.default_processing_config",
+        lambda: FakeProcessingConfig(),
+    )
+    data = np.arange(256, dtype=np.uint8).reshape(16, 16)
+
+    thresholded = calc_threshold(data, threshold=127)
+
+    expected = np.where(data > 127, 0, 255).astype(np.uint8)
+    np.testing.assert_array_equal(thresholded, expected)
 
 
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():
@@ -24,7 +62,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
         },
     )
 
-    detections = segment_frame(frame, threshold=1, roi_encoding="raw")
+    detections = segment_frame(frame, threshold=1, min_perimeter=0, padding=0, roi_encoding="raw")
 
     assert len(detections) == 1
     detection = detections[0]
@@ -61,6 +99,34 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     np.testing.assert_array_equal(decoded_mask, np.full((3, 4), 255, dtype=np.uint8))
 
 
+def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
+    data = np.zeros((10, 10), dtype=np.uint8)
+    data[2:5, 3:7] = 50
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "frame_id": FRAME_ID,
+        },
+    )
+    monkeypatch.setattr("Pelagia.processing.frame_store.retrieve_frame", lambda frame_id, context: frame)
+
+    detections = live_segment_wrapper(
+        FRAME_ID,
+        threshold=1,
+        min_perimeter=0,
+        padding=0,
+    )
+
+    assert len(detections) == 1
+    assert detections[0].roi_payload.startswith(b"\x89PNG\r\n\x1a\n")
+    assert detections[0].mask_payload.startswith(b"\x89PNG\r\n\x1a\n")
+    assert detections[0].roi_encoding == "png"
+
+
 def test_segment_frame_stores_padded_roi_context_and_mask():
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
@@ -77,7 +143,7 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
         },
     )
 
-    detections = segment_frame(frame, threshold=1, padding=1, roi_encoding="raw")
+    detections = segment_frame(frame, threshold=1, min_perimeter=0, padding=1, roi_encoding="raw")
 
     assert len(detections) == 1
     detection = detections[0]

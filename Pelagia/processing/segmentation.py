@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from ..domain import DetectionRecord, normalize_collections
+from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 
@@ -51,9 +52,15 @@ def calc_threshold(gray: np.ndarray, threshold: int | float | None = None) -> np
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     if threshold is None:
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        otsu_value, _ = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        threshold = min(
+            float(otsu_value),
+            float(default_processing_config().thresholding.thresholding_maximum_value),
+        )
+        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
     else:
-        _, binary = cv2.threshold(gray, float(threshold), 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(gray, float(threshold), 255, cv2.THRESH_BINARY_INV)
     return np.ascontiguousarray(binary)
 
 
@@ -82,10 +89,12 @@ def _as_binary_mask(mask: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray((array > 0).astype(np.uint8) * 255)
 
 
-def _choose_roi_encoding(roi: np.ndarray, encoding: str | None, zstd_min_bytes: int) -> str:
-    requested = str(encoding or "zstd").lower()
+def _choose_roi_encoding(roi: np.ndarray, encoding: str | None, zstd_min_bytes: int | None) -> str:
+    defaults = default_processing_config().segmentation
+    requested = str(encoding or defaults.roi_encoding).lower()
+    resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
     if requested == "auto":
-        return "png" if roi.nbytes < zstd_min_bytes else "zstd"
+        return "png" if roi.nbytes < resolved_zstd_min_bytes else "zstd"
     return requested
 
 
@@ -113,8 +122,8 @@ def store_roi(
     roi_index: int,
     contour: np.ndarray,
     area: float,
-    encoding: str | None = "zstd",
-    zstd_min_bytes: int = 1024,
+    encoding: str | None = None,
+    zstd_min_bytes: int | None = None,
     extra_metadata: dict[str, Any] | None = None,
 ) -> DetectionRecord:
     """
@@ -195,17 +204,50 @@ def store_roi(
     )
 
 
+def live_segment_wrapper(
+    frame_id: str,
+    *,
+    threshold: int | float | ThresholdFn | None = None,
+    min_perimeter: int | float | None = None,
+    max_perimeter: int | float | None = None,
+    padding: int | None = None,
+    roi_encoding: str | None = "png",
+    zstd_min_bytes: int | None = None,
+    context: Any = None,
+) -> list[DetectionRecord]:
+    """Load one frame, segment it, and return transient detection records."""
+    from .frame_store import retrieve_frame
+
+    frame = retrieve_frame(frame_id, context=context)
+    return segment_frame(
+        frame=frame,
+        threshold=threshold,
+        min_perimeter=min_perimeter,
+        max_perimeter=max_perimeter,
+        padding=padding,
+        roi_encoding=roi_encoding,
+        zstd_min_bytes=zstd_min_bytes,
+    )
+
+
 def segment_frame(
     frame: FrameData,
     *,
     threshold: int | float | ThresholdFn | None = None,
-    min_perimeter: int | float = 0,
+    min_perimeter: int | float | None = None,
     max_perimeter: int | float | None = None,
-    padding: int = 0,
-    roi_encoding: str | None = "zstd",
-    zstd_min_bytes: int = 1024,
+    padding: int | None = None,
+    roi_encoding: str | None = None,
+    zstd_min_bytes: int | None = None,
 ) -> list[DetectionRecord]:
     """Segment one frame into connected-component ROI detection records."""
+    defaults = default_processing_config().segmentation
+    resolved_min_perimeter = defaults.min_perimeter if min_perimeter is None else min_perimeter
+    resolved_max_perimeter = defaults.max_perimeter if max_perimeter is None else max_perimeter
+    resolved_padding = defaults.padding if padding is None else padding
+    resolved_roi_encoding = defaults.roi_encoding if roi_encoding is None else roi_encoding
+    resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
+
     gray = _as_grayscale_array(frame)
     thresh = threshold(gray) if callable(threshold) else calc_threshold(gray, threshold)
     thresh = _as_binary_mask(thresh)
@@ -217,9 +259,9 @@ def segment_frame(
     for lab in range(1, num):
         x, y, width, height, area = stats[lab]
         bbox_perimeter = 2 * int(width) + 2 * int(height)
-        if bbox_perimeter < min_perimeter:
+        if bbox_perimeter < resolved_min_perimeter:
             continue
-        if max_perimeter is not None and bbox_perimeter > max_perimeter:
+        if resolved_max_perimeter is not None and bbox_perimeter > resolved_max_perimeter:
             continue
 
         roi_labels = labels[y : y + height, x : x + width]
@@ -233,7 +275,7 @@ def segment_frame(
             int(y),
             int(width),
             int(height),
-            padding,
+            resolved_padding,
             frame_width,
             frame_height,
         )
@@ -278,7 +320,7 @@ def segment_frame(
                     int(crop_x1 - crop_x0),
                     int(crop_y1 - crop_y0),
                 ),
-                "padding": int(padding),
+                "padding": int(resolved_padding),
                 "actual_padding": {
                     "left": int(x) - crop_x0,
                     "top": int(y) - crop_y0,
@@ -287,7 +329,7 @@ def segment_frame(
                 },
             },
         )
-
+        
         roi_records.append(
             store_roi(
                 roi_frame,
@@ -295,8 +337,8 @@ def segment_frame(
                 roi_index=len(roi_records) + 1,
                 contour=contour,
                 area=float(area),
-                encoding=roi_encoding,
-                zstd_min_bytes=zstd_min_bytes,
+                encoding=resolved_roi_encoding,
+                zstd_min_bytes=resolved_zstd_min_bytes,
                 extra_metadata=roi_frame.metadata,
             )
         )

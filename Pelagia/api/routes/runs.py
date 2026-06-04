@@ -9,6 +9,9 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ._common import as_response, get_repository
 
+    def _bounded_limit(limit: int | None) -> int:
+        return min(max(1, 100 if limit is None else limit), 1000)
+
     router = APIRouter(prefix="/runs", tags=["runs"])
 
     @router.get("")
@@ -75,8 +78,21 @@ if APIRouter is not None:
         }
 
     @router.get("/{run_id}/jobs")
-    def list_run_jobs(request: Request, run_id: str, limit: int = 100) -> dict[str, list]:
-        return {"jobs": as_response(get_repository(request).list_jobs(run_id=run_id, limit=limit))}
+    def list_run_jobs(
+        request: Request,
+        run_id: str,
+        limit: int = 100,
+        include_details: bool = False,
+    ) -> dict[str, list]:
+        return {
+            "jobs": as_response(
+                get_repository(request).list_jobs(
+                    run_id=run_id,
+                    limit=_bounded_limit(limit),
+                    include_details=include_details,
+                )
+            )
+        }
 
     @router.post("/{run_id}/cancel")
     def cancel_run(request: Request, run_id: str) -> dict:

@@ -385,7 +385,7 @@ class KVStore:
             "checked_at": _utc_now(),
         }
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, deep: bool = True) -> dict[str, Any]:
         """Return counts, byte totals, rotation settings, and paths for the store."""
         if not self.initialized or self.config is None:
             return {
@@ -396,6 +396,7 @@ class KVStore:
             }
 
         total_sqlite_files = 0
+        total_sqlite_file_bytes = 0
         total_blobs = 0
         total_payload_bytes = 0
         largest_sqlite_file_size = 0
@@ -405,28 +406,34 @@ class KVStore:
             for db_path in self._sqlite_files_for_prefix(prefix):
                 total_sqlite_files += 1
                 file_size = self._db_file_size(db_path)
-                row_count = self._db_row_count(db_path)
-                total_blobs += row_count
-                total_payload_bytes += self._db_payload_bytes(db_path)
+                total_sqlite_file_bytes += file_size
+                if deep:
+                    row_count = self._db_row_count(db_path)
+                    total_blobs += row_count
+                    total_payload_bytes += self._db_payload_bytes(db_path)
+                    largest_sqlite_row_count = max(largest_sqlite_row_count, row_count)
                 largest_sqlite_file_size = max(largest_sqlite_file_size, file_size)
-                largest_sqlite_row_count = max(largest_sqlite_row_count, row_count)
 
         prefix_length = int(self.config["prefix_length"])
-        return {
+        status = {
             "root_path": str(self.root_path),
             "initialized": True,
             "hash_algorithm": self.config["hash_algorithm"],
             "prefix_length": prefix_length,
             "prefix_directory_count": 16**prefix_length,
             "total_sqlite_files": total_sqlite_files,
-            "total_stored_blobs": total_blobs,
-            "total_stored_payload_bytes": total_payload_bytes,
+            "total_sqlite_file_bytes": total_sqlite_file_bytes,
             "rotation": dict(self.config["rotation"]),
             "largest_sqlite_file_size": largest_sqlite_file_size,
-            "largest_sqlite_row_count": largest_sqlite_row_count,
             "config_path": str(self.config_path),
             "manifest_path": str(self.root_path / self._manifest_filename()),
+            "deep": deep,
         }
+        if deep:
+            status["total_stored_blobs"] = total_blobs
+            status["total_stored_payload_bytes"] = total_payload_bytes
+            status["largest_sqlite_row_count"] = largest_sqlite_row_count
+        return status
 
     def _load_config(self) -> dict[str, Any]:
         try:
