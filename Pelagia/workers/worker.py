@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from threading import Event
 
 from ..domain import PipelineStage
+from ..observability import get_core_logger
 from ..services.context import AppContext
 from .handlers import HandlerRegistry
 
@@ -61,10 +62,62 @@ class Worker:
         jobs = self.context.repository.claim_jobs(self.worker_id, stages=stages)
         for job in jobs:
             self._touch("working", stages=stages, leased_job_id=str(job["id"]))
+            started = time.perf_counter()
+            job_id = str(job["id"])
+            stage = job.get("stage")
+            run_id = None if job.get("run_id") is None else str(job.get("run_id"))
+            asset_id = None if job.get("asset_id") is None else str(job.get("asset_id"))
+            if self.context.logger is not None:
+                self.context.logger.debug(
+                    "job.handler_started",
+                    "Worker started job handler",
+                    job_id=job_id,
+                    run_id=run_id,
+                    asset_id=asset_id,
+                    worker_id=self.worker_id,
+                    payload={"stage": stage},
+                )
             try:
                 result = self.handlers.handle(job, self.context)
                 self.context.repository.complete_job(job["id"], result=result)
+                duration_ms = (time.perf_counter() - started) * 1000
+                if self.context.logger is not None:
+                    self.context.logger.info(
+                        "job.handler_completed",
+                        "Worker completed job handler",
+                        job_id=job_id,
+                        run_id=run_id,
+                        asset_id=asset_id,
+                        worker_id=self.worker_id,
+                        duration_ms=duration_ms,
+                        payload={
+                            "stage": stage,
+                            "result_keys": sorted((result or {}).keys()),
+                        },
+                    )
             except Exception as exc:
+                duration_ms = (time.perf_counter() - started) * 1000
+                get_core_logger("worker").exception(
+                    "Worker %s failed job %s stage=%s",
+                    self.worker_id,
+                    job_id,
+                    stage,
+                )
+                if self.context.logger is not None:
+                    self.context.logger.error(
+                        "job.handler_failed",
+                        "Worker failed job handler",
+                        job_id=job_id,
+                        run_id=run_id,
+                        asset_id=asset_id,
+                        worker_id=self.worker_id,
+                        duration_ms=duration_ms,
+                        payload={
+                            "stage": stage,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        },
+                    )
                 self.context.repository.record_failure(job["id"], str(exc), retryable=True)
             finally:
                 self._touch("idle", stages=stages)

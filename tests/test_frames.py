@@ -91,6 +91,15 @@ class FakeContext:
         self.config = CoreConfig()
 
 
+class FakeDatabaseLogger:
+    def __init__(self):
+        self.events = []
+
+    def log(self, **kwargs):
+        self.events.append(kwargs)
+        return {"id": len(self.events), **kwargs}
+
+
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [
@@ -583,6 +592,60 @@ def test_ingest_video_file_timestamps_frames_from_filename_and_fps(monkeypatch):
     assert first_metadata["source_timestamp_utc"] == "2025-11-10T02:21:32.482000+00:00"
     assert first_metadata["fps"] == 20.0
     assert first_metadata["frame_interval_seconds"] == 0.05
+
+
+def test_ingest_video_file_writes_structured_log_events(monkeypatch):
+    class FakeVideoCapture:
+        def __init__(self, path):
+            self.frames = [
+                np.zeros((2, 2), dtype=np.uint8),
+                np.ones((2, 2), dtype=np.uint8),
+            ]
+            self.index = 0
+
+        def isOpened(self):
+            return self.index <= len(self.frames)
+
+        def get(self, prop):
+            return 20.0 if prop == video_ingest_module.cv2.CAP_PROP_FPS else 0.0
+
+        def read(self):
+            if self.index >= len(self.frames):
+                return False, None
+            frame = self.frames[self.index]
+            self.index += 1
+            return True, frame
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(video_ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    ctx = FakeContext()
+    ctx.logger = FakeDatabaseLogger()
+
+    ingest_video_file(
+        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        n_tile=2,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata={"kvstore_encoding": "raw"},
+        flatfield_correction=False,
+    )
+
+    event_types = [event["event_type"] for event in ctx.logger.events]
+    assert event_types == [
+        "video_ingest.started",
+        "video_ingest.video_opened",
+        "video_ingest.tile_stored",
+        "video_ingest.completed",
+    ]
+    completed = ctx.logger.events[-1]
+    assert completed["duration_ms"] >= 0
+    assert completed["run_id"] == "00000000-0000-0000-0000-000000000001"
+    assert completed["asset_id"] == "00000000-0000-0000-0000-000000000002"
+    assert completed["payload"]["source_frame_count"] == 2
+    assert completed["payload"]["stored_tile_count"] == 1
 
 
 def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):

@@ -25,6 +25,7 @@ class FakeRepository:
         self.registered_runs = []
         self.shutdown_requests = []
         self.priority_updates = []
+        self.logs = []
 
     def list_runs(self, **kwargs):
         return [{"id": "run-1", **kwargs}]
@@ -154,6 +155,14 @@ class FakeRepository:
 
     def list_job_events(self, **kwargs):
         return [{"id": 1, "event_type": "job.created", **kwargs}]
+
+    def list_logs(self, **kwargs):
+        return [{"id": 1, "event_type": "job.created", "level": kwargs.get("level") or "info", **kwargs}]
+
+    def append_log(self, **kwargs):
+        row = {"id": len(self.logs) + 1, **kwargs}
+        self.logs.append(row)
+        return row
 
     def pause_job(self, job_id, reason=None):
         return {"id": job_id, "status": "paused", "reason": reason}
@@ -340,6 +349,29 @@ def test_api_lists_jobs_with_details_when_requested():
     assert job["include_details"] is True
     assert job["payload"]["frame_ids"] == ["frame-1"]
     assert job["result"]["detection_ids"] == ["det-1"]
+
+
+def test_api_can_create_and_list_structured_logs():
+    client, repository, _ = make_client()
+
+    create_response = client.post(
+        "/logs",
+        json={
+            "event_type": "ui.status_loaded",
+            "message": "Status page loaded",
+            "level": "info",
+            "duration_ms": 12.5,
+            "payload": {"route": "/status"},
+        },
+    )
+    list_response = client.get("/logs?level=warning&limit=5")
+
+    assert create_response.status_code == 200
+    assert create_response.json()["log"]["event_type"] == "ui.status_loaded"
+    assert repository.logs[0]["duration_ms"] == 12.5
+    assert list_response.status_code == 200
+    assert list_response.json()["logs"][0]["level"] == "warning"
+    assert list_response.json()["logs"][0]["limit"] == 5
 
 
 def test_api_can_queue_segmentation_job():

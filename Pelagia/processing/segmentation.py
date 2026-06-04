@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 
 from ..domain import DetectionRecord, normalize_collections
+from ._logging import log_processing_event, processing_core_logger
 from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 
 
 ThresholdFn = Callable[[np.ndarray], np.ndarray]
+_CORE_LOGGER = processing_core_logger("segmentation")
 
 
 def _frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
@@ -218,16 +221,62 @@ def live_segment_wrapper(
     """Load one frame, segment it, and return transient detection records."""
     from .frame_store import retrieve_frame
 
-    frame = retrieve_frame(frame_id, context=context)
-    return segment_frame(
-        frame=frame,
-        threshold=threshold,
-        min_perimeter=min_perimeter,
-        max_perimeter=max_perimeter,
-        padding=padding,
-        roi_encoding=roi_encoding,
-        zstd_min_bytes=zstd_min_bytes,
+    started = time.perf_counter()
+    log_processing_event(
+        context,
+        "debug",
+        "segmentation.live_started",
+        "Live frame segmentation started",
+        payload={"frame_id": frame_id},
+        logger="pelagia.processing.segmentation",
+        core_logger=_CORE_LOGGER,
     )
+    frame = retrieve_frame(frame_id, context=context)
+    try:
+        detections = segment_frame(
+            frame=frame,
+            threshold=threshold,
+            min_perimeter=min_perimeter,
+            max_perimeter=max_perimeter,
+            padding=padding,
+            roi_encoding=roi_encoding,
+            zstd_min_bytes=zstd_min_bytes,
+            context=context,
+        )
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - started) * 1000
+        _CORE_LOGGER.exception("Live frame segmentation failed frame_id=%s", frame_id)
+        log_processing_event(
+            context,
+            "error",
+            "segmentation.live_failed",
+            "Live frame segmentation failed",
+            run_id=_frame_metadata_value(frame, "run_id"),
+            asset_id=_frame_metadata_value(frame, "asset_id"),
+            duration_ms=duration_ms,
+            payload={
+                "frame_id": frame_id,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+            logger="pelagia.processing.segmentation",
+            core_logger=_CORE_LOGGER,
+        )
+        raise
+    duration_ms = (time.perf_counter() - started) * 1000
+    log_processing_event(
+        context,
+        "info",
+        "segmentation.live_completed",
+        "Live frame segmentation completed",
+        run_id=_frame_metadata_value(frame, "run_id"),
+        asset_id=_frame_metadata_value(frame, "asset_id"),
+        duration_ms=duration_ms,
+        payload={"frame_id": frame_id, "detection_count": len(detections)},
+        logger="pelagia.processing.segmentation",
+        core_logger=_CORE_LOGGER,
+    )
+    return detections
 
 
 def segment_frame(
@@ -239,8 +288,10 @@ def segment_frame(
     padding: int | None = None,
     roi_encoding: str | None = None,
     zstd_min_bytes: int | None = None,
+    context: Any = None,
 ) -> list[DetectionRecord]:
     """Segment one frame into connected-component ROI detection records."""
+    started = time.perf_counter()
     defaults = default_processing_config().segmentation
     resolved_min_perimeter = defaults.min_perimeter if min_perimeter is None else min_perimeter
     resolved_max_perimeter = defaults.max_perimeter if max_perimeter is None else max_perimeter
@@ -248,99 +299,170 @@ def segment_frame(
     resolved_roi_encoding = defaults.roi_encoding if roi_encoding is None else roi_encoding
     resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
 
-    gray = _as_grayscale_array(frame)
-    thresh = threshold(gray) if callable(threshold) else calc_threshold(gray, threshold)
-    thresh = _as_binary_mask(thresh)
+    frame_id = _frame_metadata_value(frame, "frame_id")
+    run_id = _frame_metadata_value(frame, "run_id")
+    asset_id = _frame_metadata_value(frame, "asset_id")
+    payload_base = {
+        "frame_id": frame_id,
+        "filename": frame.filename,
+        "frame_number": frame.frameNumber,
+        "tile_number": frame.tileNumber,
+        "min_perimeter": resolved_min_perimeter,
+        "max_perimeter": resolved_max_perimeter,
+        "padding": resolved_padding,
+        "roi_encoding": resolved_roi_encoding,
+    }
+    log_processing_event(
+        context,
+        "debug",
+        "segmentation.frame_started",
+        "Frame segmentation started",
+        run_id=run_id,
+        asset_id=asset_id,
+        payload=payload_base,
+        logger="pelagia.processing.segmentation",
+        core_logger=_CORE_LOGGER,
+    )
+    try:
+        gray = _as_grayscale_array(frame)
+        thresh = threshold(gray) if callable(threshold) else calc_threshold(gray, threshold)
+        thresh = _as_binary_mask(thresh)
 
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
-    roi_records: list[DetectionRecord] = []
-    frame_height, frame_width = gray.shape[:2]
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+        roi_records: list[DetectionRecord] = []
+        frame_height, frame_width = gray.shape[:2]
 
-    for lab in range(1, num):
-        x, y, width, height, area = stats[lab]
-        bbox_perimeter = 2 * int(width) + 2 * int(height)
-        if bbox_perimeter < resolved_min_perimeter:
-            continue
-        if resolved_max_perimeter is not None and bbox_perimeter > resolved_max_perimeter:
-            continue
+        for lab in range(1, num):
+            x, y, width, height, area = stats[lab]
+            bbox_perimeter = 2 * int(width) + 2 * int(height)
+            if bbox_perimeter < resolved_min_perimeter:
+                continue
+            if resolved_max_perimeter is not None and bbox_perimeter > resolved_max_perimeter:
+                continue
 
-        roi_labels = labels[y : y + height, x : x + width]
-        component = np.ascontiguousarray((roi_labels == lab).astype(np.uint8) * 255)
-        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
+            roi_labels = labels[y : y + height, x : x + width]
+            component = np.ascontiguousarray((roi_labels == lab).astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
 
-        crop_x0, crop_y0, crop_x1, crop_y1 = _padded_bounds(
-            int(x),
-            int(y),
-            int(width),
-            int(height),
-            resolved_padding,
-            frame_width,
-            frame_height,
-        )
-        padded_labels = labels[crop_y0:crop_y1, crop_x0:crop_x1]
-        padded_mask = np.ascontiguousarray((padded_labels == lab).astype(np.uint8) * 255)
-        padded_crop = np.ascontiguousarray(gray[crop_y0:crop_y1, crop_x0:crop_x1])
-
-        contour = max(contours, key=cv2.contourArea)
-        contour = contour.copy()
-        contour[:, 0, 0] += int(x) + frame.bbox_x
-        contour[:, 0, 1] += int(y) + frame.bbox_y
-
-        roi_frame = FrameData(
-            sourcePath=frame.sourcePath,
-            filename=frame.filename,
-            frameNumber=frame.frameNumber,
-            data=padded_crop,
-            mask=padded_mask,
-            width=int(crop_x1 - crop_x0),
-            height=int(crop_y1 - crop_y0),
-            bbox_x=frame.bbox_x + crop_x0,
-            bbox_y=frame.bbox_y + crop_y0,
-            parent_frame_id=_frame_metadata_value(frame, "frame_id"),
-            tileNumber=frame.tileNumber,
-            sourceFrameStart=frame.sourceFrameStart,
-            sourceFrameEnd=frame.sourceFrameEnd,
-            frameType="roi",
-            channel=frame.channel,
-            timestamp=frame.timestamp,
-            metadata={
-                "source_frame_type": frame.frameType,
-                "component_label": int(lab),
-                "object_bbox": (
-                    frame.bbox_x + int(x),
-                    frame.bbox_y + int(y),
-                    int(width),
-                    int(height),
-                ),
-                "roi_bbox": (
-                    frame.bbox_x + crop_x0,
-                    frame.bbox_y + crop_y0,
-                    int(crop_x1 - crop_x0),
-                    int(crop_y1 - crop_y0),
-                ),
-                "padding": int(resolved_padding),
-                "actual_padding": {
-                    "left": int(x) - crop_x0,
-                    "top": int(y) - crop_y0,
-                    "right": crop_x1 - (int(x) + int(width)),
-                    "bottom": crop_y1 - (int(y) + int(height)),
-                },
-            },
-        )
-        
-        roi_records.append(
-            store_roi(
-                roi_frame,
-                source_frame=frame,
-                roi_index=len(roi_records) + 1,
-                contour=contour,
-                area=float(area),
-                encoding=resolved_roi_encoding,
-                zstd_min_bytes=resolved_zstd_min_bytes,
-                extra_metadata=roi_frame.metadata,
+            crop_x0, crop_y0, crop_x1, crop_y1 = _padded_bounds(
+                int(x),
+                int(y),
+                int(width),
+                int(height),
+                resolved_padding,
+                frame_width,
+                frame_height,
             )
-        )
+            padded_labels = labels[crop_y0:crop_y1, crop_x0:crop_x1]
+            padded_mask = np.ascontiguousarray((padded_labels == lab).astype(np.uint8) * 255)
+            padded_crop = np.ascontiguousarray(gray[crop_y0:crop_y1, crop_x0:crop_x1])
 
+            contour = max(contours, key=cv2.contourArea)
+            contour = contour.copy()
+            contour[:, 0, 0] += int(x) + frame.bbox_x
+            contour[:, 0, 1] += int(y) + frame.bbox_y
+
+            roi_frame = FrameData(
+                sourcePath=frame.sourcePath,
+                filename=frame.filename,
+                frameNumber=frame.frameNumber,
+                data=padded_crop,
+                mask=padded_mask,
+                width=int(crop_x1 - crop_x0),
+                height=int(crop_y1 - crop_y0),
+                bbox_x=frame.bbox_x + crop_x0,
+                bbox_y=frame.bbox_y + crop_y0,
+                parent_frame_id=_frame_metadata_value(frame, "frame_id"),
+                tileNumber=frame.tileNumber,
+                sourceFrameStart=frame.sourceFrameStart,
+                sourceFrameEnd=frame.sourceFrameEnd,
+                frameType="roi",
+                channel=frame.channel,
+                timestamp=frame.timestamp,
+                metadata={
+                    "source_frame_type": frame.frameType,
+                    "component_label": int(lab),
+                    "object_bbox": (
+                        frame.bbox_x + int(x),
+                        frame.bbox_y + int(y),
+                        int(width),
+                        int(height),
+                    ),
+                    "roi_bbox": (
+                        frame.bbox_x + crop_x0,
+                        frame.bbox_y + crop_y0,
+                        int(crop_x1 - crop_x0),
+                        int(crop_y1 - crop_y0),
+                    ),
+                    "padding": int(resolved_padding),
+                    "actual_padding": {
+                        "left": int(x) - crop_x0,
+                        "top": int(y) - crop_y0,
+                        "right": crop_x1 - (int(x) + int(width)),
+                        "bottom": crop_y1 - (int(y) + int(height)),
+                    },
+                },
+            )
+
+            roi_records.append(
+                store_roi(
+                    roi_frame,
+                    source_frame=frame,
+                    roi_index=len(roi_records) + 1,
+                    contour=contour,
+                    area=float(area),
+                    encoding=resolved_roi_encoding,
+                    zstd_min_bytes=resolved_zstd_min_bytes,
+                    extra_metadata=roi_frame.metadata,
+                )
+            )
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - started) * 1000
+        _CORE_LOGGER.exception("Frame segmentation failed frame_id=%s run_id=%s asset_id=%s", frame_id, run_id, asset_id)
+        log_processing_event(
+            context,
+            "error",
+            "segmentation.frame_failed",
+            "Frame segmentation failed",
+            run_id=run_id,
+            asset_id=asset_id,
+            duration_ms=duration_ms,
+            payload={
+                **payload_base,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+            logger="pelagia.processing.segmentation",
+            core_logger=_CORE_LOGGER,
+        )
+        raise
+
+    duration_ms = (time.perf_counter() - started) * 1000
+    _CORE_LOGGER.debug(
+        "Segmented frame frame_id=%s run_id=%s asset_id=%s detections=%s duration_ms=%.2f",
+        frame_id,
+        run_id,
+        asset_id,
+        len(roi_records),
+        duration_ms,
+    )
+    log_processing_event(
+        context,
+        "info",
+        "segmentation.frame_completed",
+        "Frame segmentation completed",
+        run_id=run_id,
+        asset_id=asset_id,
+        duration_ms=duration_ms,
+        payload={
+            **payload_base,
+            "source_component_count": max(0, num - 1),
+            "detection_count": len(roi_records),
+            "frame_shape": list(gray.shape),
+        },
+        logger="pelagia.processing.segmentation",
+        core_logger=_CORE_LOGGER,
+    )
     return roi_records

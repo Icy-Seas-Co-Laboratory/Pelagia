@@ -5,11 +5,14 @@ import hashlib
 import shutil
 import sys
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import numpy as np
+
+from ._logging import log_processing_event, processing_core_logger
 
 # Keras 3 uses `keras` top-level; works with TF-Keras as well
 try:
@@ -19,6 +22,9 @@ except ImportError:
     from tensorflow import keras  # type: ignore
 
 import tensorflow as tf  # tf is still needed for SavedModel/TFLite bits
+
+
+_CORE_LOGGER = processing_core_logger("model_archive")
 
 
 def _sha256(path: Union[str, Path]) -> str:
@@ -91,6 +97,7 @@ def archive_keras_model(
     sample_input: Optional[np.ndarray] = None,
     include_onnx: bool = False,
     include_tflite: bool = False,
+    context: Any = None,
 ) -> Path:
     """
     Load a .keras model and archive it into multiple formats + metadata for long-term reuse.
@@ -115,8 +122,37 @@ def archive_keras_model(
     Path
         The path to the archive output directory.
     """
+    started = time.perf_counter()
     model_path = Path(model_path).expanduser().resolve()
+    payload_base = {
+        "model_path": str(model_path),
+        "include_onnx": include_onnx,
+        "include_tflite": include_tflite,
+        "has_sample_input": sample_input is not None,
+        "has_custom_objects": bool(custom_objects),
+    }
+    _CORE_LOGGER.info("Starting Keras model archive for %s", model_path)
+    log_processing_event(
+        context,
+        "info",
+        "model_archive.started",
+        "Model archive started",
+        payload=payload_base,
+        logger="pelagia.processing.model_archive",
+        core_logger=_CORE_LOGGER,
+    )
     if not model_path.exists():
+        _CORE_LOGGER.error("Model archive source was not found: %s", model_path)
+        log_processing_event(
+            context,
+            "error",
+            "model_archive.missing_source",
+            "Model archive source was not found",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            payload=payload_base,
+            logger="pelagia.processing.model_archive",
+            core_logger=_CORE_LOGGER,
+        )
         raise FileNotFoundError(model_path)
 
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -155,6 +191,17 @@ def archive_keras_model(
         status["loaded"] = False
         status["error"] = f"Failed to load model: {e!r}"
         _write_json(Path(out_dir) / "status.json", status)
+        _CORE_LOGGER.exception("Failed to load model for archive: %s", model_path)
+        log_processing_event(
+            context,
+            "error",
+            "model_archive.load_failed",
+            "Model archive failed while loading model",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            payload={**payload_base, "out_dir": str(out_dir), "error_type": type(e).__name__, "error_message": str(e)},
+            logger="pelagia.processing.model_archive",
+            core_logger=_CORE_LOGGER,
+        )
         raise
 
     # Save model summary
@@ -335,6 +382,35 @@ Created: {timestamp} (UTC)
     # Final status dump
     _write_json(Path(out_dir) / "status.json", status)
 
+    duration_ms = (time.perf_counter() - started) * 1000
+    failed_exports = [
+        name
+        for name, details in status.get("exports", {}).items()
+        if isinstance(details, dict) and "error" in details
+    ]
+    _CORE_LOGGER.info(
+        "Completed Keras model archive for %s out_dir=%s failed_exports=%s duration_ms=%.2f",
+        model_path,
+        out_dir,
+        failed_exports,
+        duration_ms,
+    )
+    log_processing_event(
+        context,
+        "info" if not failed_exports else "warning",
+        "model_archive.completed",
+        "Model archive completed",
+        duration_ms=duration_ms,
+        payload={
+            **payload_base,
+            "out_dir": str(out_dir),
+            "failed_exports": failed_exports,
+            "export_names": sorted(status.get("exports", {}).keys()),
+            "sanity_report": status.get("sanity_report", {}),
+        },
+        logger="pelagia.processing.model_archive",
+        core_logger=_CORE_LOGGER,
+    )
     return Path(out_dir)
 
 

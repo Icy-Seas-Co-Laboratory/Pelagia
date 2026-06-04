@@ -32,6 +32,29 @@ def _require_psycopg() -> None:
         raise RuntimeError("psycopg is required for PostgreSQL operations. Install seasight_core[postgres].")
 
 
+def _event_level(event_type: str) -> str:
+    lowered = event_type.lower()
+    if any(token in lowered for token in ("failed", "error", "dead_lettered")):
+        return "error"
+    if any(token in lowered for token in ("retry", "requeued", "paused", "shutdown")):
+        return "warning"
+    if any(token in lowered for token in ("heartbeat", "touched", "progress")):
+        return "debug"
+    return "info"
+
+
+def _event_message(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type.startswith("job."):
+        stage = payload.get("stage")
+        suffix = f" for {stage}" if stage else ""
+        return f"Job event {event_type}{suffix}"
+    if event_type.startswith("worker."):
+        worker_id = payload.get("worker_id")
+        suffix = f" for {worker_id}" if worker_id else ""
+        return f"Worker event {event_type}{suffix}"
+    return event_type.replace(".", " ")
+
+
 class PostgresRepository:
     def __init__(self, config: CoreConfig):
         _require_psycopg()
@@ -91,6 +114,7 @@ class PostgresRepository:
             "processing_job_dependencies",
             "worker_sessions",
             "job_events",
+            "logs",
         ]
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -1171,6 +1195,79 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    def append_log(
+        self,
+        *,
+        event_type: str,
+        message: str | None = None,
+        level: str = "info",
+        logger: str = "pelagia",
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        request_id: str | None = None,
+        duration_ms: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                row = self._append_log(
+                    cursor,
+                    event_type=event_type,
+                    message=message,
+                    level=level,
+                    logger=logger,
+                    run_id=run_id,
+                    asset_id=asset_id,
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    request_id=request_id,
+                    duration_ms=duration_ms,
+                    payload=payload,
+                )
+            connection.commit()
+        return row
+
+    def _append_log(
+        self,
+        cursor,
+        *,
+        event_type: str,
+        message: str | None = None,
+        level: str = "info",
+        logger: str = "pelagia",
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        request_id: str | None = None,
+        duration_ms: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.logs
+            (level, logger, event_type, message, run_id, asset_id, job_id, worker_id, request_id, duration_ms, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING *;
+            """,
+            (
+                str(level).lower(),
+                logger,
+                event_type,
+                message,
+                run_id,
+                asset_id,
+                job_id,
+                worker_id,
+                request_id,
+                duration_ms,
+                json.dumps(json_ready(payload or {})),
+            ),
+        )
+        return cursor.fetchone()
+
     def _append_job_event(
         self,
         cursor,
@@ -1186,7 +1283,37 @@ class PostgresRepository:
             """,
             (job_id, event_type, json.dumps(json_ready(payload or {}))),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        log_payload = dict(payload or {})
+        run_id = log_payload.get("run_id")
+        asset_id = log_payload.get("asset_id")
+        worker_id = log_payload.get("worker_id")
+        if job_id is not None and (run_id is None or asset_id is None):
+            cursor.execute(
+                f"""
+                SELECT run_id, asset_id
+                FROM {self.schema}.processing_jobs
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            job_row = cursor.fetchone()
+            if job_row is not None:
+                run_id = run_id or job_row.get("run_id")
+                asset_id = asset_id or job_row.get("asset_id")
+        self._append_log(
+            cursor,
+            event_type=event_type,
+            message=_event_message(event_type, log_payload),
+            level=_event_level(event_type),
+            logger="pelagia.jobs",
+            run_id=run_id,
+            asset_id=asset_id,
+            job_id=job_id,
+            worker_id=worker_id,
+            payload=log_payload,
+        )
+        return row
 
     def _append_worker_event(
         self,
@@ -1231,6 +1358,69 @@ class PostgresRepository:
                     {joins}
                     {where}
                     ORDER BY events.id DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def list_logs(
+        self,
+        *,
+        after_id: int | None = None,
+        before_id: int | None = None,
+        level: str | None = None,
+        event_type: str | None = None,
+        logger: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+        request_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append("id > %s")
+            params.append(after_id)
+        if before_id is not None:
+            clauses.append("id < %s")
+            params.append(before_id)
+        if level:
+            clauses.append("level = %s")
+            params.append(str(level).lower())
+        if event_type:
+            clauses.append("event_type = %s")
+            params.append(event_type)
+        if logger:
+            clauses.append("logger = %s")
+            params.append(logger)
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        if asset_id:
+            clauses.append("asset_id = %s")
+            params.append(asset_id)
+        if job_id:
+            clauses.append("job_id = %s")
+            params.append(job_id)
+        if worker_id:
+            clauses.append("worker_id = %s")
+            params.append(worker_id)
+        if request_id:
+            clauses.append("request_id = %s")
+            params.append(request_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.logs
+                    {where}
+                    ORDER BY id DESC
                     LIMIT %s
                     """,
                     tuple(params),

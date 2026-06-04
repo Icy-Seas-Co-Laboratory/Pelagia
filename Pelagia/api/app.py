@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from ..config import CoreConfig
+from ..observability import configure_core_logging
 from ..services.context import AppContext
-from .routes import assets, collections, detections, health, ingestion, jobs, kvstore, live, models, runs, segmentation, system, workers
+from .routes import assets, collections, detections, health, ingestion, jobs, kvstore, live, logs, models, runs, segmentation, system, workers
 
 
 def create_app(config: CoreConfig | None = None):
@@ -18,6 +19,8 @@ def create_app(config: CoreConfig | None = None):
         raise RuntimeError("Install FastAPI to run the Pelagia API.") from exc
 
     resolved_config = config or CoreConfig.load()
+    core_logger = configure_core_logging(resolved_config)
+    core_logger.info("Starting Pelagia API")
     app = FastAPI(title="Pelagia", version="0.0.1")
     app.add_middleware(
         CORSMiddleware,
@@ -41,6 +44,7 @@ def create_app(config: CoreConfig | None = None):
         collections,
         live,
         kvstore,
+        logs,
         models,
     ):
         if route_module.router is not None:

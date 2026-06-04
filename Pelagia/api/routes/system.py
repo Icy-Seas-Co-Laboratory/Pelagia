@@ -41,6 +41,14 @@ if APIRouter is not None:
                 "image_data_storage": {
                     "encoding": config.image_data_storage.encoding,
                 },
+                "logging": {
+                    "log_path": config.logging.log_path,
+                    "file_name": config.logging.file_name,
+                    "level": config.logging.level,
+                    "console": config.logging.console,
+                    "max_bytes": config.logging.max_bytes,
+                    "backup_count": config.logging.backup_count,
+                },
             }
         )
 
@@ -101,6 +109,12 @@ if APIRouter is not None:
             initialized["kvstore"] = True
         if context.repository is None and context.kvstore is None:
             raise HTTPException(status_code=503, detail="No system stores are configured.")
+        if context.logger is not None and initialized["postgres"]:
+            context.logger.info(
+                "system.initialized",
+                "Pelagia stores initialized",
+                payload=initialized,
+            )
         return initialized
 else:
     router = None

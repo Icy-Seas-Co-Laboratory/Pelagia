@@ -477,6 +477,22 @@ CREATE TABLE IF NOT EXISTS {schema}.job_events (
     created_at timestamptz NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS {schema}.logs (
+    id bigserial PRIMARY KEY,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    level text NOT NULL DEFAULT 'info',
+    logger text NOT NULL DEFAULT 'pelagia',
+    event_type text NOT NULL,
+    message text,
+    run_id uuid REFERENCES {schema}.runs(id) ON DELETE SET NULL,
+    asset_id uuid REFERENCES {schema}.raw_assets(id) ON DELETE SET NULL,
+    job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    worker_id text,
+    request_id text,
+    duration_ms double precision,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_run_id ON {schema}.raw_assets (run_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_assets USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
@@ -486,6 +502,13 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.proce
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dependencies_depends_on ON {schema}.processing_job_dependencies (depends_on_job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_event_type ON {schema}.logs (event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_level ON {schema}.logs (level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_run_id ON {schema}.logs (run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_job_id ON {schema}.logs (job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_worker_id ON {schema}.logs (worker_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_request_id ON {schema}.logs (request_id, created_at DESC);
 
 DROP TRIGGER IF EXISTS trg_runs_updated_at ON {schema}.runs;
 CREATE TRIGGER trg_runs_updated_at

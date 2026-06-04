@@ -193,6 +193,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
                 padding=padding,
                 roi_encoding=payload.get("roi_encoding", segment_defaults.roi_encoding),
                 zstd_min_bytes=zstd_min_bytes,
+                context=context,
             )
         )
 

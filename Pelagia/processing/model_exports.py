@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union, Sequence
 import numpy as np
 import tensorflow as tf
+
+from ._logging import log_processing_event, processing_core_logger
 
 # Keras 3 uses `keras` top-level; fallback for older tf.keras
 try:
@@ -12,21 +15,64 @@ except ImportError:
     from tensorflow import keras  # type: ignore
 
 
-def keras_to_savedmodel(model_path: str, custom_objects=None) -> str:
+_CORE_LOGGER = processing_core_logger("model_exports")
+
+
+def keras_to_savedmodel(model_path: str, custom_objects=None, *, context: Any = None) -> str:
     """
     Load a .keras model and save a TensorFlow SavedModel right next to it
     (using the same base name). Returns the SavedModel directory path.
     """
+    started = time.perf_counter()
     model_path = Path(model_path).expanduser().resolve()
+    payload_base = {
+        "model_path": str(model_path),
+        "has_custom_objects": bool(custom_objects),
+    }
+    _CORE_LOGGER.info("Starting SavedModel export for %s", model_path)
+    log_processing_event(
+        context,
+        "info",
+        "model_export.savedmodel_started",
+        "SavedModel export started",
+        payload=payload_base,
+        logger="pelagia.processing.model_exports",
+        core_logger=_CORE_LOGGER,
+    )
     if not model_path.exists():
+        log_processing_event(
+            context,
+            "error",
+            "model_export.savedmodel_missing_source",
+            "SavedModel export source was not found",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            payload=payload_base,
+            logger="pelagia.processing.model_exports",
+            core_logger=_CORE_LOGGER,
+        )
         raise FileNotFoundError(f"No such file: {model_path}")
 
-    model = keras.models.load_model(
-        str(model_path), custom_objects=custom_objects)
+    try:
+        model = keras.models.load_model(
+            str(model_path), custom_objects=custom_objects)
 
-    out_dir = model_path.with_suffix("")  # strip .keras
-    savedmodel_dir = str(out_dir)
-    keras.models.save_model(model, savedmodel_dir)
+        out_dir = model_path.with_suffix("")  # strip .keras
+        savedmodel_dir = str(out_dir)
+        keras.models.save_model(model, savedmodel_dir)
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - started) * 1000
+        _CORE_LOGGER.exception("SavedModel export failed for %s", model_path)
+        log_processing_event(
+            context,
+            "error",
+            "model_export.savedmodel_failed",
+            "SavedModel export failed",
+            duration_ms=duration_ms,
+            payload={**payload_base, "error_type": type(exc).__name__, "error_message": str(exc)},
+            logger="pelagia.processing.model_exports",
+            core_logger=_CORE_LOGGER,
+        )
+        raise
 
     # Prefer Keras 3 export() if available; otherwise fallback
     #if hasattr(model, "export"):
@@ -34,6 +80,23 @@ def keras_to_savedmodel(model_path: str, custom_objects=None) -> str:
     #else:
     #    tf.saved_model.save(model, savedmodel_dir)
 
+    duration_ms = (time.perf_counter() - started) * 1000
+    _CORE_LOGGER.info(
+        "Completed SavedModel export for %s savedmodel_dir=%s duration_ms=%.2f",
+        model_path,
+        savedmodel_dir,
+        duration_ms,
+    )
+    log_processing_event(
+        context,
+        "info",
+        "model_export.savedmodel_completed",
+        "SavedModel export completed",
+        duration_ms=duration_ms,
+        payload={**payload_base, "savedmodel_dir": savedmodel_dir},
+        logger="pelagia.processing.model_exports",
+        core_logger=_CORE_LOGGER,
+    )
     return savedmodel_dir
 
 
@@ -176,6 +239,7 @@ def test_keras_to_savedmodel_parity(
     rtol: float = 1e-4,
     seed: int = 1234,
     warmup: bool = True,
+    context: Any = None,
 ) -> Dict[str, Any]:
     """
     Export a SavedModel next to a .keras file, reload it, and verify inference parity.
@@ -203,10 +267,46 @@ def test_keras_to_savedmodel_parity(
     dict
         A report with export path, per-trial results, and overall pass/fail.
     """
+    started = time.perf_counter()
     model_path = str(Path(model_path).expanduser().resolve())
-    # Load baseline Keras model
-    base_model = keras.models.load_model(
-        model_path, custom_objects=custom_objects)
+    payload_base = {
+        "model_path": model_path,
+        "trials": trials,
+        "atol": atol,
+        "rtol": rtol,
+        "seed": seed,
+        "warmup": warmup,
+        "has_sample_inputs": sample_inputs is not None,
+        "has_custom_objects": bool(custom_objects),
+    }
+    _CORE_LOGGER.info("Starting SavedModel parity test for %s", model_path)
+    log_processing_event(
+        context,
+        "info",
+        "model_export.parity_started",
+        "SavedModel parity test started",
+        payload=payload_base,
+        logger="pelagia.processing.model_exports",
+        core_logger=_CORE_LOGGER,
+    )
+    try:
+        # Load baseline Keras model
+        base_model = keras.models.load_model(
+            model_path, custom_objects=custom_objects)
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - started) * 1000
+        _CORE_LOGGER.exception("SavedModel parity test failed while loading baseline model %s", model_path)
+        log_processing_event(
+            context,
+            "error",
+            "model_export.parity_load_failed",
+            "SavedModel parity test failed while loading baseline model",
+            duration_ms=duration_ms,
+            payload={**payload_base, "error_type": type(exc).__name__, "error_message": str(exc)},
+            logger="pelagia.processing.model_exports",
+            core_logger=_CORE_LOGGER,
+        )
+        raise
 
     # Prepare inputs
     rng = np.random.default_rng(seed)
@@ -232,7 +332,7 @@ def test_keras_to_savedmodel_parity(
 
     # Export SavedModel
     savedmodel_dir = keras_to_savedmodel(
-        model_path, custom_objects=custom_objects)
+        model_path, custom_objects=custom_objects, context=context)
 
     # Load SavedModel for inference
     km, serving_fn = _load_savedmodel_for_inference(savedmodel_dir)
@@ -290,6 +390,24 @@ def test_keras_to_savedmodel_parity(
         "passed": overall_ok,
         "loader_used": "keras" if km is not None else "tf.saved_model.load",
     }
+    duration_ms = (time.perf_counter() - started) * 1000
+    _CORE_LOGGER.info(
+        "Completed SavedModel parity test for %s passed=%s trials=%s duration_ms=%.2f",
+        model_path,
+        overall_ok,
+        len(results),
+        duration_ms,
+    )
+    log_processing_event(
+        context,
+        "info" if overall_ok else "warning",
+        "model_export.parity_completed",
+        "SavedModel parity test completed",
+        duration_ms=duration_ms,
+        payload={**payload_base, "savedmodel_dir": savedmodel_dir, "passed": overall_ok, "results": results},
+        logger="pelagia.processing.model_exports",
+        core_logger=_CORE_LOGGER,
+    )
     return report
 
 

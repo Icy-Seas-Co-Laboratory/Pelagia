@@ -73,3 +73,13 @@ max_dim = 100
 # FastAPI development server defaults.
 host = "127.0.0.1"
 port = 8000
+
+[logging]
+# Core operational logs. This layer must work even when PostgreSQL is down.
+log_path = "./logs"
+file_name = "pelagia.log"
+# Options: DEBUG, INFO, WARNING, ERROR, CRITICAL.
+level = "INFO"
+console = true
+max_bytes = 10485760
+backup_count = 10

@@ -11,6 +11,7 @@ from typing import Optional
 
 from ..config import CoreConfig
 from ..domain import AssetKind, JobStatus, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
+from ..observability import configure_core_logging
 from ..services.context import AppContext
 from ..services.stores import StoreService
 from ..utils.serialization import json_ready
@@ -54,6 +55,7 @@ if typer is not None:
         initialize_schema: bool = False,
     ) -> AppContext:
         config = _config_from_options(kvstore_root, database_dsn, schema)
+        configure_core_logging(config)
         context = AppContext.from_config(config)
         if context.kvstore is not None and not context.kvstore.initialized:
             context.kvstore.initialize(
@@ -799,6 +801,7 @@ if typer is not None:
             config.database.dsn = database_dsn
         if schema is not None:
             config.database.schema_name = schema
+        configure_core_logging(config)
         context = AppContext.from_config(config)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to request worker shutdown.")

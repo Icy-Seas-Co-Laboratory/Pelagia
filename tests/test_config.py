@@ -1,6 +1,6 @@
 import pytest
 
-from Pelagia.config import CoreConfig, ImageDataStorageConfig
+from Pelagia.config import CoreConfig, ImageDataStorageConfig, LoggingConfig
 
 
 def test_image_data_storage_config_defaults_to_zstd():
@@ -24,6 +24,15 @@ def test_core_config_load_applies_image_data_storage_encoding_env(monkeypatch):
     assert config.image_data_storage.encoding == "zstd"
 
 
+def test_logging_config_defaults_to_core_file_logger():
+    config = LoggingConfig()
+
+    assert config.log_path.as_posix() == "logs"
+    assert config.file_name == "pelagia.log"
+    assert config.level == "INFO"
+    assert config.console is True
+
+
 def test_core_config_loads_packaged_defaults_without_local_config():
     config = CoreConfig.load(local_config_path=None, use_env=False)
 
@@ -42,6 +51,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.thresholding.thresholding_maximum_value == 255.0
     assert config.processing.frame_storage.image_encoding == "jpg"
     assert config.processing.thumbhash.max_dim == 100
+    assert config.logging.log_path.as_posix() == "logs"
+    assert config.logging.file_name == "pelagia.log"
+    assert config.logging.level == "INFO"
 
 
 def test_core_config_loads_explicit_toml_overrides(tmp_path):
@@ -122,6 +134,9 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_FRAME_MASK", "true")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_FRAME_MASK_PATH", "/tmp/env-mask.png")
     monkeypatch.setenv("PELAGIA_FRAME_STORAGE_IMAGE_ENCODING", "raw")
+    monkeypatch.setenv("PELAGIA_LOG_PATH", "/tmp/env-pelagia-logs")
+    monkeypatch.setenv("PELAGIA_LOG_LEVEL", "warning")
+    monkeypatch.setenv("PELAGIA_LOG_CONSOLE", "false")
 
     config = CoreConfig.load(config_path=config_path)
 
@@ -135,6 +150,9 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.processing.video_ingest.frame_mask_path == "/tmp/env-mask.png"
     assert config.processing.thresholding.thresholding_maximum_value == 170.0
     assert config.processing.frame_storage.image_encoding == "raw"
+    assert config.logging.log_path.as_posix() == "/tmp/env-pelagia-logs"
+    assert config.logging.level == "WARNING"
+    assert config.logging.console is False
 
 
 def test_core_config_uses_pelagia_config_env(monkeypatch, tmp_path):
@@ -143,6 +161,11 @@ def test_core_config_uses_pelagia_config_env(monkeypatch, tmp_path):
         """
         [api]
         port = 9001
+
+        [logging]
+        log_path = "/tmp/pelagia-logs"
+        level = "debug"
+        console = false
         """,
         encoding="utf-8",
     )
@@ -151,3 +174,6 @@ def test_core_config_uses_pelagia_config_env(monkeypatch, tmp_path):
     config = CoreConfig.load(use_env=False)
 
     assert config.api.port == 9001
+    assert config.logging.log_path.as_posix() == "/tmp/pelagia-logs"
+    assert config.logging.level == "DEBUG"
+    assert config.logging.console is False

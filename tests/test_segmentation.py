@@ -8,6 +8,20 @@ from Pelagia.processing.segmentation import calc_threshold, live_segment_wrapper
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
 
 
+class FakeDatabaseLogger:
+    def __init__(self):
+        self.events = []
+
+    def log(self, **kwargs):
+        self.events.append(kwargs)
+        return {"id": len(self.events), **kwargs}
+
+
+class FakeContext:
+    def __init__(self):
+        self.logger = FakeDatabaseLogger()
+
+
 def test_calc_threshold_caps_default_otsu_value_at_thresholding_maximum(monkeypatch):
     class FakeThresholdingConfig:
         thresholding_maximum_value = 100
@@ -97,6 +111,44 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     }
     decoded_mask = decode_array_payload(detection.mask_payload, mask_metadata)
     np.testing.assert_array_equal(decoded_mask, np.full((3, 4), 255, dtype=np.uint8))
+
+
+def test_segment_frame_writes_structured_log_events():
+    data = np.zeros((10, 10), dtype=np.uint8)
+    data[2:5, 3:7] = 50
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+            "frame_id": FRAME_ID,
+        },
+    )
+    context = FakeContext()
+
+    detections = segment_frame(
+        frame,
+        threshold=1,
+        min_perimeter=0,
+        padding=0,
+        roi_encoding="raw",
+        context=context,
+    )
+
+    assert len(detections) == 1
+    assert [event["event_type"] for event in context.logger.events] == [
+        "segmentation.frame_started",
+        "segmentation.frame_completed",
+    ]
+    completed = context.logger.events[-1]
+    assert completed["duration_ms"] >= 0
+    assert completed["run_id"] == "00000000-0000-0000-0000-000000000001"
+    assert completed["asset_id"] == "00000000-0000-0000-0000-000000000002"
+    assert completed["payload"]["detection_count"] == 1
+    assert completed["payload"]["source_component_count"] == 1
 
 
 def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):

@@ -32,6 +32,7 @@ def test_render_schema_loads_sql_resource():
     rendered = postgres.render_schema("pelagia_unit")
 
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frames" in rendered
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
     assert "payload_ref text" in rendered
     assert "{schema}" not in rendered
 
@@ -324,6 +325,11 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     events = postgres_repo.list_job_events(job_id=job_id)
     assert [event["event_type"] for event in events] == ["job.created"]
     assert events[0]["payload"]["stage"] == PipelineStage.EXTRACT_FRAMES.value
+    mirrored_logs = postgres_repo.list_logs(job_id=job_id, event_type="job.created")
+    assert len(mirrored_logs) == 1
+    assert mirrored_logs[0]["event_type"] == "job.created"
+    assert mirrored_logs[0]["level"] == "info"
+    assert mirrored_logs[0]["payload"]["stage"] == PipelineStage.EXTRACT_FRAMES.value
 
     claimed = postgres_repo.claim_jobs("pytest-worker", stages=[PipelineStage.EXTRACT_FRAMES], limit=1)
     assert len(claimed) == 1
@@ -358,6 +364,27 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         if event["payload"].get("worker_id") == "pytest-worker"
     ]
     assert "worker.touched" in [event["event_type"] for event in worker_events]
+
+    log_row = postgres_repo.append_log(
+        event_type="pipeline.extract_timed",
+        message="Extracted frames",
+        level="info",
+        logger="pelagia.tests",
+        run_id=run_id,
+        asset_id=asset_id,
+        job_id=job_id,
+        worker_id="pytest-worker",
+        duration_ms=42.5,
+        payload={"frame_count": 2},
+    )
+    assert log_row["event_type"] == "pipeline.extract_timed"
+    assert log_row["duration_ms"] == 42.5
+    logs = postgres_repo.list_logs(
+        run_id=run_id,
+        worker_id="pytest-worker",
+        event_type="pipeline.extract_timed",
+    )
+    assert logs[0]["payload"] == {"frame_count": 2}
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
 
 

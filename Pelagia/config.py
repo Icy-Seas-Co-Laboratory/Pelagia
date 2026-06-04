@@ -76,6 +76,18 @@ class APIConfig:
 
 
 @dataclass(slots=True)
+class LoggingConfig:
+    """Operational file logging settings."""
+
+    log_path: Path = Path("./logs")
+    file_name: str = "pelagia.log"
+    level: str = "INFO"
+    console: bool = True
+    max_bytes: int = 10 * 1024 * 1024
+    backup_count: int = 10
+
+
+@dataclass(slots=True)
 class SegmentationProcessingConfig:
     """Default ROI segmentation parameters."""
 
@@ -149,6 +161,7 @@ class CoreConfig:
     kvstore: KVStoreConfig = field(default_factory=KVStoreConfig)
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
 
     @classmethod
@@ -265,6 +278,13 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "api", "host", "PELAGIA_API_HOST")
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
 
+    _set_from_env(settings, "logging", "log_path", "PELAGIA_LOG_PATH", Path)
+    _set_from_env(settings, "logging", "file_name", "PELAGIA_LOG_FILE")
+    _set_from_env(settings, "logging", "level", "PELAGIA_LOG_LEVEL")
+    _set_from_env(settings, "logging", "console", "PELAGIA_LOG_CONSOLE", _env_bool)
+    _set_from_env(settings, "logging", "max_bytes", "PELAGIA_LOG_MAX_BYTES", int)
+    _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
+
     _set_from_env(settings, "processing.segmentation", "min_perimeter", "PELAGIA_SEGMENTATION_MIN_PERIMETER", float)
     _set_from_env(settings, "processing.segmentation", "max_perimeter", "PELAGIA_SEGMENTATION_MAX_PERIMETER", float)
     _set_from_env(settings, "processing.segmentation", "padding", "PELAGIA_SEGMENTATION_PADDING", int)
@@ -309,6 +329,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     kvstore = _section(settings, "kvstore")
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
+    logging = _section(settings, "logging")
     segmentation = _section(settings, "processing.segmentation")
     video_ingest = _section(settings, "processing.video_ingest")
     thresholding = _section(settings, "processing.thresholding")
@@ -344,6 +365,14 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         api=APIConfig(
             host=str(api.get("host", APIConfig.host)),
             port=int(api.get("port", APIConfig.port)),
+        ),
+        logging=LoggingConfig(
+            log_path=Path(logging.get("log_path", LoggingConfig.log_path)),
+            file_name=str(logging.get("file_name", LoggingConfig.file_name)),
+            level=str(logging.get("level", LoggingConfig.level)).upper(),
+            console=bool(logging.get("console", LoggingConfig.console)),
+            max_bytes=int(logging.get("max_bytes", LoggingConfig.max_bytes)),
+            backup_count=int(logging.get("backup_count", LoggingConfig.backup_count)),
         ),
         processing=ProcessingConfig(
             segmentation=SegmentationProcessingConfig(
