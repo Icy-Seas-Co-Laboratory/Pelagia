@@ -101,7 +101,7 @@ uvicorn Pelagia.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 For local end-to-end testing, the dev stack script initializes storage, starts
-the API, and starts one worker for each currently runnable stage
+the API, and starts workers for each currently runnable stage
 (`extract_frames` and `segment`):
 
 ```bash
@@ -112,7 +112,9 @@ the API, and starts one worker for each currently runnable stage
 
 Override defaults with environment variables such as `PELAGIA_DATABASE_DSN`,
 `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`, and
-`PELAGIA_WORKER_STAGES`.
+`PELAGIA_WORKER_STAGES`. Use `PELAGIA_WORKER_COUNT=3` to start three workers
+for every configured stage, or `PELAGIA_WORKER_COUNTS=extract_frames=2,segment=4`
+for per-stage counts.
 
 Useful endpoint groups:
 

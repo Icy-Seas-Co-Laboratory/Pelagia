@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from ..domain import PipelineStage
 from ..domain import normalize_collections
-from ..processing import video_ingest as video_ingest_module
-from ..processing.frame_store import retrieve_frame
-from ..processing.segmentation import segment_frame
+from ..processing import ingest as ingest_module
+from ..processing.detection_candidate import segment_frame
+from ..processing.frame_preprocess import preprocess_frame_for_segmentation
+from ..processing.frame_store import retrieve_frame, store_preprocessed_frame
 from ..services.context import AppContext
 
 
@@ -79,29 +81,44 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     metadata.setdefault("worker_job_id", str(job.get("id")))
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
     ingest_defaults = context.config.processing.video_ingest
+    preprocessing_defaults = context.config.processing.preprocessing
 
-    frame_rows = video_ingest_module.ingest_video_file(
-        source_path,
-        n_tile=int(payload.get("n_tile", ingest_defaults.n_tile)),
-        context=context,
-        run_id=run_id,
-        asset_id=asset_id,
-        metadata=metadata,
-        flatfield_correction=bool(payload.get("flatfield_correction", ingest_defaults.flatfield_correction)),
-        flatfield_q=float(payload.get("flatfield_q", ingest_defaults.flatfield_q)),
-        flatfield_axis=int(payload.get("flatfield_axis", ingest_defaults.flatfield_axis)),
-        adaptive_background_subtraction=bool(
-            payload.get(
-                "adaptive_background_subtraction",
-                ingest_defaults.adaptive_background_subtraction,
-            )
-        ),
-        adaptive_background_period=int(
-            payload.get("adaptive_background_period", ingest_defaults.adaptive_background_period)
-        ),
-        frame_mask=bool(payload.get("frame_mask", ingest_defaults.frame_mask)),
-        frame_mask_path=payload.get("frame_mask_path", ingest_defaults.frame_mask_path),
-    )
+    source_is_folder = Path(str(source_path)).expanduser().is_dir()
+    asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
+    if source_is_folder or asset_kind == "image_sequence":
+        frame_rows = ingest_module.ingest_image_folder(
+            source_path,
+            recursive=bool(payload.get("recursive", False)),
+            context=context,
+            run_id=run_id,
+            asset_id=asset_id,
+            metadata=metadata,
+        )
+    else:
+        frame_rows = ingest_module.ingest_video_file(
+            source_path,
+            n_tile=int(payload.get("n_tile", ingest_defaults.n_tile)),
+            context=context,
+            run_id=run_id,
+            asset_id=asset_id,
+            metadata=metadata,
+            adaptive_background_subtraction=bool(
+                payload.get(
+                    "adaptive_background_subtraction",
+                    preprocessing_defaults.adaptive_background_subtraction,
+                )
+            ),
+            adaptive_background_period=int(
+                payload.get(
+                    "adaptive_background_period",
+                    preprocessing_defaults.adaptive_background_period,
+                )
+            ),
+            apply_mask=bool(
+                payload.get("apply_mask", preprocessing_defaults.apply_mask)
+            ),
+            mask_path=payload.get("mask_path", preprocessing_defaults.mask_path),
+        )
 
     result: dict[str, Any] = {
         "stage": PipelineStage.EXTRACT_FRAMES.value,
@@ -130,6 +147,110 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         result["segment_job_id"] = segment_job["id"]
 
     return result
+
+
+def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
+    """Worker handler for creating and storing preprocessed frame payloads."""
+    if context.repository is None:
+        raise RuntimeError("Preprocess frames handler requires a PostgresRepository.")
+
+    payload = _job_payload(job)
+    asset_id = job.get("asset_id") or payload.get("asset_id")
+    frame_ids = _payload_frame_ids(payload)
+
+    if not frame_ids:
+        if not asset_id:
+            raise ValueError("Preprocess job requires asset_id, frame_id, or frame_ids.")
+        frames = context.repository.list_frames(
+            str(asset_id),
+            start_frame=payload.get("start_frame"),
+            end_frame=payload.get("end_frame"),
+            limit=payload.get("limit"),
+        )
+        frame_ids = [str(frame["id"]) for frame in frames]
+
+    if not frame_ids:
+        return {
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": job.get("run_id") or payload.get("run_id"),
+            "asset_id": asset_id,
+            "frame_count": 0,
+            "frame_ids": [],
+        }
+
+    resolved_asset_id = None if asset_id is None else str(asset_id)
+    resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
+    flatfield_defaults = context.config.processing.flatfield
+    preprocessing_defaults = context.config.processing.preprocessing
+    flatfield_correction = payload.get("flatfield_correction", flatfield_defaults.flatfield_correction)
+    flatfield_q = payload.get("flatfield_q", flatfield_defaults.flatfield_q)
+    flatfield_axis = payload.get("flatfield_axis", flatfield_defaults.flatfield_axis)
+    apply_mask = payload.get("apply_mask", preprocessing_defaults.apply_mask)
+    crop_enabled = payload.get("crop_enabled", preprocessing_defaults.crop_enabled)
+    crop_x = payload.get("crop_x", preprocessing_defaults.crop_x)
+    crop_y = payload.get("crop_y", preprocessing_defaults.crop_y)
+    crop_w = payload.get("crop_w", preprocessing_defaults.crop_w)
+    crop_h = payload.get("crop_h", preprocessing_defaults.crop_h)
+    background_correction = payload.get(
+        "background_correction",
+        preprocessing_defaults.background_correction,
+    )
+    background_percentile = payload.get(
+        "background_percentile",
+        preprocessing_defaults.background_percentile,
+    )
+    invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
+    encoding = payload.get("encoding")
+    stored_rows = []
+
+    for frame_id in frame_ids:
+        frame_record = context.repository.get_frame_record(frame_id)
+        if frame_record is None:
+            raise KeyError(f"Frame {frame_id!r} was not found.")
+        if resolved_asset_id is None:
+            resolved_asset_id = frame_record.asset_id
+        elif frame_record.asset_id != resolved_asset_id:
+            raise ValueError("Preprocess jobs may only process frames from one asset.")
+        if resolved_run_id is None:
+            resolved_run_id = frame_record.run_id
+
+        frame = retrieve_frame(frame_id, context=context, payload_kind="original")
+        processed = preprocess_frame_for_segmentation(
+            frame,
+            flatfield_correction=flatfield_correction,
+            flatfield_q=flatfield_q,
+            flatfield_axis=flatfield_axis,
+            apply_mask=apply_mask,
+            crop_enabled=crop_enabled,
+            crop_x=crop_x,
+            crop_y=crop_y,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            background_correction=background_correction,
+            background_percentile=background_percentile,
+            invert_intensity=invert_intensity,
+            context=context,
+        )
+        stored_rows.append(
+            store_preprocessed_frame(
+                frame_id,
+                processed,
+                context=context,
+                encoding=encoding,
+            )
+        )
+
+    if resolved_run_id is None or resolved_asset_id is None:
+        raise ValueError("Preprocess job could not resolve run_id and asset_id.")
+
+    return {
+        "stage": PipelineStage.PREPROCESS_FRAMES.value,
+        "run_id": resolved_run_id,
+        "asset_id": resolved_asset_id,
+        "frame_count": len(stored_rows),
+        "frame_ids": frame_ids,
+        "preprocessed_frame_ids": [str(row.get("id")) for row in stored_rows],
+    }
 
 
 def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
@@ -167,10 +288,34 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
     segment_defaults = context.config.processing.segmentation
+    flatfield_defaults = context.config.processing.flatfield
+    preprocessing_defaults = context.config.processing.preprocessing
     padding = payload.get("padding", payload.get("segmentation_padding", segment_defaults.padding))
     zstd_min_bytes = payload.get("zstd_min_bytes", segment_defaults.zstd_min_bytes)
     min_perimeter = payload.get("min_perimeter", segment_defaults.min_perimeter)
     max_perimeter = payload.get("max_perimeter", segment_defaults.max_perimeter)
+    flatfield_correction = payload.get("flatfield_correction", flatfield_defaults.flatfield_correction)
+    flatfield_q = payload.get("flatfield_q", flatfield_defaults.flatfield_q)
+    flatfield_axis = payload.get("flatfield_axis", flatfield_defaults.flatfield_axis)
+    apply_mask = payload.get("apply_mask", preprocessing_defaults.apply_mask)
+    crop_enabled = payload.get("crop_enabled", preprocessing_defaults.crop_enabled)
+    crop_x = payload.get("crop_x", preprocessing_defaults.crop_x)
+    crop_y = payload.get("crop_y", preprocessing_defaults.crop_y)
+    crop_w = payload.get("crop_w", preprocessing_defaults.crop_w)
+    crop_h = payload.get("crop_h", preprocessing_defaults.crop_h)
+    background_correction = payload.get(
+        "background_correction",
+        preprocessing_defaults.background_correction,
+    )
+    background_percentile = payload.get(
+        "background_percentile",
+        preprocessing_defaults.background_percentile,
+    )
+    invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
+    frame_payload_kind = str(payload.get("frame_payload_kind", "original")).lower()
+    apply_preprocessing = payload.get("apply_preprocessing")
+    if apply_preprocessing is None:
+        apply_preprocessing = frame_payload_kind in {"original", "raw"}
 
     for frame_id in frame_ids:
         frame_record = context.repository.get_frame_record(frame_id)
@@ -183,11 +328,30 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         if resolved_run_id is None:
             resolved_run_id = frame_record.run_id
 
-        frame = retrieve_frame(frame_id, context=context)
+        try:
+            frame = retrieve_frame(frame_id, context=context, payload_kind=frame_payload_kind)
+        except TypeError as exc:
+            if "payload_kind" not in str(exc):
+                raise
+            frame = retrieve_frame(frame_id, context=context)
         detections.extend(
             segment_frame(
                 frame,
+                frame_record=frame_record,
                 threshold=payload.get("threshold"),
+                apply_preprocessing=bool(apply_preprocessing),
+                flatfield_correction=flatfield_correction,
+                flatfield_q=flatfield_q,
+                flatfield_axis=flatfield_axis,
+                apply_mask=apply_mask,
+                crop_enabled=crop_enabled,
+                crop_x=crop_x,
+                crop_y=crop_y,
+                crop_w=crop_w,
+                crop_h=crop_h,
+                background_correction=background_correction,
+                background_percentile=background_percentile,
+                invert_intensity=invert_intensity,
                 min_perimeter=min_perimeter,
                 max_perimeter=max_perimeter,
                 padding=padding,
@@ -220,5 +384,6 @@ def default_handler_registry() -> HandlerRegistry:
     """Build the default worker stage registry."""
     registry = HandlerRegistry()
     registry.register(PipelineStage.EXTRACT_FRAMES, extract_frames_handler)
+    registry.register(PipelineStage.PREPROCESS_FRAMES, preprocess_frames_handler)
     registry.register(PipelineStage.SEGMENT, roi_detection_handler)
     return registry

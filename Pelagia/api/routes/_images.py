@@ -34,6 +34,30 @@ def preview_image(array, max_dim: int) -> np.ndarray:
     )
 
 
+def scale_image(array, scale: float) -> np.ndarray:
+    if not np.isfinite(scale) or scale <= 0.0 or scale > 1.0:
+        raise HTTPException(status_code=422, detail="scale must be > 0 and <= 1.")
+
+    image = np.asarray(array)
+    if image.ndim < 2:
+        raise HTTPException(status_code=422, detail="Image scaling requires at least 2D image data.")
+
+    height, width = image.shape[:2]
+    if height < 1 or width < 1:
+        raise HTTPException(status_code=422, detail="Image scaling requires non-empty image data.")
+
+    if scale == 1.0:
+        return np.ascontiguousarray(image)
+
+    scaled_width = max(1, int(round(width * scale)))
+    scaled_height = max(1, int(round(height * scale)))
+    return cv2.resize(
+        np.ascontiguousarray(image),
+        (scaled_width, scaled_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def encode_image(array, fmt: str) -> tuple[bytes, str]:
     image = np.ascontiguousarray(array)
     requested = fmt.lower()
@@ -56,4 +80,3 @@ def encode_image(array, fmt: str) -> tuple[bytes, str]:
             detail=f"Image data could not be encoded as {requested}.",
         )
     return encoded.tobytes(), media_type
-

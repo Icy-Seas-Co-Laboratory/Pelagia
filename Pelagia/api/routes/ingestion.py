@@ -29,13 +29,10 @@ if APIRouter is not None:
     class QueueVideoRequest(BaseModel):
         source_path: str
         n_tile: int | None = None
-        flatfield_correction: bool | None = None
-        flatfield_q: float | None = None
-        flatfield_axis: int | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
-        frame_mask: bool | None = None
-        frame_mask_path: str | None = None
+        apply_mask: bool | None = None
+        mask_path: str | None = None
         enqueue_segment: bool = False
         segmentation_padding: int | None = None
         roi_encoding: str | None = None
@@ -52,30 +49,20 @@ if APIRouter is not None:
     def queue_video_ingestion(request: Request, body: QueueVideoRequest) -> dict:
         defaults = request.app.state.context.config.processing
         ingest_defaults = defaults.video_ingest
+        preprocessing_defaults = defaults.preprocessing
         n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
-        flatfield_correction = (
-            ingest_defaults.flatfield_correction
-            if body.flatfield_correction is None
-            else body.flatfield_correction
-        )
-        flatfield_q = ingest_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q
-        flatfield_axis = (
-            ingest_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis
-        )
         adaptive_background_subtraction = (
-            ingest_defaults.adaptive_background_subtraction
+            preprocessing_defaults.adaptive_background_subtraction
             if body.adaptive_background_subtraction is None
             else body.adaptive_background_subtraction
         )
         adaptive_background_period = (
-            ingest_defaults.adaptive_background_period
+            preprocessing_defaults.adaptive_background_period
             if body.adaptive_background_period is None
             else body.adaptive_background_period
         )
-        frame_mask = ingest_defaults.frame_mask if body.frame_mask is None else body.frame_mask
-        frame_mask_path = (
-            ingest_defaults.frame_mask_path if body.frame_mask_path is None else body.frame_mask_path
-        )
+        apply_mask = preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask
+        mask_path = preprocessing_defaults.mask_path if body.mask_path is None else body.mask_path
         segmentation_padding = (
             defaults.segmentation.padding
             if body.segmentation_padding is None
@@ -134,13 +121,10 @@ if APIRouter is not None:
             payload={
                 "source_path": str(source_path),
                 "n_tile": n_tile,
-                "flatfield_correction": flatfield_correction,
-                "flatfield_q": flatfield_q,
-                "flatfield_axis": flatfield_axis,
                 "adaptive_background_subtraction": adaptive_background_subtraction,
                 "adaptive_background_period": adaptive_background_period,
-                "frame_mask": frame_mask,
-                "frame_mask_path": frame_mask_path,
+                "apply_mask": apply_mask,
+                "mask_path": mask_path,
                 "enqueue_segment": body.enqueue_segment,
                 "segmentation_padding": segmentation_padding,
                 "roi_encoding": roi_encoding,

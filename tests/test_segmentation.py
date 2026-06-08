@@ -1,8 +1,26 @@
 import numpy as np
 
+from Pelagia.domain import DetectionRecord
 from Pelagia.processing.frame_codec import decode_array_payload
+from Pelagia.processing.detection_refinement import refine_detection
 from Pelagia.processing.frame_model import FrameData
-from Pelagia.processing.segmentation import calc_threshold, live_segment_wrapper, segment_frame, store_roi
+from Pelagia.processing.frame_preprocess import preprocess_frame_for_segmentation
+from Pelagia.processing.frame_threshold import (
+    threshold_adaptive_gaussian,
+    threshold_adaptive_mean,
+    threshold_bounded_otsu,
+    threshold_bounded_otsu_canny,
+    threshold_boundedotsu_canny,
+    threshold_canny,
+    threshold_ensemble_and,
+    threshold_ensemble_or,
+    threshold_hysteresis,
+    threshold_manual,
+    threshold_otsu,
+    threshold_percentile_background,
+    threshold_sobel_edges,
+)
+from Pelagia.processing.detection_candidate import live_segment_wrapper, segment_frame, store_roi
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
@@ -22,42 +40,215 @@ class FakeContext:
         self.logger = FakeDatabaseLogger()
 
 
-def test_calc_threshold_caps_default_otsu_value_at_thresholding_maximum(monkeypatch):
-    class FakeThresholdingConfig:
-        thresholding_maximum_value = 100
-
-    class FakeProcessingConfig:
-        thresholding = FakeThresholdingConfig()
-
-    monkeypatch.setattr(
-        "Pelagia.processing.segmentation.default_processing_config",
-        lambda: FakeProcessingConfig(),
-    )
+def test_threshold_otsu_caps_value_at_thresholding_maximum():
     data = np.arange(256, dtype=np.uint8).reshape(16, 16)
 
-    thresholded = calc_threshold(data)
+    thresholded = threshold_otsu(data, thresholding_maximum_value=100)
 
-    expected = np.where(data > 100, 0, 255).astype(np.uint8)
+    expected = np.where(data > 100, 255, 0).astype(np.uint8)
     np.testing.assert_array_equal(thresholded, expected)
 
 
-def test_calc_threshold_uses_explicit_threshold_without_thresholding_cap(monkeypatch):
-    class FakeThresholdingConfig:
-        thresholding_maximum_value = 100
-
-    class FakeProcessingConfig:
-        thresholding = FakeThresholdingConfig()
-
-    monkeypatch.setattr(
-        "Pelagia.processing.segmentation.default_processing_config",
-        lambda: FakeProcessingConfig(),
-    )
+def test_threshold_manual_uses_explicit_threshold_without_thresholding_cap():
     data = np.arange(256, dtype=np.uint8).reshape(16, 16)
 
-    thresholded = calc_threshold(data, threshold=127)
+    thresholded = threshold_manual(data, threshold=127)
 
-    expected = np.where(data > 127, 0, 255).astype(np.uint8)
+    expected = np.where(data > 127, 255, 0).astype(np.uint8)
     np.testing.assert_array_equal(thresholded, expected)
+
+
+def test_threshold_bounded_otsu_rejects_implausibly_full_masks():
+    data = np.full((12, 12), 20, dtype=np.uint8)
+    data[2:10, 2:10] = 80
+
+    mask = threshold_bounded_otsu(
+        data,
+        min_contrast=50,
+        max_foreground_fraction=0.1,
+    )
+
+    np.testing.assert_array_equal(mask, np.zeros_like(data, dtype=np.uint8))
+
+
+def test_adaptive_and_percentile_thresholds_return_binary_masks():
+    data = np.tile(np.arange(32, dtype=np.uint8), (32, 1)) + 20
+    data[10:15, 10:15] = 180
+
+    masks = [
+        threshold_adaptive_mean(data, block_size=9, c=3),
+        threshold_adaptive_gaussian(data, block_size=9, c=3),
+        threshold_percentile_background(data, background_percentile=50, min_contrast=20),
+    ]
+
+    for mask in masks:
+        assert mask.shape == data.shape
+        assert mask.dtype == np.uint8
+        assert set(np.unique(mask)).issubset({0, 255})
+
+
+def test_hysteresis_and_sobel_thresholds_return_binary_masks():
+    data = np.full((24, 24), 20, dtype=np.uint8)
+    data[8:16, 8:16] = 40
+    data[10:14, 10:14] = 80
+
+    hysteresis = threshold_hysteresis(data, low_threshold=30, high_threshold=60)
+    sobel = threshold_sobel_edges(data, percentile=80)
+
+    assert np.count_nonzero(hysteresis) > 0
+    assert np.count_nonzero(sobel) > 0
+    assert set(np.unique(hysteresis)).issubset({0, 255})
+    assert set(np.unique(sobel)).issubset({0, 255})
+
+
+def test_threshold_ensembles_combine_callables():
+    data = np.full((20, 20), 20, dtype=np.uint8)
+    data[6:14, 6:14] = 120
+
+    threshold_fns = (
+        lambda image: threshold_manual(image, 80),
+        lambda image: threshold_canny(image, canny_params=(20, 60), blur_kernel=(1, 1)),
+    )
+    mask_or = threshold_ensemble_or(data, threshold_fns)
+    mask_and = threshold_ensemble_and(data, threshold_fns)
+
+    assert np.count_nonzero(mask_or) >= np.count_nonzero(mask_and)
+    assert set(np.unique(mask_or)).issubset({0, 255})
+    assert set(np.unique(mask_and)).issubset({0, 255})
+
+
+def test_threshold_boundedotsu_canny_combines_primitives():
+    data = np.full((20, 20), 20, dtype=np.uint8)
+    data[6:14, 6:14] = 120
+
+    otsu_only = threshold_bounded_otsu(data, min_contrast=20)
+    edges = threshold_canny(data, canny_params=(20, 60))
+    combined = threshold_boundedotsu_canny(
+        data,
+        run_canny=True,
+        canny_params=(20, 60),
+        dilate_kernel=(1, 1),
+        min_contrast=20,
+    )
+    alias_combined = threshold_bounded_otsu_canny(
+        data,
+        run_canny=True,
+        canny_params=(20, 60),
+        dilate_kernel=(1, 1),
+        min_contrast=20,
+    )
+
+    assert np.count_nonzero(combined) >= np.count_nonzero(otsu_only)
+    assert np.count_nonzero(combined) >= np.count_nonzero(edges)
+    np.testing.assert_array_equal(combined, alias_combined)
+
+
+def test_preprocess_frame_for_segmentation_applies_ordered_steps():
+    data = np.full((4, 4), 20, dtype=np.uint8)
+    data[1:3, 1:3] = 80
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1:3, 1:3] = 255
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=1,
+        data=data,
+        mask=mask,
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        flatfield_correction=False,
+        background_correction=True,
+        background=10,
+        invert_intensity=True,
+    )
+
+    assert processed.metadata["preprocessing_steps"] == [
+        "mask",
+        "background_correction",
+        "invert_intensity",
+    ]
+    assert processed.metadata["foreground_polarity"] == "bright"
+    assert processed.read().shape == data.shape
+    assert processed.read()[0, 0] == 255
+    assert processed.read()[1, 1] == 185
+
+
+def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
+    data = np.arange(25, dtype=np.uint8).reshape(5, 5)
+    mask = np.zeros((5, 5), dtype=np.uint8)
+    mask[2:4, 1:4] = 255
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=1,
+        data=data,
+        mask=mask,
+        width=5,
+        height=5,
+        bbox_x=100,
+        bbox_y=200,
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        flatfield_correction=False,
+        apply_mask=False,
+        crop_enabled=True,
+        crop_x=1,
+        crop_y=2,
+        crop_w=3,
+        crop_h=2,
+    )
+
+    np.testing.assert_array_equal(processed.read(), data[2:4, 1:4])
+    np.testing.assert_array_equal(processed.mask, mask[2:4, 1:4])
+    assert processed.width == 3
+    assert processed.height == 2
+    assert processed.bbox_x == 101
+    assert processed.bbox_y == 202
+    assert processed.metadata["preprocessing_steps"] == ["crop"]
+    assert processed.metadata["crop_bbox"] == (101, 202, 3, 2)
+
+
+def test_refine_detection_identity_uses_candidate_mask():
+    roi = np.array([[0, 20], [40, 80]], dtype=np.uint8)
+    mask = np.array([[0, 255], [255, 0]], dtype=np.uint8)
+    detection = DetectionRecord(
+        run_id="00000000-0000-0000-0000-000000000001",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=2,
+        bbox_h=2,
+        area=2,
+        perimeter=4,
+        major_axis_length=2,
+        minor_axis_length=2,
+        min_gray_value=20,
+        mean_gray_value=30,
+        roi_payload=roi.tobytes(order="C"),
+        mask_payload=mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(roi.dtype),
+        roi_shape=list(roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+        id="00000000-0000-7000-8000-000000000099",
+    )
+
+    result = refine_detection(detection)
+
+    np.testing.assert_array_equal(result.roi, roi)
+    np.testing.assert_array_equal(result.candidate_mask, mask)
+    np.testing.assert_array_equal(result.refined_mask, mask)
+    assert result.method == "identity"
+    assert result.as_detection_record().metadata["detection_stage"] == "refined"
 
 
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():
@@ -76,7 +267,14 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
         },
     )
 
-    detections = segment_frame(frame, threshold=1, min_perimeter=0, padding=0, roi_encoding="raw")
+    detections = segment_frame(
+        frame,
+        threshold=1,
+        flatfield_correction=False,
+        min_perimeter=0,
+        padding=0,
+        roi_encoding="raw",
+    )
 
     assert len(detections) == 1
     detection = detections[0]
@@ -132,6 +330,7 @@ def test_segment_frame_writes_structured_log_events():
     detections = segment_frame(
         frame,
         threshold=1,
+        flatfield_correction=False,
         min_perimeter=0,
         padding=0,
         roi_encoding="raw",
@@ -169,6 +368,7 @@ def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
     detections = live_segment_wrapper(
         FRAME_ID,
         threshold=1,
+        flatfield_correction=False,
         min_perimeter=0,
         padding=0,
     )
@@ -195,7 +395,14 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
         },
     )
 
-    detections = segment_frame(frame, threshold=1, min_perimeter=0, padding=1, roi_encoding="raw")
+    detections = segment_frame(
+        frame,
+        threshold=1,
+        flatfield_correction=False,
+        min_perimeter=0,
+        padding=1,
+        roi_encoding="raw",
+    )
 
     assert len(detections) == 1
     detection = detections[0]
@@ -246,7 +453,13 @@ def test_segment_frame_filters_by_bbox_perimeter():
         },
     )
 
-    assert segment_frame(frame, threshold=1, min_perimeter=15, roi_encoding="raw") == []
+    assert segment_frame(
+        frame,
+        threshold=1,
+        flatfield_correction=False,
+        min_perimeter=15,
+        roi_encoding="raw",
+    ) == []
 
 
 def test_store_roi_auto_uses_png_for_small_roi_payloads():

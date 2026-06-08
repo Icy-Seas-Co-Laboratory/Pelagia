@@ -26,6 +26,7 @@ class FakeRepository:
         self.shutdown_requests = []
         self.priority_updates = []
         self.logs = []
+        self.preprocessed_payload_ref = None
 
     def list_runs(self, **kwargs):
         return [{"id": "run-1", **kwargs}]
@@ -76,6 +77,8 @@ class FakeRepository:
             height=10,
             kvstore_hash="fake-kv-key",
             preview_thumbhash=b"abc",
+            preprocessed_payload_ref=self.preprocessed_payload_ref,
+            preprocessed_kvstore_hash=self.preprocessed_payload_ref,
             metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
         )
 
@@ -201,6 +204,9 @@ class FakeRepository:
 class FakeKVStore:
     initialized = True
 
+    def __init__(self):
+        self.deleted_keys = []
+
     def status(self):
         return {
             "root_path": "/tmp/pelagia-kv",
@@ -210,6 +216,9 @@ class FakeKVStore:
 
     def check_health(self):
         return {"healthy": True, "errors": [], "warnings": []}
+
+    def key_delete(self, key):
+        self.deleted_keys.append(key)
 
 
 def make_client():
@@ -230,6 +239,20 @@ def test_api_lists_system_status_without_live_database():
     assert body["queue"] == {"queued": 2}
     assert body["workers"]["online"] == 1
     assert body["kvstore"]["initialized"] is True
+
+
+def test_api_exposes_system_config():
+    client, _, _ = make_client()
+
+    response = client.get("/system/config")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["effective"]["database"]["schema_name"] == "pelagia"
+    assert body["effective"]["processing"]["preprocessing"]["apply_mask"] is False
+    assert body["effective"]["kvstore"]["root_path"]
+    assert body["defaults"]["processing"]["video_ingest"]["n_tile"] == 4
+    assert body["defaults"]["processing"]["preprocessing"]["mask_path"] is None
 
 
 def test_api_kvstore_includes_status_and_health():
@@ -284,10 +307,11 @@ def test_api_live_segment_returns_transient_detections(monkeypatch):
     client, _, _ = make_client()
 
     response = client.get(
-        "/live/segment",
+        "/live/segmentation",
         params={
             "frame_id": "frame-1",
             "threshold": 1,
+            "apply_preprocessing": False,
             "min_perimeter": 0,
             "padding": 0,
         },
@@ -364,7 +388,7 @@ def test_api_can_create_and_list_structured_logs():
             "payload": {"route": "/status"},
         },
     )
-    list_response = client.get("/logs?level=warning&limit=5")
+    list_response = client.get("/logs?level=warning&limit=5&offset=10")
 
     assert create_response.status_code == 200
     assert create_response.json()["log"]["event_type"] == "ui.status_loaded"
@@ -372,6 +396,7 @@ def test_api_can_create_and_list_structured_logs():
     assert list_response.status_code == 200
     assert list_response.json()["logs"][0]["level"] == "warning"
     assert list_response.json()["logs"][0]["limit"] == 5
+    assert list_response.json()["logs"][0]["offset"] == 10
 
 
 def test_api_can_queue_segmentation_job():
@@ -395,6 +420,32 @@ def test_api_can_queue_segmentation_job():
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
     assert repository.created_jobs[-1]["payload"]["padding"] == 4
     assert repository.created_jobs[-1]["payload"]["roi_encoding"] == "raw"
+    assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is True
+    assert repository.created_jobs[-1]["payload"]["flatfield_q"] == 0.9
+    assert repository.created_jobs[-1]["payload"]["flatfield_axis"] == 0
+
+
+def test_api_can_queue_frame_preprocess_job():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/frame/preprocess/jobs",
+        json={
+            "frame_ids": ["frame-1"],
+            "flatfield_correction": False,
+            "background_correction": True,
+            "encoding": "jpg",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["stage"] == "preprocess_frames"
+    assert repository.created_jobs[-1]["run_id"] == "run-1"
+    assert repository.created_jobs[-1]["asset_id"] == "asset-1"
+    assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
+    assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is False
+    assert repository.created_jobs[-1]["payload"]["background_correction"] is True
+    assert repository.created_jobs[-1]["payload"]["encoding"] == "jpg"
 
 
 def test_api_can_request_worker_shutdown():
@@ -440,7 +491,7 @@ def test_api_filters_asset_detections():
         "&min_bbox_w=3&max_bbox_w=12&min_bbox_h=4&max_bbox_h=13"
         "&min_area=5.5&max_area=100.5&min_perimeter=6.5&max_perimeter=80.5"
         "&roi_encoding=raw&roi_format=raw_ndarray_c_order"
-        "&mask_encoding=raw&mask_format=raw_ndarray_c_order&limit=7"
+        "&mask_encoding=raw&mask_format=raw_ndarray_c_order&limit=7&offset=3"
     )
 
     assert response.status_code == 200
@@ -456,18 +507,20 @@ def test_api_filters_asset_detections():
     assert detection["roi_encoding"] == "raw"
     assert detection["mask_format"] == "raw_ndarray_c_order"
     assert detection["limit"] == 7
+    assert detection["offset"] == 3
 
 
 def test_api_lists_global_detections_without_image_payloads():
     client, _, _ = make_client()
 
-    response = client.get("/detections?asset_id=asset-1&collection=test&limit=3")
+    response = client.get("/detections?asset_id=asset-1&collection=test&limit=100&offset=400")
 
     assert response.status_code == 200
     detection = response.json()["detections"][0]
     assert detection["asset_id"] == "asset-1"
     assert detection["collection"] == "test"
-    assert detection["limit"] == 3
+    assert detection["limit"] == 100
+    assert detection["offset"] == 400
     assert "roi_payload" not in detection
     assert detection["roi_payload_bytes"] == 4
     assert detection["mask_payload_bytes"] == 4
@@ -497,6 +550,21 @@ def test_api_detection_framedata_returns_matrix_and_png():
     assert png_response.status_code == 200
     assert png_response.headers["content-type"] == "image/png"
     assert png_response.content.startswith(b"\x89PNG")
+
+
+def test_api_detection_framedata_accepts_scale():
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/detections/det-1/framedata?format=matrix&scale=0.5")
+    png_response = client.get("/detections/det-1/framedata?format=png&scale=0.5")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["shape"] == [1, 1]
+    assert matrix_response.json()["scale"] == 0.5
+    assert png_response.status_code == 200
+    assert png_response.headers["x-pelagia-scale"] == "0.5"
+    decoded = cv2.imdecode(np.frombuffer(png_response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (1, 1)
 
 
 def test_api_reports_asset_detection_stats():
@@ -553,6 +621,80 @@ def test_api_framedata_returns_matrix_and_png(monkeypatch):
     assert png_response.content.startswith(b"\x89PNG")
 
 
+def test_api_framedata_accepts_scale(monkeypatch):
+    from Pelagia.api.routes import assets
+
+    class FakeFrame:
+        def read(self):
+            return np.arange(40 * 80, dtype=np.uint8).reshape((40, 80))
+
+    monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/assets/asset-1/framedata/2?format=matrix&scale=0.25")
+    png_response = client.get("/assets/asset-1/framedata/2?format=png&scale=0.25")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["shape"] == [10, 20]
+    assert matrix_response.json()["scale"] == 0.25
+    assert png_response.status_code == 200
+    assert png_response.headers["x-pelagia-scale"] == "0.25"
+    decoded = cv2.imdecode(np.frombuffer(png_response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (10, 20)
+
+
+def test_api_framedata_accepts_flatfield_options(monkeypatch):
+    from Pelagia.api.routes import assets
+    from Pelagia.processing.frame_correction import flatfield_global_correction_for_framedata
+
+    data = np.array([[10, 20], [30, 40]], dtype=np.uint8)
+
+    class FakeFrame:
+        def read(self):
+            return data
+
+    monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
+    client, _, _ = make_client()
+
+    matrix_response = client.get(
+        "/assets/asset-1/framedata/2"
+        "?format=matrix&flatfield_correction=true&flatfield_q=0.5&flatfield_axis=0"
+    )
+    png_response = client.get(
+        "/assets/asset-1/framedata/2"
+        "?format=png&flatfield_correction=true&flatfield_q=0.5&flatfield_axis=0"
+    )
+
+    expected = flatfield_global_correction_for_framedata(data, q=0.5, axis=0)
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["flatfield_correction"] is True
+    assert matrix_response.json()["flatfield_q"] == 0.5
+    assert matrix_response.json()["flatfield_axis"] == 0
+    assert matrix_response.json()["background_correction"] is False
+    assert matrix_response.json()["data"] == expected.tolist()
+    assert png_response.status_code == 200
+    assert png_response.headers["x-pelagia-flatfield-correction"] == "true"
+    assert png_response.headers["x-pelagia-flatfield-q"] == "0.5"
+    assert png_response.headers["x-pelagia-flatfield-axis"] == "0"
+    assert png_response.headers["x-pelagia-background-correction"] == "false"
+
+
+def test_api_framedata_background_correction_is_not_implemented(monkeypatch):
+    from Pelagia.api.routes import assets
+
+    class FakeFrame:
+        def read(self):
+            return np.array([[0, 128], [255, 64]], dtype=np.uint8)
+
+    monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
+    client, _, _ = make_client()
+
+    response = client.get("/assets/asset-1/framedata/2?background_correction=true")
+
+    assert response.status_code == 501
+    assert "not implemented" in response.json()["detail"]
+
+
 def test_api_framedata_returns_small_preview(monkeypatch):
     from Pelagia.api.routes import assets
 
@@ -595,11 +737,14 @@ def test_api_queues_video_ingestion(tmp_path):
     assert repository.registered_runs[0].manifest.assets[0].path == str(video_path.resolve())
     assert repository.registered_runs[0].manifest.assets[0].collections == ["none"]
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
+    assert "flatfield_correction" not in repository.created_jobs[0]["payload"]
+    assert "flatfield_q" not in repository.created_jobs[0]["payload"]
+    assert "flatfield_axis" not in repository.created_jobs[0]["payload"]
     assert "flatfield_maximum_value" not in repository.created_jobs[0]["payload"]
     assert repository.created_jobs[0]["payload"]["adaptive_background_subtraction"] is False
     assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
-    assert repository.created_jobs[0]["payload"]["frame_mask"] is False
-    assert repository.created_jobs[0]["payload"]["frame_mask_path"] is None
+    assert repository.created_jobs[0]["payload"]["apply_mask"] is False
+    assert repository.created_jobs[0]["payload"]["mask_path"] is None
 
 
 def test_api_queues_video_ingestion_with_collections(tmp_path):
@@ -629,6 +774,55 @@ def test_api_queues_video_ingestion_with_collections(tmp_path):
     ]
 
 
+def test_live_preprocess_replaces_existing_preprocessed_payload(monkeypatch):
+    client, repository, kvstore = make_client()
+    repository.preprocessed_payload_ref = "old-preprocessed-key"
+    calls = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        calls.append(("retrieve", frame_id, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=2,
+            data=np.zeros((2, 2), dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_preprocess_frame(frame, **kwargs):
+        calls.append(("preprocess", kwargs.get("context")))
+        return frame
+
+    def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
+        calls.append(("store", frame_id, kwargs.get("encoding")))
+        return {
+            "id": frame_id,
+            "asset_id": "asset-1",
+            "frame_index": 2,
+            "preprocessed_payload_ref": "new-preprocessed-key",
+            "preprocessed_kvstore_hash": "new-preprocessed-key",
+            "preprocessed_preview_thumbhash": b"def",
+        }
+
+    monkeypatch.setattr("Pelagia.api.routes.live.retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr("Pelagia.api.routes.live.preprocess_frame_for_segmentation", fake_preprocess_frame)
+    monkeypatch.setattr("Pelagia.api.routes.live.store_preprocessed_frame", fake_store_preprocessed_frame)
+
+    response = client.post("/live/preprocess?frame_id=frame-1&encoding=png")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "stored"
+    assert body["saved"] is True
+    assert body["old_preprocessed_key"] == "old-preprocessed-key"
+    assert body["new_preprocessed_key"] == "new-preprocessed-key"
+    assert body["old_preprocessed_deleted"] is True
+    assert body["old_preprocessed_missing"] is False
+    assert kvstore.deleted_keys == ["old-preprocessed-key"]
+    assert calls[0] == ("retrieve", "frame-1", "original")
+    assert calls[2] == ("store", "frame-1", "png")
+
+
 def test_api_lists_collections_and_filters_assets():
     client, _, _ = make_client()
 
@@ -644,30 +838,34 @@ def test_api_search_endpoints_forward_optional_filters():
     client, _, _ = make_client()
 
     assets_response = client.get(
-        "/assets?collection=test&kind=video&filename=sample&limit=5"
+        "/assets?collection=test&kind=video&filename=sample&limit=5&offset=2"
     )
     runs_response = client.get(
-        "/runs?collection=test&instrument=api&source_type=video&status=registered&limit=7"
+        "/runs?collection=test&instrument=api&source_type=video&status=registered&limit=7&offset=14"
     )
-    models_response = client.get("/models?task=classification&model_key=demo&limit=3")
-    workers_response = client.get("/workers?status=idle&capability=extract_frames&limit=4")
+    models_response = client.get("/models?task=classification&model_key=demo&limit=3&offset=9")
+    workers_response = client.get("/workers?status=idle&capability=extract_frames&limit=4&offset=8")
 
     asset = assets_response.json()["assets"][0]
     assert asset["collection"] == "test"
     assert asset["kind"] == "video"
     assert asset["filename"] == "sample"
     assert asset["limit"] == 5
+    assert asset["offset"] == 2
     run = runs_response.json()["runs"][0]
     assert run["collection"] == "test"
     assert run["instrument"] == "api"
     assert run["source_type"] == "video"
     assert run["status"] == "registered"
     assert run["limit"] == 7
+    assert run["offset"] == 14
     model = models_response.json()["models"][0]
     assert model["task"] == "classification"
     assert model["model_key"] == "demo"
     assert model["limit"] == 3
+    assert model["offset"] == 9
     worker = workers_response.json()["workers"][0]
     assert worker["status"] == "idle"
     assert worker["capability"] == "extract_frames"
     assert worker["limit"] == 4
+    assert worker["offset"] == 8

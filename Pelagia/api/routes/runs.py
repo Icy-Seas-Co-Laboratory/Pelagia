@@ -12,12 +12,16 @@ if APIRouter is not None:
     def _bounded_limit(limit: int | None) -> int:
         return min(max(1, 100 if limit is None else limit), 1000)
 
+    def _bounded_offset(offset: int | None) -> int:
+        return max(0, 0 if offset is None else offset)
+
     router = APIRouter(prefix="/runs", tags=["runs"])
 
     @router.get("")
     def list_runs(
         request: Request,
         limit: int = 100,
+        offset: int = 0,
         collection: str | None = None,
         run_key: str | None = None,
         instrument: str | None = None,
@@ -29,6 +33,7 @@ if APIRouter is not None:
             "runs": as_response(
                 get_repository(request).list_runs(
                     limit=limit,
+                    offset=offset,
                     collection=collection,
                     run_key=run_key,
                     instrument=instrument,
@@ -59,6 +64,7 @@ if APIRouter is not None:
         max_size_bytes: int | None = None,
         media_count: int | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         return {
             "assets": as_response(
@@ -73,6 +79,7 @@ if APIRouter is not None:
                     max_size_bytes=max_size_bytes,
                     media_count=media_count,
                     limit=limit,
+                    offset=offset,
                 )
             )
         }
@@ -82,6 +89,7 @@ if APIRouter is not None:
         request: Request,
         run_id: str,
         limit: int = 100,
+        offset: int = 0,
         include_details: bool = False,
     ) -> dict[str, list]:
         return {
@@ -89,6 +97,7 @@ if APIRouter is not None:
                 get_repository(request).list_jobs(
                     run_id=run_id,
                     limit=_bounded_limit(limit),
+                    offset=_bounded_offset(offset),
                     include_details=include_details,
                 )
             )

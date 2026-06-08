@@ -16,10 +16,15 @@ if APIRouter is not None:
         request: Request,
         collection: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         return {
             "collections": as_response(
-                get_repository(request).list_collections(collection=collection, limit=limit)
+                get_repository(request).list_collections(
+                    collection=collection,
+                    limit=limit,
+                    offset=max(0, offset),
+                )
             )
         }
 else:

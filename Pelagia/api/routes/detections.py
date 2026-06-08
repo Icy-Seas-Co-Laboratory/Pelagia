@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 try:
     from fastapi import APIRouter, HTTPException, Request, Response
 except ImportError:  # pragma: no cover
@@ -11,7 +13,7 @@ if APIRouter is not None:
 
     from ...processing.frame_codec import decode_array_payload
     from ._common import as_response, detection_summary, get_repository
-    from ._images import encode_image
+    from ._images import encode_image, scale_image
 
     router = APIRouter(prefix="/detections", tags=["detections"])
 
@@ -61,7 +63,10 @@ if APIRouter is not None:
         roi_format: str | None = None,
         mask_encoding: str | None = None,
         mask_format: str | None = None,
+        sort_by: Literal["area", "byte_size", "id", "asset_frame"] = "asset_frame",
+        sort_dir: Literal["asc", "desc"] = "desc",
         limit: int | None = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         detections = get_repository(request).list_detections(
             asset_id=asset_id,
@@ -87,7 +92,10 @@ if APIRouter is not None:
             roi_format=roi_format,
             mask_encoding=mask_encoding,
             mask_format=mask_format,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
             limit=limit,
+            offset=offset,
         )
         return {"detections": [detection_summary(detection) for detection in detections]}
 
@@ -103,6 +111,7 @@ if APIRouter is not None:
         request: Request,
         detection_id: str,
         format: str = "png",
+        scale: float = 1.0,
     ):
         detection = get_repository(request).get_detection(detection_id)
         if detection is None:
@@ -111,7 +120,7 @@ if APIRouter is not None:
         array = _detection_image_array(detection)
         requested = format.lower()
         if requested == "matrix":
-            matrix = np.asarray(array)
+            matrix = np.asarray(scale_image(array, scale))
             return as_response(
                 {
                     "detection_id": detection_id,
@@ -119,11 +128,12 @@ if APIRouter is not None:
                     "asset_id": detection.get("asset_id"),
                     "dtype": str(matrix.dtype),
                     "shape": list(matrix.shape),
+                    "scale": scale,
                     "data": matrix.tolist(),
                 }
             )
 
-        payload, media_type = encode_image(array, requested)
+        payload, media_type = encode_image(scale_image(array, scale), requested)
         extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
         return Response(
             content=payload,
@@ -131,9 +141,9 @@ if APIRouter is not None:
             headers={
                 "Content-Disposition": (
                     f'inline; filename="{detection_id}_framedata.{extension}"'
-                )
+                ),
+                "X-Pelagia-Scale": str(scale),
             },
         )
 else:
     router = None
-

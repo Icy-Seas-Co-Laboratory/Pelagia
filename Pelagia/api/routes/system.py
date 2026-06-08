@@ -7,6 +7,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ...config import CoreConfig
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
 
     router = APIRouter(prefix="/system", tags=["system"])
@@ -52,6 +53,17 @@ if APIRouter is not None:
             }
         )
 
+    @router.get("/config")
+    def get_system_config(request: Request) -> dict:
+        context = get_context(request)
+        defaults = CoreConfig.load(local_config_path=None, use_env=False)
+        return as_response(
+            {
+                "effective": context.config,
+                "defaults": defaults,
+            }
+        )
+
     @router.get("/status")
     def get_system_status(request: Request) -> dict:
         repository = get_repository(request)
@@ -84,6 +96,9 @@ if APIRouter is not None:
             ],
             "common_flows": {
                 "queue_video_ingestion": "POST /ingestion/videos",
+                "preprocess_frame_now": "POST /frame/preprocess",
+                "queue_preprocessing": "POST /frame/preprocess/jobs",
+                "live_segmentation": "GET /live/segmentation",
                 "segment_frame_now": "POST /segmentation/frames/{frame_id}",
                 "queue_job": "POST /jobs",
                 "worker_status": "GET /workers",

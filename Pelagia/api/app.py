@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..config import CoreConfig
 from ..observability import configure_core_logging
 from ..services.context import AppContext
-from .routes import assets, collections, detections, health, ingestion, jobs, kvstore, live, logs, models, runs, segmentation, system, workers
+from .routes import assets, collections, detections, frame, health, ingestion, jobs, kvstore, live, logs, models, runs, segmentation, system, workers
 
 
 def create_app(config: CoreConfig | None = None):
@@ -39,6 +39,7 @@ def create_app(config: CoreConfig | None = None):
         runs,
         jobs,
         workers,
+        frame,
         assets,
         detections,
         collections,

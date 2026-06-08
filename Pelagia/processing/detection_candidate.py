@@ -6,15 +6,17 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from ..domain import DetectionRecord, normalize_collections
+from ..domain import DetectionRecord, FrameRecord, normalize_collections
 from ._logging import log_processing_event, processing_core_logger
 from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
+from .frame_preprocess import as_grayscale_array, preprocess_frame_for_segmentation
+from .frame_threshold import threshold_manual, threshold_otsu
 
 
 ThresholdFn = Callable[[np.ndarray], np.ndarray]
-_CORE_LOGGER = processing_core_logger("segmentation")
+_CORE_LOGGER = processing_core_logger("detection_candidate")
 
 
 def _frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
@@ -29,42 +31,7 @@ def _as_grayscale_array(frame: FrameData) -> np.ndarray:
     data = frame.read()
     if data is None:
         raise ValueError("Frame has no image data to segment.")
-
-    array = np.asarray(data)
-    if array.ndim == 2:
-        return np.ascontiguousarray(array)
-    if array.ndim != 3:
-        raise ValueError(f"Expected a 2D grayscale or 3D color frame, got shape {array.shape}.")
-
-    channels = array.shape[2]
-    if channels == 1:
-        return np.ascontiguousarray(array[:, :, 0])
-    if channels == 3:
-        return cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
-    if channels == 4:
-        return cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Expected frame with 1, 3, or 4 channels, got {channels}.")
-
-
-def calc_threshold(gray: np.ndarray, threshold: int | float | None = None) -> np.ndarray:
-    """Create an 8-bit binary segmentation mask from a grayscale frame."""
-    if gray.ndim != 2:
-        raise ValueError("Thresholding expects a 2D grayscale image.")
-
-    if gray.dtype != np.uint8:
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    if threshold is None:
-        otsu_value, _ = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        threshold = min(
-            float(otsu_value),
-            float(default_processing_config().thresholding.thresholding_maximum_value),
-        )
-        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
-    else:
-        _, binary = cv2.threshold(gray, float(threshold), 255, cv2.THRESH_BINARY_INV)
-    return np.ascontiguousarray(binary)
+    return as_grayscale_array(data)
 
 
 def _component_axis_lengths(contour: np.ndarray, width: int, height: int) -> tuple[float, float]:
@@ -211,6 +178,20 @@ def live_segment_wrapper(
     frame_id: str,
     *,
     threshold: int | float | ThresholdFn | None = None,
+    frame_payload_kind: str = "original",
+    apply_preprocessing: bool | None = None,
+    apply_mask: bool | None = None,
+    crop_enabled: bool | None = None,
+    crop_x: int | None = None,
+    crop_y: int | None = None,
+    crop_w: int | None = None,
+    crop_h: int | None = None,
+    flatfield_correction: bool | None = None,
+    flatfield_q: float | None = None,
+    flatfield_axis: int | None = None,
+    background_correction: bool | None = None,
+    background_percentile: int | float | None = None,
+    invert_intensity: bool | None = None,
     min_perimeter: int | float | None = None,
     max_perimeter: int | float | None = None,
     padding: int | None = None,
@@ -228,14 +209,40 @@ def live_segment_wrapper(
         "segmentation.live_started",
         "Live frame segmentation started",
         payload={"frame_id": frame_id},
-        logger="pelagia.processing.segmentation",
+        logger="pelagia.processing.detection_candidate",
         core_logger=_CORE_LOGGER,
     )
-    frame = retrieve_frame(frame_id, context=context)
+    try:
+        frame = retrieve_frame(frame_id, context=context, payload_kind=frame_payload_kind)
+    except TypeError as exc:
+        if "payload_kind" not in str(exc):
+            raise
+        frame = retrieve_frame(frame_id, context=context)
+    frame_record = None
+    if context is not None and getattr(context, "repository", None) is not None:
+        frame_record = context.repository.get_frame_record(frame_id)
     try:
         detections = segment_frame(
             frame=frame,
+            frame_record=frame_record,
             threshold=threshold,
+            apply_preprocessing=(
+                frame_payload_kind in {"original", "raw"}
+                if apply_preprocessing is None
+                else apply_preprocessing
+            ),
+            flatfield_correction=flatfield_correction,
+            flatfield_q=flatfield_q,
+            flatfield_axis=flatfield_axis,
+            apply_mask=apply_mask,
+            crop_enabled=crop_enabled,
+            crop_x=crop_x,
+            crop_y=crop_y,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            background_correction=background_correction,
+            background_percentile=background_percentile,
+            invert_intensity=invert_intensity,
             min_perimeter=min_perimeter,
             max_perimeter=max_perimeter,
             padding=padding,
@@ -259,7 +266,7 @@ def live_segment_wrapper(
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
             },
-            logger="pelagia.processing.segmentation",
+            logger="pelagia.processing.detection_candidate",
             core_logger=_CORE_LOGGER,
         )
         raise
@@ -273,7 +280,7 @@ def live_segment_wrapper(
         asset_id=_frame_metadata_value(frame, "asset_id"),
         duration_ms=duration_ms,
         payload={"frame_id": frame_id, "detection_count": len(detections)},
-        logger="pelagia.processing.segmentation",
+        logger="pelagia.processing.detection_candidate",
         core_logger=_CORE_LOGGER,
     )
     return detections
@@ -282,7 +289,22 @@ def live_segment_wrapper(
 def segment_frame(
     frame: FrameData,
     *,
+    frame_record: FrameRecord | None = None,
     threshold: int | float | ThresholdFn | None = None,
+    apply_preprocessing: bool = True,
+    apply_mask: bool | None = None,
+    crop_enabled: bool | None = None,
+    crop_x: int | None = None,
+    crop_y: int | None = None,
+    crop_w: int | None = None,
+    crop_h: int | None = None,
+    flatfield_correction: bool | None = None,
+    flatfield_q: float | None = None,
+    flatfield_axis: int | None = None,
+    background_correction: bool | None = None,
+    background: np.ndarray | int | float | None = None,
+    background_percentile: int | float | None = None,
+    invert_intensity: bool | None = None,
     min_perimeter: int | float | None = None,
     max_perimeter: int | float | None = None,
     padding: int | None = None,
@@ -293,6 +315,51 @@ def segment_frame(
     """Segment one frame into connected-component ROI detection records."""
     started = time.perf_counter()
     defaults = default_processing_config().segmentation
+    preprocessing_defaults = (
+        context.config.processing.preprocessing
+        if context is not None and getattr(context, "config", None) is not None
+        else default_processing_config().preprocessing
+    )
+    thresholding_defaults = (
+        context.config.processing.thresholding
+        if context is not None and getattr(context, "config", None) is not None
+        else default_processing_config().thresholding
+    )
+    flatfield_defaults = (
+        context.config.processing.flatfield
+        if context is not None and getattr(context, "config", None) is not None
+        else default_processing_config().flatfield
+    )
+    resolved_flatfield_correction = (
+        flatfield_defaults.flatfield_correction
+        if flatfield_correction is None
+        else flatfield_correction
+    )
+    resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
+    resolved_flatfield_axis = (
+        flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    )
+    resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
+    resolved_crop_enabled = (
+        preprocessing_defaults.crop_enabled if crop_enabled is None else crop_enabled
+    )
+    resolved_crop_x = preprocessing_defaults.crop_x if crop_x is None else crop_x
+    resolved_crop_y = preprocessing_defaults.crop_y if crop_y is None else crop_y
+    resolved_crop_w = preprocessing_defaults.crop_w if crop_w is None else crop_w
+    resolved_crop_h = preprocessing_defaults.crop_h if crop_h is None else crop_h
+    resolved_background_correction = (
+        preprocessing_defaults.background_correction
+        if background_correction is None
+        else background_correction
+    )
+    resolved_background_percentile = (
+        preprocessing_defaults.background_percentile
+        if background_percentile is None
+        else background_percentile
+    )
+    resolved_invert_intensity = (
+        preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
+    )
     resolved_min_perimeter = defaults.min_perimeter if min_perimeter is None else min_perimeter
     resolved_max_perimeter = defaults.max_perimeter if max_perimeter is None else max_perimeter
     resolved_padding = defaults.padding if padding is None else padding
@@ -307,6 +374,19 @@ def segment_frame(
         "filename": frame.filename,
         "frame_number": frame.frameNumber,
         "tile_number": frame.tileNumber,
+        "flatfield_correction": bool(resolved_flatfield_correction),
+        "apply_preprocessing": bool(apply_preprocessing),
+        "flatfield_q": resolved_flatfield_q,
+        "flatfield_axis": resolved_flatfield_axis,
+        "background_correction": bool(resolved_background_correction),
+        "background_percentile": resolved_background_percentile,
+        "intensity_inverted": bool(resolved_invert_intensity),
+        "apply_mask": bool(resolved_apply_mask),
+        "crop_enabled": bool(resolved_crop_enabled),
+        "crop_x": resolved_crop_x,
+        "crop_y": resolved_crop_y,
+        "crop_w": resolved_crop_w,
+        "crop_h": resolved_crop_h,
         "min_perimeter": resolved_min_perimeter,
         "max_perimeter": resolved_max_perimeter,
         "padding": resolved_padding,
@@ -320,12 +400,38 @@ def segment_frame(
         run_id=run_id,
         asset_id=asset_id,
         payload=payload_base,
-        logger="pelagia.processing.segmentation",
+        logger="pelagia.processing.detection_candidate",
         core_logger=_CORE_LOGGER,
     )
     try:
+        if apply_preprocessing:
+            frame = preprocess_frame_for_segmentation(
+                frame,
+                flatfield_correction=resolved_flatfield_correction,
+                flatfield_q=resolved_flatfield_q,
+                flatfield_axis=resolved_flatfield_axis,
+                apply_mask=resolved_apply_mask,
+                crop_enabled=resolved_crop_enabled,
+                crop_x=resolved_crop_x,
+                crop_y=resolved_crop_y,
+                crop_w=resolved_crop_w,
+                crop_h=resolved_crop_h,
+                background_correction=resolved_background_correction,
+                background=background,
+                background_percentile=resolved_background_percentile,
+                invert_intensity=resolved_invert_intensity,
+                context=context,
+            )
         gray = _as_grayscale_array(frame)
-        thresh = threshold(gray) if callable(threshold) else calc_threshold(gray, threshold)
+        if callable(threshold):
+            thresh = threshold(gray)
+        elif threshold is None:
+            thresh = threshold_otsu(
+                gray,
+                thresholding_maximum_value=thresholding_defaults.thresholding_maximum_value,
+            )
+        else:
+            thresh = threshold_manual(gray, threshold)
         thresh = _as_binary_mask(thresh)
 
         num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
@@ -384,6 +490,9 @@ def segment_frame(
                 metadata={
                     "source_frame_type": frame.frameType,
                     "component_label": int(lab),
+                    "detection_stage": "candidate",
+                    "mask_kind": "candidate",
+                    "foreground_polarity": "bright",
                     "object_bbox": (
                         frame.bbox_x + int(x),
                         frame.bbox_y + int(y),
@@ -434,7 +543,7 @@ def segment_frame(
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
             },
-            logger="pelagia.processing.segmentation",
+            logger="pelagia.processing.detection_candidate",
             core_logger=_CORE_LOGGER,
         )
         raise
@@ -462,7 +571,7 @@ def segment_frame(
             "detection_count": len(roi_records),
             "frame_shape": list(gray.shape),
         },
-        logger="pelagia.processing.segmentation",
+        logger="pelagia.processing.detection_candidate",
         core_logger=_CORE_LOGGER,
     )
     return roi_records

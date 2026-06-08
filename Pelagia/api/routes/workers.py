@@ -22,6 +22,7 @@ if APIRouter is not None:
         capability: str | None = None,
         shutdown_requested: bool | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         return {
             "workers": as_response(
@@ -30,6 +31,7 @@ if APIRouter is not None:
                     capability=capability,
                     shutdown_requested=shutdown_requested,
                     limit=limit,
+                    offset=max(0, offset),
                 )
             )
         }

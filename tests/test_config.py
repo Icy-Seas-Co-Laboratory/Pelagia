@@ -39,16 +39,31 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
     assert config.image_data_storage.encoding == "zstd"
-    assert config.processing.segmentation.min_perimeter == 100.0
-    assert config.processing.segmentation.padding == 100
+    assert config.processing.segmentation.min_perimeter == 50.0
+    assert config.processing.segmentation.padding == 50
     assert config.processing.segmentation.roi_encoding == "zstd"
-    assert config.processing.video_ingest.n_tile == 2
-    assert config.processing.video_ingest.flatfield_q == 0.9
-    assert config.processing.video_ingest.adaptive_background_subtraction is False
-    assert config.processing.video_ingest.adaptive_background_period == 50
-    assert config.processing.video_ingest.frame_mask is False
-    assert config.processing.video_ingest.frame_mask_path is None
+    assert config.processing.segmentation.zstd_min_bytes == 16384
+    assert config.processing.video_ingest.n_tile == 4
+    assert config.processing.flatfield.flatfield_correction is True
+    assert config.processing.flatfield.flatfield_q == 0.5
+    assert config.processing.flatfield.flatfield_axis == 0
+    assert config.processing.thresholding.method == "otsu"
     assert config.processing.thresholding.thresholding_maximum_value == 255.0
+    assert config.processing.thresholding.bounded_otsu_min_contrast == 50.0
+    assert config.processing.thresholding.canny_low_threshold == 30.0
+    assert config.processing.thresholding.adaptive_block_size == 31
+    assert config.processing.preprocessing.apply_mask is False
+    assert config.processing.preprocessing.mask_path is None
+    assert config.processing.preprocessing.adaptive_background_subtraction is False
+    assert config.processing.preprocessing.adaptive_background_period == 50
+    assert config.processing.preprocessing.background_correction is False
+    assert config.processing.preprocessing.background_percentile == 50.0
+    assert config.processing.preprocessing.invert_intensity is True
+    assert config.processing.preprocessing.crop_enabled is False
+    assert config.processing.preprocessing.crop_x is None
+    assert config.processing.preprocessing.crop_y is None
+    assert config.processing.preprocessing.crop_w is None
+    assert config.processing.preprocessing.crop_h is None
     assert config.processing.frame_storage.image_encoding == "jpg"
     assert config.processing.thumbhash.max_dim == 100
     assert config.logging.log_path.as_posix() == "logs"
@@ -78,17 +93,38 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [processing.video_ingest]
         n_tile = 4
-        adaptive_background_subtraction = true
-        adaptive_background_period = 12
-        frame_mask = true
-        frame_mask_path = "/tmp/mask.png"
+
+        [processing.flatfield]
+        flatfield_correction = false
+        flatfield_q = 0.8
+        flatfield_axis = 1
 
         [processing.thresholding]
+        method = "bounded_otsu_canny"
         thresholding_maximum_value = 180
+        bounded_otsu_min_contrast = 22
+        canny_low_threshold = 12
+        adaptive_block_size = 17
+
+        [processing.preprocessing]
+        apply_mask = false
+        mask_path = "/tmp/mask.png"
+        adaptive_background_subtraction = true
+        adaptive_background_period = 12
+        background_correction = true
+        background_percentile = 25
+        invert_intensity = true
+        crop_enabled = true
+        crop_x = 10
+        crop_y = 20
+        crop_w = 300
+        crop_h = 400
 
         [processing.frame_storage]
         image_encoding = "png"
-        thumbhash_max_dim = 64
+
+        [processing.thumbhash]
+        max_dim = 64
         """,
         encoding="utf-8",
     )
@@ -103,13 +139,28 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.segmentation.min_perimeter == 12.5
     assert config.processing.segmentation.padding == 3
     assert config.processing.video_ingest.n_tile == 4
-    assert config.processing.video_ingest.adaptive_background_subtraction is True
-    assert config.processing.video_ingest.adaptive_background_period == 12
-    assert config.processing.video_ingest.frame_mask is True
-    assert config.processing.video_ingest.frame_mask_path == "/tmp/mask.png"
+    assert config.processing.flatfield.flatfield_correction is False
+    assert config.processing.flatfield.flatfield_q == 0.8
+    assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.thresholding.method == "bounded_otsu_canny"
     assert config.processing.thresholding.thresholding_maximum_value == 180.0
+    assert config.processing.thresholding.bounded_otsu_min_contrast == 22.0
+    assert config.processing.thresholding.canny_low_threshold == 12.0
+    assert config.processing.thresholding.adaptive_block_size == 17
+    assert config.processing.preprocessing.apply_mask is False
+    assert config.processing.preprocessing.mask_path == "/tmp/mask.png"
+    assert config.processing.preprocessing.adaptive_background_subtraction is True
+    assert config.processing.preprocessing.adaptive_background_period == 12
+    assert config.processing.preprocessing.background_correction is True
+    assert config.processing.preprocessing.background_percentile == 25.0
+    assert config.processing.preprocessing.invert_intensity is True
+    assert config.processing.preprocessing.crop_enabled is True
+    assert config.processing.preprocessing.crop_x == 10
+    assert config.processing.preprocessing.crop_y == 20
+    assert config.processing.preprocessing.crop_w == 300
+    assert config.processing.preprocessing.crop_h == 400
     assert config.processing.frame_storage.image_encoding == "png"
-    assert config.processing.frame_storage.thumbhash_max_dim == 64
+    assert config.processing.thumbhash.max_dim == 64
 
 
 def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
@@ -128,11 +179,25 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_ENCODING", "zstd")
     monkeypatch.setenv("PELAGIA_SEGMENTATION_MIN_PERIMETER", "9")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_N_TILE", "5")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_AXIS", "1")
+    monkeypatch.setenv("PELAGIA_THRESHOLDING_METHOD", "adaptive_mean")
     monkeypatch.setenv("PELAGIA_THRESHOLDING_MAXIMUM_VALUE", "170")
-    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_ADAPTIVE_BACKGROUND_SUBTRACTION", "true")
-    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_ADAPTIVE_BACKGROUND_PERIOD", "20")
-    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_FRAME_MASK", "true")
-    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_FRAME_MASK_PATH", "/tmp/env-mask.png")
+    monkeypatch.setenv("PELAGIA_THRESHOLDING_CANNY_LOW_THRESHOLD", "9")
+    monkeypatch.setenv("PELAGIA_THRESHOLDING_ADAPTIVE_BLOCK_SIZE", "19")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_APPLY_MASK", "false")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_MASK_PATH", "/tmp/env-mask.png")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_SUBTRACTION", "true")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_PERIOD", "20")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_CORRECTION", "true")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_PERCENTILE", "30")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_INVERT_INTENSITY", "true")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_ENABLED", "true")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_X", "1")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_Y", "2")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_W", "3")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_H", "4")
     monkeypatch.setenv("PELAGIA_FRAME_STORAGE_IMAGE_ENCODING", "raw")
     monkeypatch.setenv("PELAGIA_LOG_PATH", "/tmp/env-pelagia-logs")
     monkeypatch.setenv("PELAGIA_LOG_LEVEL", "warning")
@@ -144,11 +209,25 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.image_data_storage.encoding == "zstd"
     assert config.processing.segmentation.min_perimeter == 9.0
     assert config.processing.video_ingest.n_tile == 5
-    assert config.processing.video_ingest.adaptive_background_subtraction is True
-    assert config.processing.video_ingest.adaptive_background_period == 20
-    assert config.processing.video_ingest.frame_mask is True
-    assert config.processing.video_ingest.frame_mask_path == "/tmp/env-mask.png"
+    assert config.processing.flatfield.flatfield_correction is False
+    assert config.processing.flatfield.flatfield_q == 0.7
+    assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.thresholding.method == "adaptive_mean"
     assert config.processing.thresholding.thresholding_maximum_value == 170.0
+    assert config.processing.thresholding.canny_low_threshold == 9.0
+    assert config.processing.thresholding.adaptive_block_size == 19
+    assert config.processing.preprocessing.apply_mask is False
+    assert config.processing.preprocessing.mask_path == "/tmp/env-mask.png"
+    assert config.processing.preprocessing.adaptive_background_subtraction is True
+    assert config.processing.preprocessing.adaptive_background_period == 20
+    assert config.processing.preprocessing.background_correction is True
+    assert config.processing.preprocessing.background_percentile == 30.0
+    assert config.processing.preprocessing.invert_intensity is True
+    assert config.processing.preprocessing.crop_enabled is True
+    assert config.processing.preprocessing.crop_x == 1
+    assert config.processing.preprocessing.crop_y == 2
+    assert config.processing.preprocessing.crop_w == 3
+    assert config.processing.preprocessing.crop_h == 4
     assert config.processing.frame_storage.image_encoding == "raw"
     assert config.logging.log_path.as_posix() == "/tmp/env-pelagia-logs"
     assert config.logging.level == "WARNING"

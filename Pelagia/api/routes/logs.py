@@ -15,6 +15,9 @@ if APIRouter is not None:
     def _bounded_limit(limit: int | None) -> int:
         return min(max(1, 100 if limit is None else limit), 1000)
 
+    def _bounded_offset(offset: int | None) -> int:
+        return max(0, 0 if offset is None else offset)
+
     class CreateLogRequest(BaseModel):
         event_type: str
         message: str | None = None
@@ -44,6 +47,7 @@ if APIRouter is not None:
         worker_id: str | None = None,
         request_id: str | None = None,
         limit: int | None = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         repository = get_repository(request)
         logs = repository.list_logs(
@@ -58,6 +62,7 @@ if APIRouter is not None:
             worker_id=worker_id,
             request_id=request_id,
             limit=_bounded_limit(limit),
+            offset=_bounded_offset(offset),
         )
         return {"logs": as_response(logs)}
 

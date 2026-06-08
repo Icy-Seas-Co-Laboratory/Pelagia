@@ -21,6 +21,22 @@ except ImportError:  # pragma: no cover - exercised only when postgres extras ar
     dict_row = None
 
 
+REQUIRED_SCHEMA_TABLES = (
+    "runs",
+    "raw_assets",
+    "frames",
+    "detection_candidate",
+    "detections_refined",
+    "models",
+    "classification_results",
+    "processing_jobs",
+    "processing_job_dependencies",
+    "worker_sessions",
+    "job_events",
+    "logs",
+)
+
+
 def render_schema(schema: str = "seasight") -> str:
     schema = validate_schema_name(schema)
     template = files(__package__).joinpath("sql", "schema.sql").read_text(encoding="utf-8")
@@ -101,21 +117,31 @@ class PostgresRepository:
                 cursor.execute(render_schema(self.schema))
             connection.commit()
 
+    def schema_status(self) -> dict[str, Any]:
+        required = list(REQUIRED_SCHEMA_TABLES)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = ANY(%s)
+                    """,
+                    (self.schema, required),
+                )
+                existing = sorted(row["table_name"] for row in cursor.fetchall())
+        missing = sorted(set(required) - set(existing))
+        return {
+            "schema": self.schema,
+            "ready": not missing,
+            "required_tables": required,
+            "existing_tables": existing,
+            "missing_tables": missing,
+        }
+
     def purge_all(self) -> dict[str, Any]:
         """Delete all Pelagia rows while preserving the schema, indexes, and functions."""
-        tables = [
-            "runs",
-            "raw_assets",
-            "frames",
-            "detections",
-            "models",
-            "classification_results",
-            "processing_jobs",
-            "processing_job_dependencies",
-            "worker_sessions",
-            "job_events",
-            "logs",
-        ]
+        tables = list(REQUIRED_SCHEMA_TABLES)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 before: dict[str, int] = {}
@@ -149,6 +175,7 @@ class PostgresRepository:
     def list_runs(
         self,
         limit: int = 100,
+        offset: int = 0,
         collection: str | None = None,
         run_key: str | None = None,
         instrument: str | None = None,
@@ -185,11 +212,11 @@ class PostgresRepository:
             clauses.append("source_path ILIKE %s")
             params.append(f"%{source_path}%")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.runs {where} ORDER BY created_at DESC LIMIT %s",
+                    f"SELECT * FROM {self.schema}.runs {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -218,6 +245,7 @@ class PostgresRepository:
         limit: int | None = None,
         cursor: str | None = None,
         include_details: bool = True,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -247,8 +275,11 @@ class PostgresRepository:
                 params.extend([cursor_created_at, cursor_id])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_sql = "LIMIT %s" if limit else ""
+        offset_sql = "OFFSET %s" if offset else ""
         if limit:
             params.append(limit)
+        if offset:
+            params.append(max(0, int(offset)))
         select_sql = "*"
         if not include_details:
             select_sql = """
@@ -280,7 +311,7 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT {select_sql} FROM {self.schema}.processing_jobs {where} ORDER BY created_at DESC, id DESC {limit_sql}",
+                    f"SELECT {select_sql} FROM {self.schema}.processing_jobs {where} ORDER BY created_at DESC, id DESC {limit_sql} {offset_sql}",
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -297,6 +328,7 @@ class PostgresRepository:
         capability: str | None = None,
         shutdown_requested: bool | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -310,7 +342,7 @@ class PostgresRepository:
             clauses.append("shutdown_requested = %s")
             params.append(shutdown_requested)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -319,7 +351,7 @@ class PostgresRepository:
                     FROM {self.schema}.worker_sessions
                     {where}
                     ORDER BY last_heartbeat DESC, updated_at DESC, worker_id ASC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
                     tuple(params),
                 )
@@ -437,6 +469,7 @@ class PostgresRepository:
         max_size_bytes: int | None = None,
         media_count: int | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -468,22 +501,27 @@ class PostgresRepository:
             clauses.append("media_count = %s")
             params.append(media_count)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.raw_assets {where} ORDER BY created_at DESC, filename ASC LIMIT %s",
+                    f"SELECT * FROM {self.schema}.raw_assets {where} ORDER BY created_at DESC, filename ASC LIMIT %s OFFSET %s",
                     tuple(params),
                 )
                 return cursor.fetchall()
 
-    def list_collections(self, collection: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    def list_collections(
+        self,
+        collection: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         having = ""
         params: list[Any] = []
         if collection:
             having = "WHERE collection ILIKE %s"
             params.append(f"%{collection}%")
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -497,7 +535,7 @@ class PostgresRepository:
                     ) collections
                     {having}
                     ORDER BY collection ASC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """
                     ,
                     tuple(params),
@@ -566,6 +604,7 @@ class PostgresRepository:
         start_frame: int | None = None,
         end_frame: int | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = ["asset_id = %s"]
         params: list[Any] = [asset_id]
@@ -576,8 +615,11 @@ class PostgresRepository:
             clauses.append("frame_index <= %s")
             params.append(end_frame)
         limit_sql = "LIMIT %s" if limit is not None else ""
+        offset_sql = "OFFSET %s" if offset else ""
         if limit is not None:
             params.append(limit)
+        if offset:
+            params.append(max(0, int(offset)))
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -587,6 +629,7 @@ class PostgresRepository:
                     WHERE {' AND '.join(clauses)}
                     ORDER BY frame_index DESC
                     {limit_sql}
+                    {offset_sql}
                     """,
                     tuple(params),
                 )
@@ -617,6 +660,7 @@ class PostgresRepository:
         start_frame: int | None = None,
         end_frame: int | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[FrameRecord]:
         return [
             FrameRecord.from_row(row)
@@ -625,6 +669,7 @@ class PostgresRepository:
                 start_frame=start_frame,
                 end_frame=end_frame,
                 limit=limit,
+                offset=offset,
             )
         ]
 
@@ -633,6 +678,54 @@ class PostgresRepository:
         if row is None:
             return None
         return FrameRecord.from_row(row)
+
+    def update_frame_preprocessed_payload(
+        self,
+        frame_id: str,
+        *,
+        kvstore_hash: str,
+        preview_thumbhash: bytes,
+        payload_ref: str,
+        payload_encoding: str,
+        payload_format: str,
+        payload_dtype: str,
+        payload_shape: Sequence[int],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.frames
+                    SET
+                        preprocessed_kvstore_hash = %s,
+                        preprocessed_preview_thumbhash = %s,
+                        preprocessed_payload_ref = %s,
+                        preprocessed_payload_encoding = %s,
+                        preprocessed_payload_format = %s,
+                        preprocessed_payload_dtype = %s,
+                        preprocessed_payload_shape = %s::jsonb,
+                        preprocessed_metadata = %s::jsonb
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (
+                        kvstore_hash,
+                        preview_thumbhash,
+                        payload_ref,
+                        payload_encoding,
+                        payload_format,
+                        payload_dtype,
+                        json.dumps(json_ready(list(payload_shape))),
+                        json.dumps(json_ready(metadata or {})),
+                        frame_id,
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        if row is None:
+            raise KeyError(frame_id)
+        return row
 
     def _insert_detection_rows(
         self,
@@ -644,7 +737,7 @@ class PostgresRepository:
         for detection in detections:
             cursor.execute(
                 f"""
-                INSERT INTO {self.schema}.detections
+                INSERT INTO {self.schema}.detection_candidate
                 (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
                  crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
                  area, perimeter, major_axis_length, minor_axis_length,
@@ -690,12 +783,103 @@ class PostgresRepository:
             inserted.append(cursor.fetchone())
         return inserted
 
+    def upsert_refined_detections(
+        self,
+        refined_detections: Sequence[tuple[str, DetectionRecord]],
+    ) -> list[dict[str, Any]]:
+        if not refined_detections:
+            return []
+        inserted: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                for candidate_detection_id, detection in refined_detections:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.detections_refined
+                        (candidate_detection_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                         crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
+                         area, perimeter, major_axis_length, minor_axis_length,
+                         min_gray_value, mean_gray_value, roi_payload, mask_payload,
+                         roi_encoding, roi_format, roi_dtype, roi_shape,
+                         mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                                %s, %s::jsonb, %s, %s::jsonb)
+                        ON CONFLICT (candidate_detection_id) DO UPDATE SET
+                            run_id = EXCLUDED.run_id,
+                            frame_id = EXCLUDED.frame_id,
+                            roi_index = EXCLUDED.roi_index,
+                            bbox_x = EXCLUDED.bbox_x,
+                            bbox_y = EXCLUDED.bbox_y,
+                            bbox_w = EXCLUDED.bbox_w,
+                            bbox_h = EXCLUDED.bbox_h,
+                            crop_bbox_x = EXCLUDED.crop_bbox_x,
+                            crop_bbox_y = EXCLUDED.crop_bbox_y,
+                            crop_bbox_w = EXCLUDED.crop_bbox_w,
+                            crop_bbox_h = EXCLUDED.crop_bbox_h,
+                            area = EXCLUDED.area,
+                            perimeter = EXCLUDED.perimeter,
+                            major_axis_length = EXCLUDED.major_axis_length,
+                            minor_axis_length = EXCLUDED.minor_axis_length,
+                            min_gray_value = EXCLUDED.min_gray_value,
+                            mean_gray_value = EXCLUDED.mean_gray_value,
+                            roi_payload = EXCLUDED.roi_payload,
+                            mask_payload = EXCLUDED.mask_payload,
+                            roi_encoding = EXCLUDED.roi_encoding,
+                            roi_format = EXCLUDED.roi_format,
+                            roi_dtype = EXCLUDED.roi_dtype,
+                            roi_shape = EXCLUDED.roi_shape,
+                            mask_encoding = EXCLUDED.mask_encoding,
+                            mask_format = EXCLUDED.mask_format,
+                            mask_dtype = EXCLUDED.mask_dtype,
+                            mask_shape = EXCLUDED.mask_shape,
+                            refinement_method = EXCLUDED.refinement_method,
+                            metadata = EXCLUDED.metadata
+                        RETURNING *;
+                        """,
+                        (
+                            candidate_detection_id,
+                            detection.run_id,
+                            detection.frame_id,
+                            detection.roi_index,
+                            detection.bbox_x,
+                            detection.bbox_y,
+                            detection.bbox_w,
+                            detection.bbox_h,
+                            detection.crop_bbox_x,
+                            detection.crop_bbox_y,
+                            detection.crop_bbox_w,
+                            detection.crop_bbox_h,
+                            detection.area,
+                            detection.perimeter,
+                            detection.major_axis_length,
+                            detection.minor_axis_length,
+                            detection.min_gray_value,
+                            detection.mean_gray_value,
+                            detection.roi_payload,
+                            detection.mask_payload,
+                            detection.roi_encoding,
+                            detection.roi_format,
+                            detection.roi_dtype,
+                            json.dumps(json_ready(detection.roi_shape)),
+                            detection.mask_encoding,
+                            detection.mask_format,
+                            detection.mask_dtype,
+                            json.dumps(json_ready(detection.mask_shape)),
+                            detection.metadata.get("refinement_method", "identity"),
+                            json.dumps(json_ready(detection.metadata)),
+                        ),
+                    )
+                    inserted.append(cursor.fetchone())
+            connection.commit()
+        return inserted
+
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    DELETE FROM {self.schema}.detections
+                    DELETE FROM {self.schema}.detection_candidate
                     WHERE frame_id IN (SELECT id FROM {self.schema}.frames WHERE asset_id = %s)
                     """,
                     (asset_id,),
@@ -717,7 +901,7 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    DELETE FROM {self.schema}.detections
+                    DELETE FROM {self.schema}.detection_candidate
                     WHERE frame_id = ANY(%s)
                     """,
                     (resolved_frame_ids,),
@@ -752,7 +936,10 @@ class PostgresRepository:
         roi_format: str | None = None,
         mask_encoding: str | None = None,
         mask_format: str | None = None,
+        sort_by: str = "asset_frame",
+        sort_dir: str = "desc",
         limit: int | None = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -808,10 +995,23 @@ class PostgresRepository:
                 clauses.append(f"{column} = %s")
                 params.append(value)
 
+        direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+        sort_key = str(sort_by or "asset_frame").lower()
+        order_by_options = {
+            "area": f"detections.area {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
+            "byte_size": f"octet_length(detections.roi_payload) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
+            "id": f"detections.id {direction}",
+            "asset_frame": f"assets.filename {direction} NULLS LAST, frames.frame_index {direction}, detections.roi_index {direction}",
+        }
+        order_by = order_by_options.get(sort_key, order_by_options["asset_frame"])
+
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_sql = "LIMIT %s" if limit is not None else ""
+        offset_sql = "OFFSET %s" if offset else ""
         if limit is not None:
             params.append(limit)
+        if offset:
+            params.append(max(0, int(offset)))
 
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -822,12 +1022,13 @@ class PostgresRepository:
                         frames.asset_id,
                         frames.frame_index,
                         assets.filename AS asset_filename
-                    FROM {self.schema}.detections detections
+                    FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     {where}
-                    ORDER BY frames.frame_index DESC, detections.roi_index ASC
+                    ORDER BY {order_by}
                     {limit_sql}
+                    {offset_sql}
                     """,
                     tuple(params),
                 )
@@ -843,7 +1044,7 @@ class PostgresRepository:
                         frames.asset_id,
                         frames.frame_index,
                         assets.filename AS asset_filename
-                    FROM {self.schema}.detections detections
+                    FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE detections.id = %s
@@ -864,6 +1065,7 @@ class PostgresRepository:
         filename: str | None = None,
         min_detection_count: int | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, Any]:
         clauses = []
         params: list[Any] = []
@@ -895,7 +1097,7 @@ class PostgresRepository:
                     COUNT(detections.id) AS detection_count
                 FROM {self.schema}.raw_assets assets
                 LEFT JOIN {self.schema}.frames frames ON frames.asset_id = assets.id
-                LEFT JOIN {self.schema}.detections detections ON detections.frame_id = frames.id
+                LEFT JOIN {self.schema}.detection_candidate detections ON detections.frame_id = frames.id
                 {where}
                 GROUP BY assets.id, assets.run_id, assets.filename, assets.kind, assets.collections
                 {having}
@@ -921,9 +1123,9 @@ class PostgresRepository:
                     SELECT *
                     FROM asset_detection_counts
                     ORDER BY detection_count DESC, filename ASC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
-                    aggregate_params + (limit,),
+                    aggregate_params + (limit, max(0, int(offset))),
                 )
                 assets = cursor.fetchall()
 
@@ -975,6 +1177,7 @@ class PostgresRepository:
         task: str | None = None,
         artifact_uri: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -994,11 +1197,11 @@ class PostgresRepository:
             clauses.append("artifact_uri ILIKE %s")
             params.append(f"%{artifact_uri}%")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT * FROM {self.schema}.models {where} ORDER BY created_at DESC LIMIT %s",
+                    f"SELECT * FROM {self.schema}.models {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
                     tuple(params),
                 )
                 return cursor.fetchall()
@@ -1333,6 +1536,7 @@ class PostgresRepository:
         run_id: str | None = None,
         job_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -1348,7 +1552,7 @@ class PostgresRepository:
             clauses.append("jobs.run_id = %s")
             params.append(run_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1358,7 +1562,7 @@ class PostgresRepository:
                     {joins}
                     {where}
                     ORDER BY events.id DESC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
                     tuple(params),
                 )
@@ -1378,6 +1582,7 @@ class PostgresRepository:
         worker_id: str | None = None,
         request_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -1412,7 +1617,7 @@ class PostgresRepository:
             clauses.append("request_id = %s")
             params.append(request_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1421,7 +1626,7 @@ class PostgresRepository:
                     FROM {self.schema}.logs
                     {where}
                     ORDER BY id DESC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
                     tuple(params),
                 )

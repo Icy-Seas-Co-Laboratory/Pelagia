@@ -21,9 +21,9 @@ heartbeat_interval_seconds = 30
 # Cold storage for large frame payloads.
 root_path = "./data/kvstore"
 # Options: sha256, blake3.
-hash_algorithm = "sha256"
+hash_algorithm = "blake3"
 # Number of hash-prefix characters used to shard object storage paths.
-prefix_length = 1
+prefix_length = 2
 max_db_bytes = 4294967296
 max_rows = 1000000
 
@@ -33,37 +33,86 @@ encoding = "zstd"
 
 [processing.segmentation]
 # ROI detection defaults used by API, CLI, and workers unless explicitly overridden.
-min_perimeter = 100
-padding = 100
+min_perimeter = 50
+padding = 50
 # Options: zstd, png, raw, auto.
 roi_encoding = "zstd"
 # Minimum ROI byte size before auto encoding prefers zstd over png.
-zstd_min_bytes = 1024
+zstd_min_bytes = 16384
 
 [processing.video_ingest]
-# Video-to-frame extraction defaults. These are also used by frame_store
-# when it performs ingest-time frame preparation such as flatfield correction.
-n_tile = 2
+# Video-to-frame extraction defaults. Frame storage preserves extracted pixels;
+# downstream processing steps own correction and segmentation transforms.
+# Number of source video frames stacked into one stored frame/tile.
+n_tile = 4
+
+[processing.flatfield]
+# Flatfield correction defaults used during segmentation. Must be > 0 and < 1.
 flatfield_correction = true
-# Quantile used to estimate the flatfield profile. Must be > 0 and < 1.
-flatfield_q = 0.9
+# Quantile used to estimate the flatfield profile.
+flatfield_q = 0.5
 # Axis used by global flatfield correction. Options: 0, 1.
 flatfield_axis = 0
-# Future background-subtraction controls. Recorded in frame metadata today.
-adaptive_background_subtraction = false
-adaptive_background_period = 50
-# Future frame mask controls. Use null when no mask file is configured.
-frame_mask = false
-frame_mask_path = null
 
 [processing.thresholding]
-# Maximum threshold value used when default Otsu thresholding is capped.
+# Candidate mask generation defaults. Method options currently include:
+# otsu, bounded_otsu, bounded_otsu_canny, adaptive_mean, adaptive_gaussian,
+# percentile_background, hysteresis, sobel_edges.
+method = "otsu"
+# Maximum threshold value used when Otsu-style thresholding is capped.
 thresholding_maximum_value = 255
+# Bounded Otsu rejects weak foreground/background separation and overly full masks.
+bounded_otsu_min_contrast = 50
+bounded_otsu_max_foreground_fraction = 0.9
+# Canny thresholds and blur kernel used by bounded_otsu_canny.
+canny_enabled = true
+canny_low_threshold = 30
+canny_high_threshold = 80
+canny_blur_kernel = 5
+# Final dilation kernel applied by combined threshold methods.
+dilate_kernel_w = 2
+dilate_kernel_h = 2
+# Adaptive threshold window size and constant offset.
+adaptive_block_size = 31
+adaptive_c = 5
+# Percentile-background threshold estimates background brightness, then adds contrast.
+percentile_background_percentile = 50
+percentile_min_contrast = 50
+# Hysteresis keeps weak pixels only when connected to strong pixels.
+hysteresis_low_threshold = 30
+hysteresis_high_threshold = 80
+hysteresis_connectivity = 8
+# Sobel edge thresholding uses a gradient percentile unless an explicit threshold is supplied.
+sobel_percentile = 90
+sobel_kernel_size = 3
+
+[processing.preprocessing]
+# Frame preprocessing defaults used before candidate detection.
+# Processing order is: grayscale -> optional crop -> optional mask ->
+# optional flatfield -> optional background correction -> optional inversion.
+# Enable mask application when a frame mask is available or mask_path is set.
+apply_mask = false
+# Frame mask controls. Use null when no mask file is configured.
+mask_path = null
+# Future adaptive background-subtraction controls.
+adaptive_background_subtraction = false
+adaptive_background_period = 50
+# Subtract scalar/image background before inversion and thresholding.
+background_correction = false
+background_percentile = 50
+# Convert dark-foreground imagery to Pelagia's bright-foreground convention.
+invert_intensity = true
+# Crop uses x/y origin plus width/height in source-frame pixels. Leave disabled
+# or use null values when no default crop should be applied.
+crop_enabled = false
+crop_x = null
+crop_y = null
+crop_w = null
+crop_h = null
 
 [processing.frame_storage]
 # Stored frame payload encoding. Options: zstd, png, jpg, raw.
 image_encoding = "jpg"
-thumbhash_max_dim = 100
 
 [processing.thumbhash]
 # Maximum image dimension used before computing preview thumbhashes.

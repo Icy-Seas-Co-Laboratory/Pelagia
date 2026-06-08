@@ -11,7 +11,9 @@ PELAGIA_DATABASE_SCHEMA="${PELAGIA_DATABASE_SCHEMA:-pelagia}"
 PELAGIA_KVSTORE_ROOT="${PELAGIA_KVSTORE_ROOT:-$ROOT_DIR/data/kvstore}"
 PELAGIA_API_HOST="${PELAGIA_API_HOST:-127.0.0.1}"
 PELAGIA_API_PORT="${PELAGIA_API_PORT:-8000}"
-PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,segment}"
+PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,preprocess_frames,segment}"
+PELAGIA_WORKER_COUNT="${PELAGIA_WORKER_COUNT:-1}"
+PELAGIA_WORKER_COUNTS="${PELAGIA_WORKER_COUNTS:-}"
 PELAGIA_IDLE_SLEEP_SECONDS="${PELAGIA_IDLE_SLEEP_SECONDS:-2.0}"
 PELAGIA_REQUEUE_INTERVAL_SECONDS="${PELAGIA_REQUEUE_INTERVAL_SECONDS:-30.0}"
 PELAGIA_INIT_ON_START="${PELAGIA_INIT_ON_START:-auto}"
@@ -26,9 +28,15 @@ is_running() {
     if [[ ! -f "$pid_file" ]]; then
         return 1
     fi
-    local pid
+    local pid kill_output
     pid="$(cat "$pid_file")"
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+    if [[ -z "$pid" ]]; then
+        return 1
+    fi
+    if kill_output="$(kill -0 "$pid" 2>&1)"; then
+        return 0
+    fi
+    [[ "$kill_output" == *"Operation not permitted"* ]]
 }
 
 start_process() {
@@ -76,17 +84,75 @@ stop_pid_file() {
     echo "force-stopped $name"
 }
 
+cleanup_stale_pid_files() {
+    local pid_file name
+    for pid_file in "$PID_DIR"/*.pid; do
+        [[ -e "$pid_file" ]] || return 0
+        if ! is_running "$pid_file"; then
+            name="$(basename "$pid_file" .pid)"
+            rm -f "$pid_file"
+            echo "removed stale pid file for $name"
+        fi
+    done
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+worker_count_for_stage() {
+    local stage="$1"
+    local count="$PELAGIA_WORKER_COUNT"
+    if [[ -n "$PELAGIA_WORKER_COUNTS" ]]; then
+        local entries raw_entry entry entry_stage entry_count
+        IFS=',' read -r -a entries <<<"$PELAGIA_WORKER_COUNTS"
+        for raw_entry in "${entries[@]}"; do
+            entry="$(echo "$raw_entry" | xargs)"
+            [[ -z "$entry" ]] && continue
+            if [[ "$entry" != *=* ]]; then
+                echo "invalid PELAGIA_WORKER_COUNTS entry '$entry'; expected stage=count" >&2
+                return 2
+            fi
+            entry_stage="$(echo "${entry%%=*}" | xargs)"
+            entry_count="$(echo "${entry#*=}" | xargs)"
+            if [[ "$entry_stage" == "$stage" ]]; then
+                count="$entry_count"
+            fi
+        done
+    fi
+    if ! is_positive_integer "$count"; then
+        echo "worker count for stage '$stage' must be a positive integer, got '$count'" >&2
+        return 2
+    fi
+    echo "$count"
+}
+
 worker_name_for_stage() {
     local stage="$1"
-    echo "pelagia-${stage//_/-}-1"
+    local index="$2"
+    echo "pelagia-${stage//_/-}-$index"
+}
+
+process_name_for_stage() {
+    local stage="$1"
+    local index="$2"
+    local total="$3"
+    local legacy_name="worker-$stage"
+    if [[ "$index" == "1" && -f "$PID_DIR/$legacy_name.pid" ]]; then
+        echo "$legacy_name"
+    elif [[ "$total" == "1" ]]; then
+        echo "$legacy_name"
+    else
+        echo "worker-$stage-$index"
+    fi
 }
 
 storage_is_ready() {
-    python -m Pelagia.cli.app list_asset_ids \
+    python -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
-        --limit 1 >"$LOG_DIR/storage-check.log" 2>&1
+        >"$LOG_DIR/storage-check.log" 2>&1
 }
 
 initialize_system() {
@@ -123,6 +189,7 @@ initialize_system() {
 }
 
 start_stack() {
+    cleanup_stale_pid_files
     initialize_system
 
     export PELAGIA_DATABASE_DSN
@@ -141,16 +208,20 @@ start_stack() {
         if [[ -z "$stage" ]]; then
             continue
         fi
-        worker_id="$(worker_name_for_stage "$stage")"
-        start_process "worker-$stage" \
-            python -m Pelagia.cli.app worker_run \
-            --database-dsn "$PELAGIA_DATABASE_DSN" \
-            --schema "$PELAGIA_DATABASE_SCHEMA" \
-            --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
-            --worker-id "$worker_id" \
-            --stages "$stage" \
-            --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
-            --requeue-interval-seconds "$PELAGIA_REQUEUE_INTERVAL_SECONDS"
+        worker_count="$(worker_count_for_stage "$stage")"
+        for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
+            worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
+            process_name="$(process_name_for_stage "$stage" "$worker_index" "$worker_count")"
+            start_process "$process_name" \
+                python -m Pelagia.cli.app worker_run \
+                --database-dsn "$PELAGIA_DATABASE_DSN" \
+                --schema "$PELAGIA_DATABASE_SCHEMA" \
+                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+                --worker-id "$worker_id" \
+                --stages "$stage" \
+                --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
+                --requeue-interval-seconds "$PELAGIA_REQUEUE_INTERVAL_SECONDS"
+        done
     done
 
     echo "api url=http://$PELAGIA_API_HOST:$PELAGIA_API_PORT"
@@ -165,17 +236,35 @@ stop_stack() {
         if [[ -z "$stage" ]]; then
             continue
         fi
-        worker_id="$(worker_name_for_stage "$stage")"
-        python -m Pelagia.cli.app worker_shutdown "$worker_id" \
-            --database-dsn "$PELAGIA_DATABASE_DSN" \
-            --schema "$PELAGIA_DATABASE_SCHEMA" \
-            --reason "dev stack stop" >"$LOG_DIR/worker-$stage.shutdown.log" 2>&1 || true
-        stop_pid_file "worker-$stage"
+        worker_count="$(worker_count_for_stage "$stage")"
+        for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
+            worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
+            process_name="$(process_name_for_stage "$stage" "$worker_index" "$worker_count")"
+            python -m Pelagia.cli.app worker_shutdown "$worker_id" \
+                --database-dsn "$PELAGIA_DATABASE_DSN" \
+                --schema "$PELAGIA_DATABASE_SCHEMA" \
+                --reason "dev stack stop" >"$LOG_DIR/$process_name.shutdown.log" 2>&1 || true
+            stop_pid_file "$process_name"
+        done
+        for pid_file in "$PID_DIR/worker-$stage-"*.pid "$PID_DIR/worker-$stage.pid"; do
+            [[ -e "$pid_file" ]] || continue
+            process_name="$(basename "$pid_file" .pid)"
+            worker_index="${process_name##worker-$stage-}"
+            if is_positive_integer "$worker_index"; then
+                worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
+                python -m Pelagia.cli.app worker_shutdown "$worker_id" \
+                    --database-dsn "$PELAGIA_DATABASE_DSN" \
+                    --schema "$PELAGIA_DATABASE_SCHEMA" \
+                    --reason "dev stack stop" >"$LOG_DIR/$process_name.shutdown.log" 2>&1 || true
+            fi
+            stop_pid_file "$process_name"
+        done
     done
     stop_pid_file api
 }
 
 status_stack() {
+    cleanup_stale_pid_files
     for pid_file in "$PID_DIR"/*.pid; do
         [[ -e "$pid_file" ]] || {
             echo "no pid files in $PID_DIR"

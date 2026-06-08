@@ -58,6 +58,13 @@ def frame_summary(row: Any) -> dict[str, Any]:
     if preview_thumbhash is not None:
         item["preview_thumbhash_bytes"] = len(preview_thumbhash)
         item["preview_thumbhash_base64"] = thumbhash_to_base64(preview_thumbhash)
+    preprocessed_preview_thumbhash = item.pop("preprocessed_preview_thumbhash", None)
+    if preprocessed_preview_thumbhash is not None:
+        item["preprocessed_preview_thumbhash_bytes"] = len(preprocessed_preview_thumbhash)
+        item["preprocessed_preview_thumbhash_base64"] = thumbhash_to_base64(preprocessed_preview_thumbhash)
+    item["has_preprocessed_payload"] = bool(
+        item.get("preprocessed_payload_ref") or item.get("preprocessed_kvstore_hash")
+    )
     return as_response(item)
 
 

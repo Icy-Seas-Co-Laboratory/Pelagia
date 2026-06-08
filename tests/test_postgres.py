@@ -204,6 +204,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
 
     frames = postgres_repo.list_frames(asset_id)
     assert [frame["frame_index"] for frame in frames] == [2, 1]
+    assert postgres_repo.list_frames(asset_id, limit=1, offset=1)[0]["frame_index"] == 1
     assert frames[1]["metadata"]["kvstore_key"] == "kvstore-key-1"
     assert postgres_repo.count_frames(asset_id) == 2
     assert postgres_repo.get_frame_record(inserted_frames[0]["id"]).payload_ref == "kvstore-key-1"
@@ -280,6 +281,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         inserted_frames[1]["id"],
         inserted_frames[0]["id"],
     ]
+    assert postgres_repo.list_detections(asset_id, limit=1, offset=1)[0]["frame_id"] == inserted_frames[0]["id"]
     assert detections[1]["mask_payload"] == b"mask-bytes"
     filtered_detections = postgres_repo.list_detections(
         asset_id,

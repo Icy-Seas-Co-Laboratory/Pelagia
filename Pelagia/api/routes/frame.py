@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+from typing import Literal
+
+try:
+    from fastapi import APIRouter, HTTPException, Request, Response
+    from pydantic import BaseModel
+except ImportError:  # pragma: no cover
+    APIRouter = None  # type: ignore
+
+
+if APIRouter is not None:
+    import numpy as np
+
+    from ...domain import PipelineStage
+    from ...processing.frame_preprocess import preprocess_frame_for_segmentation
+    from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
+    from ._common import as_response, frame_summary, get_context, get_repository
+    from ._images import encode_image, preview_image, scale_image
+
+    router = APIRouter(prefix="/frame", tags=["frame"])
+
+    class FramePreprocessRequest(BaseModel):
+        frame_id: str | None = None
+        asset_id: str | None = None
+        frame_num: int | None = None
+        flatfield_correction: bool | None = None
+        flatfield_q: float | None = None
+        flatfield_axis: int | None = None
+        apply_mask: bool | None = None
+        crop_enabled: bool | None = None
+        crop_x: int | None = None
+        crop_y: int | None = None
+        crop_w: int | None = None
+        crop_h: int | None = None
+        background_correction: bool | None = None
+        background_percentile: int | float | None = None
+        invert_intensity: bool | None = None
+        store: bool = True
+        encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
+        response_format: Literal["metadata", "matrix"] = "metadata"
+
+    class QueueFramePreprocessRequest(BaseModel):
+        run_id: str | None = None
+        asset_id: str | None = None
+        frame_id: str | None = None
+        frame_ids: list[str] | None = None
+        start_frame: int | None = None
+        end_frame: int | None = None
+        limit: int | None = None
+        flatfield_correction: bool | None = None
+        flatfield_q: float | None = None
+        flatfield_axis: int | None = None
+        apply_mask: bool | None = None
+        crop_enabled: bool | None = None
+        crop_x: int | None = None
+        crop_y: int | None = None
+        crop_w: int | None = None
+        crop_h: int | None = None
+        background_correction: bool | None = None
+        background_percentile: int | float | None = None
+        invert_intensity: bool | None = None
+        encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
+        priority: int | None = None
+        depends_on: list[str] | None = None
+
+    def _resolve_frame_row(request: Request, frame_id: str | None, asset_id: str | None, frame_num: int | None) -> dict:
+        repository = get_repository(request)
+        if frame_id is not None:
+            row = repository.get_frame(frame_id)
+            label = f"Frame {frame_id!r}"
+        elif asset_id is not None and frame_num is not None:
+            row = repository.get_frame_by_asset_index(asset_id, frame_num)
+            label = f"Frame {frame_num!r} for asset {asset_id!r}"
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Provide frame_id, or provide both asset_id and frame_num.",
+            )
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"{label} was not found.")
+        return row
+
+    def _frame_data_response(
+        *,
+        request: Request,
+        row: dict,
+        payload_kind: str,
+        format: str,
+        preview_max_dim: int,
+        scale: float,
+    ):
+        context = get_context(request)
+        try:
+            frame = retrieve_frame(str(row["id"]), context=context, payload_kind=payload_kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        array = frame.read()
+        if array is None:
+            raise HTTPException(status_code=404, detail=f"Frame {row['id']!r} has no image data.")
+
+        requested = format.lower()
+        if requested == "matrix":
+            matrix = np.asarray(scale_image(array, scale))
+            return as_response(
+                {
+                    "frame_id": row["id"],
+                    "asset_id": row["asset_id"],
+                    "frame_num": row["frame_index"],
+                    "payload_kind": payload_kind,
+                    "dtype": str(matrix.dtype),
+                    "shape": list(matrix.shape),
+                    "scale": scale,
+                    "data": matrix.tolist(),
+                }
+            )
+        if requested == "preview":
+            payload, media_type = encode_image(preview_image(array, preview_max_dim), "png")
+            extension = "png"
+            headers = {
+                "X-Pelagia-Preview": "true",
+                "X-Pelagia-Preview-Max-Dim": str(preview_max_dim),
+            }
+        else:
+            payload, media_type = encode_image(scale_image(array, scale), requested)
+            extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
+            headers = {"X-Pelagia-Scale": str(scale)}
+
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="{row["id"]}_{payload_kind}.{extension}"'
+                ),
+                "X-Pelagia-Frame-Id": str(row["id"]),
+                "X-Pelagia-Payload-Kind": payload_kind,
+                **headers,
+            },
+        )
+
+    @router.get("/original")
+    def get_original_frame(
+        request: Request,
+        frame_id: str | None = None,
+        asset_id: str | None = None,
+        frame_num: int | None = None,
+        format: str = "png",
+        preview_max_dim: int = 128,
+        scale: float = 1.0,
+    ):
+        row = _resolve_frame_row(request, frame_id, asset_id, frame_num)
+        return _frame_data_response(
+            request=request,
+            row=row,
+            payload_kind="original",
+            format=format,
+            preview_max_dim=preview_max_dim,
+            scale=scale,
+        )
+
+    @router.get("/preprocessed")
+    def get_preprocessed_frame(
+        request: Request,
+        frame_id: str | None = None,
+        asset_id: str | None = None,
+        frame_num: int | None = None,
+        format: str = "png",
+        preview_max_dim: int = 128,
+        scale: float = 1.0,
+    ):
+        row = _resolve_frame_row(request, frame_id, asset_id, frame_num)
+        return _frame_data_response(
+            request=request,
+            row=row,
+            payload_kind="preprocessed",
+            format=format,
+            preview_max_dim=preview_max_dim,
+            scale=scale,
+        )
+
+    @router.post("/preprocess")
+    def preprocess_frame(request: Request, body: FramePreprocessRequest) -> dict:
+        context = get_context(request)
+        row = _resolve_frame_row(request, body.frame_id, body.asset_id, body.frame_num)
+        source_frame = retrieve_frame(str(row["id"]), context=context, payload_kind="original")
+        processed = preprocess_frame_for_segmentation(
+            source_frame,
+            flatfield_correction=body.flatfield_correction,
+            flatfield_q=body.flatfield_q,
+            flatfield_axis=body.flatfield_axis,
+            apply_mask=body.apply_mask,
+            crop_enabled=body.crop_enabled,
+            crop_x=body.crop_x,
+            crop_y=body.crop_y,
+            crop_w=body.crop_w,
+            crop_h=body.crop_h,
+            background_correction=body.background_correction,
+            background_percentile=body.background_percentile,
+            invert_intensity=body.invert_intensity,
+            context=context,
+        )
+        array = processed.read()
+        if array is None:
+            raise HTTPException(status_code=500, detail="Preprocessing produced no frame data.")
+
+        stored_row = None
+        if body.store:
+            stored_row = store_preprocessed_frame(
+                str(row["id"]),
+                processed,
+                context=context,
+                encoding=body.encoding,
+            )
+
+        response = {
+            "frame_id": row["id"],
+            "asset_id": row["asset_id"],
+            "frame_num": row["frame_index"],
+            "stored": body.store,
+            "dtype": str(np.asarray(array).dtype),
+            "shape": list(np.asarray(array).shape),
+            "preprocessing": processed.metadata,
+        }
+        if stored_row is not None:
+            response["frame"] = frame_summary(stored_row)
+        if body.response_format == "matrix":
+            response["data"] = np.asarray(array).tolist()
+        return as_response(response)
+
+    @router.post("/preprocess/jobs")
+    def queue_frame_preprocess_job(request: Request, body: QueueFramePreprocessRequest) -> dict:
+        repository = get_repository(request)
+        processing_defaults = get_context(request).config.processing
+        flatfield_defaults = processing_defaults.flatfield
+        preprocessing_defaults = processing_defaults.preprocessing
+        frame_ids = list(body.frame_ids or [])
+        if body.frame_id is not None:
+            frame_ids.append(body.frame_id)
+
+        run_id = body.run_id
+        asset_id = body.asset_id
+        if asset_id is None and frame_ids:
+            first_frame = repository.get_frame_record(frame_ids[0])
+            if first_frame is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Frame {frame_ids[0]!r} was not found.",
+                )
+            run_id = run_id or first_frame.run_id
+            asset_id = first_frame.asset_id
+
+        if asset_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Preprocess jobs require asset_id or at least one frame_id.",
+            )
+
+        if run_id is None:
+            asset = repository.get_asset(asset_id)
+            if asset is None:
+                raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
+            run_id = asset.get("run_id")
+
+        payload = {
+            "frame_ids": frame_ids,
+            "start_frame": body.start_frame,
+            "end_frame": body.end_frame,
+            "limit": body.limit,
+            "flatfield_correction": (
+                flatfield_defaults.flatfield_correction
+                if body.flatfield_correction is None
+                else body.flatfield_correction
+            ),
+            "flatfield_q": flatfield_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q,
+            "flatfield_axis": flatfield_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis,
+            "apply_mask": preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask,
+            "crop_enabled": (
+                preprocessing_defaults.crop_enabled
+                if body.crop_enabled is None
+                else body.crop_enabled
+            ),
+            "crop_x": preprocessing_defaults.crop_x if body.crop_x is None else body.crop_x,
+            "crop_y": preprocessing_defaults.crop_y if body.crop_y is None else body.crop_y,
+            "crop_w": preprocessing_defaults.crop_w if body.crop_w is None else body.crop_w,
+            "crop_h": preprocessing_defaults.crop_h if body.crop_h is None else body.crop_h,
+            "background_correction": (
+                preprocessing_defaults.background_correction
+                if body.background_correction is None
+                else body.background_correction
+            ),
+            "background_percentile": (
+                preprocessing_defaults.background_percentile
+                if body.background_percentile is None
+                else body.background_percentile
+            ),
+            "invert_intensity": (
+                preprocessing_defaults.invert_intensity
+                if body.invert_intensity is None
+                else body.invert_intensity
+            ),
+            "encoding": body.encoding,
+        }
+        job = repository.create_job(
+            PipelineStage.PREPROCESS_FRAMES,
+            run_id=run_id,
+            asset_id=asset_id,
+            priority=body.priority,
+            payload=payload,
+            depends_on=body.depends_on or [],
+            summary=f"preprocess queued for asset {asset_id}",
+        )
+        return {"job": as_response(job)}
+else:
+    router = None

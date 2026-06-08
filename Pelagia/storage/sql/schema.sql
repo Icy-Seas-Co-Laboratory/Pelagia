@@ -7,7 +7,7 @@ BEGIN
         CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'segment', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
+        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'preprocess_frames', 'segment', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
         CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
@@ -15,6 +15,7 @@ BEGIN
 END $$;
 
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'train_model';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'preprocess_frames';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_import';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_export';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
@@ -164,6 +165,14 @@ CREATE TABLE IF NOT EXISTS {schema}.frames (
     payload_format text,
     payload_dtype text,
     payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    preprocessed_kvstore_hash text,
+    preprocessed_preview_thumbhash bytea,
+    preprocessed_payload_ref text,
+    preprocessed_payload_encoding text,
+    preprocessed_payload_format text,
+    preprocessed_payload_dtype text,
+    preprocessed_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    preprocessed_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     UNIQUE (asset_id, frame_index)
@@ -179,7 +188,15 @@ ALTER TABLE {schema}.frames
     ADD COLUMN IF NOT EXISTS payload_encoding text,
     ADD COLUMN IF NOT EXISTS payload_format text,
     ADD COLUMN IF NOT EXISTS payload_dtype text,
-    ADD COLUMN IF NOT EXISTS payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb;
+    ADD COLUMN IF NOT EXISTS payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS preprocessed_kvstore_hash text,
+    ADD COLUMN IF NOT EXISTS preprocessed_preview_thumbhash bytea,
+    ADD COLUMN IF NOT EXISTS preprocessed_payload_ref text,
+    ADD COLUMN IF NOT EXISTS preprocessed_payload_encoding text,
+    ADD COLUMN IF NOT EXISTS preprocessed_payload_format text,
+    ADD COLUMN IF NOT EXISTS preprocessed_payload_dtype text,
+    ADD COLUMN IF NOT EXISTS preprocessed_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS preprocessed_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 UPDATE {schema}.frames
 SET
@@ -244,7 +261,20 @@ BEGIN
     END IF;
 END $$;
 
-CREATE TABLE IF NOT EXISTS {schema}.detections (
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = '{schema}' AND table_name = 'detections'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = '{schema}' AND table_name = 'detection_candidate'
+    ) THEN
+        ALTER TABLE {schema}.detections RENAME TO detection_candidate;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS {schema}.detection_candidate (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
@@ -289,7 +319,7 @@ CREATE TABLE IF NOT EXISTS {schema}.detections (
     UNIQUE (frame_id, roi_index)
 );
 
-ALTER TABLE {schema}.detections
+ALTER TABLE {schema}.detection_candidate
     ADD COLUMN IF NOT EXISTS crop_bbox_x integer,
     ADD COLUMN IF NOT EXISTS crop_bbox_y integer,
     ADD COLUMN IF NOT EXISTS crop_bbox_w integer,
@@ -311,26 +341,26 @@ BEGIN
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = '{schema}'
-          AND table_name = 'detections'
+          AND table_name = 'detection_candidate'
           AND column_name = 'crop_png'
     ) THEN
-        EXECUTE 'UPDATE {schema}.detections SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL';
+        EXECUTE 'UPDATE {schema}.detection_candidate SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL';
     END IF;
     IF EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = '{schema}'
-          AND table_name = 'detections'
+          AND table_name = 'detection_candidate'
           AND column_name = 'mask_png'
     ) THEN
-        EXECUTE 'UPDATE {schema}.detections SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL';
+        EXECUTE 'UPDATE {schema}.detection_candidate SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'detections_bbox_positive'
           AND connamespace = '{schema}'::regnamespace
     ) THEN
-        ALTER TABLE {schema}.detections
+        ALTER TABLE {schema}.detection_candidate
             ADD CONSTRAINT detections_bbox_positive CHECK (bbox_w > 0 AND bbox_h > 0);
     END IF;
     IF NOT EXISTS (
@@ -338,7 +368,7 @@ BEGIN
         WHERE conname = 'detections_crop_bbox_positive'
           AND connamespace = '{schema}'::regnamespace
     ) THEN
-        ALTER TABLE {schema}.detections
+        ALTER TABLE {schema}.detection_candidate
             ADD CONSTRAINT detections_crop_bbox_positive CHECK (
                 (
                     crop_bbox_x IS NULL AND crop_bbox_y IS NULL
@@ -352,7 +382,7 @@ BEGIN
     END IF;
 END $$;
 
-UPDATE {schema}.detections
+UPDATE {schema}.detection_candidate
 SET
     roi_encoding = COALESCE(roi_encoding, metadata->>'roi_encoding', metadata->>'array_encoding'),
     roi_format = COALESCE(roi_format, metadata->>'roi_format'),
@@ -398,6 +428,42 @@ WHERE
     OR (crop_bbox_w IS NULL AND metadata ? 'roi_bbox')
     OR (crop_bbox_h IS NULL AND metadata ? 'roi_bbox');
 
+CREATE TABLE IF NOT EXISTS {schema}.detections_refined (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    candidate_detection_id uuid NOT NULL REFERENCES {schema}.detection_candidate(id) ON DELETE CASCADE,
+    run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
+    frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
+    roi_index integer NOT NULL,
+    bbox_x integer NOT NULL,
+    bbox_y integer NOT NULL,
+    bbox_w integer NOT NULL,
+    bbox_h integer NOT NULL,
+    crop_bbox_x integer,
+    crop_bbox_y integer,
+    crop_bbox_w integer,
+    crop_bbox_h integer,
+    area double precision,
+    perimeter double precision,
+    major_axis_length double precision,
+    minor_axis_length double precision,
+    min_gray_value integer,
+    mean_gray_value double precision,
+    roi_payload bytea,
+    mask_payload bytea,
+    roi_encoding text,
+    roi_format text,
+    roi_dtype text,
+    roi_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    mask_encoding text,
+    mask_format text,
+    mask_dtype text,
+    mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    refinement_method text NOT NULL DEFAULT 'identity',
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    UNIQUE (candidate_detection_id)
+);
+
 CREATE TABLE IF NOT EXISTS {schema}.models (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     model_key text NOT NULL UNIQUE,
@@ -412,7 +478,7 @@ CREATE TABLE IF NOT EXISTS {schema}.models (
 
 CREATE TABLE IF NOT EXISTS {schema}.classification_results (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    detection_id uuid NOT NULL REFERENCES {schema}.detections(id) ON DELETE CASCADE,
+    detection_id uuid NOT NULL REFERENCES {schema}.detection_candidate(id) ON DELETE CASCADE,
     model_id uuid NOT NULL REFERENCES {schema}.models(id) ON DELETE CASCADE,
     label text,
     score double precision,
@@ -496,7 +562,9 @@ CREATE TABLE IF NOT EXISTS {schema}.logs (
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_run_id ON {schema}.raw_assets (run_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_assets USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
-CREATE INDEX IF NOT EXISTS idx_{schema}_detections_frame_id ON {schema}.detections (frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_detection_candidate_frame_id ON {schema}.detection_candidate (frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_candidate_id ON {schema}.detections_refined (candidate_detection_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_frame_id ON {schema}.detections_refined (frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);

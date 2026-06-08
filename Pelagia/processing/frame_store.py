@@ -10,7 +10,6 @@ from ..services.context import AppContext
 from ..utils.serialization import json_ready
 from ._logging import log_processing_event, processing_core_logger
 from .frame_codec import decode_array_payload, encode_array_payload
-from .frame_correction import flatfield_correction_for_framedata, metadata_bool
 from .frame_model import FrameData
 from .thumbhash import compute_thumbhash
 
@@ -52,20 +51,6 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
     if frame_index is None:
         frame_index = frame.tileNumber if frame.tileNumber is not None else frame.frameNumber
     try:
-        if metadata_bool(metadata, "flatfield_correction"):
-            ingest_defaults = ctx.config.processing.video_ingest
-            flatfield_q = float(metadata.get("flatfield_q", ingest_defaults.flatfield_q))
-            data = flatfield_correction_for_framedata(
-                data,
-                q=flatfield_q,
-            )
-            metadata.update(
-                {
-                    "flatfield_correction": True,
-                    "flatfield_q": flatfield_q,
-                }
-            )
-
         array = np.ascontiguousarray(data)
         if array.ndim < 2:
             raise ValueError("Frame data must have at least two dimensions.")
@@ -83,7 +68,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         )
         payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
         kvstore_key = ctx.kvstore.put_store(payload)
-        preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.frame_storage.thumbhash_max_dim)
+        preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
         width, height = frame.get_size()
         source_frame_start, source_frame_end = frame.get_source_frame_range()
         captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None
@@ -227,7 +212,59 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         raise
 
 
-def retrieve_frame(id: str, context: AppContext | None = None) -> FrameData:
+def store_preprocessed_frame(
+    frame_id: str,
+    frame: FrameData,
+    *,
+    context: AppContext | None = None,
+    encoding: str | None = None,
+) -> dict[str, Any]:
+    data = frame.read()
+    if data is None:
+        raise ValueError("Preprocessed frame has no numpy data to store.")
+
+    ctx = context or default_context()
+    if ctx.kvstore is None:
+        raise RuntimeError("A KVStore is required to store preprocessed frame data.")
+    if ctx.repository is None:
+        raise RuntimeError("A PostgresRepository is required to record preprocessed frame metadata.")
+
+    array = np.ascontiguousarray(data)
+    requested_encoding = encoding or ctx.config.processing.frame_storage.image_encoding
+    payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
+    kvstore_key = ctx.kvstore.put_store(payload)
+    preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
+    metadata = metadata_without_none(
+        {
+            **dict(frame.metadata or {}),
+            "kvstore_key": kvstore_key,
+            "kvstore_hash": kvstore_key,
+            "kvstore_encoding": kvstore_encoding,
+            "kvstore_format": kvstore_format,
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+            "frame_variant": "preprocessed",
+        }
+    )
+    return ctx.repository.update_frame_preprocessed_payload(
+        frame_id,
+        kvstore_hash=kvstore_key,
+        preview_thumbhash=preview_thumbhash,
+        payload_ref=kvstore_key,
+        payload_encoding=kvstore_encoding,
+        payload_format=kvstore_format,
+        payload_dtype=str(array.dtype),
+        payload_shape=list(array.shape),
+        metadata=metadata,
+    )
+
+
+def retrieve_frame(
+    id: str,
+    context: AppContext | None = None,
+    *,
+    payload_kind: str = "original",
+) -> FrameData:
     started = time.perf_counter()
     ctx = context or default_context()
     if ctx.kvstore is None:
@@ -243,12 +280,29 @@ def retrieve_frame(id: str, context: AppContext | None = None) -> FrameData:
         raise KeyError(id)
 
     record = FrameRecord.from_row(row)
-    metadata = dict(record.metadata or {})
-    kvstore_key = record.payload_ref or metadata.get("kvstore_key") or record.kvstore_hash
+    requested_kind = str(payload_kind or "original").lower()
+    if requested_kind in {"preprocessed", "processed", "corrected"}:
+        metadata = {**dict(record.metadata or {}), **dict(record.preprocessed_metadata or {})}
+        kvstore_key = record.preprocessed_payload_ref or record.preprocessed_kvstore_hash
+        if record.preprocessed_payload_encoding is not None:
+            metadata["kvstore_encoding"] = record.preprocessed_payload_encoding
+        if record.preprocessed_payload_format is not None:
+            metadata["kvstore_format"] = record.preprocessed_payload_format
+        if record.preprocessed_payload_dtype is not None:
+            metadata["dtype"] = record.preprocessed_payload_dtype
+        if record.preprocessed_payload_shape:
+            metadata["shape"] = list(record.preprocessed_payload_shape)
+        metadata["frame_variant"] = "preprocessed"
+    elif requested_kind in {"original", "raw"}:
+        metadata = dict(record.metadata or {})
+        kvstore_key = record.payload_ref or metadata.get("kvstore_key") or record.kvstore_hash
+        metadata["frame_variant"] = "original"
+    else:
+        raise ValueError("payload_kind must be one of: original, raw, preprocessed, processed, corrected.")
     if not kvstore_key:
-        raise ValueError(f"Frame {id} does not include a kvstore key.")
+        raise ValueError(f"Frame {id} does not include a {requested_kind} kvstore key.")
 
-    frame_data = FrameData.from_record(record)
+    frame_data = FrameData.from_record(record, metadata=metadata)
     array = decode_array_payload(ctx.kvstore.get_store(kvstore_key), frame_data.metadata)
     frame_data.update(array)
     _CORE_LOGGER.debug(

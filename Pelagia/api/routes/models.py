@@ -20,6 +20,7 @@ if APIRouter is not None:
         task: str | None = None,
         artifact_uri: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         return {
             "models": as_response(
@@ -30,6 +31,7 @@ if APIRouter is not None:
                     task=task,
                     artifact_uri=artifact_uri,
                     limit=limit,
+                    offset=max(0, offset),
                 )
             )
         }

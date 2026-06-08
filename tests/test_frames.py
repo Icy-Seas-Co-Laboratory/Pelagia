@@ -6,15 +6,19 @@ import pytest
 
 from Pelagia.config import CoreConfig
 from Pelagia.domain import FrameRecord
-from Pelagia.processing import video_ingest as video_ingest_module
+from Pelagia.processing import ingest as ingest_module
 from Pelagia.processing.frame_codec import decode_array_payload
-from Pelagia.processing.frame_correction import flatfield_correction_for_framedata
+from Pelagia.processing.frame_correction import (
+    apply_flatfield_correction,
+    flatfield_correction_for_framedata,
+    flatfield_global_correction_for_framedata,
+)
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_store import retrieve_frame, store_frame
 from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.thumbhash import compute_thumbhash
-from Pelagia.processing.video_ingest import convert_frame_to_grayscale
-from Pelagia.processing.video_ingest import ingest_video_file
+from Pelagia.processing.ingest import convert_frame_to_grayscale, discover_ingest_sources
+from Pelagia.processing.ingest import ingest_image_folder, ingest_video_file
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
@@ -133,8 +137,10 @@ def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
     corrected = flatfield_correction_for_framedata(data, q=0.5)
+    global_corrected = flatfield_global_correction_for_framedata(data, q=0.5, axis=0)
 
-    np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
+    np.testing.assert_array_equal(corrected, np.array([[25, 20], [75, 80]], dtype=np.uint8))
+    np.testing.assert_array_equal(corrected, global_corrected)
 
 
 def test_frame_infers_full_frame_geometry_from_data():
@@ -360,7 +366,7 @@ def test_store_frame_uses_configured_default_image_data_storage_encoding():
     assert metadata["kvstore_format"] == "raw_ndarray_c_order"
 
 
-def test_store_frame_applies_flatfield_correction_when_requested():
+def test_store_frame_preserves_data_when_flatfield_metadata_is_present():
     ctx = FakeContext()
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
@@ -382,12 +388,48 @@ def test_store_frame_applies_flatfield_correction_when_requested():
 
     np.testing.assert_array_equal(
         np.frombuffer(ctx.kvstore.payload, dtype=np.uint8).reshape(2, 2),
-        np.array([[127, 102], [255, 255]], dtype=np.uint8),
+        data,
     )
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["flatfield_correction"] is True
     assert metadata["flatfield_q"] == 0.5
     assert "flatfield_maximum_value" not in metadata
+
+
+def test_apply_flatfield_correction_returns_corrected_runtime_frame():
+    data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
+    record = FrameRecord(
+        id=FRAME_ID,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        frame_index=7,
+        width=2,
+        height=2,
+        kvstore_hash="kvstore-key",
+        preview_thumbhash=b"",
+    )
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": record.run_id,
+            "asset_id": record.asset_id,
+            "frame_id": record.id,
+        },
+    )
+
+    corrected = apply_flatfield_correction(record, frame=frame, q=0.5, axis=0)
+
+    np.testing.assert_array_equal(
+        corrected.read(),
+        np.array([[25, 20], [75, 80]], dtype=np.uint8),
+    )
+    assert corrected.metadata["flatfield_correction"] is True
+    assert corrected.metadata["flatfield_q"] == 0.5
+    assert corrected.metadata["flatfield_axis"] == 0
+    assert corrected.metadata["flatfield_source_frame_id"] == FRAME_ID
 
 
 def test_convert_frame_to_grayscale_keeps_existing_grayscale_frame():
@@ -405,11 +447,11 @@ def test_convert_frame_to_grayscale_converts_bgr_and_bgra_frames():
 
     np.testing.assert_array_equal(
         convert_frame_to_grayscale(bgr),
-        video_ingest_module.cv2.cvtColor(bgr, video_ingest_module.cv2.COLOR_BGR2GRAY),
+        ingest_module.cv2.cvtColor(bgr, ingest_module.cv2.COLOR_BGR2GRAY),
     )
     np.testing.assert_array_equal(
         convert_frame_to_grayscale(bgra),
-        video_ingest_module.cv2.cvtColor(bgra, video_ingest_module.cv2.COLOR_BGRA2GRAY),
+        ingest_module.cv2.cvtColor(bgra, ingest_module.cv2.COLOR_BGRA2GRAY),
     )
 
 
@@ -557,7 +599,7 @@ def test_ingest_video_file_timestamps_frames_from_filename_and_fps(monkeypatch):
             return self.index <= len(self.frames)
 
         def get(self, prop):
-            if prop == video_ingest_module.cv2.CAP_PROP_FPS:
+            if prop == ingest_module.cv2.CAP_PROP_FPS:
                 return 20.0
             return 0.0
 
@@ -571,16 +613,16 @@ def test_ingest_video_file_timestamps_frames_from_filename_and_fps(monkeypatch):
         def release(self):
             pass
 
-    monkeypatch.setattr(video_ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
     ctx = FakeContext()
 
     ingest_video_file(
         "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        n_tile=1,
         context=ctx,
         run_id="00000000-0000-0000-0000-000000000001",
         asset_id="00000000-0000-0000-0000-000000000002",
         metadata={"kvstore_encoding": "raw"},
-        flatfield_correction=False,
     )
 
     first_params, second_params = ctx.repository.cursor_obj.params_history
@@ -607,7 +649,7 @@ def test_ingest_video_file_writes_structured_log_events(monkeypatch):
             return self.index <= len(self.frames)
 
         def get(self, prop):
-            return 20.0 if prop == video_ingest_module.cv2.CAP_PROP_FPS else 0.0
+            return 20.0 if prop == ingest_module.cv2.CAP_PROP_FPS else 0.0
 
         def read(self):
             if self.index >= len(self.frames):
@@ -619,7 +661,7 @@ def test_ingest_video_file_writes_structured_log_events(monkeypatch):
         def release(self):
             pass
 
-    monkeypatch.setattr(video_ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
     ctx = FakeContext()
     ctx.logger = FakeDatabaseLogger()
 
@@ -630,7 +672,6 @@ def test_ingest_video_file_writes_structured_log_events(monkeypatch):
         run_id="00000000-0000-0000-0000-000000000001",
         asset_id="00000000-0000-0000-0000-000000000002",
         metadata={"kvstore_encoding": "raw"},
-        flatfield_correction=False,
     )
 
     event_types = [event["event_type"] for event in ctx.logger.events]
@@ -660,7 +701,7 @@ def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
             return self.index <= len(self.frames)
 
         def get(self, prop):
-            return 20.0 if prop == video_ingest_module.cv2.CAP_PROP_FPS else 0.0
+            return 20.0 if prop == ingest_module.cv2.CAP_PROP_FPS else 0.0
 
         def read(self):
             if self.index >= len(self.frames):
@@ -672,7 +713,7 @@ def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
         def release(self):
             pass
 
-    monkeypatch.setattr(video_ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
     ctx = FakeContext()
 
     ingest_video_file(
@@ -680,8 +721,48 @@ def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
         context=ctx,
         run_id="00000000-0000-0000-0000-000000000001",
         asset_id="00000000-0000-0000-0000-000000000002",
-        metadata={"kvstore_encoding": "raw", "flatfield_correction": False},
-        flatfield_correction=False,
+        metadata={"kvstore_encoding": "raw"},
     )
 
     assert len(ctx.kvstore.payload) == 2
+
+
+def test_ingest_image_folder_stores_supported_images_in_order(tmp_path):
+    image_dir = tmp_path / "frames"
+    image_dir.mkdir()
+    ingest_module.cv2.imwrite(str(image_dir / "frame_002.jpg"), np.full((2, 2), 20, dtype=np.uint8))
+    ingest_module.cv2.imwrite(str(image_dir / "frame_001.png"), np.full((2, 2), 10, dtype=np.uint8))
+    (image_dir / "notes.txt").write_text("ignored", encoding="utf-8")
+    ctx = FakeContext()
+
+    rows = ingest_image_folder(
+        image_dir,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata={"kvstore_encoding": "raw"},
+    )
+
+    assert len(rows) == 2
+    first_params, second_params = ctx.repository.cursor_obj.params_history
+    first_metadata = json.loads(first_params[17])
+    second_metadata = json.loads(second_params[17])
+    assert first_params[2] == 1
+    assert second_params[2] == 2
+    assert first_metadata["source_image_filename"] == "frame_001.png"
+    assert second_metadata["source_image_filename"] == "frame_002.jpg"
+    assert first_metadata["source_type"] == "image_folder"
+
+
+def test_discover_ingest_sources_finds_image_folders_and_video_files(tmp_path):
+    image_dir = tmp_path / "frames"
+    image_dir.mkdir()
+    (image_dir / "frame_001.png").write_bytes(b"not-a-real-image")
+    video_path = tmp_path / "Camera-00001-2025-11-10 02-21-32.482.mkv"
+    video_path.write_bytes(b"not-a-real-video")
+    (tmp_path / "notes.txt").write_text("ignored", encoding="utf-8")
+
+    sources = discover_ingest_sources(tmp_path)
+
+    assert [source.kind for source in sources] == ["image_sequence", "video"]
+    assert [source.path for source in sources] == [image_dir.resolve(), video_path.resolve()]

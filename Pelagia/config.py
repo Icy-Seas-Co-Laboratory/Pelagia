@@ -48,7 +48,7 @@ class KVStoreConfig:
 
     root_path: Path = Path("./data/kvstore")
     hash_algorithm: str = "sha256"
-    prefix_length: int = 1
+    prefix_length: int = 3
     max_db_bytes: int = 4 * 1024 * 1024 * 1024
     max_rows: int = 1_000_000
 
@@ -91,40 +91,77 @@ class LoggingConfig:
 class SegmentationProcessingConfig:
     """Default ROI segmentation parameters."""
 
-    min_perimeter: float = 0.0
+    min_perimeter: float = 50.0
     max_perimeter: float | None = None
-    padding: int = 0
+    padding: int = 50
     roi_encoding: str = "zstd"
-    zstd_min_bytes: int = 1024
+    zstd_min_bytes: int = 16_384
 
 
 @dataclass(slots=True)
 class VideoIngestProcessingConfig:
     """Default video-to-frame extraction parameters."""
 
-    n_tile: int = 1
+    n_tile: int = 4
+
+
+@dataclass(slots=True)
+class FlatfieldProcessingConfig:
+    """Default flatfield correction parameters."""
+
     flatfield_correction: bool = True
     flatfield_q: float = 0.9
     flatfield_axis: int = 0
-    adaptive_background_subtraction: bool = False
-    adaptive_background_period: int = 50
-    frame_mask: bool = False
-    frame_mask_path: str | None = None
 
 
 @dataclass(slots=True)
 class ThresholdingProcessingConfig:
     """Default thresholding parameters."""
 
+    method: str = "otsu"
     thresholding_maximum_value: float = 255.0
+    bounded_otsu_min_contrast: float = 50.0
+    bounded_otsu_max_foreground_fraction: float = 0.9
+    canny_enabled: bool = True
+    canny_low_threshold: float = 30.0
+    canny_high_threshold: float = 80.0
+    canny_blur_kernel: int = 5
+    dilate_kernel_w: int = 3
+    dilate_kernel_h: int = 3
+    adaptive_block_size: int = 31
+    adaptive_c: float = 5.0
+    percentile_background_percentile: float = 50.0
+    percentile_min_contrast: float = 50.0
+    hysteresis_low_threshold: float = 30.0
+    hysteresis_high_threshold: float = 80.0
+    hysteresis_connectivity: int = 8
+    sobel_percentile: float = 90.0
+    sobel_kernel_size: int = 3
+
+
+@dataclass(slots=True)
+class PreprocessingConfig:
+    """Default frame preprocessing parameters."""
+
+    apply_mask: bool = False
+    mask_path: str | None = None
+    adaptive_background_subtraction: bool = False
+    adaptive_background_period: int = 50
+    background_correction: bool = False
+    background_percentile: float = 50.0
+    invert_intensity: bool = True
+    crop_enabled: bool = False
+    crop_x: int | None = None
+    crop_y: int | None = None
+    crop_w: int | None = None
+    crop_h: int | None = None
 
 
 @dataclass(slots=True)
 class FrameStorageProcessingConfig:
     """Default frame storage parameters."""
 
-    image_encoding: ImageDataStorageEncoding = "zstd"
-    thumbhash_max_dim: int = 100
+    image_encoding: ImageDataStorageEncoding = "jpg"
 
     def __post_init__(self) -> None:
         self.image_encoding = str(self.image_encoding).lower()
@@ -147,7 +184,9 @@ class ProcessingConfig:
 
     segmentation: SegmentationProcessingConfig = field(default_factory=SegmentationProcessingConfig)
     video_ingest: VideoIngestProcessingConfig = field(default_factory=VideoIngestProcessingConfig)
+    flatfield: FlatfieldProcessingConfig = field(default_factory=FlatfieldProcessingConfig)
     thresholding: ThresholdingProcessingConfig = field(default_factory=ThresholdingProcessingConfig)
+    preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     frame_storage: FrameStorageProcessingConfig = field(default_factory=FrameStorageProcessingConfig)
     thumbhash: ThumbhashProcessingConfig = field(default_factory=ThumbhashProcessingConfig)
 
@@ -292,18 +331,45 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.segmentation", "zstd_min_bytes", "PELAGIA_SEGMENTATION_ZSTD_MIN_BYTES", int)
 
     _set_from_env(settings, "processing.video_ingest", "n_tile", "PELAGIA_VIDEO_INGEST_N_TILE", int)
-    _set_from_env(settings, "processing.video_ingest", "flatfield_correction", "PELAGIA_VIDEO_INGEST_FLATFIELD_CORRECTION", _env_bool)
-    _set_from_env(settings, "processing.video_ingest", "flatfield_q", "PELAGIA_VIDEO_INGEST_FLATFIELD_Q", float)
-    _set_from_env(settings, "processing.video_ingest", "flatfield_axis", "PELAGIA_VIDEO_INGEST_FLATFIELD_AXIS", int)
-    _set_from_env(settings, "processing.video_ingest", "adaptive_background_subtraction", "PELAGIA_VIDEO_INGEST_ADAPTIVE_BACKGROUND_SUBTRACTION", _env_bool)
-    _set_from_env(settings, "processing.video_ingest", "adaptive_background_period", "PELAGIA_VIDEO_INGEST_ADAPTIVE_BACKGROUND_PERIOD", int)
-    _set_from_env(settings, "processing.video_ingest", "frame_mask", "PELAGIA_VIDEO_INGEST_FRAME_MASK", _env_bool)
-    _set_from_env(settings, "processing.video_ingest", "frame_mask_path", "PELAGIA_VIDEO_INGEST_FRAME_MASK_PATH")
 
+    _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
+    _set_from_env(settings, "processing.flatfield", "flatfield_q", "PELAGIA_FLATFIELD_Q", float)
+    _set_from_env(settings, "processing.flatfield", "flatfield_axis", "PELAGIA_FLATFIELD_AXIS", int)
+
+    _set_from_env(settings, "processing.thresholding", "method", "PELAGIA_THRESHOLDING_METHOD")
     _set_from_env(settings, "processing.thresholding", "thresholding_maximum_value", "PELAGIA_THRESHOLDING_MAXIMUM_VALUE", float)
+    _set_from_env(settings, "processing.thresholding", "bounded_otsu_min_contrast", "PELAGIA_THRESHOLDING_BOUNDED_OTSU_MIN_CONTRAST", float)
+    _set_from_env(settings, "processing.thresholding", "bounded_otsu_max_foreground_fraction", "PELAGIA_THRESHOLDING_BOUNDED_OTSU_MAX_FOREGROUND_FRACTION", float)
+    _set_from_env(settings, "processing.thresholding", "canny_enabled", "PELAGIA_THRESHOLDING_CANNY_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.thresholding", "canny_low_threshold", "PELAGIA_THRESHOLDING_CANNY_LOW_THRESHOLD", float)
+    _set_from_env(settings, "processing.thresholding", "canny_high_threshold", "PELAGIA_THRESHOLDING_CANNY_HIGH_THRESHOLD", float)
+    _set_from_env(settings, "processing.thresholding", "canny_blur_kernel", "PELAGIA_THRESHOLDING_CANNY_BLUR_KERNEL", int)
+    _set_from_env(settings, "processing.thresholding", "dilate_kernel_w", "PELAGIA_THRESHOLDING_DILATE_KERNEL_W", int)
+    _set_from_env(settings, "processing.thresholding", "dilate_kernel_h", "PELAGIA_THRESHOLDING_DILATE_KERNEL_H", int)
+    _set_from_env(settings, "processing.thresholding", "adaptive_block_size", "PELAGIA_THRESHOLDING_ADAPTIVE_BLOCK_SIZE", int)
+    _set_from_env(settings, "processing.thresholding", "adaptive_c", "PELAGIA_THRESHOLDING_ADAPTIVE_C", float)
+    _set_from_env(settings, "processing.thresholding", "percentile_background_percentile", "PELAGIA_THRESHOLDING_PERCENTILE_BACKGROUND_PERCENTILE", float)
+    _set_from_env(settings, "processing.thresholding", "percentile_min_contrast", "PELAGIA_THRESHOLDING_PERCENTILE_MIN_CONTRAST", float)
+    _set_from_env(settings, "processing.thresholding", "hysteresis_low_threshold", "PELAGIA_THRESHOLDING_HYSTERESIS_LOW_THRESHOLD", float)
+    _set_from_env(settings, "processing.thresholding", "hysteresis_high_threshold", "PELAGIA_THRESHOLDING_HYSTERESIS_HIGH_THRESHOLD", float)
+    _set_from_env(settings, "processing.thresholding", "hysteresis_connectivity", "PELAGIA_THRESHOLDING_HYSTERESIS_CONNECTIVITY", int)
+    _set_from_env(settings, "processing.thresholding", "sobel_percentile", "PELAGIA_THRESHOLDING_SOBEL_PERCENTILE", float)
+    _set_from_env(settings, "processing.thresholding", "sobel_kernel_size", "PELAGIA_THRESHOLDING_SOBEL_KERNEL_SIZE", int)
+
+    _set_from_env(settings, "processing.preprocessing", "apply_mask", "PELAGIA_PREPROCESSING_APPLY_MASK", _env_bool)
+    _set_from_env(settings, "processing.preprocessing", "mask_path", "PELAGIA_PREPROCESSING_MASK_PATH")
+    _set_from_env(settings, "processing.preprocessing", "adaptive_background_subtraction", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_SUBTRACTION", _env_bool)
+    _set_from_env(settings, "processing.preprocessing", "adaptive_background_period", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_PERIOD", int)
+    _set_from_env(settings, "processing.preprocessing", "background_correction", "PELAGIA_PREPROCESSING_BACKGROUND_CORRECTION", _env_bool)
+    _set_from_env(settings, "processing.preprocessing", "background_percentile", "PELAGIA_PREPROCESSING_BACKGROUND_PERCENTILE", float)
+    _set_from_env(settings, "processing.preprocessing", "invert_intensity", "PELAGIA_PREPROCESSING_INVERT_INTENSITY", _env_bool)
+    _set_from_env(settings, "processing.preprocessing", "crop_enabled", "PELAGIA_PREPROCESSING_CROP_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.preprocessing", "crop_x", "PELAGIA_PREPROCESSING_CROP_X", int)
+    _set_from_env(settings, "processing.preprocessing", "crop_y", "PELAGIA_PREPROCESSING_CROP_Y", int)
+    _set_from_env(settings, "processing.preprocessing", "crop_w", "PELAGIA_PREPROCESSING_CROP_W", int)
+    _set_from_env(settings, "processing.preprocessing", "crop_h", "PELAGIA_PREPROCESSING_CROP_H", int)
 
     _set_from_env(settings, "processing.frame_storage", "image_encoding", "PELAGIA_FRAME_STORAGE_IMAGE_ENCODING")
-    _set_from_env(settings, "processing.frame_storage", "thumbhash_max_dim", "PELAGIA_FRAME_STORAGE_THUMBHASH_MAX_DIM", int)
 
     _set_from_env(settings, "processing.thumbhash", "max_dim", "PELAGIA_THUMBHASH_MAX_DIM", int)
 
@@ -332,7 +398,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     logging = _section(settings, "logging")
     segmentation = _section(settings, "processing.segmentation")
     video_ingest = _section(settings, "processing.video_ingest")
+    flatfield = _section(settings, "processing.flatfield")
     thresholding = _section(settings, "processing.thresholding")
+    preprocessing = _section(settings, "processing.preprocessing")
     frame_storage = _section(settings, "processing.frame_storage")
     thumbhash = _section(settings, "processing.thumbhash")
 
@@ -388,38 +456,125 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
             video_ingest=VideoIngestProcessingConfig(
                 n_tile=int(video_ingest.get("n_tile", VideoIngestProcessingConfig.n_tile)),
+            ),
+            flatfield=FlatfieldProcessingConfig(
                 flatfield_correction=bool(
-                    video_ingest.get("flatfield_correction", VideoIngestProcessingConfig.flatfield_correction)
+                    flatfield.get("flatfield_correction", FlatfieldProcessingConfig.flatfield_correction)
                 ),
-                flatfield_q=float(video_ingest.get("flatfield_q", VideoIngestProcessingConfig.flatfield_q)),
-                flatfield_axis=int(video_ingest.get("flatfield_axis", VideoIngestProcessingConfig.flatfield_axis)),
-                adaptive_background_subtraction=bool(
-                    video_ingest.get(
-                        "adaptive_background_subtraction",
-                        VideoIngestProcessingConfig.adaptive_background_subtraction,
-                    )
-                ),
-                adaptive_background_period=int(
-                    video_ingest.get("adaptive_background_period", VideoIngestProcessingConfig.adaptive_background_period)
-                ),
-                frame_mask=bool(video_ingest.get("frame_mask", VideoIngestProcessingConfig.frame_mask)),
-                frame_mask_path=video_ingest.get("frame_mask_path", VideoIngestProcessingConfig.frame_mask_path),
+                flatfield_q=float(flatfield.get("flatfield_q", FlatfieldProcessingConfig.flatfield_q)),
+                flatfield_axis=int(flatfield.get("flatfield_axis", FlatfieldProcessingConfig.flatfield_axis)),
             ),
             thresholding=ThresholdingProcessingConfig(
+                method=str(thresholding.get("method", ThresholdingProcessingConfig.method)),
                 thresholding_maximum_value=float(
                     thresholding.get(
                         "thresholding_maximum_value",
                         ThresholdingProcessingConfig.thresholding_maximum_value,
                     )
                 ),
+                bounded_otsu_min_contrast=float(
+                    thresholding.get(
+                        "bounded_otsu_min_contrast",
+                        ThresholdingProcessingConfig.bounded_otsu_min_contrast,
+                    )
+                ),
+                bounded_otsu_max_foreground_fraction=float(
+                    thresholding.get(
+                        "bounded_otsu_max_foreground_fraction",
+                        ThresholdingProcessingConfig.bounded_otsu_max_foreground_fraction,
+                    )
+                ),
+                canny_enabled=bool(thresholding.get("canny_enabled", ThresholdingProcessingConfig.canny_enabled)),
+                canny_low_threshold=float(
+                    thresholding.get("canny_low_threshold", ThresholdingProcessingConfig.canny_low_threshold)
+                ),
+                canny_high_threshold=float(
+                    thresholding.get("canny_high_threshold", ThresholdingProcessingConfig.canny_high_threshold)
+                ),
+                canny_blur_kernel=int(
+                    thresholding.get("canny_blur_kernel", ThresholdingProcessingConfig.canny_blur_kernel)
+                ),
+                dilate_kernel_w=int(
+                    thresholding.get("dilate_kernel_w", ThresholdingProcessingConfig.dilate_kernel_w)
+                ),
+                dilate_kernel_h=int(
+                    thresholding.get("dilate_kernel_h", ThresholdingProcessingConfig.dilate_kernel_h)
+                ),
+                adaptive_block_size=int(
+                    thresholding.get("adaptive_block_size", ThresholdingProcessingConfig.adaptive_block_size)
+                ),
+                adaptive_c=float(thresholding.get("adaptive_c", ThresholdingProcessingConfig.adaptive_c)),
+                percentile_background_percentile=float(
+                    thresholding.get(
+                        "percentile_background_percentile",
+                        ThresholdingProcessingConfig.percentile_background_percentile,
+                    )
+                ),
+                percentile_min_contrast=float(
+                    thresholding.get(
+                        "percentile_min_contrast",
+                        ThresholdingProcessingConfig.percentile_min_contrast,
+                    )
+                ),
+                hysteresis_low_threshold=float(
+                    thresholding.get(
+                        "hysteresis_low_threshold",
+                        ThresholdingProcessingConfig.hysteresis_low_threshold,
+                    )
+                ),
+                hysteresis_high_threshold=float(
+                    thresholding.get(
+                        "hysteresis_high_threshold",
+                        ThresholdingProcessingConfig.hysteresis_high_threshold,
+                    )
+                ),
+                hysteresis_connectivity=int(
+                    thresholding.get(
+                        "hysteresis_connectivity",
+                        ThresholdingProcessingConfig.hysteresis_connectivity,
+                    )
+                ),
+                sobel_percentile=float(
+                    thresholding.get("sobel_percentile", ThresholdingProcessingConfig.sobel_percentile)
+                ),
+                sobel_kernel_size=int(
+                    thresholding.get("sobel_kernel_size", ThresholdingProcessingConfig.sobel_kernel_size)
+                ),
+            ),
+            preprocessing=PreprocessingConfig(
+                apply_mask=bool(preprocessing.get("apply_mask", PreprocessingConfig.apply_mask)),
+                mask_path=preprocessing.get("mask_path", PreprocessingConfig.mask_path),
+                adaptive_background_subtraction=bool(
+                    preprocessing.get(
+                        "adaptive_background_subtraction",
+                        PreprocessingConfig.adaptive_background_subtraction,
+                    )
+                ),
+                adaptive_background_period=int(
+                    preprocessing.get(
+                        "adaptive_background_period",
+                        PreprocessingConfig.adaptive_background_period,
+                    )
+                ),
+                background_correction=bool(
+                    preprocessing.get("background_correction", PreprocessingConfig.background_correction)
+                ),
+                background_percentile=float(
+                    preprocessing.get("background_percentile", PreprocessingConfig.background_percentile)
+                ),
+                invert_intensity=bool(
+                    preprocessing.get("invert_intensity", PreprocessingConfig.invert_intensity)
+                ),
+                crop_enabled=bool(preprocessing.get("crop_enabled", PreprocessingConfig.crop_enabled)),
+                crop_x=_optional_int(preprocessing.get("crop_x", PreprocessingConfig.crop_x)),
+                crop_y=_optional_int(preprocessing.get("crop_y", PreprocessingConfig.crop_y)),
+                crop_w=_optional_int(preprocessing.get("crop_w", PreprocessingConfig.crop_w)),
+                crop_h=_optional_int(preprocessing.get("crop_h", PreprocessingConfig.crop_h)),
             ),
             frame_storage=FrameStorageProcessingConfig(
                 image_encoding=frame_storage.get(
                     "image_encoding",
                     image_data_storage.get("encoding", FrameStorageProcessingConfig.image_encoding),
-                ),
-                thumbhash_max_dim=int(
-                    frame_storage.get("thumbhash_max_dim", FrameStorageProcessingConfig.thumbhash_max_dim)
                 ),
             ),
             thumbhash=ThumbhashProcessingConfig(
@@ -427,3 +582,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
         ),
     )
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)

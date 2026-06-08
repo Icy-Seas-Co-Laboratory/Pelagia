@@ -44,6 +44,7 @@ class AssetKind(str, Enum):
 class PipelineStage(str, Enum):
     INGEST_RUN = "ingest_run"
     EXTRACT_FRAMES = "extract_frames"
+    PREPROCESS_FRAMES = "preprocess_frames"
     SEGMENT = "segment"
     CLASSIFY = "classify"
     PUBLISH = "publish"
@@ -132,6 +133,14 @@ class FrameRecord:
     payload_format: str | None = None
     payload_dtype: str | None = None
     payload_shape: list[int] = field(default_factory=list)
+    preprocessed_kvstore_hash: str | None = None
+    preprocessed_preview_thumbhash: bytes | None = None
+    preprocessed_payload_ref: str | None = None
+    preprocessed_payload_encoding: str | None = None
+    preprocessed_payload_format: str | None = None
+    preprocessed_payload_dtype: str | None = None
+    preprocessed_payload_shape: list[int] = field(default_factory=list)
+    preprocessed_metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
 
     @classmethod
@@ -166,6 +175,14 @@ class FrameRecord:
             payload_format=data.get("payload_format") or metadata.get("kvstore_format"),
             payload_dtype=data.get("payload_dtype") or metadata.get("dtype"),
             payload_shape=list(data.get("payload_shape") or metadata.get("shape") or []),
+            preprocessed_kvstore_hash=data.get("preprocessed_kvstore_hash"),
+            preprocessed_preview_thumbhash=data.get("preprocessed_preview_thumbhash"),
+            preprocessed_payload_ref=data.get("preprocessed_payload_ref"),
+            preprocessed_payload_encoding=data.get("preprocessed_payload_encoding"),
+            preprocessed_payload_format=data.get("preprocessed_payload_format"),
+            preprocessed_payload_dtype=data.get("preprocessed_payload_dtype"),
+            preprocessed_payload_shape=list(data.get("preprocessed_payload_shape") or []),
+            preprocessed_metadata=dict(data.get("preprocessed_metadata") or {}),
             metadata=metadata,
             created_at=data.get("created_at"),
         )

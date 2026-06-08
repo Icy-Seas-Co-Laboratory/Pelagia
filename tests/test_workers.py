@@ -1,8 +1,15 @@
+import numpy as np
+
 from Pelagia.config import CoreConfig
 from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.services.context import AppContext
-from Pelagia.workers.handlers import default_handler_registry, extract_frames_handler, roi_detection_handler
+from Pelagia.workers.handlers import (
+    default_handler_registry,
+    extract_frames_handler,
+    preprocess_frames_handler,
+    roi_detection_handler,
+)
 from Pelagia.workers.worker import Worker
 
 
@@ -95,7 +102,7 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
         return [{"id": 10}, {"id": 11}]
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.video_ingest_module.ingest_video_file",
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
         fake_ingest_video_file,
     )
 
@@ -106,7 +113,6 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
         "asset_id": "asset-1",
         "payload": {
             "n_tile": 2,
-            "flatfield_correction": False,
             "metadata": {"source": "test"},
         },
     }
@@ -128,12 +134,14 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["context"] is context
     assert kwargs["run_id"] == "run-1"
     assert kwargs["asset_id"] == "asset-1"
-    assert kwargs["flatfield_correction"] is False
+    assert "flatfield_correction" not in kwargs
+    assert "flatfield_q" not in kwargs
+    assert "flatfield_axis" not in kwargs
     assert "flatfield_maximum_value" not in kwargs
     assert kwargs["adaptive_background_subtraction"] is False
     assert kwargs["adaptive_background_period"] == 50
-    assert kwargs["frame_mask"] is False
-    assert kwargs["frame_mask_path"] is None
+    assert kwargs["apply_mask"] is False
+    assert kwargs["mask_path"] is None
     assert kwargs["metadata"]["source"] == "test"
     assert kwargs["metadata"]["collections"] == ["test"]
     assert kwargs["metadata"]["worker_job_id"] == "job-1"
@@ -144,7 +152,7 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
     context = make_context(repo)
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.video_ingest_module.ingest_video_file",
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
         lambda *args, **kwargs: [{"id": 10}],
     )
 
@@ -172,6 +180,99 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
         "collections": ["test"],
     }
     assert repo.created_jobs[0]["depends_on"] == ["job-1"]
+
+
+def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_path):
+    repo = FakeRepository()
+    image_dir = tmp_path / "frames"
+    image_dir.mkdir()
+    repo.assets["asset-1"]["path"] = str(image_dir)
+    repo.assets["asset-1"]["kind"] = "image_sequence"
+    context = make_context(repo)
+    calls = []
+
+    def fake_ingest_image_folder(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"id": 20}, {"id": 21}]
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.ingest_module.ingest_image_folder",
+        fake_ingest_image_folder,
+    )
+
+    result = extract_frames_handler(
+        {
+            "id": "job-1",
+            "stage": PipelineStage.EXTRACT_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"recursive": True},
+        },
+        context,
+    )
+
+    assert result["frame_count"] == 2
+    assert result["frame_ids"] == [20, 21]
+    args, kwargs = calls[0]
+    assert args == (str(image_dir),)
+    assert kwargs["recursive"] is True
+    assert kwargs["context"] is context
+    assert kwargs["run_id"] == "run-1"
+    assert kwargs["asset_id"] == "asset-1"
+
+
+def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    retrieved = []
+    preprocessed = []
+    stored = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        retrieved.append((frame_id, context, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_preprocess_frame(frame, **kwargs):
+        preprocessed.append((frame, kwargs))
+        return frame
+
+    def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
+        stored.append((frame_id, frame, kwargs))
+        return {"id": frame_id}
+
+    monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", fake_preprocess_frame)
+    monkeypatch.setattr("Pelagia.workers.handlers.store_preprocessed_frame", fake_store_preprocessed_frame)
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "frame_ids": ["frame-1"],
+                "flatfield_correction": False,
+                "background_correction": True,
+                "encoding": "jpg",
+            },
+        },
+        context,
+    )
+
+    assert result["stage"] == PipelineStage.PREPROCESS_FRAMES.value
+    assert result["frame_count"] == 1
+    assert result["preprocessed_frame_ids"] == ["frame-1"]
+    assert retrieved == [("frame-1", context, "original")]
+    assert preprocessed[0][1]["flatfield_correction"] is False
+    assert preprocessed[0][1]["background_correction"] is True
+    assert stored[0][2]["encoding"] == "jpg"
 
 
 def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch):
@@ -298,7 +399,7 @@ def test_worker_run_once_uses_default_extract_frames_handler(monkeypatch):
     context = make_context(repo)
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.video_ingest_module.ingest_video_file",
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
         lambda *args, **kwargs: [{"id": 10}, {"id": 11}],
     )
 

@@ -17,6 +17,9 @@ if APIRouter is not None:
     def _bounded_limit(limit: int | None) -> int:
         return min(max(1, 100 if limit is None else limit), 1000)
 
+    def _bounded_offset(offset: int | None) -> int:
+        return max(0, 0 if offset is None else offset)
+
     class CreateJobRequest(BaseModel):
         stage: PipelineStage
         run_id: str | None = None
@@ -46,6 +49,7 @@ if APIRouter is not None:
         stage: PipelineStage | None = None,
         worker_id: str | None = None,
         limit: int | None = 100,
+        offset: int = 0,
         cursor: str | None = None,
         include_details: bool = False,
     ) -> dict[str, list]:
@@ -58,6 +62,7 @@ if APIRouter is not None:
             stage=None if stage is None else stage.value,
             worker_id=worker_id,
             limit=resolved_limit,
+            offset=_bounded_offset(offset),
             cursor=cursor,
             include_details=include_details,
         )
@@ -86,6 +91,7 @@ if APIRouter is not None:
         run_id: str | None = None,
         job_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, list]:
         repository = get_repository(request)
         events = repository.list_job_events(
@@ -93,6 +99,7 @@ if APIRouter is not None:
             run_id=run_id,
             job_id=job_id,
             limit=limit,
+            offset=_bounded_offset(offset),
         )
         return {"events": as_response(events)}
 

@@ -11,11 +11,25 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ...processing.frame_store import retrieve_frame
-    from ...processing.segmentation import segment_frame
+    from ...processing.detection_candidate import segment_frame
     from ._common import as_response, detection_summary, get_context, get_repository
 
     class SegmentFrameRequest(BaseModel):
         threshold: int | float | None = None
+        frame_payload_kind: Literal["original", "raw", "preprocessed", "processed", "corrected"] = "original"
+        apply_preprocessing: bool | None = None
+        flatfield_correction: bool | None = None
+        flatfield_q: float | None = None
+        flatfield_axis: int | None = None
+        apply_mask: bool | None = None
+        crop_enabled: bool | None = None
+        crop_x: int | None = None
+        crop_y: int | None = None
+        crop_w: int | None = None
+        crop_h: int | None = None
+        background_correction: bool | None = None
+        background_percentile: int | float | None = None
+        invert_intensity: bool | None = None
         min_perimeter: int | float | None = None
         max_perimeter: int | float | None = None
         padding: int | None = None
@@ -49,10 +63,52 @@ if APIRouter is not None:
 
         try:
             defaults = context.config.processing.segmentation
-            frame = retrieve_frame(frame_id, context=context)
+            flatfield_defaults = context.config.processing.flatfield
+            preprocessing_defaults = context.config.processing.preprocessing
+            frame = retrieve_frame(frame_id, context=context, payload_kind=body.frame_payload_kind)
             detections = segment_frame(
                 frame,
+                frame_record=frame_record,
                 threshold=body.threshold,
+                apply_preprocessing=(
+                    body.frame_payload_kind in {"original", "raw"}
+                    if body.apply_preprocessing is None
+                    else body.apply_preprocessing
+                ),
+                flatfield_correction=(
+                    flatfield_defaults.flatfield_correction
+                    if body.flatfield_correction is None
+                    else body.flatfield_correction
+                ),
+                flatfield_q=flatfield_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q,
+                flatfield_axis=(
+                    flatfield_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis
+                ),
+                apply_mask=preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask,
+                crop_enabled=(
+                    preprocessing_defaults.crop_enabled
+                    if body.crop_enabled is None
+                    else body.crop_enabled
+                ),
+                crop_x=preprocessing_defaults.crop_x if body.crop_x is None else body.crop_x,
+                crop_y=preprocessing_defaults.crop_y if body.crop_y is None else body.crop_y,
+                crop_w=preprocessing_defaults.crop_w if body.crop_w is None else body.crop_w,
+                crop_h=preprocessing_defaults.crop_h if body.crop_h is None else body.crop_h,
+                background_correction=(
+                    preprocessing_defaults.background_correction
+                    if body.background_correction is None
+                    else body.background_correction
+                ),
+                background_percentile=(
+                    preprocessing_defaults.background_percentile
+                    if body.background_percentile is None
+                    else body.background_percentile
+                ),
+                invert_intensity=(
+                    preprocessing_defaults.invert_intensity
+                    if body.invert_intensity is None
+                    else body.invert_intensity
+                ),
                 min_perimeter=defaults.min_perimeter if body.min_perimeter is None else body.min_perimeter,
                 max_perimeter=defaults.max_perimeter if body.max_perimeter is None else body.max_perimeter,
                 padding=defaults.padding if body.padding is None else body.padding,
@@ -80,7 +136,10 @@ if APIRouter is not None:
     @router.post("/jobs")
     def queue_segmentation_job(request: Request, body: QueueSegmentationRequest) -> dict:
         repository = get_repository(request)
-        defaults = get_context(request).config.processing.segmentation
+        processing_defaults = get_context(request).config.processing
+        defaults = processing_defaults.segmentation
+        flatfield_defaults = processing_defaults.flatfield
+        preprocessing_defaults = processing_defaults.preprocessing
         run_id = body.run_id
         asset_id = body.asset_id
 
@@ -112,6 +171,44 @@ if APIRouter is not None:
             "end_frame": body.end_frame,
             "limit": body.limit,
             "threshold": body.threshold,
+            "frame_payload_kind": body.frame_payload_kind,
+            "apply_preprocessing": (
+                body.frame_payload_kind in {"original", "raw"}
+                if body.apply_preprocessing is None
+                else body.apply_preprocessing
+            ),
+            "flatfield_correction": (
+                flatfield_defaults.flatfield_correction
+                if body.flatfield_correction is None
+                else body.flatfield_correction
+            ),
+            "flatfield_q": flatfield_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q,
+            "flatfield_axis": flatfield_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis,
+            "apply_mask": preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask,
+            "crop_enabled": (
+                preprocessing_defaults.crop_enabled
+                if body.crop_enabled is None
+                else body.crop_enabled
+            ),
+            "crop_x": preprocessing_defaults.crop_x if body.crop_x is None else body.crop_x,
+            "crop_y": preprocessing_defaults.crop_y if body.crop_y is None else body.crop_y,
+            "crop_w": preprocessing_defaults.crop_w if body.crop_w is None else body.crop_w,
+            "crop_h": preprocessing_defaults.crop_h if body.crop_h is None else body.crop_h,
+            "background_correction": (
+                preprocessing_defaults.background_correction
+                if body.background_correction is None
+                else body.background_correction
+            ),
+            "background_percentile": (
+                preprocessing_defaults.background_percentile
+                if body.background_percentile is None
+                else body.background_percentile
+            ),
+            "invert_intensity": (
+                preprocessing_defaults.invert_intensity
+                if body.invert_intensity is None
+                else body.invert_intensity
+            ),
             "min_perimeter": defaults.min_perimeter if body.min_perimeter is None else body.min_perimeter,
             "max_perimeter": defaults.max_perimeter if body.max_perimeter is None else body.max_perimeter,
             "padding": defaults.padding if body.padding is None else body.padding,
