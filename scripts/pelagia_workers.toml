@@ -1,0 +1,76 @@
+# Example worker stack for scripts/pelagia_stack_from_toml.sh.
+# Run with:
+#   ./scripts/pelagia_stack_from_toml.sh start scripts/pelagia_workers.example.toml
+
+[stack]
+name = "dev-workers"
+# Options: auto, always, never.
+init_on_start = "auto"
+
+[database]
+dsn = "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"
+schema = "pelagia"
+
+[kvstore]
+root = "./data/kvstore"
+
+[api]
+enabled = true
+host = "127.0.0.1"
+port = 8000
+
+[worker_defaults]
+idle_sleep_seconds = 2.0
+requeue_interval_seconds = 30.0
+
+[[worker]]
+name = "ingest-1"
+capabilities = ["ingest"]
+
+[[worker]]
+name = "preprocess-1"
+capabilities = ["preprocess"]
+
+[[worker]]
+name = "segment-1"
+capabilities = ["segment"]
+
+[[worker]]
+name = "general-1"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-2"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-3"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-4"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-5"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-6"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-7"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-8"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-9"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-10"
+capabilities = ["ingest", "preprocess", "segment"]
