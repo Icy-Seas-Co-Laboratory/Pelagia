@@ -201,6 +201,41 @@ if APIRouter is not None:
     def _has_preprocessed_payload(row: dict) -> bool:
         return bool(row.get("preprocessed_payload_ref") or row.get("preprocessed_kvstore_hash"))
 
+    @frames_router.get("/processing-state")
+    def list_frame_processing_state(
+        request: Request,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        preprocessing_state: str | None = None,
+        detection_state: str | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> dict:
+        stats = get_repository(request).list_frame_processing_state(
+            run_id=run_id,
+            asset_id=asset_id,
+            collection=collection,
+            kind=kind,
+            filename=filename,
+            preprocessing_state=preprocessing_state,
+            detection_state=detection_state,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            limit=limit,
+            offset=offset,
+        )
+        return as_response(
+            {
+                **stats,
+                "page": page_metadata(limit=limit, offset=offset, count=len(stats.get("frames", []))),
+            }
+        )
+
     @frames_router.get("/{frame_id}/context")
     def get_frame_context(
         request: Request,

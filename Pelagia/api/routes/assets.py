@@ -71,6 +71,35 @@ if APIRouter is not None:
         )
         return as_response(stats)
 
+    @router.get("/processing-state")
+    def list_asset_processing_state(
+        request: Request,
+        run_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        preprocessing_state: str | None = None,
+        detection_state: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        stats = get_repository(request).list_asset_processing_state(
+            run_id=run_id,
+            collection=collection,
+            kind=kind,
+            filename=filename,
+            preprocessing_state=preprocessing_state,
+            detection_state=detection_state,
+            limit=limit,
+            offset=offset,
+        )
+        return as_response(
+            {
+                **stats,
+                "page": page_metadata(limit=limit, offset=offset, count=len(stats.get("assets", []))),
+            }
+        )
+
     @router.get("/{asset_id}")
     def get_asset(request: Request, asset_id: str) -> dict:
         repository = get_repository(request)

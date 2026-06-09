@@ -1138,6 +1138,279 @@ class PostgresRepository:
             "assets": assets,
         }
 
+    def list_asset_processing_state(
+        self,
+        *,
+        run_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        preprocessing_state: str | None = None,
+        detection_state: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        clauses = []
+        params: list[Any] = []
+        if run_id:
+            clauses.append("assets.run_id = %s")
+            params.append(run_id)
+        if collection:
+            clauses.append("%s = ANY(assets.collections)")
+            params.append(collection)
+        if kind:
+            clauses.append("assets.kind = %s")
+            params.append(kind)
+        if filename:
+            clauses.append("assets.filename ILIKE %s")
+            params.append(f"%{filename}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        state_clauses = []
+        if preprocessing_state in {"has-preprocessed", "has_preprocessed"}:
+            state_clauses.append("preprocessed_frame_count > 0")
+        elif preprocessing_state in {"needs-preprocessed", "needs_preprocessed", "none"}:
+            state_clauses.append("preprocessed_frame_count = 0")
+        elif preprocessing_state in {"fully-preprocessed", "fully_preprocessed", "complete"}:
+            state_clauses.append("frame_count > 0 AND preprocessed_frame_count = frame_count")
+        elif preprocessing_state in {"partially-preprocessed", "partially_preprocessed", "partial"}:
+            state_clauses.append("preprocessed_frame_count > 0 AND preprocessed_frame_count < frame_count")
+
+        if detection_state in {"has-detections", "has_detections"}:
+            state_clauses.append("detection_count > 0")
+        elif detection_state in {"needs-detections", "needs_detections", "none"}:
+            state_clauses.append("detection_count = 0")
+        elif detection_state in {"fully-detected", "fully_detected", "complete"}:
+            state_clauses.append("frame_count > 0 AND detected_frame_count = frame_count")
+        elif detection_state in {"partially-detected", "partially_detected", "partial"}:
+            state_clauses.append("detected_frame_count > 0 AND detected_frame_count < frame_count")
+        state_where = f"WHERE {' AND '.join(state_clauses)}" if state_clauses else ""
+
+        query = f"""
+            WITH asset_processing_counts AS (
+                SELECT
+                    assets.id AS asset_id,
+                    assets.run_id,
+                    assets.filename,
+                    assets.kind,
+                    assets.collections,
+                    COUNT(DISTINCT frames.id) AS frame_count,
+                    COUNT(DISTINCT frames.id) FILTER (
+                        WHERE frames.preprocessed_payload_ref IS NOT NULL
+                           OR frames.preprocessed_kvstore_hash IS NOT NULL
+                    ) AS preprocessed_frame_count,
+                    COUNT(DISTINCT frames.id) FILTER (
+                        WHERE detections.id IS NOT NULL
+                    ) AS detected_frame_count,
+                    COUNT(detections.id) AS detection_count
+                FROM {self.schema}.raw_assets assets
+                LEFT JOIN {self.schema}.frames frames ON frames.asset_id = assets.id
+                LEFT JOIN {self.schema}.detection_candidate detections ON detections.frame_id = frames.id
+                {where}
+                GROUP BY assets.id, assets.run_id, assets.filename, assets.kind, assets.collections
+            ),
+            asset_processing_state AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN frame_count > 0 AND preprocessed_frame_count = frame_count THEN 'fully-preprocessed'
+                        WHEN preprocessed_frame_count > 0 THEN 'partially-preprocessed'
+                        ELSE 'needs-preprocessed'
+                    END AS preprocessing_state,
+                    CASE
+                        WHEN frame_count > 0 AND detected_frame_count = frame_count THEN 'fully-detected'
+                        WHEN detection_count > 0 THEN 'partially-detected'
+                        ELSE 'needs-detections'
+                    END AS detection_state
+                FROM asset_processing_counts
+            )
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    query
+                    + f"""
+                    SELECT
+                        COUNT(*) AS total_asset_count,
+                        COALESCE(SUM(frame_count), 0) AS total_frame_count,
+                        COALESCE(SUM(preprocessed_frame_count), 0) AS total_preprocessed_frame_count,
+                        COALESCE(SUM(detected_frame_count), 0) AS total_detected_frame_count,
+                        COALESCE(SUM(detection_count), 0) AS total_detection_count
+                    FROM asset_processing_state
+                    {state_where}
+                    """,
+                    tuple(params),
+                )
+                summary = cursor.fetchone()
+                cursor.execute(
+                    query
+                    + f"""
+                    SELECT *
+                    FROM asset_processing_state
+                    {state_where}
+                    ORDER BY filename ASC NULLS LAST, asset_id ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, max(0, int(offset))]),
+                )
+                assets = cursor.fetchall()
+
+        return {
+            "summary": {
+                "total_asset_count": summary["total_asset_count"],
+                "total_frame_count": summary["total_frame_count"],
+                "total_preprocessed_frame_count": summary["total_preprocessed_frame_count"],
+                "total_detected_frame_count": summary["total_detected_frame_count"],
+                "total_detection_count": summary["total_detection_count"],
+            },
+            "assets": assets,
+        }
+
+    def list_frame_processing_state(
+        self,
+        *,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        kind: str | None = None,
+        filename: str | None = None,
+        preprocessing_state: str | None = None,
+        detection_state: str | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        clauses = []
+        params: list[Any] = []
+        if run_id:
+            clauses.append("assets.run_id = %s")
+            params.append(run_id)
+        if asset_id:
+            clauses.append("assets.id = %s")
+            params.append(asset_id)
+        if collection:
+            clauses.append("%s = ANY(assets.collections)")
+            params.append(collection)
+        if kind:
+            clauses.append("assets.kind = %s")
+            params.append(kind)
+        if filename:
+            clauses.append("assets.filename ILIKE %s")
+            params.append(f"%{filename}%")
+        if start_frame is not None:
+            clauses.append("frames.frame_index >= %s")
+            params.append(start_frame)
+        if end_frame is not None:
+            clauses.append("frames.frame_index <= %s")
+            params.append(end_frame)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        state_clauses = []
+        if preprocessing_state in {"has-preprocessed", "has_preprocessed"}:
+            state_clauses.append("has_preprocessed_payload")
+        elif preprocessing_state in {"needs-preprocessed", "needs_preprocessed", "none"}:
+            state_clauses.append("NOT has_preprocessed_payload")
+        elif preprocessing_state in {"fully-preprocessed", "fully_preprocessed", "complete"}:
+            state_clauses.append("has_preprocessed_payload")
+        elif preprocessing_state in {"partially-preprocessed", "partially_preprocessed", "partial"}:
+            state_clauses.append("FALSE")
+
+        if detection_state in {"has-detections", "has_detections"}:
+            state_clauses.append("detection_count > 0")
+        elif detection_state in {"needs-detections", "needs_detections", "none"}:
+            state_clauses.append("detection_count = 0")
+        elif detection_state in {"fully-detected", "fully_detected", "complete"}:
+            state_clauses.append("detection_count > 0")
+        elif detection_state in {"partially-detected", "partially_detected", "partial"}:
+            state_clauses.append("FALSE")
+        state_where = f"WHERE {' AND '.join(state_clauses)}" if state_clauses else ""
+
+        query = f"""
+            WITH frame_processing_counts AS (
+                SELECT
+                    frames.id AS frame_id,
+                    frames.run_id,
+                    frames.asset_id,
+                    frames.frame_index,
+                    frames.captured_at,
+                    assets.filename AS asset_filename,
+                    assets.kind,
+                    assets.collections,
+                    (
+                        frames.preprocessed_payload_ref IS NOT NULL
+                        OR frames.preprocessed_kvstore_hash IS NOT NULL
+                    ) AS has_preprocessed_payload,
+                    COUNT(detections.id) AS detection_count
+                FROM {self.schema}.frames frames
+                JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                LEFT JOIN {self.schema}.detection_candidate detections ON detections.frame_id = frames.id
+                {where}
+                GROUP BY
+                    frames.id,
+                    frames.run_id,
+                    frames.asset_id,
+                    frames.frame_index,
+                    frames.captured_at,
+                    assets.filename,
+                    assets.kind,
+                    assets.collections,
+                    frames.preprocessed_payload_ref,
+                    frames.preprocessed_kvstore_hash
+            ),
+            frame_processing_state AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN has_preprocessed_payload THEN 'fully-preprocessed'
+                        ELSE 'needs-preprocessed'
+                    END AS preprocessing_state,
+                    CASE
+                        WHEN detection_count > 0 THEN 'fully-detected'
+                        ELSE 'needs-detections'
+                    END AS detection_state
+                FROM frame_processing_counts
+            )
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    query
+                    + f"""
+                    SELECT
+                        COUNT(*) AS total_frame_count,
+                        COUNT(*) FILTER (WHERE has_preprocessed_payload) AS total_preprocessed_frame_count,
+                        COUNT(*) FILTER (WHERE detection_count > 0) AS total_detected_frame_count,
+                        COALESCE(SUM(detection_count), 0) AS total_detection_count
+                    FROM frame_processing_state
+                    {state_where}
+                    """,
+                    tuple(params),
+                )
+                summary = cursor.fetchone()
+                cursor.execute(
+                    query
+                    + f"""
+                    SELECT *
+                    FROM frame_processing_state
+                    {state_where}
+                    ORDER BY asset_filename ASC NULLS LAST, asset_id ASC, frame_index ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, max(0, int(offset))]),
+                )
+                frames = cursor.fetchall()
+
+        return {
+            "summary": {
+                "total_frame_count": summary["total_frame_count"],
+                "total_preprocessed_frame_count": summary["total_preprocessed_frame_count"],
+                "total_detected_frame_count": summary["total_detected_frame_count"],
+                "total_detection_count": summary["total_detection_count"],
+            },
+            "frames": frames,
+        }
+
     def register_model(self, model: ModelRecord) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:

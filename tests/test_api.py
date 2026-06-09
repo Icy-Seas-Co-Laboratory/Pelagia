@@ -152,6 +152,78 @@ class FakeRepository:
             ],
         }
 
+    def list_asset_processing_state(self, **kwargs):
+        return {
+            "summary": {
+                "total_asset_count": 2,
+                "total_frame_count": 12,
+                "total_preprocessed_frame_count": 7,
+                "total_detected_frame_count": 3,
+                "total_detection_count": 9,
+            },
+            "assets": [
+                {
+                    "asset_id": "asset-1",
+                    "filename": "sample.mkv",
+                    "run_id": "run-1",
+                    "kind": kwargs.get("kind") or "video",
+                    "collections": ["test"],
+                    "frame_count": 12,
+                    "preprocessed_frame_count": 7,
+                    "detected_frame_count": 3,
+                    "detection_count": 9,
+                    **kwargs,
+                    "preprocessing_state": "partially-preprocessed",
+                    "detection_state": "partially-detected",
+                }
+            ],
+        }
+
+    def list_frame_processing_state(self, **kwargs):
+        query_fields = {
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and key not in {"asset_id", "run_id"}
+        }
+        return {
+            "summary": {
+                "total_frame_count": 2,
+                "total_preprocessed_frame_count": 1,
+                "total_detected_frame_count": 1,
+                "total_detection_count": 7,
+            },
+            "frames": [
+                {
+                    "frame_id": "frame-1",
+                    "run_id": "run-1",
+                    "asset_id": "asset-1",
+                    "frame_index": 2,
+                    "asset_filename": "sample.mkv",
+                    "kind": kwargs.get("kind") or "video",
+                    "collections": ["test"],
+                    "has_preprocessed_payload": True,
+                    "detection_count": 7,
+                    "preprocessing_state": "fully-preprocessed",
+                    "detection_state": "fully-detected",
+                    **query_fields,
+                },
+                {
+                    "frame_id": "frame-2",
+                    "run_id": "run-1",
+                    "asset_id": "asset-1",
+                    "frame_index": 3,
+                    "asset_filename": "sample.mkv",
+                    "kind": kwargs.get("kind") or "video",
+                    "collections": ["test"],
+                    "has_preprocessed_payload": False,
+                    "detection_count": 0,
+                    "preprocessing_state": "needs-preprocessed",
+                    "detection_state": "needs-detections",
+                    **query_fields,
+                },
+            ],
+        }
+
     def replace_frame_detections(self, run_id, frame_ids, detections):
         rows = []
         for index, detection in enumerate(detections, start=1):
@@ -836,6 +908,57 @@ def test_api_reports_asset_detection_stats():
     assert body["assets"][0]["filename"] == "sample"
     assert body["assets"][0]["min_detection_count"] == 1
     assert body["assets"][0]["limit"] == 5
+
+
+def test_api_reports_asset_processing_state():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/assets/processing-state?collection=test&kind=video&filename=sample&preprocessing_state=has-preprocessed&detection_state=has-detections&limit=5"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_asset_count"] == 2
+    assert body["summary"]["total_frame_count"] == 12
+    assert body["summary"]["total_preprocessed_frame_count"] == 7
+    assert body["summary"]["total_detected_frame_count"] == 3
+    assert body["summary"]["total_detection_count"] == 9
+    assert body["assets"][0]["asset_id"] == "asset-1"
+    assert body["assets"][0]["filename"] == "sample"
+    assert body["assets"][0]["kind"] == "video"
+    assert body["assets"][0]["collection"] == "test"
+    assert body["assets"][0]["preprocessing_state"] == "partially-preprocessed"
+    assert body["assets"][0]["detection_state"] == "partially-detected"
+    assert body["assets"][0]["frame_count"] == 12
+    assert body["assets"][0]["preprocessed_frame_count"] == 7
+    assert body["assets"][0]["detected_frame_count"] == 3
+    assert body["assets"][0]["detection_count"] == 9
+    assert body["page"] == {"limit": 5, "offset": 0, "count": 1, "next_offset": None}
+
+
+def test_api_reports_frame_processing_state():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/frames/processing-state?collection=test&kind=video&preprocessing_state=fully-preprocessed&detection_state=fully-detected&start_frame=2&end_frame=5&limit=5"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_frame_count"] == 2
+    assert body["summary"]["total_preprocessed_frame_count"] == 1
+    assert body["summary"]["total_detected_frame_count"] == 1
+    assert body["summary"]["total_detection_count"] == 7
+    assert body["frames"][0]["frame_id"] == "frame-1"
+    assert body["frames"][0]["asset_id"] == "asset-1"
+    assert body["frames"][0]["asset_filename"] == "sample.mkv"
+    assert body["frames"][0]["frame_index"] == 2
+    assert body["frames"][0]["preprocessing_state"] == "fully-preprocessed"
+    assert body["frames"][0]["detection_state"] == "fully-detected"
+    assert body["frames"][0]["start_frame"] == 2
+    assert body["frames"][0]["end_frame"] == 5
+    assert body["page"] == {"limit": 5, "offset": 0, "count": 2, "next_offset": None}
 
 
 def test_api_asset_frames_accepts_range_filters():
