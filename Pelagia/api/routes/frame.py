@@ -269,7 +269,9 @@ if APIRouter is not None:
             }
         )
 
+    @router.head("/original")
     @router.get("/original")
+    @frames_router.head("/original")
     @frames_router.get("/original")
     def get_original_frame(
         request: Request,
@@ -294,8 +296,11 @@ if APIRouter is not None:
             height=height,
         )
 
+    @router.head("/preprocessed")
     @router.get("/preprocessed")
+    @frames_router.head("/preprocessed")
     @frames_router.get("/preprocessed")
+    @frames_router.head("/preprocess")
     @frames_router.get("/preprocess")
     def get_preprocessed_frame(
         request: Request,

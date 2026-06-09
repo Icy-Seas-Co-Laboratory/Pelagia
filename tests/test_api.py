@@ -526,6 +526,42 @@ def test_api_frame_endpoints_accept_dimension_resize(monkeypatch):
     assert calls == [("frame-1", "original"), ("frame-1", "preprocessed")]
 
 
+def test_api_frame_image_endpoints_accept_head_for_scale_headers(monkeypatch):
+    from Pelagia.api.routes import frame
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=2,
+            data=np.arange(10 * 20, dtype=np.uint8).reshape((10, 20)),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    monkeypatch.setattr(frame, "retrieve_frame", fake_retrieve_frame)
+    client, _, _ = make_client()
+
+    original = client.head("/frame/original?frame_id=frame-1&format=jpg&width=5")
+    preprocessed = client.head("/frames/preprocess?frame_id=frame-1&format=jpg&height=4")
+
+    assert original.status_code == 200
+    assert original.headers["x-pelagia-source-width"] == "20"
+    assert original.headers["x-pelagia-source-height"] == "10"
+    assert original.headers["x-pelagia-image-width"] == "5"
+    assert original.headers["x-pelagia-image-height"] == "2"
+    assert original.headers["x-pelagia-scale-x"] == "0.25"
+    assert original.headers["x-pelagia-scale-y"] == "0.2"
+    assert original.content == b""
+    assert preprocessed.status_code == 200
+    assert preprocessed.headers["x-pelagia-source-width"] == "20"
+    assert preprocessed.headers["x-pelagia-source-height"] == "10"
+    assert preprocessed.headers["x-pelagia-image-width"] == "8"
+    assert preprocessed.headers["x-pelagia-image-height"] == "4"
+    assert preprocessed.headers["x-pelagia-scale-x"] == "0.4"
+    assert preprocessed.headers["x-pelagia-scale-y"] == "0.4"
+    assert preprocessed.content == b""
+
+
 def test_api_frame_context_returns_ui_ready_contract():
     client, repository, _ = make_client()
     repository.preprocessed_payload_ref = "preprocessed-key"
