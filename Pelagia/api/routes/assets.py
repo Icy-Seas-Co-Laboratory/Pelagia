@@ -11,7 +11,7 @@ if APIRouter is not None:
 
     from ...processing.frame_correction import flatfield_global_correction_for_framedata
     from ...processing.frame_store import retrieve_frame
-    from ._common import as_response, detection_summary, frame_summary, get_context, get_repository
+    from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
     from ._images import encode_image, preview_image, scale_image
 
     router = APIRouter(prefix="/assets", tags=["assets"])
@@ -30,7 +30,7 @@ if APIRouter is not None:
         media_count: int | None = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> dict[str, list]:
+    ) -> dict:
         return {
             "assets": as_response(
                 get_repository(request).list_assets(
@@ -230,7 +230,7 @@ if APIRouter is not None:
         mask_format: str | None = None,
         limit: int | None = 100,
         offset: int = 0,
-    ) -> dict[str, list]:
+    ) -> dict:
         detections = get_repository(request).list_detections(
             asset_id,
             frame_id=frame_id,
@@ -256,6 +256,10 @@ if APIRouter is not None:
             limit=limit,
             offset=offset,
         )
-        return {"detections": [detection_summary(detection) for detection in detections]}
+        summaries = [detection_summary(detection) for detection in detections]
+        return {
+            "detections": summaries,
+            "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
+        }
 else:
     router = None

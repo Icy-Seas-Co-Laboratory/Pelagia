@@ -12,7 +12,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ...processing.frame_codec import decode_array_payload
-    from ._common import as_response, detection_summary, get_repository
+    from ._common import as_response, detection_summary, get_repository, page_metadata
     from ._images import encode_image, scale_image
 
     router = APIRouter(prefix="/detections", tags=["detections"])
@@ -67,7 +67,7 @@ if APIRouter is not None:
         sort_dir: Literal["asc", "desc"] = "desc",
         limit: int | None = 100,
         offset: int = 0,
-    ) -> dict[str, list]:
+    ) -> dict:
         detections = get_repository(request).list_detections(
             asset_id=asset_id,
             run_id=run_id,
@@ -97,7 +97,11 @@ if APIRouter is not None:
             limit=limit,
             offset=offset,
         )
-        return {"detections": [detection_summary(detection) for detection in detections]}
+        summaries = [detection_summary(detection) for detection in detections]
+        return {
+            "detections": summaries,
+            "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
+        }
 
     @router.get("/{detection_id}")
     def get_detection(request: Request, detection_id: str) -> dict:

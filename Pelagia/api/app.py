@@ -24,10 +24,25 @@ def create_app(config: CoreConfig | None = None):
     app = FastAPI(title="Pelagia", version="0.0.1")
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
+        allow_origin_regex=resolved_config.api.cors_allow_origin_regex,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "X-Pelagia-Frame-Id",
+            "X-Pelagia-Payload-Kind",
+            "X-Pelagia-Source-Width",
+            "X-Pelagia-Source-Height",
+            "X-Pelagia-Image-Width",
+            "X-Pelagia-Image-Height",
+            "X-Pelagia-Scale-X",
+            "X-Pelagia-Scale-Y",
+            "X-Pelagia-Width",
+            "X-Pelagia-Height",
+            "X-Pelagia-Resize-Width",
+            "X-Pelagia-Resize-Height",
+            "X-Pelagia-Scale",
+        ],
     )
     app.state.config = resolved_config
     app.state.context = AppContext.from_config(resolved_config)
@@ -50,4 +65,7 @@ def create_app(config: CoreConfig | None = None):
     ):
         if route_module.router is not None:
             app.include_router(route_module.router)
+        for extra_router in getattr(route_module, "routers", []):
+            if extra_router is not None:
+                app.include_router(extra_router)
     return app

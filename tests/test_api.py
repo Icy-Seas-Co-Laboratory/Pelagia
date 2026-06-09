@@ -60,26 +60,42 @@ class FakeRepository:
     def list_frames(self, asset_id, **kwargs):
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 2, "preview_thumbhash": b"abc", **kwargs}]
 
+    def get_frame(self, frame_id):
+        if frame_id not in {"frame-1", "frame-2"}:
+            return None
+        return {
+            "id": frame_id,
+            "asset_id": "asset-1",
+            "frame_index": 2 if frame_id == "frame-1" else 3,
+            "preview_thumbhash": b"abc",
+            "preprocessed_payload_ref": self.preprocessed_payload_ref,
+            "preprocessed_kvstore_hash": self.preprocessed_payload_ref,
+            "preprocessed_preview_thumbhash": b"def" if self.preprocessed_payload_ref else None,
+            "width": 10,
+            "height": 10,
+            "metadata": {"frame_id": frame_id},
+        }
+
     def get_frame_by_asset_index(self, asset_id, frame_index):
         if asset_id != "asset-1" or frame_index != 2:
             return None
-        return {"id": 1, "asset_id": asset_id, "frame_index": frame_index}
+        return {"id": "frame-1", "asset_id": asset_id, "frame_index": frame_index}
 
     def get_frame_record(self, frame_id):
-        if frame_id != "frame-1":
+        if frame_id not in {"frame-1", "frame-2"}:
             return None
         return FrameRecord(
-            id="frame-1",
+            id=frame_id,
             run_id="run-1",
             asset_id="asset-1",
-            frame_index=2,
+            frame_index=2 if frame_id == "frame-1" else 3,
             width=10,
             height=10,
             kvstore_hash="fake-kv-key",
             preview_thumbhash=b"abc",
             preprocessed_payload_ref=self.preprocessed_payload_ref,
             preprocessed_kvstore_hash=self.preprocessed_payload_ref,
-            metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
+            metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": frame_id},
         )
 
     def _detection_row(self, **overrides):
@@ -91,6 +107,14 @@ class FakeRepository:
             "frame_id": "frame-1",
             "frame_index": 2,
             "roi_index": 1,
+            "bbox_x": 3,
+            "bbox_y": 4,
+            "bbox_w": 5,
+            "bbox_h": 6,
+            "crop_bbox_x": 1,
+            "crop_bbox_y": 2,
+            "crop_bbox_w": 9,
+            "crop_bbox_h": 10,
             "roi_payload": np.array([[0, 128], [255, 64]], dtype=np.uint8).tobytes(order="C"),
             "mask_payload": b"mask",
             "roi_encoding": "raw",
@@ -127,6 +151,23 @@ class FakeRepository:
                 }
             ],
         }
+
+    def replace_frame_detections(self, run_id, frame_ids, detections):
+        rows = []
+        for index, detection in enumerate(detections, start=1):
+            frame_id = getattr(detection, "frame_id", None)
+            if frame_id is None and isinstance(detection, dict):
+                frame_id = detection.get("frame_id")
+            rows.append(
+                self._detection_row(
+                    id=f"det-{index}",
+                    run_id=run_id,
+                    frame_id=frame_id or frame_ids[0],
+                    roi_payload=b"roi",
+                    mask_payload=b"mask",
+                )
+            )
+        return rows
 
     def list_models(self, **kwargs):
         return [{"id": "model-1", "model_key": "demo", **kwargs}]
@@ -448,6 +489,175 @@ def test_api_can_queue_frame_preprocess_job():
     assert repository.created_jobs[-1]["payload"]["encoding"] == "jpg"
 
 
+def test_api_frame_endpoints_accept_dimension_resize(monkeypatch):
+    from Pelagia.api.routes import frame
+
+    calls = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        calls.append((frame_id, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=2,
+            data=np.arange(10 * 20, dtype=np.uint8).reshape((10, 20)),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    monkeypatch.setattr(frame, "retrieve_frame", fake_retrieve_frame)
+    client, _, _ = make_client()
+
+    original = client.get("/frames/original?frame_id=frame-1&format=matrix&width=5")
+    preprocessed = client.get("/frames/preprocess?frame_id=frame-1&format=png&height=4")
+
+    assert original.status_code == 200
+    assert original.json()["shape"] == [2, 5]
+    assert original.json()["requested_width"] == 5
+    assert preprocessed.status_code == 200
+    decoded = cv2.imdecode(np.frombuffer(preprocessed.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (4, 8)
+    assert preprocessed.headers["x-pelagia-height"] == "4"
+    assert preprocessed.headers["x-pelagia-source-width"] == "20"
+    assert preprocessed.headers["x-pelagia-source-height"] == "10"
+    assert preprocessed.headers["x-pelagia-image-width"] == "8"
+    assert preprocessed.headers["x-pelagia-image-height"] == "4"
+    assert preprocessed.headers["x-pelagia-scale-x"] == "0.4"
+    assert preprocessed.headers["x-pelagia-scale-y"] == "0.4"
+    assert calls == [("frame-1", "original"), ("frame-1", "preprocessed")]
+
+
+def test_api_frame_context_returns_ui_ready_contract():
+    client, repository, _ = make_client()
+    repository.preprocessed_payload_ref = "preprocessed-key"
+
+    response = client.get(
+        "/frames/frame-1/context?width=320&detection_limit=1&detection_offset=4"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["frame"]["id"] == "frame-1"
+    assert body["frame"]["has_preprocessed_payload"] is True
+    assert body["asset"]["id"] == "asset-1"
+    assert body["image_urls"]["original"] == "/frame/original?frame_id=frame-1&format=jpg&width=320"
+    assert body["image_urls"]["preprocessed"] == "/frame/preprocessed?frame_id=frame-1&format=jpg&width=320"
+    assert body["detection_count"] == 1
+    assert body["detections"][0]["bbox"] == {"x": 3, "y": 4, "w": 5, "h": 6}
+    assert body["detections"][0]["crop_bbox"] == {"x": 1, "y": 2, "w": 9, "h": 10}
+    assert body["page"] == {"limit": 1, "offset": 4, "count": 1, "next_offset": 5}
+
+
+def test_api_frame_context_handles_missing_frame_and_missing_preprocessed_image():
+    client, repository, _ = make_client()
+
+    missing = client.get("/frames/missing/context")
+    no_preprocessed = client.get("/frames/frame-1/context?include_detections=false")
+
+    assert missing.status_code == 404
+    assert no_preprocessed.status_code == 200
+    body = no_preprocessed.json()
+    assert body["image_urls"]["original"].startswith("/frame/original?")
+    assert body["image_urls"]["preprocessed"] is None
+    assert body["detections"] == []
+    assert body["detection_count"] == 0
+    assert body["page"] == {"limit": 500, "offset": 0, "count": 0, "next_offset": None}
+
+
+def test_api_direct_preprocess_accepts_frame_ids(monkeypatch):
+    from Pelagia.api.routes import frame
+
+    stored = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        return FrameData(
+            sourcePath="/tmp",
+            filename=f"{frame_id}.png",
+            frameNumber=2,
+            data=np.zeros((2, 2), dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_preprocess_frame(source_frame, **kwargs):
+        array = np.asarray(source_frame.read()) + 1
+        return FrameData(
+            sourcePath=source_frame.sourcePath,
+            filename=source_frame.filename,
+            frameNumber=source_frame.frameNumber,
+            data=array,
+            metadata={"preprocessed": True},
+        )
+
+    def fake_store_preprocessed_frame(frame_id, processed, **kwargs):
+        stored.append((frame_id, kwargs.get("encoding")))
+        return {
+            "id": frame_id,
+            "asset_id": "asset-1",
+            "frame_index": 2,
+            "preprocessed_payload_ref": f"{frame_id}-preprocessed",
+        }
+
+    monkeypatch.setattr(frame, "retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr(frame, "preprocess_frame_for_segmentation", fake_preprocess_frame)
+    monkeypatch.setattr(frame, "store_preprocessed_frame", fake_store_preprocessed_frame)
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/frame/preprocess",
+        json={"frame_ids": ["frame-1", "frame-2"], "encoding": "png"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["frame_count"] == 2
+    assert body["frame_ids"] == ["frame-1", "frame-2"]
+    assert [frame["stored"] for frame in body["frames"]] == [True, True]
+    assert stored == [("frame-1", "png"), ("frame-2", "png")]
+
+    asset_response = client.post(
+        "/frame/preprocess",
+        json={"asset_id": "asset-1", "start_frame": 2, "limit": 1, "store": False},
+    )
+    assert asset_response.status_code == 200
+    assert asset_response.json()["asset_id"] == "asset-1"
+    assert asset_response.json()["frame_count"] == 1
+    assert asset_response.json()["frames"][0]["stored"] is False
+
+
+def test_api_direct_segmentation_accepts_frame_ids(monkeypatch):
+    from Pelagia.api.routes import segmentation
+
+    segmented = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        return FrameData(
+            sourcePath="/tmp",
+            filename=f"{frame_id}.png",
+            frameNumber=2,
+            data=np.zeros((2, 2), dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_segment_frame(source_frame, *, frame_record, **kwargs):
+        segmented.append((frame_record.id, kwargs.get("padding")))
+        return [{"frame_id": frame_record.id, "roi_payload": b"roi", "mask_payload": b"mask"}]
+
+    monkeypatch.setattr(segmentation, "retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr(segmentation, "segment_frame", fake_segment_frame)
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/segmentation/frames",
+        json={"frame_ids": ["frame-1", "frame-2"], "padding": 4},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["frame_count"] == 2
+    assert body["detection_count"] == 2
+    assert body["frame_ids"] == ["frame-1", "frame-2"]
+    assert segmented == [("frame-1", 4), ("frame-2", 4)]
+
+
 def test_api_can_request_worker_shutdown():
     client, repository, _ = make_client()
 
@@ -508,6 +718,9 @@ def test_api_filters_asset_detections():
     assert detection["mask_format"] == "raw_ndarray_c_order"
     assert detection["limit"] == 7
     assert detection["offset"] == 3
+    assert detection["bbox"] == {"x": 3, "y": 4, "w": 5, "h": 6}
+    assert detection["crop_bbox"] == {"x": 1, "y": 2, "w": 9, "h": 10}
+    assert response.json()["page"] == {"limit": 7, "offset": 3, "count": 1, "next_offset": None}
 
 
 def test_api_lists_global_detections_without_image_payloads():
@@ -524,6 +737,7 @@ def test_api_lists_global_detections_without_image_payloads():
     assert "roi_payload" not in detection
     assert detection["roi_payload_bytes"] == 4
     assert detection["mask_payload_bytes"] == 4
+    assert response.json()["page"] == {"limit": 100, "offset": 400, "count": 1, "next_offset": None}
 
 
 def test_api_get_detection_includes_payload_data():

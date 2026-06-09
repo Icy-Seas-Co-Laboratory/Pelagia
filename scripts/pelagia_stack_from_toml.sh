@@ -22,9 +22,10 @@ LOG_DIR=""
 PELAGIA_DATABASE_DSN=""
 PELAGIA_DATABASE_SCHEMA=""
 PELAGIA_KVSTORE_ROOT=""
-PELAGIA_API_ENABLED=""
-PELAGIA_API_HOST=""
-PELAGIA_API_PORT=""
+PELAGIA_API_ENABLED=true
+PELAGIA_API_HOST="0.0.0.0"
+PELAGIA_API_PORT="8000"
+PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX=""
 PELAGIA_INIT_ON_START=""
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS=""
 WORKER_ROWS=()
@@ -44,6 +45,7 @@ load_stack_config() {
                     api_enabled) PELAGIA_API_ENABLED="$value" ;;
                     api_host) PELAGIA_API_HOST="$value" ;;
                     api_port) PELAGIA_API_PORT="$value" ;;
+                    api_cors_allow_origin_regex) PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX="$value" ;;
                     init_on_start) PELAGIA_INIT_ON_START="$value" ;;
                     init_statement_timeout_ms) PELAGIA_INIT_STATEMENT_TIMEOUT_MS="$value" ;;
                 esac
@@ -143,6 +145,10 @@ config_rows = {
     "api_enabled": bool_text(api.get("enabled", True)),
     "api_host": scalar(api.get("host"), os.environ.get("PELAGIA_API_HOST", "127.0.0.1")),
     "api_port": scalar(api.get("port"), os.environ.get("PELAGIA_API_PORT", "8000")),
+    "api_cors_allow_origin_regex": scalar(
+        api.get("cors_allow_origin_regex"),
+        os.environ.get("PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX", ""),
+    ),
     "init_on_start": scalar(stack.get("init_on_start"), os.environ.get("PELAGIA_INIT_ON_START", "auto")),
     "init_statement_timeout_ms": scalar(
         stack.get("init_statement_timeout_ms"),
@@ -343,6 +349,9 @@ start_stack() {
     export PELAGIA_DATABASE_DSN
     export PELAGIA_DATABASE_SCHEMA
     export PELAGIA_KVSTORE_ROOT
+    if [[ -n "$PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX" ]]; then
+        export PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX
+    fi
 
     if [[ "$PELAGIA_API_ENABLED" == "true" ]]; then
         start_process api \

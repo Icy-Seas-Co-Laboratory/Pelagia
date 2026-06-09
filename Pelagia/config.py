@@ -73,6 +73,15 @@ class APIConfig:
 
     host: str = "127.0.0.1"
     port: int = 8000
+    cors_allow_origin_regex: str = (
+        r"https?://("
+        r"localhost|127\.0\.0\.1|\[::1\]|"
+        r"10(?:\.\d{1,3}){3}|"
+        r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|"
+        r"192\.168(?:\.\d{1,3}){2}|"
+        r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+        r")(?::\d+)?"
+    )
 
 
 @dataclass(slots=True)
@@ -316,6 +325,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
 
     _set_from_env(settings, "api", "host", "PELAGIA_API_HOST")
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
+    _set_from_env(settings, "api", "cors_allow_origin_regex", "PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX")
 
     _set_from_env(settings, "logging", "log_path", "PELAGIA_LOG_PATH", Path)
     _set_from_env(settings, "logging", "file_name", "PELAGIA_LOG_FILE")
@@ -433,6 +443,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         api=APIConfig(
             host=str(api.get("host", APIConfig.host)),
             port=int(api.get("port", APIConfig.port)),
+            cors_allow_origin_regex=str(
+                api.get("cors_allow_origin_regex", APIConfig.cors_allow_origin_regex)
+            ),
         ),
         logging=LoggingConfig(
             log_path=Path(logging.get("log_path", LoggingConfig.log_path)),

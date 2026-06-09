@@ -16,8 +16,10 @@ root = "./data/kvstore"
 
 [api]
 enabled = true
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 8000
+# Allows PelagiaView from localhost and common private LAN IP origins.
+cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
 
 [worker_defaults]
 idle_sleep_seconds = 2.0

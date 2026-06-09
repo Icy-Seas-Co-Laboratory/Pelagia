@@ -48,8 +48,7 @@ if APIRouter is not None:
 
     router = APIRouter(prefix="/segmentation", tags=["segmentation"])
 
-    @router.post("/frames/{frame_id}")
-    def segment_stored_frame(request: Request, frame_id: str, body: SegmentFrameRequest) -> dict:
+    def _segment_resolved_frame(request: Request, frame_id: str, body: SegmentFrameRequest) -> dict:
         context = get_context(request)
         repository = get_repository(request)
         frame_record = repository.get_frame_record(frame_id)
@@ -123,13 +122,44 @@ if APIRouter is not None:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+        return {
+            "frame_id": frame_id,
+            "run_id": frame_record.run_id,
+            "asset_id": frame_record.asset_id,
+            "detection_count": len(inserted),
+            "detections": [detection_summary(row) for row in inserted],
+        }
+
+    @router.post("/frames/{frame_id}")
+    def segment_stored_frame(request: Request, frame_id: str, body: SegmentFrameRequest) -> dict:
+        return as_response(_segment_resolved_frame(request, frame_id, body))
+
+    @router.post("/frames")
+    def segment_stored_frames(request: Request, body: QueueSegmentationRequest) -> dict:
+        repository = get_repository(request)
+        frame_ids = list(dict.fromkeys(str(frame_id) for frame_id in (body.frame_ids or [])))
+
+        if not frame_ids:
+            if body.asset_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide frame_ids or asset_id for batch segmentation.",
+                )
+            frames = repository.list_frames(
+                body.asset_id,
+                start_frame=body.start_frame,
+                end_frame=body.end_frame,
+                limit=body.limit,
+            )
+            frame_ids = [str(frame["id"]) for frame in frames]
+
+        frames = [_segment_resolved_frame(request, frame_id, body) for frame_id in frame_ids]
         return as_response(
             {
-                "frame_id": frame_id,
-                "run_id": frame_record.run_id,
-                "asset_id": frame_record.asset_id,
-                "detection_count": len(inserted),
-                "detections": [detection_summary(row) for row in inserted],
+                "frame_count": len(frames),
+                "detection_count": sum(int(frame["detection_count"]) for frame in frames),
+                "frame_ids": frame_ids,
+                "frames": frames,
             }
         )
 

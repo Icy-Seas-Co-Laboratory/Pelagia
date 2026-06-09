@@ -52,6 +52,27 @@ def without_payload_bytes(row: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return as_response(item)
 
 
+def page_metadata(*, limit: int | None, offset: int = 0, count: int = 0) -> dict[str, int | None]:
+    resolved_offset = max(0, int(offset or 0))
+    resolved_count = max(0, int(count or 0))
+    if limit is None:
+        resolved_limit = None
+        next_offset = None
+    else:
+        resolved_limit = max(0, int(limit))
+        next_offset = (
+            resolved_offset + resolved_count
+            if resolved_limit > 0 and resolved_count >= resolved_limit
+            else None
+        )
+    return {
+        "limit": resolved_limit,
+        "offset": resolved_offset,
+        "count": resolved_count,
+        "next_offset": next_offset,
+    }
+
+
 def frame_summary(row: Any) -> dict[str, Any]:
     item = _as_dict(row)
     preview_thumbhash = item.pop("preview_thumbhash", item.pop("frame_png", None))
@@ -69,7 +90,29 @@ def frame_summary(row: Any) -> dict[str, Any]:
 
 
 def detection_summary(row: Any) -> dict[str, Any]:
-    return without_payload_bytes(row, ("roi_payload", "mask_payload"))
+    item = without_payload_bytes(row, ("roi_payload", "mask_payload"))
+    bbox_values = [item.get("bbox_x"), item.get("bbox_y"), item.get("bbox_w"), item.get("bbox_h")]
+    if all(value is not None for value in bbox_values):
+        item["bbox"] = {
+            "x": item.get("bbox_x"),
+            "y": item.get("bbox_y"),
+            "w": item.get("bbox_w"),
+            "h": item.get("bbox_h"),
+        }
+    crop_bbox_values = [
+        item.get("crop_bbox_x"),
+        item.get("crop_bbox_y"),
+        item.get("crop_bbox_w"),
+        item.get("crop_bbox_h"),
+    ]
+    if all(value is not None for value in crop_bbox_values):
+        item["crop_bbox"] = {
+            "x": item.get("crop_bbox_x"),
+            "y": item.get("crop_bbox_y"),
+            "w": item.get("crop_bbox_w"),
+            "h": item.get("crop_bbox_h"),
+        }
+    return as_response(item)
 
 
 def postgres_ping(repository) -> dict[str, Any]:

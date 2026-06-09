@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlencode
 
 try:
     from fastapi import APIRouter, HTTPException, Request, Response
@@ -15,15 +16,21 @@ if APIRouter is not None:
     from ...domain import PipelineStage
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
-    from ._common import as_response, frame_summary, get_context, get_repository
-    from ._images import encode_image, preview_image, scale_image
+    from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
+    from ._images import encode_image, preview_image, resize_image_to_dimension, scale_image
 
     router = APIRouter(prefix="/frame", tags=["frame"])
+    frames_router = APIRouter(prefix="/frames", tags=["frame"])
+    routers = [frames_router]
 
     class FramePreprocessRequest(BaseModel):
         frame_id: str | None = None
+        frame_ids: list[str] | None = None
         asset_id: str | None = None
         frame_num: int | None = None
+        start_frame: int | None = None
+        end_frame: int | None = None
+        limit: int | None = None
         flatfield_correction: bool | None = None
         flatfield_q: float | None = None
         flatfield_axis: int | None = None
@@ -89,6 +96,8 @@ if APIRouter is not None:
         format: str,
         preview_max_dim: int,
         scale: float,
+        width: int | None = None,
+        height: int | None = None,
     ):
         context = get_context(request)
         try:
@@ -100,8 +109,26 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Frame {row['id']!r} has no image data.")
 
         requested = format.lower()
+        source_height, source_width = np.asarray(array).shape[:2]
+        resized = (
+            resize_image_to_dimension(array, width=width, height=height)
+            if width is not None or height is not None
+            else scale_image(array, scale)
+        )
+        if width is not None or height is not None:
+            size_headers = {
+                "X-Pelagia-Width": str(np.asarray(resized).shape[1]),
+                "X-Pelagia-Height": str(np.asarray(resized).shape[0]),
+            }
+            if width is not None:
+                size_headers["X-Pelagia-Resize-Width"] = str(width)
+            if height is not None:
+                size_headers["X-Pelagia-Resize-Height"] = str(height)
+        else:
+            size_headers = {"X-Pelagia-Scale": str(scale)}
+
         if requested == "matrix":
-            matrix = np.asarray(scale_image(array, scale))
+            matrix = np.asarray(resized)
             return as_response(
                 {
                     "frame_id": row["id"],
@@ -110,21 +137,27 @@ if APIRouter is not None:
                     "payload_kind": payload_kind,
                     "dtype": str(matrix.dtype),
                     "shape": list(matrix.shape),
-                    "scale": scale,
+                    "scale": None if width is not None or height is not None else scale,
+                    "requested_width": width,
+                    "requested_height": height,
                     "data": matrix.tolist(),
                 }
             )
         if requested == "preview":
-            payload, media_type = encode_image(preview_image(array, preview_max_dim), "png")
+            delivered = preview_image(resized, preview_max_dim)
+            payload, media_type = encode_image(delivered, "png")
             extension = "png"
             headers = {
                 "X-Pelagia-Preview": "true",
                 "X-Pelagia-Preview-Max-Dim": str(preview_max_dim),
+                **size_headers,
             }
         else:
-            payload, media_type = encode_image(scale_image(array, scale), requested)
+            delivered = resized
+            payload, media_type = encode_image(delivered, requested)
             extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
-            headers = {"X-Pelagia-Scale": str(scale)}
+            headers = size_headers
+        delivered_height, delivered_width = np.asarray(delivered).shape[:2]
 
         return Response(
             content=payload,
@@ -135,11 +168,109 @@ if APIRouter is not None:
                 ),
                 "X-Pelagia-Frame-Id": str(row["id"]),
                 "X-Pelagia-Payload-Kind": payload_kind,
+                "X-Pelagia-Source-Width": str(source_width),
+                "X-Pelagia-Source-Height": str(source_height),
+                "X-Pelagia-Image-Width": str(delivered_width),
+                "X-Pelagia-Image-Height": str(delivered_height),
+                "X-Pelagia-Scale-X": str(delivered_width / source_width),
+                "X-Pelagia-Scale-Y": str(delivered_height / source_height),
                 **headers,
             },
         )
 
+    def _frame_image_url(
+        *,
+        path: str,
+        frame_id: str,
+        width: int | None,
+        height: int | None,
+        scale: float,
+    ) -> str:
+        params: dict[str, str | int | float] = {
+            "frame_id": frame_id,
+            "format": "jpg",
+        }
+        if width is not None:
+            params["width"] = width
+        elif height is not None:
+            params["height"] = height
+        else:
+            params["scale"] = scale
+        return f"{path}?{urlencode(params)}"
+
+    def _has_preprocessed_payload(row: dict) -> bool:
+        return bool(row.get("preprocessed_payload_ref") or row.get("preprocessed_kvstore_hash"))
+
+    @frames_router.get("/{frame_id}/context")
+    def get_frame_context(
+        request: Request,
+        frame_id: str,
+        width: int | None = None,
+        height: int | None = None,
+        scale: float = 1.0,
+        include_detections: bool = True,
+        detection_limit: int = 500,
+        detection_offset: int = 0,
+        frame_payload_kind: Literal["original", "preprocessed"] = "preprocessed",
+    ) -> dict:
+        repository = get_repository(request)
+        row = repository.get_frame(frame_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
+
+        asset = repository.get_asset(row["asset_id"])
+        if asset is None:
+            raise HTTPException(status_code=404, detail=f"Asset {row['asset_id']!r} was not found.")
+
+        detections = []
+        if include_detections:
+            detections = repository.list_detections(
+                row["asset_id"],
+                frame_id=frame_id,
+                limit=detection_limit,
+                offset=detection_offset,
+            )
+        detection_summaries = [detection_summary(detection) for detection in detections]
+        image_urls = {
+            "original": _frame_image_url(
+                path="/frame/original",
+                frame_id=frame_id,
+                width=width,
+                height=height,
+                scale=scale,
+            ),
+            "preprocessed": (
+                _frame_image_url(
+                    path="/frame/preprocessed",
+                    frame_id=frame_id,
+                    width=width,
+                    height=height,
+                    scale=scale,
+                )
+                if _has_preprocessed_payload(row)
+                else None
+            ),
+        }
+        return as_response(
+            {
+                "frame": frame_summary(row),
+                "asset": asset,
+                "image_urls": image_urls,
+                "frame_payload_kind": (
+                    frame_payload_kind if frame_payload_kind == "original" or image_urls["preprocessed"] else "original"
+                ),
+                "detections": detection_summaries,
+                "detection_count": len(detection_summaries),
+                "page": page_metadata(
+                    limit=detection_limit,
+                    offset=detection_offset,
+                    count=len(detection_summaries),
+                ),
+            }
+        )
+
     @router.get("/original")
+    @frames_router.get("/original")
     def get_original_frame(
         request: Request,
         frame_id: str | None = None,
@@ -148,6 +279,8 @@ if APIRouter is not None:
         format: str = "png",
         preview_max_dim: int = 128,
         scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
     ):
         row = _resolve_frame_row(request, frame_id, asset_id, frame_num)
         return _frame_data_response(
@@ -157,9 +290,13 @@ if APIRouter is not None:
             format=format,
             preview_max_dim=preview_max_dim,
             scale=scale,
+            width=width,
+            height=height,
         )
 
     @router.get("/preprocessed")
+    @frames_router.get("/preprocessed")
+    @frames_router.get("/preprocess")
     def get_preprocessed_frame(
         request: Request,
         frame_id: str | None = None,
@@ -168,6 +305,8 @@ if APIRouter is not None:
         format: str = "png",
         preview_max_dim: int = 128,
         scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
     ):
         row = _resolve_frame_row(request, frame_id, asset_id, frame_num)
         return _frame_data_response(
@@ -177,12 +316,12 @@ if APIRouter is not None:
             format=format,
             preview_max_dim=preview_max_dim,
             scale=scale,
+            width=width,
+            height=height,
         )
 
-    @router.post("/preprocess")
-    def preprocess_frame(request: Request, body: FramePreprocessRequest) -> dict:
+    def _preprocess_resolved_frame(request: Request, row: dict, body: FramePreprocessRequest) -> dict:
         context = get_context(request)
-        row = _resolve_frame_row(request, body.frame_id, body.asset_id, body.frame_num)
         source_frame = retrieve_frame(str(row["id"]), context=context, payload_kind="original")
         processed = preprocess_frame_for_segmentation(
             source_frame,
@@ -226,7 +365,69 @@ if APIRouter is not None:
             response["frame"] = frame_summary(stored_row)
         if body.response_format == "matrix":
             response["data"] = np.asarray(array).tolist()
-        return as_response(response)
+        return response
+
+    @router.post("/preprocess")
+    def preprocess_frame(request: Request, body: FramePreprocessRequest) -> dict:
+        repository = get_repository(request)
+        requested_frame_ids = list(body.frame_ids or [])
+        if body.frame_id is not None:
+            requested_frame_ids.append(body.frame_id)
+        requested_frame_ids = list(dict.fromkeys(requested_frame_ids))
+
+        if requested_frame_ids:
+            if body.asset_id is not None or body.frame_num is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide frame_ids/frame_id, or provide asset_id and frame_num, not both.",
+                )
+            if body.response_format == "matrix" and len(requested_frame_ids) > 1:
+                raise HTTPException(
+                    status_code=422,
+                    detail="response_format='matrix' is only supported for single-frame preprocessing.",
+                )
+            frames = [
+                _preprocess_resolved_frame(
+                    request,
+                    _resolve_frame_row(request, frame_id, None, None),
+                    body,
+                )
+                for frame_id in requested_frame_ids
+            ]
+            return as_response(
+                {
+                    "frame_count": len(frames),
+                    "frame_ids": [str(frame["frame_id"]) for frame in frames],
+                    "stored": body.store,
+                    "frames": frames,
+                }
+            )
+
+        if body.asset_id is not None and body.frame_num is None:
+            rows = repository.list_frames(
+                body.asset_id,
+                start_frame=body.start_frame,
+                end_frame=body.end_frame,
+                limit=body.limit,
+            )
+            if body.response_format == "matrix" and len(rows) > 1:
+                raise HTTPException(
+                    status_code=422,
+                    detail="response_format='matrix' is only supported for single-frame preprocessing.",
+                )
+            frames = [_preprocess_resolved_frame(request, row, body) for row in rows]
+            return as_response(
+                {
+                    "frame_count": len(frames),
+                    "frame_ids": [str(frame["frame_id"]) for frame in frames],
+                    "asset_id": body.asset_id,
+                    "stored": body.store,
+                    "frames": frames,
+                }
+            )
+
+        row = _resolve_frame_row(request, body.frame_id, body.asset_id, body.frame_num)
+        return as_response(_preprocess_resolved_frame(request, row, body))
 
     @router.post("/preprocess/jobs")
     def queue_frame_preprocess_job(request: Request, body: QueueFramePreprocessRequest) -> dict:
@@ -313,3 +514,5 @@ if APIRouter is not None:
         return {"job": as_response(job)}
 else:
     router = None
+    frames_router = None
+    routers = []
