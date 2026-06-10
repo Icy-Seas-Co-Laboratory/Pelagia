@@ -34,7 +34,7 @@ if APIRouter is not None:
         apply_mask: bool | None = None
         mask_path: str | None = None
         enqueue_segment: bool = False
-        segmentation_padding: int | None = None
+        roi_padding: int | None = None
         roi_encoding: str | None = None
         collections: str | list[str] | None = None
         run_id: str | None = None
@@ -50,6 +50,7 @@ if APIRouter is not None:
         defaults = request.app.state.context.config.processing
         ingest_defaults = defaults.video_ingest
         preprocessing_defaults = defaults.preprocessing
+        roi_recording_defaults = defaults.roi_recording
         n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
         adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
@@ -63,12 +64,14 @@ if APIRouter is not None:
         )
         apply_mask = preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask
         mask_path = preprocessing_defaults.mask_path if body.mask_path is None else body.mask_path
-        segmentation_padding = (
-            defaults.segmentation.padding
-            if body.segmentation_padding is None
-            else body.segmentation_padding
+        roi_padding = (
+            roi_recording_defaults.padding
+            if body.roi_padding is None
+            else body.roi_padding
         )
-        roi_encoding = defaults.segmentation.roi_encoding if body.roi_encoding is None else body.roi_encoding
+        roi_encoding = (
+            roi_recording_defaults.roi_encoding if body.roi_encoding is None else body.roi_encoding
+        )
         if n_tile < 1:
             raise HTTPException(status_code=422, detail="n_tile must be >= 1.")
         if adaptive_background_period < 1:
@@ -126,7 +129,7 @@ if APIRouter is not None:
                 "apply_mask": apply_mask,
                 "mask_path": mask_path,
                 "enqueue_segment": body.enqueue_segment,
-                "segmentation_padding": segmentation_padding,
+                "padding": roi_padding,
                 "roi_encoding": roi_encoding,
                 "collections": collections,
             },

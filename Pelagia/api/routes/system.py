@@ -8,9 +8,12 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ...config import CoreConfig
+    from ...processing.capabilities import preprocessing_capabilities, system_capabilities
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
 
     router = APIRouter(prefix="/system", tags=["system"])
+    preprocessing_router = APIRouter(prefix="/preprocessing", tags=["preprocessing"])
+    routers = [preprocessing_router]
 
     @router.get("")
     def get_system(request: Request) -> dict:
@@ -64,6 +67,14 @@ if APIRouter is not None:
             }
         )
 
+    @router.get("/capabilities")
+    def get_system_capabilities(request: Request) -> dict:
+        return as_response(system_capabilities(get_context(request).config))
+
+    @preprocessing_router.get("/options")
+    def get_preprocessing_options(request: Request) -> dict:
+        return as_response(preprocessing_capabilities(get_context(request).config.processing))
+
     @router.get("/status")
     def get_system_status(request: Request) -> dict:
         repository = get_repository(request)
@@ -96,6 +107,9 @@ if APIRouter is not None:
             ],
             "common_flows": {
                 "queue_video_ingestion": "POST /ingestion/videos",
+                "system_capabilities": "GET /system/capabilities",
+                "preprocessing_options": "GET /preprocessing/options",
+                "segmentation_options": "GET /segmentation/options",
                 "preprocess_frame_now": "POST /frame/preprocess",
                 "queue_preprocessing": "POST /frame/preprocess/jobs",
                 "live_segmentation": "GET /live/segmentation",
@@ -133,3 +147,5 @@ if APIRouter is not None:
         return initialized
 else:
     router = None
+    preprocessing_router = None
+    routers = []

@@ -118,7 +118,8 @@ if typer is not None:
         zstd_min_bytes: Optional[int],
         processing_defaults,
     ) -> dict:
-        segmentation_defaults = processing_defaults.segmentation
+        roi_filter_defaults = processing_defaults.roi_filter
+        roi_recording_defaults = processing_defaults.roi_recording
         flatfield_defaults = processing_defaults.flatfield
         preprocessing_defaults = processing_defaults.preprocessing
         return {
@@ -165,11 +166,11 @@ if typer is not None:
                 if invert_intensity is None
                 else invert_intensity
             ),
-            "min_perimeter": segmentation_defaults.min_perimeter if min_perimeter is None else min_perimeter,
-            "max_perimeter": segmentation_defaults.max_perimeter if max_perimeter is None else max_perimeter,
-            "padding": segmentation_defaults.padding if padding is None else padding,
-            "roi_encoding": segmentation_defaults.roi_encoding if roi_encoding is None else roi_encoding,
-            "zstd_min_bytes": segmentation_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes,
+            "min_perimeter": roi_filter_defaults.min_perimeter if min_perimeter is None else min_perimeter,
+            "max_perimeter": roi_filter_defaults.max_perimeter if max_perimeter is None else max_perimeter,
+            "padding": roi_recording_defaults.padding if padding is None else padding,
+            "roi_encoding": roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding,
+            "zstd_min_bytes": roi_recording_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes,
         }
 
     def _preprocess_payload(
@@ -919,7 +920,7 @@ if typer is not None:
         input_path: Path,
         n_tile: Optional[int] = None,
         enqueue_segment: bool = False,
-        segmentation_padding: Optional[int] = None,
+        roi_padding: Optional[int] = None,
         roi_encoding: Optional[str] = None,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -939,7 +940,7 @@ if typer is not None:
         context = _context_from_options(kvstore_root, database_dsn, schema)
         ingest_defaults = context.config.processing.video_ingest
         preprocessing_defaults = context.config.processing.preprocessing
-        segment_defaults = context.config.processing.segmentation
+        roi_recording_defaults = context.config.processing.roi_recording
         resolved_n_tile = ingest_defaults.n_tile if n_tile is None else n_tile
         resolved_adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
@@ -953,10 +954,10 @@ if typer is not None:
         )
         resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
         resolved_mask_path = preprocessing_defaults.mask_path if mask_path is None else mask_path
-        resolved_segmentation_padding = (
-            segment_defaults.padding if segmentation_padding is None else segmentation_padding
+        resolved_roi_padding = (
+            roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
-        resolved_roi_encoding = segment_defaults.roi_encoding if roi_encoding is None else roi_encoding
+        resolved_roi_encoding = roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
         normalized_collections = normalize_collections(collections)
         resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
             context,
@@ -984,7 +985,7 @@ if typer is not None:
                 "apply_mask": resolved_apply_mask,
                 "mask_path": resolved_mask_path,
                 "enqueue_segment": enqueue_segment,
-                "segmentation_padding": resolved_segmentation_padding,
+                "padding": resolved_roi_padding,
                 "roi_encoding": resolved_roi_encoding,
                 "collections": normalized_collections,
                 "checksum_status": "computed" if compute_checksum else "deferred",
@@ -1008,7 +1009,7 @@ if typer is not None:
         recursive: bool = True,
         n_tile: Optional[int] = None,
         enqueue_segment: bool = False,
-        segmentation_padding: Optional[int] = None,
+        roi_padding: Optional[int] = None,
         roi_encoding: Optional[str] = None,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -1031,7 +1032,7 @@ if typer is not None:
 
         ingest_defaults = context.config.processing.video_ingest
         preprocessing_defaults = context.config.processing.preprocessing
-        segment_defaults = context.config.processing.segmentation
+        roi_recording_defaults = context.config.processing.roi_recording
         resolved_n_tile = ingest_defaults.n_tile if n_tile is None else n_tile
         resolved_adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
@@ -1045,10 +1046,10 @@ if typer is not None:
         )
         resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
         resolved_mask_path = preprocessing_defaults.mask_path if mask_path is None else mask_path
-        resolved_segmentation_padding = (
-            segment_defaults.padding if segmentation_padding is None else segmentation_padding
+        resolved_roi_padding = (
+            roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
-        resolved_roi_encoding = segment_defaults.roi_encoding if roi_encoding is None else roi_encoding
+        resolved_roi_encoding = roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
         normalized_collections = normalize_collections(collections)
 
         queued = []
@@ -1079,7 +1080,7 @@ if typer is not None:
                     "apply_mask": resolved_apply_mask,
                     "mask_path": resolved_mask_path,
                     "enqueue_segment": enqueue_segment,
-                    "segmentation_padding": resolved_segmentation_padding,
+                    "padding": resolved_roi_padding,
                     "roi_encoding": resolved_roi_encoding,
                     "collections": normalized_collections,
                     "checksum_status": "computed" if compute_checksum else "deferred",

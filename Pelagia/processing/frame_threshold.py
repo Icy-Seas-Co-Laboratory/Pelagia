@@ -234,7 +234,120 @@ def threshold_ensemble_and(gray: np.ndarray, threshold_fns: Sequence[ThresholdFn
     return combine_masks_and(*(fn(gray) for fn in threshold_fns))
 
 
-def threshold_boundedotsu_canny(
+def calculate_threshold_mask(
+    gray: np.ndarray,
+    *,
+    threshold: int | float | ThresholdFn | None = None,
+    method: str = "otsu",
+    manual_threshold: int | float | None = None,
+    thresholding_maximum_value: int | float | None = None,
+    bounded_otsu_min_contrast: int | float = 50,
+    bounded_otsu_max_foreground_fraction: float = 0.9,
+    canny_enabled: bool = True,
+    canny_low_threshold: int | float = 30,
+    canny_high_threshold: int | float = 80,
+    canny_blur_kernel: int = 5,
+    adaptive_block_size: int = 31,
+    adaptive_c: int | float = 5,
+    percentile_background_percentile: int | float = 50,
+    percentile_min_contrast: int | float = 50,
+    hysteresis_low_threshold: int | float = 30,
+    hysteresis_high_threshold: int | float = 80,
+    hysteresis_connectivity: int = 8,
+    sobel_percentile: int | float = 90,
+    sobel_threshold: int | float | None = None,
+    sobel_kernel_size: int = 3,
+) -> np.ndarray:
+    """Calculate the first-pass binary mask using one thresholding algorithm."""
+    if callable(threshold):
+        return _binary_mask(threshold(gray))
+
+    resolved_method = str(method).replace("-", "_").lower()
+    if resolved_method == "auto":
+        resolved_method = "otsu" if threshold is None else "manual"
+
+    if resolved_method == "manual":
+        resolved_threshold = threshold if threshold is not None else manual_threshold
+        if resolved_threshold is None:
+            raise ValueError("Manual thresholding requires a threshold value.")
+        return _binary_mask(threshold_manual(gray, resolved_threshold))
+    if resolved_method == "otsu":
+        return _binary_mask(
+            threshold_otsu(
+                gray,
+                thresholding_maximum_value=thresholding_maximum_value,
+            )
+        )
+    if resolved_method == "bounded_otsu":
+        return _binary_mask(
+            threshold_bounded_otsu(
+                gray,
+                min_contrast=bounded_otsu_min_contrast,
+                max_foreground_fraction=bounded_otsu_max_foreground_fraction,
+                thresholding_maximum_value=thresholding_maximum_value,
+            )
+        )
+    if resolved_method in {"bounded_otsu_canny", "boundedotsu_canny"}:
+        base = threshold_bounded_otsu(
+            gray,
+            min_contrast=bounded_otsu_min_contrast,
+            max_foreground_fraction=bounded_otsu_max_foreground_fraction,
+            thresholding_maximum_value=thresholding_maximum_value,
+        )
+        if not np.any(base):
+            return _binary_mask(base)
+        if not canny_enabled:
+            return _binary_mask(base)
+        edges = threshold_canny(
+            gray,
+            canny_params=(canny_low_threshold, canny_high_threshold),
+            blur_kernel=(int(canny_blur_kernel), int(canny_blur_kernel)),
+        )
+        return _binary_mask(combine_masks_or(base, edges))
+    if resolved_method == "canny":
+        return _binary_mask(
+            threshold_canny(
+                gray,
+                canny_params=(canny_low_threshold, canny_high_threshold),
+                blur_kernel=(int(canny_blur_kernel), int(canny_blur_kernel)),
+            )
+        )
+    if resolved_method == "adaptive_mean":
+        return _binary_mask(threshold_adaptive_mean(gray, block_size=int(adaptive_block_size), c=adaptive_c))
+    if resolved_method == "adaptive_gaussian":
+        return _binary_mask(
+            threshold_adaptive_gaussian(gray, block_size=int(adaptive_block_size), c=adaptive_c)
+        )
+    if resolved_method == "percentile_background":
+        return _binary_mask(
+            threshold_percentile_background(
+                gray,
+                background_percentile=percentile_background_percentile,
+                min_contrast=percentile_min_contrast,
+            )
+        )
+    if resolved_method == "hysteresis":
+        return _binary_mask(
+            threshold_hysteresis(
+                gray,
+                low_threshold=hysteresis_low_threshold,
+                high_threshold=hysteresis_high_threshold,
+                connectivity=int(hysteresis_connectivity),
+            )
+        )
+    if resolved_method == "sobel_edges":
+        return _binary_mask(
+            threshold_sobel_edges(
+                gray,
+                threshold=threshold if threshold is not None else sobel_threshold,
+                percentile=sobel_percentile,
+                kernel_size=int(sobel_kernel_size),
+            )
+        )
+    raise ValueError(f"Unsupported threshold method {method!r}.")
+
+
+def threshold_bounded_otsu_canny(
     gray: np.ndarray,
     *,
     run_canny: bool = True,
@@ -258,11 +371,6 @@ def threshold_boundedotsu_canny(
     return dilate_mask(mask, kernel_size=dilate_kernel)
 
 
-def threshold_bounded_otsu_canny(*args, **kwargs) -> np.ndarray:
-    """Alias for callers that prefer separated words in the function name."""
-    return threshold_boundedotsu_canny(*args, **kwargs)
-
-
 def _odd_block_size(block_size: int) -> int:
     resolved = int(block_size)
     if resolved < 3:
@@ -279,3 +387,10 @@ def _odd_kernel_size(kernel_size: int) -> int:
     if resolved % 2 == 0:
         resolved += 1
     return resolved
+
+
+def _binary_mask(mask: np.ndarray) -> np.ndarray:
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise ValueError("Threshold functions must return a 2D mask.")
+    return np.ascontiguousarray((array > 0).astype(np.uint8) * 255)

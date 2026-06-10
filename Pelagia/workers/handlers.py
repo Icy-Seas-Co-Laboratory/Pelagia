@@ -10,6 +10,7 @@ from ..processing import ingest as ingest_module
 from ..processing.detection_candidate import segment_frame
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_store import retrieve_frame, store_preprocessed_frame
+from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..services.context import AppContext
 
 
@@ -130,15 +131,15 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     }
 
     if payload.get("enqueue_segment"):
-        segment_defaults = context.config.processing.segmentation
+        roi_recording_defaults = context.config.processing.roi_recording
         segment_job = context.repository.create_job(
             PipelineStage.SEGMENT,
             run_id=run_id,
             asset_id=asset_id,
             payload={
                 "frame_ids": result["frame_ids"],
-                "padding": payload.get("segmentation_padding", payload.get("padding", segment_defaults.padding)),
-                "roi_encoding": payload.get("roi_encoding", segment_defaults.roi_encoding),
+                "padding": payload.get("padding", roi_recording_defaults.padding),
+                "roi_encoding": payload.get("roi_encoding", roi_recording_defaults.roi_encoding),
                 "collections": collections,
             },
             depends_on=[str(job["id"])],
@@ -287,35 +288,9 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     detections = []
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
-    segment_defaults = context.config.processing.segmentation
-    flatfield_defaults = context.config.processing.flatfield
-    preprocessing_defaults = context.config.processing.preprocessing
-    padding = payload.get("padding", payload.get("segmentation_padding", segment_defaults.padding))
-    zstd_min_bytes = payload.get("zstd_min_bytes", segment_defaults.zstd_min_bytes)
-    min_perimeter = payload.get("min_perimeter", segment_defaults.min_perimeter)
-    max_perimeter = payload.get("max_perimeter", segment_defaults.max_perimeter)
-    flatfield_correction = payload.get("flatfield_correction", flatfield_defaults.flatfield_correction)
-    flatfield_q = payload.get("flatfield_q", flatfield_defaults.flatfield_q)
-    flatfield_axis = payload.get("flatfield_axis", flatfield_defaults.flatfield_axis)
-    apply_mask = payload.get("apply_mask", preprocessing_defaults.apply_mask)
-    crop_enabled = payload.get("crop_enabled", preprocessing_defaults.crop_enabled)
-    crop_x = payload.get("crop_x", preprocessing_defaults.crop_x)
-    crop_y = payload.get("crop_y", preprocessing_defaults.crop_y)
-    crop_w = payload.get("crop_w", preprocessing_defaults.crop_w)
-    crop_h = payload.get("crop_h", preprocessing_defaults.crop_h)
-    background_correction = payload.get(
-        "background_correction",
-        preprocessing_defaults.background_correction,
-    )
-    background_percentile = payload.get(
-        "background_percentile",
-        preprocessing_defaults.background_percentile,
-    )
-    invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
-    frame_payload_kind = str(payload.get("frame_payload_kind", "original")).lower()
-    apply_preprocessing = payload.get("apply_preprocessing")
-    if apply_preprocessing is None:
-        apply_preprocessing = frame_payload_kind in {"original", "raw"}
+    resolved_options = resolve_segmentation_options(payload, context.config.processing)
+    frame_payload_kind = resolved_options["source"]["frame_payload_kind"]
+    frame_kwargs = segment_frame_kwargs(resolved_options)
 
     for frame_id in frame_ids:
         frame_record = context.repository.get_frame_record(frame_id)
@@ -338,25 +313,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
             segment_frame(
                 frame,
                 frame_record=frame_record,
-                threshold=payload.get("threshold"),
-                apply_preprocessing=bool(apply_preprocessing),
-                flatfield_correction=flatfield_correction,
-                flatfield_q=flatfield_q,
-                flatfield_axis=flatfield_axis,
-                apply_mask=apply_mask,
-                crop_enabled=crop_enabled,
-                crop_x=crop_x,
-                crop_y=crop_y,
-                crop_w=crop_w,
-                crop_h=crop_h,
-                background_correction=background_correction,
-                background_percentile=background_percentile,
-                invert_intensity=invert_intensity,
-                min_perimeter=min_perimeter,
-                max_perimeter=max_perimeter,
-                padding=padding,
-                roi_encoding=payload.get("roi_encoding", segment_defaults.roi_encoding),
-                zstd_min_bytes=zstd_min_bytes,
+                **frame_kwargs,
                 context=context,
             )
         )
@@ -377,6 +334,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         "detection_count": len(inserted),
         "frame_ids": frame_ids,
         "detection_ids": [row.get("id") for row in inserted],
+        "resolved_options": resolved_options,
     }
 
 

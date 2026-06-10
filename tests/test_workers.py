@@ -164,7 +164,7 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
             "asset_id": "asset-1",
             "payload": {
                 "enqueue_segment": True,
-                "segmentation_padding": 4,
+                "padding": 4,
                 "roi_encoding": "raw",
             },
         },
@@ -329,6 +329,12 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
                 "min_perimeter": 3,
                 "padding": 5,
                 "roi_encoding": "raw",
+                "mask_augmentation_steps": ["erode"],
+                "erode_iterations": 2,
+                "roi_assembly_method": "contours",
+                "min_area": 4,
+                "store_roi_payload_min_area": 10,
+                "always_store_mask": False,
             },
         },
         context,
@@ -345,6 +351,13 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
     assert segmented[0][1]["min_perimeter"] == 3
     assert segmented[0][1]["padding"] == 5
     assert segmented[0][1]["roi_encoding"] == "raw"
+    assert segmented[0][1]["mask_augmentation_steps"] == ["erode"]
+    assert segmented[0][1]["erode_iterations"] == 2
+    assert segmented[0][1]["roi_assembly_method"] == "contours"
+    assert segmented[0][1]["min_area"] == 4
+    assert segmented[0][1]["store_roi_payload_min_area"] == 10
+    assert segmented[0][1]["always_store_mask"] is False
+    assert result["resolved_options"]["roi_assembly"]["roi_assembly_method"] == "contours"
     assert repo.replaced_detections[0][0] == "run-1"
     assert repo.replaced_detections[0][1] == ["frame-1"]
 

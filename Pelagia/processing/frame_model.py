@@ -14,8 +14,8 @@ class FrameData:
     and ``bbox_y`` describe its origin in a parent image coordinate system, so
     a full frame starts at (0, 0) and an ROI can preserve its source position.
 
-    The constructor keeps the historical camelCase field names so existing
-    segmentation calls remain compatible.
+    The constructor keeps source metadata close to the runtime image payload so
+    processing stages can pass frame, ROI, and mask data through one container.
     """
     sourcePath: str
     filename: str

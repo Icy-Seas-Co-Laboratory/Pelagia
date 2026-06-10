@@ -3,16 +3,21 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-import cv2
 import numpy as np
 
-from ..domain import DetectionRecord, FrameRecord, normalize_collections
+from ..domain import DetectionRecord, FrameRecord
 from ._logging import log_processing_event, processing_core_logger
 from .defaults import default_processing_config
-from .frame_codec import encode_array_payload
+from .detection_recording import (
+    build_candidate_detection_record,
+    frame_metadata_value,
+)
 from .frame_model import FrameData
 from .frame_preprocess import as_grayscale_array, preprocess_frame_for_segmentation
-from .frame_threshold import threshold_manual, threshold_otsu
+from .frame_threshold import calculate_threshold_mask
+from .mask_augmentation import as_binary_mask, augment_mask
+from .roi_assembly import assemble_candidate_rois
+from .roi_filter import filter_candidate_rois, should_store_roi_payload
 
 
 ThresholdFn = Callable[[np.ndarray], np.ndarray]
@@ -20,11 +25,7 @@ _CORE_LOGGER = processing_core_logger("detection_candidate")
 
 
 def _frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
-    if hasattr(frame, key):
-        value = getattr(frame, key)
-        if value is not None:
-            return value
-    return frame.metadata.get(key, default)
+    return frame_metadata_value(frame, key, default)
 
 
 def _as_grayscale_array(frame: FrameData) -> np.ndarray:
@@ -34,150 +35,45 @@ def _as_grayscale_array(frame: FrameData) -> np.ndarray:
     return as_grayscale_array(data)
 
 
-def _component_axis_lengths(contour: np.ndarray, width: int, height: int) -> tuple[float, float]:
-    if len(contour) >= 5:
-        try:
-            (_, _), axes, _ = cv2.fitEllipse(contour)
-            major, minor = sorted((float(axes[0]), float(axes[1])), reverse=True)
-            return major, minor
-        except cv2.error:
-            pass
-    return float(max(width, height)), float(min(width, height))
-
-
-def _component_gray_stats(gray_crop: np.ndarray, mask: np.ndarray) -> tuple[int, float]:
-    pixels = gray_crop[mask > 0]
-    if pixels.size == 0:
-        return 0, 0.0
-    return int(np.min(pixels)), float(np.mean(pixels))
-
-
-def _as_binary_mask(mask: np.ndarray) -> np.ndarray:
-    array = np.asarray(mask)
-    if array.ndim != 2:
-        raise ValueError("Segmentation mask must be a 2D image.")
-    return np.ascontiguousarray((array > 0).astype(np.uint8) * 255)
-
-
-def _choose_roi_encoding(roi: np.ndarray, encoding: str | None, zstd_min_bytes: int | None) -> str:
-    defaults = default_processing_config().segmentation
-    requested = str(encoding or defaults.roi_encoding).lower()
-    resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
-    if requested == "auto":
-        return "png" if roi.nbytes < resolved_zstd_min_bytes else "zstd"
-    return requested
-
-
-def _padded_bounds(
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    padding: int,
-    image_width: int,
-    image_height: int,
-) -> tuple[int, int, int, int]:
-    pad = max(0, int(padding))
-    x0 = max(0, int(x) - pad)
-    y0 = max(0, int(y) - pad)
-    x1 = min(image_width, int(x) + int(width) + pad)
-    y1 = min(image_height, int(y) + int(height) + pad)
-    return x0, y0, x1, y1
-
-
-def store_roi(
-    roi_frame: FrameData,
-    *,
-    source_frame: FrameData,
-    roi_index: int,
-    contour: np.ndarray,
-    area: float,
-    encoding: str | None = None,
-    zstd_min_bytes: int | None = None,
-    extra_metadata: dict[str, Any] | None = None,
-) -> DetectionRecord:
-    """
-    Build a DetectionRecord for an ROI, storing encoded ROI bytes in Postgres-ready form.
-    """
-    roi_data = roi_frame.read()
-    if roi_data is None:
-        raise ValueError("ROI frame has no image data to store.")
-
-    roi_array = np.ascontiguousarray(roi_data)
-    if roi_array.ndim < 2:
-        raise ValueError("ROI data must have at least two dimensions.")
-    roi_frame.validate_geometry(roi_array)
-    roi_frame.validate_mask()
-
-    selected_encoding = _choose_roi_encoding(roi_array, encoding, zstd_min_bytes)
-    payload, array_encoding, array_format = encode_array_payload(roi_array, selected_encoding)
-
-    frame_id = _frame_metadata_value(source_frame, "frame_id")
-    run_id = _frame_metadata_value(source_frame, "run_id")
-    if frame_id is None:
-        raise ValueError("Source frame metadata must include frame_id before storing ROIs.")
-    if run_id is None:
-        raise ValueError("Source frame metadata must include run_id before storing ROIs.")
-
-    if roi_frame.mask is not None:
-        mask_array = _as_binary_mask(roi_frame.mask)
-    else:
-        mask_array = _as_binary_mask(roi_array)
-    mask_payload, mask_encoding, mask_format = encode_array_payload(mask_array, selected_encoding)
-
-    min_gray, mean_gray = _component_gray_stats(roi_array, mask_array)
-    major_axis, minor_axis = _component_axis_lengths(contour, roi_frame.width, roi_frame.height)
-
-    metadata = dict(extra_metadata or {})
-    bbox = metadata.get("object_bbox") or roi_frame.get_bbox()
-    bbox_x, bbox_y, bbox_w, bbox_h = bbox
-    crop_bbox = metadata.get("roi_bbox") or roi_frame.get_bbox()
-    crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h = crop_bbox
-
-    metadata.update(
-        {
-            "collections": normalize_collections(source_frame.metadata.get("collections")),
-            "source_frame_number": source_frame.frameNumber,
-            "parent_frame_id": frame_id,
-        }
-    )
-
-    return DetectionRecord(
-        run_id=str(run_id),
-        frame_id=str(frame_id),
-        roi_index=int(roi_index),
-        bbox_x=int(bbox_x),
-        bbox_y=int(bbox_y),
-        bbox_w=int(bbox_w),
-        bbox_h=int(bbox_h),
-        area=float(area),
-        perimeter=float(cv2.arcLength(contour, True)),
-        major_axis_length=major_axis,
-        minor_axis_length=minor_axis,
-        min_gray_value=min_gray,
-        mean_gray_value=mean_gray,
-        roi_payload=payload,
-        mask_payload=mask_payload,
-        crop_bbox_x=int(crop_bbox_x),
-        crop_bbox_y=int(crop_bbox_y),
-        crop_bbox_w=int(crop_bbox_w),
-        crop_bbox_h=int(crop_bbox_h),
-        roi_encoding=array_encoding,
-        roi_format=array_format,
-        roi_dtype=str(roi_array.dtype),
-        roi_shape=list(roi_array.shape),
-        mask_encoding=mask_encoding,
-        mask_format=mask_format,
-        mask_dtype=str(mask_array.dtype),
-        mask_shape=list(mask_array.shape),
-        metadata=metadata,
-    )
-
-
 def live_segment_wrapper(
     frame_id: str,
     *,
     threshold: int | float | ThresholdFn | None = None,
+    threshold_method: str | None = None,
+    manual_threshold: int | float | None = None,
+    thresholding_maximum_value: int | float | None = None,
+    bounded_otsu_min_contrast: int | float | None = None,
+    bounded_otsu_max_foreground_fraction: float | None = None,
+    canny_enabled: bool | None = None,
+    canny_low_threshold: int | float | None = None,
+    canny_high_threshold: int | float | None = None,
+    canny_blur_kernel: int | None = None,
+    dilate_kernel_w: int | None = None,
+    dilate_kernel_h: int | None = None,
+    dilate_iterations: int | None = None,
+    erode_kernel_w: int | None = None,
+    erode_kernel_h: int | None = None,
+    erode_iterations: int | None = None,
+    open_kernel_w: int | None = None,
+    open_kernel_h: int | None = None,
+    open_iterations: int | None = None,
+    close_kernel_w: int | None = None,
+    close_kernel_h: int | None = None,
+    close_iterations: int | None = None,
+    fill_holes: bool | None = None,
+    remove_small_components: bool | None = None,
+    min_component_area: int | float | None = None,
+    clear_border: bool | None = None,
+    adaptive_block_size: int | None = None,
+    adaptive_c: int | float | None = None,
+    percentile_background_percentile: int | float | None = None,
+    percentile_min_contrast: int | float | None = None,
+    hysteresis_low_threshold: int | float | None = None,
+    hysteresis_high_threshold: int | float | None = None,
+    hysteresis_connectivity: int | None = None,
+    sobel_percentile: int | float | None = None,
+    sobel_threshold: int | float | None = None,
+    sobel_kernel_size: int | None = None,
     frame_payload_kind: str = "original",
     apply_preprocessing: bool | None = None,
     apply_mask: bool | None = None,
@@ -192,11 +88,30 @@ def live_segment_wrapper(
     background_correction: bool | None = None,
     background_percentile: int | float | None = None,
     invert_intensity: bool | None = None,
+    mask_augmentation_enabled: bool | None = None,
+    mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
+    roi_assembly_method: str | None = None,
+    roi_assembly_connectivity: int | None = None,
+    min_area: int | float | None = None,
+    max_area: int | float | None = None,
     min_perimeter: int | float | None = None,
     max_perimeter: int | float | None = None,
+    min_width: int | float | None = None,
+    max_width: int | float | None = None,
+    min_height: int | float | None = None,
+    max_height: int | float | None = None,
+    min_width_plus_height: int | float | None = None,
+    max_width_plus_height: int | float | None = None,
     padding: int | None = None,
     roi_encoding: str | None = "png",
     zstd_min_bytes: int | None = None,
+    store_roi_payload_min_area: int | float | None = None,
+    store_roi_payload_min_width: int | float | None = None,
+    store_roi_payload_min_height: int | float | None = None,
+    store_roi_payload_min_width_plus_height: int | float | None = None,
+    always_store_mask: bool | None = None,
+    encode_payloads: bool = True,
+    max_detections: int | None = None,
     context: Any = None,
 ) -> list[DetectionRecord]:
     """Load one frame, segment it, and return transient detection records."""
@@ -226,6 +141,41 @@ def live_segment_wrapper(
             frame=frame,
             frame_record=frame_record,
             threshold=threshold,
+            threshold_method=threshold_method,
+            manual_threshold=manual_threshold,
+            thresholding_maximum_value=thresholding_maximum_value,
+            bounded_otsu_min_contrast=bounded_otsu_min_contrast,
+            bounded_otsu_max_foreground_fraction=bounded_otsu_max_foreground_fraction,
+            canny_enabled=canny_enabled,
+            canny_low_threshold=canny_low_threshold,
+            canny_high_threshold=canny_high_threshold,
+            canny_blur_kernel=canny_blur_kernel,
+            dilate_kernel_w=dilate_kernel_w,
+            dilate_kernel_h=dilate_kernel_h,
+            dilate_iterations=dilate_iterations,
+            erode_kernel_w=erode_kernel_w,
+            erode_kernel_h=erode_kernel_h,
+            erode_iterations=erode_iterations,
+            open_kernel_w=open_kernel_w,
+            open_kernel_h=open_kernel_h,
+            open_iterations=open_iterations,
+            close_kernel_w=close_kernel_w,
+            close_kernel_h=close_kernel_h,
+            close_iterations=close_iterations,
+            fill_holes=fill_holes,
+            remove_small_components=remove_small_components,
+            min_component_area=min_component_area,
+            clear_border=clear_border,
+            adaptive_block_size=adaptive_block_size,
+            adaptive_c=adaptive_c,
+            percentile_background_percentile=percentile_background_percentile,
+            percentile_min_contrast=percentile_min_contrast,
+            hysteresis_low_threshold=hysteresis_low_threshold,
+            hysteresis_high_threshold=hysteresis_high_threshold,
+            hysteresis_connectivity=hysteresis_connectivity,
+            sobel_percentile=sobel_percentile,
+            sobel_threshold=sobel_threshold,
+            sobel_kernel_size=sobel_kernel_size,
             apply_preprocessing=(
                 frame_payload_kind in {"original", "raw"}
                 if apply_preprocessing is None
@@ -243,11 +193,30 @@ def live_segment_wrapper(
             background_correction=background_correction,
             background_percentile=background_percentile,
             invert_intensity=invert_intensity,
+            mask_augmentation_enabled=mask_augmentation_enabled,
+            mask_augmentation_steps=mask_augmentation_steps,
+            roi_assembly_method=roi_assembly_method,
+            roi_assembly_connectivity=roi_assembly_connectivity,
+            min_area=min_area,
+            max_area=max_area,
             min_perimeter=min_perimeter,
             max_perimeter=max_perimeter,
+            min_width=min_width,
+            max_width=max_width,
+            min_height=min_height,
+            max_height=max_height,
+            min_width_plus_height=min_width_plus_height,
+            max_width_plus_height=max_width_plus_height,
             padding=padding,
             roi_encoding=roi_encoding,
             zstd_min_bytes=zstd_min_bytes,
+            store_roi_payload_min_area=store_roi_payload_min_area,
+            store_roi_payload_min_width=store_roi_payload_min_width,
+            store_roi_payload_min_height=store_roi_payload_min_height,
+            store_roi_payload_min_width_plus_height=store_roi_payload_min_width_plus_height,
+            always_store_mask=always_store_mask,
+            encode_payloads=encode_payloads,
+            max_detections=max_detections,
             context=context,
         )
     except Exception as exc:
@@ -291,6 +260,41 @@ def segment_frame(
     *,
     frame_record: FrameRecord | None = None,
     threshold: int | float | ThresholdFn | None = None,
+    threshold_method: str | None = None,
+    manual_threshold: int | float | None = None,
+    thresholding_maximum_value: int | float | None = None,
+    bounded_otsu_min_contrast: int | float | None = None,
+    bounded_otsu_max_foreground_fraction: float | None = None,
+    canny_enabled: bool | None = None,
+    canny_low_threshold: int | float | None = None,
+    canny_high_threshold: int | float | None = None,
+    canny_blur_kernel: int | None = None,
+    dilate_kernel_w: int | None = None,
+    dilate_kernel_h: int | None = None,
+    dilate_iterations: int | None = None,
+    erode_kernel_w: int | None = None,
+    erode_kernel_h: int | None = None,
+    erode_iterations: int | None = None,
+    open_kernel_w: int | None = None,
+    open_kernel_h: int | None = None,
+    open_iterations: int | None = None,
+    close_kernel_w: int | None = None,
+    close_kernel_h: int | None = None,
+    close_iterations: int | None = None,
+    fill_holes: bool | None = None,
+    remove_small_components: bool | None = None,
+    min_component_area: int | float | None = None,
+    clear_border: bool | None = None,
+    adaptive_block_size: int | None = None,
+    adaptive_c: int | float | None = None,
+    percentile_background_percentile: int | float | None = None,
+    percentile_min_contrast: int | float | None = None,
+    hysteresis_low_threshold: int | float | None = None,
+    hysteresis_high_threshold: int | float | None = None,
+    hysteresis_connectivity: int | None = None,
+    sobel_percentile: int | float | None = None,
+    sobel_threshold: int | float | None = None,
+    sobel_kernel_size: int | None = None,
     apply_preprocessing: bool = True,
     apply_mask: bool | None = None,
     crop_enabled: bool | None = None,
@@ -305,30 +309,47 @@ def segment_frame(
     background: np.ndarray | int | float | None = None,
     background_percentile: int | float | None = None,
     invert_intensity: bool | None = None,
+    mask_augmentation_enabled: bool | None = None,
+    mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
+    roi_assembly_method: str | None = None,
+    roi_assembly_connectivity: int | None = None,
+    min_area: int | float | None = None,
+    max_area: int | float | None = None,
     min_perimeter: int | float | None = None,
     max_perimeter: int | float | None = None,
+    min_width: int | float | None = None,
+    max_width: int | float | None = None,
+    min_height: int | float | None = None,
+    max_height: int | float | None = None,
+    min_width_plus_height: int | float | None = None,
+    max_width_plus_height: int | float | None = None,
     padding: int | None = None,
     roi_encoding: str | None = None,
     zstd_min_bytes: int | None = None,
+    store_roi_payload_min_area: int | float | None = None,
+    store_roi_payload_min_width: int | float | None = None,
+    store_roi_payload_min_height: int | float | None = None,
+    store_roi_payload_min_width_plus_height: int | float | None = None,
+    always_store_mask: bool | None = None,
+    encode_payloads: bool = True,
+    max_detections: int | None = None,
     context: Any = None,
 ) -> list[DetectionRecord]:
     """Segment one frame into connected-component ROI detection records."""
     started = time.perf_counter()
-    defaults = default_processing_config().segmentation
+    config = context.config.processing if context is not None and getattr(context, "config", None) is not None else default_processing_config()
+    mask_defaults = config.mask_augmentation
+    assembly_defaults = config.roi_assembly
+    filter_defaults = config.roi_filter
+    recording_defaults = config.roi_recording
     preprocessing_defaults = (
-        context.config.processing.preprocessing
-        if context is not None and getattr(context, "config", None) is not None
-        else default_processing_config().preprocessing
+        config.preprocessing
     )
     thresholding_defaults = (
-        context.config.processing.thresholding
-        if context is not None and getattr(context, "config", None) is not None
-        else default_processing_config().thresholding
+        config.thresholding
     )
     flatfield_defaults = (
-        context.config.processing.flatfield
-        if context is not None and getattr(context, "config", None) is not None
-        else default_processing_config().flatfield
+        config.flatfield
     )
     resolved_flatfield_correction = (
         flatfield_defaults.flatfield_correction
@@ -360,11 +381,138 @@ def segment_frame(
     resolved_invert_intensity = (
         preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
     )
-    resolved_min_perimeter = defaults.min_perimeter if min_perimeter is None else min_perimeter
-    resolved_max_perimeter = defaults.max_perimeter if max_perimeter is None else max_perimeter
-    resolved_padding = defaults.padding if padding is None else padding
-    resolved_roi_encoding = defaults.roi_encoding if roi_encoding is None else roi_encoding
-    resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
+    resolved_mask_augmentation_enabled = (
+        mask_defaults.enabled if mask_augmentation_enabled is None else mask_augmentation_enabled
+    )
+    explicit_manual_threshold = threshold is not None and threshold_method is None
+    resolved_mask_augmentation_steps = (
+        []
+        if explicit_manual_threshold and mask_augmentation_steps is None
+        else (
+            list(mask_defaults.steps)
+            if mask_augmentation_steps is None
+            else [str(step) for step in mask_augmentation_steps]
+        )
+    )
+    resolved_roi_assembly_method = (
+        assembly_defaults.method if roi_assembly_method is None else roi_assembly_method
+    )
+    resolved_roi_assembly_connectivity = (
+        assembly_defaults.connectivity
+        if roi_assembly_connectivity is None
+        else roi_assembly_connectivity
+    )
+    resolved_min_area = filter_defaults.min_area if min_area is None else min_area
+    resolved_max_area = filter_defaults.max_area if max_area is None else max_area
+    resolved_min_perimeter = filter_defaults.min_perimeter if min_perimeter is None else min_perimeter
+    resolved_max_perimeter = filter_defaults.max_perimeter if max_perimeter is None else max_perimeter
+    resolved_min_width = filter_defaults.min_width if min_width is None else min_width
+    resolved_max_width = filter_defaults.max_width if max_width is None else max_width
+    resolved_min_height = filter_defaults.min_height if min_height is None else min_height
+    resolved_max_height = filter_defaults.max_height if max_height is None else max_height
+    resolved_min_width_plus_height = (
+        filter_defaults.min_width_plus_height
+        if min_width_plus_height is None
+        else min_width_plus_height
+    )
+    resolved_max_width_plus_height = (
+        filter_defaults.max_width_plus_height
+        if max_width_plus_height is None
+        else max_width_plus_height
+    )
+    resolved_padding = recording_defaults.padding if padding is None else padding
+    resolved_roi_encoding = recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
+    resolved_zstd_min_bytes = recording_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
+    resolved_store_roi_payload_min_area = (
+        recording_defaults.store_roi_payload_min_area
+        if store_roi_payload_min_area is None
+        else store_roi_payload_min_area
+    )
+    resolved_store_roi_payload_min_width = (
+        recording_defaults.store_roi_payload_min_width
+        if store_roi_payload_min_width is None
+        else store_roi_payload_min_width
+    )
+    resolved_store_roi_payload_min_height = (
+        recording_defaults.store_roi_payload_min_height
+        if store_roi_payload_min_height is None
+        else store_roi_payload_min_height
+    )
+    resolved_store_roi_payload_min_width_plus_height = (
+        recording_defaults.store_roi_payload_min_width_plus_height
+        if store_roi_payload_min_width_plus_height is None
+        else store_roi_payload_min_width_plus_height
+    )
+    resolved_always_store_mask = recording_defaults.always_store_mask if always_store_mask is None else always_store_mask
+    resolved_threshold_method = str(
+        threshold_method or ("manual" if explicit_manual_threshold else thresholding_defaults.method)
+    ).lower()
+    resolved_manual_threshold = (
+        thresholding_defaults.manual_threshold if manual_threshold is None else manual_threshold
+    )
+    resolved_thresholding_maximum_value = (
+        thresholding_defaults.thresholding_maximum_value
+        if thresholding_maximum_value is None
+        else thresholding_maximum_value
+    )
+    resolved_bounded_otsu_min_contrast = (
+        thresholding_defaults.bounded_otsu_min_contrast
+        if bounded_otsu_min_contrast is None
+        else bounded_otsu_min_contrast
+    )
+    resolved_bounded_otsu_max_foreground_fraction = (
+        thresholding_defaults.bounded_otsu_max_foreground_fraction
+        if bounded_otsu_max_foreground_fraction is None
+        else bounded_otsu_max_foreground_fraction
+    )
+    resolved_canny_enabled = thresholding_defaults.canny_enabled if canny_enabled is None else canny_enabled
+    resolved_canny_low_threshold = (
+        thresholding_defaults.canny_low_threshold if canny_low_threshold is None else canny_low_threshold
+    )
+    resolved_canny_high_threshold = (
+        thresholding_defaults.canny_high_threshold if canny_high_threshold is None else canny_high_threshold
+    )
+    resolved_canny_blur_kernel = thresholding_defaults.canny_blur_kernel if canny_blur_kernel is None else canny_blur_kernel
+    resolved_dilate_kernel_w = mask_defaults.dilate_kernel_w if dilate_kernel_w is None else dilate_kernel_w
+    resolved_dilate_kernel_h = mask_defaults.dilate_kernel_h if dilate_kernel_h is None else dilate_kernel_h
+    resolved_dilate_iterations = mask_defaults.dilate_iterations if dilate_iterations is None else dilate_iterations
+    resolved_erode_kernel_w = mask_defaults.erode_kernel_w if erode_kernel_w is None else erode_kernel_w
+    resolved_erode_kernel_h = mask_defaults.erode_kernel_h if erode_kernel_h is None else erode_kernel_h
+    resolved_erode_iterations = mask_defaults.erode_iterations if erode_iterations is None else erode_iterations
+    resolved_open_kernel_w = mask_defaults.open_kernel_w if open_kernel_w is None else open_kernel_w
+    resolved_open_kernel_h = mask_defaults.open_kernel_h if open_kernel_h is None else open_kernel_h
+    resolved_open_iterations = mask_defaults.open_iterations if open_iterations is None else open_iterations
+    resolved_close_kernel_w = mask_defaults.close_kernel_w if close_kernel_w is None else close_kernel_w
+    resolved_close_kernel_h = mask_defaults.close_kernel_h if close_kernel_h is None else close_kernel_h
+    resolved_close_iterations = mask_defaults.close_iterations if close_iterations is None else close_iterations
+    resolved_fill_holes = mask_defaults.fill_holes if fill_holes is None else fill_holes
+    resolved_remove_small_components = (
+        mask_defaults.remove_small_components if remove_small_components is None else remove_small_components
+    )
+    resolved_min_component_area = mask_defaults.min_component_area if min_component_area is None else min_component_area
+    resolved_clear_border = mask_defaults.clear_border if clear_border is None else clear_border
+    resolved_adaptive_block_size = thresholding_defaults.adaptive_block_size if adaptive_block_size is None else adaptive_block_size
+    resolved_adaptive_c = thresholding_defaults.adaptive_c if adaptive_c is None else adaptive_c
+    resolved_percentile_background_percentile = (
+        thresholding_defaults.percentile_background_percentile
+        if percentile_background_percentile is None
+        else percentile_background_percentile
+    )
+    resolved_percentile_min_contrast = (
+        thresholding_defaults.percentile_min_contrast if percentile_min_contrast is None else percentile_min_contrast
+    )
+    resolved_hysteresis_low_threshold = (
+        thresholding_defaults.hysteresis_low_threshold if hysteresis_low_threshold is None else hysteresis_low_threshold
+    )
+    resolved_hysteresis_high_threshold = (
+        thresholding_defaults.hysteresis_high_threshold if hysteresis_high_threshold is None else hysteresis_high_threshold
+    )
+    resolved_hysteresis_connectivity = (
+        thresholding_defaults.hysteresis_connectivity if hysteresis_connectivity is None else hysteresis_connectivity
+    )
+    resolved_sobel_percentile = thresholding_defaults.sobel_percentile if sobel_percentile is None else sobel_percentile
+    resolved_sobel_threshold = thresholding_defaults.sobel_threshold if sobel_threshold is None else sobel_threshold
+    resolved_sobel_kernel_size = thresholding_defaults.sobel_kernel_size if sobel_kernel_size is None else sobel_kernel_size
 
     frame_id = _frame_metadata_value(frame, "frame_id")
     run_id = _frame_metadata_value(frame, "run_id")
@@ -387,10 +535,43 @@ def segment_frame(
         "crop_y": resolved_crop_y,
         "crop_w": resolved_crop_w,
         "crop_h": resolved_crop_h,
+        "mask_augmentation_enabled": bool(resolved_mask_augmentation_enabled),
+        "mask_augmentation_steps": resolved_mask_augmentation_steps,
+        "dilate_kernel_w": resolved_dilate_kernel_w,
+        "dilate_kernel_h": resolved_dilate_kernel_h,
+        "dilate_iterations": resolved_dilate_iterations,
+        "erode_kernel_w": resolved_erode_kernel_w,
+        "erode_kernel_h": resolved_erode_kernel_h,
+        "erode_iterations": resolved_erode_iterations,
+        "open_kernel_w": resolved_open_kernel_w,
+        "open_kernel_h": resolved_open_kernel_h,
+        "open_iterations": resolved_open_iterations,
+        "close_kernel_w": resolved_close_kernel_w,
+        "close_kernel_h": resolved_close_kernel_h,
+        "close_iterations": resolved_close_iterations,
+        "fill_holes": bool(resolved_fill_holes),
+        "remove_small_components": bool(resolved_remove_small_components),
+        "min_component_area": resolved_min_component_area,
+        "clear_border": bool(resolved_clear_border),
+        "roi_assembly_method": resolved_roi_assembly_method,
+        "roi_assembly_connectivity": resolved_roi_assembly_connectivity,
+        "min_area": resolved_min_area,
+        "max_area": resolved_max_area,
         "min_perimeter": resolved_min_perimeter,
         "max_perimeter": resolved_max_perimeter,
+        "min_width": resolved_min_width,
+        "max_width": resolved_max_width,
+        "min_height": resolved_min_height,
+        "max_height": resolved_max_height,
+        "min_width_plus_height": resolved_min_width_plus_height,
+        "max_width_plus_height": resolved_max_width_plus_height,
         "padding": resolved_padding,
         "roi_encoding": resolved_roi_encoding,
+        "always_store_mask": bool(resolved_always_store_mask),
+        "encode_payloads": bool(encode_payloads),
+        "max_detections": max_detections,
+        "threshold_method": resolved_threshold_method,
+        "manual_threshold": resolved_manual_threshold,
     }
     log_processing_event(
         context,
@@ -404,7 +585,10 @@ def segment_frame(
         core_logger=_CORE_LOGGER,
     )
     try:
+        stage_durations_ms: dict[str, float] = {}
+        source_frame = frame
         if apply_preprocessing:
+            stage_started = time.perf_counter()
             frame = preprocess_frame_for_segmentation(
                 frame,
                 flatfield_correction=resolved_flatfield_correction,
@@ -422,111 +606,130 @@ def segment_frame(
                 invert_intensity=resolved_invert_intensity,
                 context=context,
             )
-        gray = _as_grayscale_array(frame)
-        if callable(threshold):
-            thresh = threshold(gray)
-        elif threshold is None:
-            thresh = threshold_otsu(
-                gray,
-                thresholding_maximum_value=thresholding_defaults.thresholding_maximum_value,
-            )
+            stage_durations_ms["preprocessing"] = (time.perf_counter() - stage_started) * 1000
         else:
-            thresh = threshold_manual(gray, threshold)
-        thresh = _as_binary_mask(thresh)
-
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+            stage_durations_ms["preprocessing"] = 0.0
+        stage_started = time.perf_counter()
+        gray = _as_grayscale_array(frame)
+        stage_durations_ms["grayscale"] = (time.perf_counter() - stage_started) * 1000
+        stage_started = time.perf_counter()
+        threshold_mask = calculate_threshold_mask(
+            gray,
+            threshold=threshold,
+            method=resolved_threshold_method,
+            manual_threshold=resolved_manual_threshold,
+            thresholding_maximum_value=resolved_thresholding_maximum_value,
+            bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
+            bounded_otsu_max_foreground_fraction=resolved_bounded_otsu_max_foreground_fraction,
+            canny_enabled=resolved_canny_enabled,
+            canny_low_threshold=resolved_canny_low_threshold,
+            canny_high_threshold=resolved_canny_high_threshold,
+            canny_blur_kernel=resolved_canny_blur_kernel,
+            adaptive_block_size=resolved_adaptive_block_size,
+            adaptive_c=resolved_adaptive_c,
+            percentile_background_percentile=resolved_percentile_background_percentile,
+            percentile_min_contrast=resolved_percentile_min_contrast,
+            hysteresis_low_threshold=resolved_hysteresis_low_threshold,
+            hysteresis_high_threshold=resolved_hysteresis_high_threshold,
+            hysteresis_connectivity=resolved_hysteresis_connectivity,
+            sobel_percentile=resolved_sobel_percentile,
+            sobel_threshold=resolved_sobel_threshold,
+            sobel_kernel_size=resolved_sobel_kernel_size,
+        )
+        threshold_mask = as_binary_mask(threshold_mask)
+        stage_durations_ms["thresholding"] = (time.perf_counter() - stage_started) * 1000
+        stage_started = time.perf_counter()
+        augmented_mask = augment_mask(
+            threshold_mask,
+            enabled=bool(resolved_mask_augmentation_enabled),
+            steps=resolved_mask_augmentation_steps,
+            dilate_kernel_size=(int(resolved_dilate_kernel_w), int(resolved_dilate_kernel_h)),
+            dilate_iterations=resolved_dilate_iterations,
+            erode_kernel_size=(int(resolved_erode_kernel_w), int(resolved_erode_kernel_h)),
+            erode_iterations=resolved_erode_iterations,
+            open_kernel_size=(int(resolved_open_kernel_w), int(resolved_open_kernel_h)),
+            open_iterations=resolved_open_iterations,
+            close_kernel_size=(int(resolved_close_kernel_w), int(resolved_close_kernel_h)),
+            close_iterations=resolved_close_iterations,
+            fill_holes=resolved_fill_holes,
+            remove_small_components=resolved_remove_small_components,
+            min_component_area=resolved_min_component_area,
+            clear_border=resolved_clear_border,
+        )
+        stage_durations_ms["mask_augmentation"] = (time.perf_counter() - stage_started) * 1000
+        stage_started = time.perf_counter()
+        assembled_candidates = assemble_candidate_rois(
+            augmented_mask,
+            method=str(resolved_roi_assembly_method),
+            connectivity=int(resolved_roi_assembly_connectivity),
+        )
+        stage_durations_ms["roi_assembly"] = (time.perf_counter() - stage_started) * 1000
+        stage_started = time.perf_counter()
+        candidates = filter_candidate_rois(
+            assembled_candidates,
+            min_area=resolved_min_area,
+            max_area=resolved_max_area,
+            min_perimeter=resolved_min_perimeter,
+            max_perimeter=resolved_max_perimeter,
+            min_width=resolved_min_width,
+            max_width=resolved_max_width,
+            min_height=resolved_min_height,
+            max_height=resolved_max_height,
+            min_width_plus_height=resolved_min_width_plus_height,
+            max_width_plus_height=resolved_max_width_plus_height,
+        )
+        filtered_candidate_count = len(candidates)
+        if max_detections is not None:
+            candidates = candidates[:max(0, int(max_detections))]
+        stage_durations_ms["roi_filter"] = (time.perf_counter() - stage_started) * 1000
+        stage_started = time.perf_counter()
         roi_records: list[DetectionRecord] = []
-        frame_height, frame_width = gray.shape[:2]
-
-        for lab in range(1, num):
-            x, y, width, height, area = stats[lab]
-            bbox_perimeter = 2 * int(width) + 2 * int(height)
-            if bbox_perimeter < resolved_min_perimeter:
-                continue
-            if resolved_max_perimeter is not None and bbox_perimeter > resolved_max_perimeter:
-                continue
-
-            roi_labels = labels[y : y + height, x : x + width]
-            component = np.ascontiguousarray((roi_labels == lab).astype(np.uint8) * 255)
-            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-
-            crop_x0, crop_y0, crop_x1, crop_y1 = _padded_bounds(
-                int(x),
-                int(y),
-                int(width),
-                int(height),
-                resolved_padding,
-                frame_width,
-                frame_height,
+        for candidate in candidates:
+            store_payload = bool(encode_payloads) and should_store_roi_payload(
+                candidate,
+                min_area=resolved_store_roi_payload_min_area,
+                min_width=resolved_store_roi_payload_min_width,
+                min_height=resolved_store_roi_payload_min_height,
+                min_width_plus_height=resolved_store_roi_payload_min_width_plus_height,
             )
-            padded_labels = labels[crop_y0:crop_y1, crop_x0:crop_x1]
-            padded_mask = np.ascontiguousarray((padded_labels == lab).astype(np.uint8) * 255)
-            padded_crop = np.ascontiguousarray(gray[crop_y0:crop_y1, crop_x0:crop_x1])
-
-            contour = max(contours, key=cv2.contourArea)
-            contour = contour.copy()
-            contour[:, 0, 0] += int(x) + frame.bbox_x
-            contour[:, 0, 1] += int(y) + frame.bbox_y
-
-            roi_frame = FrameData(
-                sourcePath=frame.sourcePath,
-                filename=frame.filename,
-                frameNumber=frame.frameNumber,
-                data=padded_crop,
-                mask=padded_mask,
-                width=int(crop_x1 - crop_x0),
-                height=int(crop_y1 - crop_y0),
-                bbox_x=frame.bbox_x + crop_x0,
-                bbox_y=frame.bbox_y + crop_y0,
-                parent_frame_id=_frame_metadata_value(frame, "frame_id"),
-                tileNumber=frame.tileNumber,
-                sourceFrameStart=frame.sourceFrameStart,
-                sourceFrameEnd=frame.sourceFrameEnd,
-                frameType="roi",
-                channel=frame.channel,
-                timestamp=frame.timestamp,
-                metadata={
-                    "source_frame_type": frame.frameType,
-                    "component_label": int(lab),
-                    "detection_stage": "candidate",
-                    "mask_kind": "candidate",
-                    "foreground_polarity": "bright",
-                    "object_bbox": (
-                        frame.bbox_x + int(x),
-                        frame.bbox_y + int(y),
-                        int(width),
-                        int(height),
-                    ),
-                    "roi_bbox": (
-                        frame.bbox_x + crop_x0,
-                        frame.bbox_y + crop_y0,
-                        int(crop_x1 - crop_x0),
-                        int(crop_y1 - crop_y0),
-                    ),
-                    "padding": int(resolved_padding),
-                    "actual_padding": {
-                        "left": int(x) - crop_x0,
-                        "top": int(y) - crop_y0,
-                        "right": crop_x1 - (int(x) + int(width)),
-                        "bottom": crop_y1 - (int(y) + int(height)),
-                    },
-                },
-            )
-
             roi_records.append(
-                store_roi(
-                    roi_frame,
-                    source_frame=frame,
-                    roi_index=len(roi_records) + 1,
-                    contour=contour,
-                    area=float(area),
+                build_candidate_detection_record(
+                    candidate,
+                    source_frame=source_frame,
+                    processed_frame=frame,
+                    roi_index=candidate.roi_index,
+                    padding=int(resolved_padding),
                     encoding=resolved_roi_encoding,
                     zstd_min_bytes=resolved_zstd_min_bytes,
-                    extra_metadata=roi_frame.metadata,
+                    store_roi_payload=store_payload,
+                    always_store_mask=bool(encode_payloads) and bool(resolved_always_store_mask),
+                    extra_metadata={
+                        "threshold_method": resolved_threshold_method,
+                        "mask_augmentation_steps": resolved_mask_augmentation_steps,
+                        "payloads_encoded": bool(encode_payloads),
+                    },
                 )
             )
+        stage_durations_ms["roi_recording"] = (time.perf_counter() - stage_started) * 1000
+        stage_metadata = {
+            "stage_counts": {
+                "threshold_foreground_pixels": int(np.count_nonzero(threshold_mask)),
+                "augmented_foreground_pixels": int(np.count_nonzero(augmented_mask)),
+                "assembled_candidate_count": len(assembled_candidates),
+                "filtered_candidate_count": filtered_candidate_count,
+                "recordable_candidate_count": len(candidates),
+                "recorded_detection_count": len(roi_records),
+            },
+            "candidate_limit": max_detections,
+            "candidate_limit_applied": len(candidates) < filtered_candidate_count,
+            "stage_durations_ms": {
+                key: round(value, 3) for key, value in stage_durations_ms.items()
+            },
+            "processed_frame_shape": list(gray.shape),
+            "bbox_coordinate_space": "processed_frame_with_frame_bbox_offset",
+        }
+        for record in roi_records:
+            record.metadata.update(stage_metadata)
     except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000
         _CORE_LOGGER.exception("Frame segmentation failed frame_id=%s run_id=%s asset_id=%s", frame_id, run_id, asset_id)
@@ -567,7 +770,7 @@ def segment_frame(
         duration_ms=duration_ms,
         payload={
             **payload_base,
-            "source_component_count": max(0, num - 1),
+            "source_component_count": len(assembled_candidates),
             "detection_count": len(roi_records),
             "frame_shape": list(gray.shape),
         },

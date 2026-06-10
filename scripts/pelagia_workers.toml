@@ -26,18 +26,6 @@ idle_sleep_seconds = 2.0
 requeue_interval_seconds = 30.0
 
 [[worker]]
-name = "ingest-1"
-capabilities = ["ingest"]
-
-[[worker]]
-name = "preprocess-1"
-capabilities = ["preprocess"]
-
-[[worker]]
-name = "segment-1"
-capabilities = ["segment"]
-
-[[worker]]
 name = "general-1"
 capabilities = ["ingest", "preprocess", "segment"]
 
@@ -67,12 +55,4 @@ capabilities = ["ingest", "preprocess", "segment"]
 
 [[worker]]
 name = "general-8"
-capabilities = ["ingest", "preprocess", "segment"]
-
-[[worker]]
-name = "general-9"
-capabilities = ["ingest", "preprocess", "segment"]
-
-[[worker]]
-name = "general-10"
 capabilities = ["ingest", "preprocess", "segment"]

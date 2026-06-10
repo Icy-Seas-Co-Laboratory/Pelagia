@@ -10,7 +10,6 @@ from Pelagia.processing.frame_threshold import (
     threshold_adaptive_mean,
     threshold_bounded_otsu,
     threshold_bounded_otsu_canny,
-    threshold_boundedotsu_canny,
     threshold_canny,
     threshold_ensemble_and,
     threshold_ensemble_or,
@@ -20,7 +19,11 @@ from Pelagia.processing.frame_threshold import (
     threshold_percentile_background,
     threshold_sobel_edges,
 )
-from Pelagia.processing.detection_candidate import live_segment_wrapper, segment_frame, store_roi
+from Pelagia.processing.detection_candidate import live_segment_wrapper, segment_frame
+from Pelagia.processing.detection_recording import build_candidate_detection_record
+from Pelagia.processing.mask_augmentation import augment_mask
+from Pelagia.processing.roi_assembly import assemble_candidate_rois
+from Pelagia.processing.roi_filter import filter_candidate_rois, should_store_roi_payload
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
@@ -117,20 +120,13 @@ def test_threshold_ensembles_combine_callables():
     assert set(np.unique(mask_and)).issubset({0, 255})
 
 
-def test_threshold_boundedotsu_canny_combines_primitives():
+def test_threshold_bounded_otsu_canny_combines_primitives():
     data = np.full((20, 20), 20, dtype=np.uint8)
     data[6:14, 6:14] = 120
 
     otsu_only = threshold_bounded_otsu(data, min_contrast=20)
     edges = threshold_canny(data, canny_params=(20, 60))
-    combined = threshold_boundedotsu_canny(
-        data,
-        run_canny=True,
-        canny_params=(20, 60),
-        dilate_kernel=(1, 1),
-        min_contrast=20,
-    )
-    alias_combined = threshold_bounded_otsu_canny(
+    combined = threshold_bounded_otsu_canny(
         data,
         run_canny=True,
         canny_params=(20, 60),
@@ -140,7 +136,61 @@ def test_threshold_boundedotsu_canny_combines_primitives():
 
     assert np.count_nonzero(combined) >= np.count_nonzero(otsu_only)
     assert np.count_nonzero(combined) >= np.count_nonzero(edges)
-    np.testing.assert_array_equal(combined, alias_combined)
+
+
+def test_mask_augmentation_assembly_and_filtering_are_discrete_steps():
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:4, 2:4] = 255
+    mask[6, 6] = 255
+
+    augmented = augment_mask(
+        mask,
+        steps=["remove_small_components", "dilate"],
+        min_component_area=2,
+        dilate_kernel_size=(3, 3),
+    )
+    candidates = assemble_candidate_rois(augmented, method="connected_components")
+    filtered = filter_candidate_rois(candidates, min_width=3, min_height=3)
+
+    assert len(candidates) == 1
+    assert len(filtered) == 1
+    assert filtered[0].bbox_x == 1
+    assert filtered[0].bbox_y == 1
+    assert filtered[0].bbox_w == 4
+    assert filtered[0].bbox_h == 4
+
+
+def test_recording_can_store_masks_without_small_roi_image_payloads():
+    data = np.zeros((8, 8), dtype=np.uint8)
+    data[2:4, 2:4] = 90
+    mask = np.zeros_like(data)
+    mask[2:4, 2:4] = 255
+    source = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=2,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "frame_id": FRAME_ID,
+        },
+    )
+    candidate = assemble_candidate_rois(mask)[0]
+
+    assert should_store_roi_payload(candidate, min_area=5) is False
+    detection = build_candidate_detection_record(
+        candidate,
+        source_frame=source,
+        processed_frame=source,
+        encoding="raw",
+        store_roi_payload=False,
+        always_store_mask=True,
+    )
+
+    assert detection.roi_payload is None
+    assert detection.roi_encoding is None
+    assert detection.mask_payload is not None
+    assert detection.mask_encoding == "raw"
 
 
 def test_preprocess_frame_for_segmentation_applies_ordered_steps():
@@ -159,6 +209,7 @@ def test_preprocess_frame_for_segmentation_applies_ordered_steps():
     processed = preprocess_frame_for_segmentation(
         frame,
         flatfield_correction=False,
+        apply_mask=True,
         background_correction=True,
         background=10,
         invert_intensity=True,
@@ -195,6 +246,7 @@ def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
         frame,
         flatfield_correction=False,
         apply_mask=False,
+        invert_intensity=False,
         crop_enabled=True,
         crop_x=1,
         crop_y=2,
@@ -271,6 +323,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
         frame,
         threshold=1,
         flatfield_correction=False,
+        invert_intensity=False,
         min_perimeter=0,
         padding=0,
         roi_encoding="raw",
@@ -331,6 +384,7 @@ def test_segment_frame_writes_structured_log_events():
         frame,
         threshold=1,
         flatfield_correction=False,
+        invert_intensity=False,
         min_perimeter=0,
         padding=0,
         roi_encoding="raw",
@@ -369,6 +423,7 @@ def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
         FRAME_ID,
         threshold=1,
         flatfield_correction=False,
+        invert_intensity=False,
         min_perimeter=0,
         padding=0,
     )
@@ -399,6 +454,7 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
         frame,
         threshold=1,
         flatfield_correction=False,
+        invert_intensity=False,
         min_perimeter=0,
         padding=1,
         roi_encoding="raw",
@@ -457,41 +513,33 @@ def test_segment_frame_filters_by_bbox_perimeter():
         frame,
         threshold=1,
         flatfield_correction=False,
+        invert_intensity=False,
         min_perimeter=15,
         roi_encoding="raw",
     ) == []
 
 
-def test_store_roi_auto_uses_png_for_small_roi_payloads():
+def test_candidate_recording_auto_uses_png_for_small_roi_payloads():
+    data = np.full((4, 4), 10, dtype=np.uint8)
+    data[1:3, 1:3] = 255
     source = FrameData(
         sourcePath="/tmp/",
         filename="frame.png",
         frameNumber=7,
-        data=np.full((4, 4), 10, dtype=np.uint8),
+        data=data,
         metadata={
             "run_id": "00000000-0000-0000-0000-000000000001",
             "frame_id": FRAME_ID,
         },
     )
-    roi = FrameData(
-        sourcePath="/tmp/",
-        filename="frame.png",
-        frameNumber=7,
-        data=np.full((2, 2), 255, dtype=np.uint8),
-        width=2,
-        height=2,
-        bbox_x=1,
-        bbox_y=1,
-        parent_frame_id=FRAME_ID,
-    )
-    contour = np.array([[[1, 1]], [[2, 1]], [[2, 2]], [[1, 2]]], dtype=np.int32)
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1:3, 1:3] = 255
+    candidate = assemble_candidate_rois(mask)[0]
 
-    detection = store_roi(
-        roi,
+    detection = build_candidate_detection_record(
+        candidate,
         source_frame=source,
-        roi_index=1,
-        contour=contour,
-        area=4,
+        processed_frame=source,
         encoding="auto",
         zstd_min_bytes=100,
     )

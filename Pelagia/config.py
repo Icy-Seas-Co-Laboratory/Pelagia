@@ -97,14 +97,65 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
-class SegmentationProcessingConfig:
-    """Default ROI segmentation parameters."""
+class MaskAugmentationProcessingConfig:
+    """Default binary-mask augmentation parameters."""
 
+    enabled: bool = True
+    steps: list[str] = field(default_factory=lambda: ["dilate"])
+    dilate_kernel_w: int = 3
+    dilate_kernel_h: int = 3
+    dilate_iterations: int = 1
+    erode_kernel_w: int = 3
+    erode_kernel_h: int = 3
+    erode_iterations: int = 1
+    open_kernel_w: int = 3
+    open_kernel_h: int = 3
+    open_iterations: int = 1
+    close_kernel_w: int = 3
+    close_kernel_h: int = 3
+    close_iterations: int = 1
+    fill_holes: bool = False
+    remove_small_components: bool = False
+    min_component_area: float = 1.0
+    clear_border: bool = False
+
+
+@dataclass(slots=True)
+class RoiAssemblyProcessingConfig:
+    """Default candidate ROI assembly parameters."""
+
+    method: str = "connected_components"
+    connectivity: int = 8
+
+
+@dataclass(slots=True)
+class RoiFilterProcessingConfig:
+    """Default candidate ROI filtering parameters."""
+
+    min_area: float | None = None
+    max_area: float | None = None
     min_perimeter: float = 50.0
     max_perimeter: float | None = None
+    min_width: float | None = None
+    max_width: float | None = None
+    min_height: float | None = None
+    max_height: float | None = None
+    min_width_plus_height: float | None = None
+    max_width_plus_height: float | None = None
+
+
+@dataclass(slots=True)
+class RoiRecordingProcessingConfig:
+    """Default candidate ROI recording parameters."""
+
     padding: int = 50
     roi_encoding: str = "zstd"
     zstd_min_bytes: int = 16_384
+    always_store_mask: bool = True
+    store_roi_payload_min_area: float | None = None
+    store_roi_payload_min_width: float | None = None
+    store_roi_payload_min_height: float | None = None
+    store_roi_payload_min_width_plus_height: float | None = None
 
 
 @dataclass(slots=True)
@@ -128,6 +179,7 @@ class ThresholdingProcessingConfig:
     """Default thresholding parameters."""
 
     method: str = "otsu"
+    manual_threshold: float = 100.0
     thresholding_maximum_value: float = 255.0
     bounded_otsu_min_contrast: float = 50.0
     bounded_otsu_max_foreground_fraction: float = 0.9
@@ -135,8 +187,6 @@ class ThresholdingProcessingConfig:
     canny_low_threshold: float = 30.0
     canny_high_threshold: float = 80.0
     canny_blur_kernel: int = 5
-    dilate_kernel_w: int = 3
-    dilate_kernel_h: int = 3
     adaptive_block_size: int = 31
     adaptive_c: float = 5.0
     percentile_background_percentile: float = 50.0
@@ -145,6 +195,7 @@ class ThresholdingProcessingConfig:
     hysteresis_high_threshold: float = 80.0
     hysteresis_connectivity: int = 8
     sobel_percentile: float = 90.0
+    sobel_threshold: float | None = None
     sobel_kernel_size: int = 3
 
 
@@ -191,7 +242,10 @@ class ThumbhashProcessingConfig:
 class ProcessingConfig:
     """Processing defaults shared by CLI, API, workers, and direct function calls."""
 
-    segmentation: SegmentationProcessingConfig = field(default_factory=SegmentationProcessingConfig)
+    mask_augmentation: MaskAugmentationProcessingConfig = field(default_factory=MaskAugmentationProcessingConfig)
+    roi_assembly: RoiAssemblyProcessingConfig = field(default_factory=RoiAssemblyProcessingConfig)
+    roi_filter: RoiFilterProcessingConfig = field(default_factory=RoiFilterProcessingConfig)
+    roi_recording: RoiRecordingProcessingConfig = field(default_factory=RoiRecordingProcessingConfig)
     video_ingest: VideoIngestProcessingConfig = field(default_factory=VideoIngestProcessingConfig)
     flatfield: FlatfieldProcessingConfig = field(default_factory=FlatfieldProcessingConfig)
     thresholding: ThresholdingProcessingConfig = field(default_factory=ThresholdingProcessingConfig)
@@ -334,12 +388,6 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "logging", "max_bytes", "PELAGIA_LOG_MAX_BYTES", int)
     _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
 
-    _set_from_env(settings, "processing.segmentation", "min_perimeter", "PELAGIA_SEGMENTATION_MIN_PERIMETER", float)
-    _set_from_env(settings, "processing.segmentation", "max_perimeter", "PELAGIA_SEGMENTATION_MAX_PERIMETER", float)
-    _set_from_env(settings, "processing.segmentation", "padding", "PELAGIA_SEGMENTATION_PADDING", int)
-    _set_from_env(settings, "processing.segmentation", "roi_encoding", "PELAGIA_SEGMENTATION_ROI_ENCODING")
-    _set_from_env(settings, "processing.segmentation", "zstd_min_bytes", "PELAGIA_SEGMENTATION_ZSTD_MIN_BYTES", int)
-
     _set_from_env(settings, "processing.video_ingest", "n_tile", "PELAGIA_VIDEO_INGEST_N_TILE", int)
 
     _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
@@ -347,6 +395,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.flatfield", "flatfield_axis", "PELAGIA_FLATFIELD_AXIS", int)
 
     _set_from_env(settings, "processing.thresholding", "method", "PELAGIA_THRESHOLDING_METHOD")
+    _set_from_env(settings, "processing.thresholding", "manual_threshold", "PELAGIA_THRESHOLDING_MANUAL_THRESHOLD", float)
     _set_from_env(settings, "processing.thresholding", "thresholding_maximum_value", "PELAGIA_THRESHOLDING_MAXIMUM_VALUE", float)
     _set_from_env(settings, "processing.thresholding", "bounded_otsu_min_contrast", "PELAGIA_THRESHOLDING_BOUNDED_OTSU_MIN_CONTRAST", float)
     _set_from_env(settings, "processing.thresholding", "bounded_otsu_max_foreground_fraction", "PELAGIA_THRESHOLDING_BOUNDED_OTSU_MAX_FOREGROUND_FRACTION", float)
@@ -354,8 +403,6 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.thresholding", "canny_low_threshold", "PELAGIA_THRESHOLDING_CANNY_LOW_THRESHOLD", float)
     _set_from_env(settings, "processing.thresholding", "canny_high_threshold", "PELAGIA_THRESHOLDING_CANNY_HIGH_THRESHOLD", float)
     _set_from_env(settings, "processing.thresholding", "canny_blur_kernel", "PELAGIA_THRESHOLDING_CANNY_BLUR_KERNEL", int)
-    _set_from_env(settings, "processing.thresholding", "dilate_kernel_w", "PELAGIA_THRESHOLDING_DILATE_KERNEL_W", int)
-    _set_from_env(settings, "processing.thresholding", "dilate_kernel_h", "PELAGIA_THRESHOLDING_DILATE_KERNEL_H", int)
     _set_from_env(settings, "processing.thresholding", "adaptive_block_size", "PELAGIA_THRESHOLDING_ADAPTIVE_BLOCK_SIZE", int)
     _set_from_env(settings, "processing.thresholding", "adaptive_c", "PELAGIA_THRESHOLDING_ADAPTIVE_C", float)
     _set_from_env(settings, "processing.thresholding", "percentile_background_percentile", "PELAGIA_THRESHOLDING_PERCENTILE_BACKGROUND_PERCENTILE", float)
@@ -364,7 +411,43 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.thresholding", "hysteresis_high_threshold", "PELAGIA_THRESHOLDING_HYSTERESIS_HIGH_THRESHOLD", float)
     _set_from_env(settings, "processing.thresholding", "hysteresis_connectivity", "PELAGIA_THRESHOLDING_HYSTERESIS_CONNECTIVITY", int)
     _set_from_env(settings, "processing.thresholding", "sobel_percentile", "PELAGIA_THRESHOLDING_SOBEL_PERCENTILE", float)
+    _set_from_env(settings, "processing.thresholding", "sobel_threshold", "PELAGIA_THRESHOLDING_SOBEL_THRESHOLD", float)
     _set_from_env(settings, "processing.thresholding", "sobel_kernel_size", "PELAGIA_THRESHOLDING_SOBEL_KERNEL_SIZE", int)
+
+    _set_from_env(settings, "processing.mask_augmentation", "enabled", "PELAGIA_MASK_AUGMENTATION_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.mask_augmentation", "dilate_kernel_w", "PELAGIA_MASK_AUGMENTATION_DILATE_KERNEL_W", int)
+    _set_from_env(settings, "processing.mask_augmentation", "dilate_kernel_h", "PELAGIA_MASK_AUGMENTATION_DILATE_KERNEL_H", int)
+    _set_from_env(settings, "processing.mask_augmentation", "dilate_iterations", "PELAGIA_MASK_AUGMENTATION_DILATE_ITERATIONS", int)
+    _set_from_env(settings, "processing.mask_augmentation", "erode_kernel_w", "PELAGIA_MASK_AUGMENTATION_ERODE_KERNEL_W", int)
+    _set_from_env(settings, "processing.mask_augmentation", "erode_kernel_h", "PELAGIA_MASK_AUGMENTATION_ERODE_KERNEL_H", int)
+    _set_from_env(settings, "processing.mask_augmentation", "erode_iterations", "PELAGIA_MASK_AUGMENTATION_ERODE_ITERATIONS", int)
+    _set_from_env(settings, "processing.mask_augmentation", "fill_holes", "PELAGIA_MASK_AUGMENTATION_FILL_HOLES", _env_bool)
+    _set_from_env(settings, "processing.mask_augmentation", "remove_small_components", "PELAGIA_MASK_AUGMENTATION_REMOVE_SMALL_COMPONENTS", _env_bool)
+    _set_from_env(settings, "processing.mask_augmentation", "min_component_area", "PELAGIA_MASK_AUGMENTATION_MIN_COMPONENT_AREA", float)
+    _set_from_env(settings, "processing.mask_augmentation", "clear_border", "PELAGIA_MASK_AUGMENTATION_CLEAR_BORDER", _env_bool)
+
+    _set_from_env(settings, "processing.roi_assembly", "method", "PELAGIA_ROI_ASSEMBLY_METHOD")
+    _set_from_env(settings, "processing.roi_assembly", "connectivity", "PELAGIA_ROI_ASSEMBLY_CONNECTIVITY", int)
+
+    _set_from_env(settings, "processing.roi_filter", "min_area", "PELAGIA_ROI_FILTER_MIN_AREA", float)
+    _set_from_env(settings, "processing.roi_filter", "max_area", "PELAGIA_ROI_FILTER_MAX_AREA", float)
+    _set_from_env(settings, "processing.roi_filter", "min_perimeter", "PELAGIA_ROI_FILTER_MIN_PERIMETER", float)
+    _set_from_env(settings, "processing.roi_filter", "max_perimeter", "PELAGIA_ROI_FILTER_MAX_PERIMETER", float)
+    _set_from_env(settings, "processing.roi_filter", "min_width", "PELAGIA_ROI_FILTER_MIN_WIDTH", float)
+    _set_from_env(settings, "processing.roi_filter", "max_width", "PELAGIA_ROI_FILTER_MAX_WIDTH", float)
+    _set_from_env(settings, "processing.roi_filter", "min_height", "PELAGIA_ROI_FILTER_MIN_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_filter", "max_height", "PELAGIA_ROI_FILTER_MAX_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_filter", "min_width_plus_height", "PELAGIA_ROI_FILTER_MIN_WIDTH_PLUS_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_filter", "max_width_plus_height", "PELAGIA_ROI_FILTER_MAX_WIDTH_PLUS_HEIGHT", float)
+
+    _set_from_env(settings, "processing.roi_recording", "padding", "PELAGIA_ROI_RECORDING_PADDING", int)
+    _set_from_env(settings, "processing.roi_recording", "roi_encoding", "PELAGIA_ROI_RECORDING_ROI_ENCODING")
+    _set_from_env(settings, "processing.roi_recording", "zstd_min_bytes", "PELAGIA_ROI_RECORDING_ZSTD_MIN_BYTES", int)
+    _set_from_env(settings, "processing.roi_recording", "always_store_mask", "PELAGIA_ROI_RECORDING_ALWAYS_STORE_MASK", _env_bool)
+    _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_area", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_AREA", float)
+    _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_width", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_WIDTH", float)
+    _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_height", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_width_plus_height", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_WIDTH_PLUS_HEIGHT", float)
 
     _set_from_env(settings, "processing.preprocessing", "apply_mask", "PELAGIA_PREPROCESSING_APPLY_MASK", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "mask_path", "PELAGIA_PREPROCESSING_MASK_PATH")
@@ -406,13 +489,20 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
     logging = _section(settings, "logging")
-    segmentation = _section(settings, "processing.segmentation")
+    mask_augmentation = _section(settings, "processing.mask_augmentation")
+    roi_assembly = _section(settings, "processing.roi_assembly")
+    roi_filter = _section(settings, "processing.roi_filter")
+    roi_recording = _section(settings, "processing.roi_recording")
     video_ingest = _section(settings, "processing.video_ingest")
     flatfield = _section(settings, "processing.flatfield")
     thresholding = _section(settings, "processing.thresholding")
     preprocessing = _section(settings, "processing.preprocessing")
     frame_storage = _section(settings, "processing.frame_storage")
     thumbhash = _section(settings, "processing.thumbhash")
+    mask_defaults = MaskAugmentationProcessingConfig()
+    assembly_defaults = RoiAssemblyProcessingConfig()
+    filter_defaults = RoiFilterProcessingConfig()
+    recording_defaults = RoiRecordingProcessingConfig()
 
     return CoreConfig(
         database=DatabaseConfig(
@@ -456,16 +546,174 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             backup_count=int(logging.get("backup_count", LoggingConfig.backup_count)),
         ),
         processing=ProcessingConfig(
-            segmentation=SegmentationProcessingConfig(
-                min_perimeter=float(segmentation.get("min_perimeter", SegmentationProcessingConfig.min_perimeter)),
-                max_perimeter=(
-                    None
-                    if segmentation.get("max_perimeter", None) is None
-                    else float(segmentation["max_perimeter"])
+            mask_augmentation=MaskAugmentationProcessingConfig(
+                enabled=bool(mask_augmentation.get("enabled", mask_defaults.enabled)),
+                steps=_string_list(
+                    mask_augmentation.get("steps", mask_defaults.steps)
                 ),
-                padding=int(segmentation.get("padding", SegmentationProcessingConfig.padding)),
-                roi_encoding=str(segmentation.get("roi_encoding", SegmentationProcessingConfig.roi_encoding)),
-                zstd_min_bytes=int(segmentation.get("zstd_min_bytes", SegmentationProcessingConfig.zstd_min_bytes)),
+                dilate_kernel_w=int(
+                    mask_augmentation.get(
+                        "dilate_kernel_w",
+                        mask_defaults.dilate_kernel_w,
+                    )
+                ),
+                dilate_kernel_h=int(
+                    mask_augmentation.get(
+                        "dilate_kernel_h",
+                        mask_defaults.dilate_kernel_h,
+                    )
+                ),
+                dilate_iterations=int(
+                    mask_augmentation.get(
+                        "dilate_iterations",
+                        mask_defaults.dilate_iterations,
+                    )
+                ),
+                erode_kernel_w=int(
+                    mask_augmentation.get(
+                        "erode_kernel_w",
+                        mask_defaults.erode_kernel_w,
+                    )
+                ),
+                erode_kernel_h=int(
+                    mask_augmentation.get(
+                        "erode_kernel_h",
+                        mask_defaults.erode_kernel_h,
+                    )
+                ),
+                erode_iterations=int(
+                    mask_augmentation.get(
+                        "erode_iterations",
+                        mask_defaults.erode_iterations,
+                    )
+                ),
+                open_kernel_w=int(
+                    mask_augmentation.get(
+                        "open_kernel_w",
+                        mask_defaults.open_kernel_w,
+                    )
+                ),
+                open_kernel_h=int(
+                    mask_augmentation.get(
+                        "open_kernel_h",
+                        mask_defaults.open_kernel_h,
+                    )
+                ),
+                open_iterations=int(
+                    mask_augmentation.get(
+                        "open_iterations",
+                        mask_defaults.open_iterations,
+                    )
+                ),
+                close_kernel_w=int(
+                    mask_augmentation.get(
+                        "close_kernel_w",
+                        mask_defaults.close_kernel_w,
+                    )
+                ),
+                close_kernel_h=int(
+                    mask_augmentation.get(
+                        "close_kernel_h",
+                        mask_defaults.close_kernel_h,
+                    )
+                ),
+                close_iterations=int(
+                    mask_augmentation.get(
+                        "close_iterations",
+                        mask_defaults.close_iterations,
+                    )
+                ),
+                fill_holes=bool(
+                    mask_augmentation.get("fill_holes", mask_defaults.fill_holes)
+                ),
+                remove_small_components=bool(
+                    mask_augmentation.get(
+                        "remove_small_components",
+                        mask_defaults.remove_small_components,
+                    )
+                ),
+                min_component_area=float(
+                    mask_augmentation.get(
+                        "min_component_area",
+                        mask_defaults.min_component_area,
+                    )
+                ),
+                clear_border=bool(
+                    mask_augmentation.get("clear_border", mask_defaults.clear_border)
+                ),
+            ),
+            roi_assembly=RoiAssemblyProcessingConfig(
+                method=str(roi_assembly.get("method", assembly_defaults.method)),
+                connectivity=int(
+                    roi_assembly.get("connectivity", assembly_defaults.connectivity)
+                ),
+            ),
+            roi_filter=RoiFilterProcessingConfig(
+                min_area=_optional_float(roi_filter.get("min_area", filter_defaults.min_area)),
+                max_area=_optional_float(roi_filter.get("max_area", filter_defaults.max_area)),
+                min_perimeter=float(
+                    roi_filter.get("min_perimeter", filter_defaults.min_perimeter)
+                ),
+                max_perimeter=_optional_float(
+                    roi_filter.get("max_perimeter", filter_defaults.max_perimeter)
+                ),
+                min_width=_optional_float(roi_filter.get("min_width", filter_defaults.min_width)),
+                max_width=_optional_float(roi_filter.get("max_width", filter_defaults.max_width)),
+                min_height=_optional_float(roi_filter.get("min_height", filter_defaults.min_height)),
+                max_height=_optional_float(roi_filter.get("max_height", filter_defaults.max_height)),
+                min_width_plus_height=_optional_float(
+                    roi_filter.get(
+                        "min_width_plus_height",
+                        filter_defaults.min_width_plus_height,
+                    )
+                ),
+                max_width_plus_height=_optional_float(
+                    roi_filter.get(
+                        "max_width_plus_height",
+                        filter_defaults.max_width_plus_height,
+                    )
+                ),
+            ),
+            roi_recording=RoiRecordingProcessingConfig(
+                padding=int(
+                    roi_recording.get("padding", recording_defaults.padding)
+                ),
+                roi_encoding=str(
+                    roi_recording.get("roi_encoding", recording_defaults.roi_encoding)
+                ),
+                zstd_min_bytes=int(
+                    roi_recording.get("zstd_min_bytes", recording_defaults.zstd_min_bytes)
+                ),
+                always_store_mask=bool(
+                    roi_recording.get(
+                        "always_store_mask",
+                        recording_defaults.always_store_mask,
+                    )
+                ),
+                store_roi_payload_min_area=_optional_float(
+                    roi_recording.get(
+                        "store_roi_payload_min_area",
+                        recording_defaults.store_roi_payload_min_area,
+                    )
+                ),
+                store_roi_payload_min_width=_optional_float(
+                    roi_recording.get(
+                        "store_roi_payload_min_width",
+                        recording_defaults.store_roi_payload_min_width,
+                    )
+                ),
+                store_roi_payload_min_height=_optional_float(
+                    roi_recording.get(
+                        "store_roi_payload_min_height",
+                        recording_defaults.store_roi_payload_min_height,
+                    )
+                ),
+                store_roi_payload_min_width_plus_height=_optional_float(
+                    roi_recording.get(
+                        "store_roi_payload_min_width_plus_height",
+                        recording_defaults.store_roi_payload_min_width_plus_height,
+                    )
+                ),
             ),
             video_ingest=VideoIngestProcessingConfig(
                 n_tile=int(video_ingest.get("n_tile", VideoIngestProcessingConfig.n_tile)),
@@ -479,6 +727,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
             thresholding=ThresholdingProcessingConfig(
                 method=str(thresholding.get("method", ThresholdingProcessingConfig.method)),
+                manual_threshold=float(
+                    thresholding.get("manual_threshold", ThresholdingProcessingConfig.manual_threshold)
+                ),
                 thresholding_maximum_value=float(
                     thresholding.get(
                         "thresholding_maximum_value",
@@ -506,12 +757,6 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 ),
                 canny_blur_kernel=int(
                     thresholding.get("canny_blur_kernel", ThresholdingProcessingConfig.canny_blur_kernel)
-                ),
-                dilate_kernel_w=int(
-                    thresholding.get("dilate_kernel_w", ThresholdingProcessingConfig.dilate_kernel_w)
-                ),
-                dilate_kernel_h=int(
-                    thresholding.get("dilate_kernel_h", ThresholdingProcessingConfig.dilate_kernel_h)
                 ),
                 adaptive_block_size=int(
                     thresholding.get("adaptive_block_size", ThresholdingProcessingConfig.adaptive_block_size)
@@ -549,6 +794,11 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 ),
                 sobel_percentile=float(
                     thresholding.get("sobel_percentile", ThresholdingProcessingConfig.sobel_percentile)
+                ),
+                sobel_threshold=(
+                    None
+                    if thresholding.get("sobel_threshold", ThresholdingProcessingConfig.sobel_threshold) is None
+                    else float(thresholding["sobel_threshold"])
                 ),
                 sobel_kernel_size=int(
                     thresholding.get("sobel_kernel_size", ThresholdingProcessingConfig.sobel_kernel_size)
@@ -599,3 +849,19 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    raise ValueError("Config list value must be a string, list, or tuple.")

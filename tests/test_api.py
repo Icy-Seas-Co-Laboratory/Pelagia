@@ -363,9 +363,61 @@ def test_api_exposes_system_config():
     body = response.json()
     assert body["effective"]["database"]["schema_name"] == "pelagia"
     assert body["effective"]["processing"]["preprocessing"]["apply_mask"] is False
+    assert "mask_augmentation" in body["effective"]["processing"]
+    assert "roi_assembly" in body["effective"]["processing"]
+    assert "roi_filter" in body["effective"]["processing"]
+    assert "roi_recording" in body["effective"]["processing"]
+    assert body["effective"]["processing"]["roi_recording"]["roi_encoding"] == "zstd"
     assert body["effective"]["kvstore"]["root_path"]
     assert body["defaults"]["processing"]["video_ingest"]["n_tile"] == 4
     assert body["defaults"]["processing"]["preprocessing"]["mask_path"] is None
+
+
+def test_api_exposes_system_capabilities():
+    client, _, _ = make_client()
+
+    response = client.get("/system/capabilities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "Pelagia"
+    assert body["api"]["endpoints"]["segmentation_options"] == "/segmentation/options"
+    assert body["api"]["endpoints"]["preprocessing_options"] == "/preprocessing/options"
+    assert "extract_frames" in body["supported"]["pipeline_stages"]
+    assert "preprocess_frames" in body["jobs"]["queueable_stages"]
+    assert "jpg" in body["supported"]["image_encodings"]
+    assert "preprocessed" in body["supported"]["frame_payload_kinds"]
+    assert "segmentation" in body["processing"]
+    assert "preprocessing" in body["processing"]
+    assert "mask_augmentation" in body["processing"]["groups"]
+    assert body["storage"]["kvstore"]["hash_algorithm_options"] == ["sha256", "blake3"]
+
+
+def test_api_preprocessing_options_are_ui_ready():
+    client, _, _ = make_client()
+
+    response = client.get("/preprocessing/options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pipeline_stage_order"] == [
+        "source",
+        "crop",
+        "mask",
+        "flatfield",
+        "background_correction",
+        "inversion",
+        "recording",
+    ]
+    assert "jpg" in body["supported"]["image_encodings"]
+    assert body["defaults"]["preprocessing"]["invert_intensity"] is True
+    assert body["defaults"]["flatfield"]["flatfield_q"] == 0.9
+    flatfield_fields = {field["key"]: field for field in body["fields"]["flatfield"]}
+    assert flatfield_fields["flatfield_q"]["min"] == 0
+    assert flatfield_fields["flatfield_q"]["max"] == 1
+    assert flatfield_fields["flatfield_axis"]["options"] == [0, 1]
+    recording_fields = {field["key"]: field for field in body["fields"]["recording"]}
+    assert recording_fields["encoding"]["options"] == ["jpg", "png", "raw", "zstd"]
 
 
 def test_api_kvstore_includes_status_and_health():
@@ -439,9 +491,43 @@ def test_api_live_segment_returns_transient_detections(monkeypatch):
     assert detection["bbox_x"] == 3
     assert detection["bbox_y"] == 2
     assert "roi_payload" not in detection
-    assert detection["roi_payload_bytes"] > 0
-    assert detection["mask_payload_bytes"] > 0
-    assert detection["roi_encoding"] == "png"
+    assert "roi_payload_bytes" not in detection
+    assert "mask_payload_bytes" not in detection
+    assert detection["roi_encoding"] is None
+    assert body["payloads_encoded"] is False
+    assert body["resolved_options"]["thresholding"]["threshold_method"] == "manual"
+    assert body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == []
+    assert body["stage_counts"]["recorded_detection_count"] == 1
+    assert "roi_assembly" in body["stage_durations_ms"]
+
+
+def test_api_segmentation_options_are_ui_ready():
+    client, _, _ = make_client()
+
+    response = client.get("/segmentation/options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pipeline_stage_order"] == [
+        "source",
+        "preprocessing",
+        "thresholding",
+        "mask_augmentation",
+        "roi_assembly",
+        "roi_filter",
+        "roi_recording",
+    ]
+    assert "bounded_otsu_canny" in body["supported"]["threshold_methods"]
+    assert "erode" in body["supported"]["mask_augmentation_steps"]
+    assert "connected_components" in body["supported"]["roi_assembly_methods"]
+    assert body["defaults"]["roi_filter"]["min_perimeter"] == 50.0
+    assert body["defaults"]["roi_recording"]["roi_encoding"] == "zstd"
+    threshold_fields = {field["key"]: field for field in body["fields"]["thresholding"]}
+    assert threshold_fields["canny_low_threshold"]["threshold_methods"] == [
+        "canny",
+        "bounded_otsu_canny",
+    ]
+    assert body["fields"]["mask_augmentation"][1]["type"] == "multi-enum"
 
 
 def test_api_can_create_queue_job():
@@ -523,6 +609,15 @@ def test_api_can_queue_segmentation_job():
             "frame_ids": ["frame-1"],
             "padding": 4,
             "roi_encoding": "raw",
+            "mask_augmentation_steps": ["erode"],
+            "erode_kernel_w": 5,
+            "erode_kernel_h": 3,
+            "erode_iterations": 2,
+            "roi_assembly_method": "contours",
+            "min_area": 7,
+            "min_width": 2,
+            "store_roi_payload_min_area": 20,
+            "always_store_mask": False,
         },
     )
 
@@ -533,9 +628,66 @@ def test_api_can_queue_segmentation_job():
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
     assert repository.created_jobs[-1]["payload"]["padding"] == 4
     assert repository.created_jobs[-1]["payload"]["roi_encoding"] == "raw"
+    assert repository.created_jobs[-1]["payload"]["mask_augmentation_steps"] == ["erode"]
+    assert repository.created_jobs[-1]["payload"]["erode_kernel_w"] == 5
+    assert repository.created_jobs[-1]["payload"]["erode_iterations"] == 2
+    assert repository.created_jobs[-1]["payload"]["roi_assembly_method"] == "contours"
+    assert repository.created_jobs[-1]["payload"]["min_area"] == 7
+    assert repository.created_jobs[-1]["payload"]["min_width"] == 2
+    assert repository.created_jobs[-1]["payload"]["store_roi_payload_min_area"] == 20
+    assert repository.created_jobs[-1]["payload"]["always_store_mask"] is False
     assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is True
     assert repository.created_jobs[-1]["payload"]["flatfield_q"] == 0.9
     assert repository.created_jobs[-1]["payload"]["flatfield_axis"] == 0
+
+
+def test_api_validate_segmentation_resolves_without_queueing():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/segmentation/validate",
+        json={
+            "asset_id": "asset-1",
+            "frame_ids": ["frame-1"],
+            "threshold_method": "adaptive_mean",
+            "mask_augmentation_steps": ["open", "fill_holes"],
+            "open_iterations": 2,
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["payload"]["threshold_method"] == "adaptive_mean"
+    assert body["payload"]["mask_augmentation_steps"] == ["open", "fill_holes"]
+    assert body["resolved_options"]["mask_augmentation"]["open_iterations"] == 2
+    assert repository.created_jobs == []
+
+
+def test_api_queue_segmentation_dry_run_does_not_create_job():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/segmentation/jobs",
+        json={"asset_id": "asset-1", "frame_ids": ["frame-1"], "dry_run": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["dry_run"] is True
+    assert response.json()["payload"]["frame_ids"] == ["frame-1"]
+    assert repository.created_jobs == []
+
+
+def test_api_segmentation_rejects_invalid_enum_values():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/segmentation/jobs",
+        json={"asset_id": "asset-1", "threshold_method": "definitely-not-real"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_api_can_queue_frame_preprocess_job():
@@ -763,6 +915,8 @@ def test_api_direct_segmentation_accepts_frame_ids(monkeypatch):
     assert body["frame_count"] == 2
     assert body["detection_count"] == 2
     assert body["frame_ids"] == ["frame-1", "frame-2"]
+    assert body["frames"][0]["resolved_options"]["roi_recording"]["padding"] == 4
+    assert body["frames"][0]["stage_counts"]["recorded_detection_count"] == 1
     assert segmented == [("frame-1", 4), ("frame-2", 4)]
 
 
@@ -1098,7 +1252,7 @@ def test_api_queues_video_ingestion(tmp_path):
             "source_path": str(video_path),
             "n_tile": 2,
             "enqueue_segment": True,
-            "segmentation_padding": 4,
+            "roi_padding": 4,
         },
     )
 

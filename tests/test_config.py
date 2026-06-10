@@ -39,19 +39,25 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
     assert config.image_data_storage.encoding == "zstd"
-    assert config.processing.segmentation.min_perimeter == 50.0
-    assert config.processing.segmentation.padding == 50
-    assert config.processing.segmentation.roi_encoding == "zstd"
-    assert config.processing.segmentation.zstd_min_bytes == 16384
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
-    assert config.processing.thresholding.method == "otsu"
-    assert config.processing.thresholding.thresholding_maximum_value == 255.0
+    assert config.processing.thresholding.method == "bounded_otsu_canny"
+    assert config.processing.thresholding.thresholding_maximum_value == 100.0
     assert config.processing.thresholding.bounded_otsu_min_contrast == 50.0
-    assert config.processing.thresholding.canny_low_threshold == 30.0
+    assert config.processing.thresholding.canny_low_threshold == 60.0
     assert config.processing.thresholding.adaptive_block_size == 31
+    assert config.processing.mask_augmentation.enabled is True
+    assert config.processing.mask_augmentation.steps == ["dilate"]
+    assert config.processing.roi_assembly.method == "connected_components"
+    assert config.processing.roi_assembly.connectivity == 8
+    assert config.processing.roi_filter.min_perimeter == 50.0
+    assert config.processing.roi_filter.min_area is None
+    assert config.processing.roi_recording.padding == 50
+    assert config.processing.roi_recording.roi_encoding == "zstd"
+    assert config.processing.roi_recording.zstd_min_bytes == 16384
+    assert config.processing.roi_recording.always_store_mask is True
     assert config.processing.preprocessing.apply_mask is False
     assert config.processing.preprocessing.mask_path is None
     assert config.processing.preprocessing.adaptive_background_subtraction is False
@@ -64,7 +70,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.preprocessing.crop_y is None
     assert config.processing.preprocessing.crop_w is None
     assert config.processing.preprocessing.crop_h is None
-    assert config.processing.frame_storage.image_encoding == "jpg"
+    assert config.processing.frame_storage.image_encoding == "zstd"
     assert config.processing.thumbhash.max_dim == 100
     assert config.logging.log_path.as_posix() == "logs"
     assert config.logging.file_name == "pelagia.log"
@@ -87,10 +93,6 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         [image_data_storage]
         encoding = "raw"
 
-        [processing.segmentation]
-        min_perimeter = 12.5
-        padding = 3
-
         [processing.video_ingest]
         n_tile = 4
 
@@ -105,6 +107,25 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         bounded_otsu_min_contrast = 22
         canny_low_threshold = 12
         adaptive_block_size = 17
+
+        [processing.mask_augmentation]
+        steps = ["open", "fill_holes"]
+        open_kernel_w = 5
+        open_kernel_h = 5
+
+        [processing.roi_assembly]
+        method = "contours"
+        connectivity = 4
+
+        [processing.roi_filter]
+        min_area = 5
+        min_perimeter = 12.5
+        min_width_plus_height = 9
+
+        [processing.roi_recording]
+        padding = 8
+        roi_encoding = "png"
+        store_roi_payload_min_area = 25
 
         [processing.preprocessing]
         apply_mask = false
@@ -136,8 +157,6 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.queue.lease_seconds == 42
     assert config.kvstore.root_path.as_posix() == "/tmp/pelagia-kv"
     assert config.image_data_storage.encoding == "raw"
-    assert config.processing.segmentation.min_perimeter == 12.5
-    assert config.processing.segmentation.padding == 3
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.8
@@ -147,6 +166,17 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.thresholding.bounded_otsu_min_contrast == 22.0
     assert config.processing.thresholding.canny_low_threshold == 12.0
     assert config.processing.thresholding.adaptive_block_size == 17
+    assert config.processing.mask_augmentation.steps == ["open", "fill_holes"]
+    assert config.processing.mask_augmentation.open_kernel_w == 5
+    assert config.processing.mask_augmentation.open_kernel_h == 5
+    assert config.processing.roi_assembly.method == "contours"
+    assert config.processing.roi_assembly.connectivity == 4
+    assert config.processing.roi_filter.min_area == 5.0
+    assert config.processing.roi_filter.min_width_plus_height == 9.0
+    assert config.processing.roi_filter.min_perimeter == 12.5
+    assert config.processing.roi_recording.padding == 8
+    assert config.processing.roi_recording.roi_encoding == "png"
+    assert config.processing.roi_recording.store_roi_payload_min_area == 25.0
     assert config.processing.preprocessing.apply_mask is False
     assert config.processing.preprocessing.mask_path == "/tmp/mask.png"
     assert config.processing.preprocessing.adaptive_background_subtraction is True
@@ -177,7 +207,7 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("PELAGIA_DATABASE_SCHEMA", "pelagia_from_env")
     monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_ENCODING", "zstd")
-    monkeypatch.setenv("PELAGIA_SEGMENTATION_MIN_PERIMETER", "9")
+    monkeypatch.setenv("PELAGIA_ROI_FILTER_MIN_PERIMETER", "9")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_N_TILE", "5")
     monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
@@ -207,7 +237,7 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
 
     assert config.database.schema_name == "pelagia_from_env"
     assert config.image_data_storage.encoding == "zstd"
-    assert config.processing.segmentation.min_perimeter == 9.0
+    assert config.processing.roi_filter.min_perimeter == 9.0
     assert config.processing.video_ingest.n_tile == 5
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.7

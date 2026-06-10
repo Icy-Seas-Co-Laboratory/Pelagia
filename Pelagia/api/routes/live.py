@@ -25,6 +25,11 @@ if APIRouter is not None:
     from ...processing.detection_candidate import live_segment_wrapper
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
+    from ...processing.segmentation_options import (
+        flatten_segmentation_options,
+        resolve_segmentation_options,
+        segment_frame_kwargs,
+    )
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository
 
     router = APIRouter(prefix="/live", tags=["live"])
@@ -163,6 +168,41 @@ if APIRouter is not None:
         request: Request,
         frame_id: str,
         threshold: int | float | None = None,
+        threshold_method: str | None = None,
+        manual_threshold: int | float | None = None,
+        thresholding_maximum_value: int | float | None = None,
+        bounded_otsu_min_contrast: int | float | None = None,
+        bounded_otsu_max_foreground_fraction: float | None = None,
+        canny_enabled: bool | None = None,
+        canny_low_threshold: int | float | None = None,
+        canny_high_threshold: int | float | None = None,
+        canny_blur_kernel: int | None = None,
+        dilate_kernel_w: int | None = None,
+        dilate_kernel_h: int | None = None,
+        dilate_iterations: int | None = None,
+        erode_kernel_w: int | None = None,
+        erode_kernel_h: int | None = None,
+        erode_iterations: int | None = None,
+        open_kernel_w: int | None = None,
+        open_kernel_h: int | None = None,
+        open_iterations: int | None = None,
+        close_kernel_w: int | None = None,
+        close_kernel_h: int | None = None,
+        close_iterations: int | None = None,
+        fill_holes: bool | None = None,
+        remove_small_components: bool | None = None,
+        min_component_area: int | float | None = None,
+        clear_border: bool | None = None,
+        adaptive_block_size: int | None = None,
+        adaptive_c: int | float | None = None,
+        percentile_background_percentile: int | float | None = None,
+        percentile_min_contrast: int | float | None = None,
+        hysteresis_low_threshold: int | float | None = None,
+        hysteresis_high_threshold: int | float | None = None,
+        hysteresis_connectivity: int | None = None,
+        sobel_percentile: int | float | None = None,
+        sobel_threshold: int | float | None = None,
+        sobel_kernel_size: int | None = None,
         frame_payload_kind: str = "original",
         apply_preprocessing: bool | None = None,
         flatfield_correction: bool | None = None,
@@ -177,9 +217,30 @@ if APIRouter is not None:
         background_correction: bool | None = None,
         background_percentile: int | float | None = None,
         invert_intensity: bool | None = None,
+        mask_augmentation_enabled: bool | None = None,
+        mask_augmentation_steps: list[str] | None = None,
+        roi_assembly_method: str | None = None,
+        roi_assembly_connectivity: int | None = None,
+        min_area: int | float | None = None,
+        max_area: int | float | None = None,
         min_perimeter: int | float | None = None,
         max_perimeter: int | float | None = None,
+        min_width: int | float | None = None,
+        max_width: int | float | None = None,
+        min_height: int | float | None = None,
+        max_height: int | float | None = None,
+        min_width_plus_height: int | float | None = None,
+        max_width_plus_height: int | float | None = None,
         padding: int | None = None,
+        roi_encoding: str | None = "png",
+        zstd_min_bytes: int | None = None,
+        store_roi_payload_min_area: int | float | None = None,
+        store_roi_payload_min_width: int | float | None = None,
+        store_roi_payload_min_height: int | float | None = None,
+        store_roi_payload_min_width_plus_height: int | float | None = None,
+        always_store_mask: bool | None = None,
+        include_detection_payloads: bool = False,
+        max_detections: int | None = 500,
     ) -> dict:
         context = get_context(request)
         repository = get_repository(request)
@@ -187,93 +248,122 @@ if APIRouter is not None:
         if frame_record is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
 
-        defaults = context.config.processing.segmentation
-        flatfield_defaults = context.config.processing.flatfield
-        preprocessing_defaults = context.config.processing.preprocessing
+        option_names = [
+            "threshold",
+            "threshold_method",
+            "manual_threshold",
+            "thresholding_maximum_value",
+            "bounded_otsu_min_contrast",
+            "bounded_otsu_max_foreground_fraction",
+            "canny_enabled",
+            "canny_low_threshold",
+            "canny_high_threshold",
+            "canny_blur_kernel",
+            "dilate_kernel_w",
+            "dilate_kernel_h",
+            "dilate_iterations",
+            "erode_kernel_w",
+            "erode_kernel_h",
+            "erode_iterations",
+            "open_kernel_w",
+            "open_kernel_h",
+            "open_iterations",
+            "close_kernel_w",
+            "close_kernel_h",
+            "close_iterations",
+            "fill_holes",
+            "remove_small_components",
+            "min_component_area",
+            "clear_border",
+            "adaptive_block_size",
+            "adaptive_c",
+            "percentile_background_percentile",
+            "percentile_min_contrast",
+            "hysteresis_low_threshold",
+            "hysteresis_high_threshold",
+            "hysteresis_connectivity",
+            "sobel_percentile",
+            "sobel_threshold",
+            "sobel_kernel_size",
+            "frame_payload_kind",
+            "apply_preprocessing",
+            "flatfield_correction",
+            "flatfield_q",
+            "flatfield_axis",
+            "apply_mask",
+            "crop_enabled",
+            "crop_x",
+            "crop_y",
+            "crop_w",
+            "crop_h",
+            "background_correction",
+            "background_percentile",
+            "invert_intensity",
+            "mask_augmentation_enabled",
+            "mask_augmentation_steps",
+            "roi_assembly_method",
+            "roi_assembly_connectivity",
+            "min_area",
+            "max_area",
+            "min_perimeter",
+            "max_perimeter",
+            "min_width",
+            "max_width",
+            "min_height",
+            "max_height",
+            "min_width_plus_height",
+            "max_width_plus_height",
+            "padding",
+            "roi_encoding",
+            "zstd_min_bytes",
+            "store_roi_payload_min_area",
+            "store_roi_payload_min_width",
+            "store_roi_payload_min_height",
+            "store_roi_payload_min_width_plus_height",
+            "always_store_mask",
+        ]
+        local_values = locals()
+        overrides = {name: local_values[name] for name in option_names}
         try:
+            resolved_options = resolve_segmentation_options(
+                overrides,
+                context.config.processing,
+            )
+            flat_options = flatten_segmentation_options(resolved_options)
             detections = live_segment_wrapper(
                 frame_id,
-                threshold=threshold,
-                frame_payload_kind=frame_payload_kind,
-                apply_preprocessing=apply_preprocessing,
-                flatfield_correction=(
-                    flatfield_defaults.flatfield_correction
-                    if flatfield_correction is None
-                    else flatfield_correction
-                ),
-                flatfield_q=flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q,
-                flatfield_axis=flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis,
-                apply_mask=preprocessing_defaults.apply_mask if apply_mask is None else apply_mask,
-                crop_enabled=(
-                    preprocessing_defaults.crop_enabled
-                    if crop_enabled is None
-                    else crop_enabled
-                ),
-                crop_x=preprocessing_defaults.crop_x if crop_x is None else crop_x,
-                crop_y=preprocessing_defaults.crop_y if crop_y is None else crop_y,
-                crop_w=preprocessing_defaults.crop_w if crop_w is None else crop_w,
-                crop_h=preprocessing_defaults.crop_h if crop_h is None else crop_h,
-                background_correction=(
-                    preprocessing_defaults.background_correction
-                    if background_correction is None
-                    else background_correction
-                ),
-                background_percentile=(
-                    preprocessing_defaults.background_percentile
-                    if background_percentile is None
-                    else background_percentile
-                ),
-                invert_intensity=(
-                    preprocessing_defaults.invert_intensity
-                    if invert_intensity is None
-                    else invert_intensity
-                ),
-                min_perimeter=defaults.min_perimeter if min_perimeter is None else min_perimeter,
-                max_perimeter=defaults.max_perimeter if max_perimeter is None else max_perimeter,
-                padding=defaults.padding if padding is None else padding,
+                frame_payload_kind=flat_options["frame_payload_kind"],
+                encode_payloads=include_detection_payloads,
+                max_detections=max_detections,
+                **segment_frame_kwargs(resolved_options),
                 context=context,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         detection_rows = [detection_summary(detection) for detection in detections]
+        metadata = getattr(detections[0], "metadata", {}) if detections else {}
+        stage_counts = dict(metadata.get("stage_counts") or {})
+        stage_counts.setdefault("recorded_detection_count", len(detections))
+        stage_durations_ms = dict(metadata.get("stage_durations_ms") or {})
 
         response = {
             "frame_id": frame_id,
             "run_id": getattr(frame_record, "run_id", None),
             "asset_id": getattr(frame_record, "asset_id", None),
             "saved": False,
-            "frame_payload_kind": frame_payload_kind,
-            "apply_preprocessing": (
-                frame_payload_kind in {"original", "raw"}
-                if apply_preprocessing is None
-                else apply_preprocessing
-            ),
-            "apply_mask": preprocessing_defaults.apply_mask if apply_mask is None else apply_mask,
-            "crop_enabled": (
-                preprocessing_defaults.crop_enabled
-                if crop_enabled is None
-                else crop_enabled
-            ),
-            "crop_x": preprocessing_defaults.crop_x if crop_x is None else crop_x,
-            "crop_y": preprocessing_defaults.crop_y if crop_y is None else crop_y,
-            "crop_w": preprocessing_defaults.crop_w if crop_w is None else crop_w,
-            "crop_h": preprocessing_defaults.crop_h if crop_h is None else crop_h,
-            "background_correction": (
-                preprocessing_defaults.background_correction
-                if background_correction is None
-                else background_correction
-            ),
-            "background_percentile": (
-                preprocessing_defaults.background_percentile
-                if background_percentile is None
-                else background_percentile
-            ),
-            "intensity_inverted": (
-                preprocessing_defaults.invert_intensity
-                if invert_intensity is None
-                else invert_intensity
-            ),
+            "frame_payload_kind": flat_options["frame_payload_kind"],
+            "apply_preprocessing": flat_options["apply_preprocessing"],
+            "resolved_options": resolved_options,
+            "bbox_coordinate_space": metadata.get("bbox_coordinate_space"),
+            "processed_frame_shape": metadata.get("processed_frame_shape"),
+            "stage_counts": stage_counts,
+            "stage_durations_ms": stage_durations_ms,
+            "payloads_encoded": include_detection_payloads,
+            "max_detections": max_detections,
+            "candidate_limit_applied": metadata.get("candidate_limit_applied"),
             "detection_count": len(detections),
             "detections": detection_rows,
         }

@@ -31,14 +31,64 @@ max_rows = 1000000
 # Default image payload encoding. Options: zstd, png, jpg, raw.
 encoding = "zstd"
 
-[processing.segmentation]
-# ROI detection defaults used by API, CLI, and workers unless explicitly overridden.
+[processing.mask_augmentation]
+# Binary-mask cleanup after thresholding and before candidate assembly.
+enabled = true
+# Ordered steps. Options: dilate, erode, open, close, fill_holes,
+# remove_small_components, clear_border, none.
+steps = ["dilate"]
+dilate_kernel_w = 3
+dilate_kernel_h = 3
+dilate_iterations = 1
+erode_kernel_w = 3
+erode_kernel_h = 3
+erode_iterations = 1
+open_kernel_w = 3
+open_kernel_h = 3
+open_iterations = 1
+close_kernel_w = 3
+close_kernel_h = 3
+close_iterations = 1
+fill_holes = false
+remove_small_components = false
+min_component_area = 1
+clear_border = false
+
+[processing.roi_assembly]
+# Candidate ROI assembly from the augmented mask.
+# Options: connected_components, contours.
+method = "connected_components"
+connectivity = 8
+
+[processing.roi_filter]
+# Candidate ROI filters. Null disables a given criterion.
+min_area = null
+max_area = null
+# Perimeter uses the candidate bounding-box perimeter.
 min_perimeter = 50
+max_perimeter = null
+min_width = null
+max_width = null
+min_height = null
+max_height = null
+# Width + height is often easier to reason about than box perimeter.
+min_width_plus_height = null
+max_width_plus_height = null
+
+[processing.roi_recording]
+# Stored candidate ROI payload and mask behavior.
 padding = 50
-# Options: zstd, png, raw, auto.
+# ROI and mask payload encoding. Options: zstd, png, raw, auto.
 roi_encoding = "zstd"
 # Minimum ROI byte size before auto encoding prefers zstd over png.
 zstd_min_bytes = 16384
+# Store masks for every retained candidate, even when ROI image bytes are skipped.
+always_store_mask = true
+# ROI image blobs are only stored when all non-null thresholds are satisfied.
+store_roi_payload_min_area = null
+store_roi_payload_min_width = null
+store_roi_payload_min_height = null
+store_roi_payload_min_width_plus_height = null
 
 [processing.video_ingest]
 # Video-to-frame extraction defaults. Frame storage preserves extracted pixels;
@@ -55,35 +105,54 @@ flatfield_q = 0.5
 flatfield_axis = 0
 
 [processing.thresholding]
-# Candidate mask generation defaults. Method options currently include:
-# otsu, bounded_otsu, bounded_otsu_canny, adaptive_mean, adaptive_gaussian,
-# percentile_background, hysteresis, sobel_edges.
-method = "otsu"
+# Candidate mask generation defaults.
+#
+# Method options:
+# - manual: fixed grayscale threshold using manual_threshold.
+# - otsu: Otsu automatic thresholding with optional maximum cap.
+# - bounded_otsu: Otsu with minimum contrast and foreground-fraction safeguards.
+# - bounded_otsu_canny: bounded_otsu with optional Canny edge support.
+# - canny: standalone Canny edge detection.
+# - adaptive_mean/adaptive_gaussian: local adaptive thresholding.
+# - percentile_background: background percentile plus minimum contrast.
+# - hysteresis: connected weak/strong thresholding.
+# - sobel_edges: Sobel gradient thresholding.
+method = "bounded_otsu_canny"
+
+# Manual threshold method.
+manual_threshold = 100
+
+# Otsu-style methods.
 # Maximum threshold value used when Otsu-style thresholding is capped.
-thresholding_maximum_value = 255
+thresholding_maximum_value = 100
+
 # Bounded Otsu rejects weak foreground/background separation and overly full masks.
 bounded_otsu_min_contrast = 50
-bounded_otsu_max_foreground_fraction = 0.9
-# Canny thresholds and blur kernel used by bounded_otsu_canny.
-canny_enabled = true
-canny_low_threshold = 30
-canny_high_threshold = 80
+bounded_otsu_max_foreground_fraction = 0.5
+
+# Canny edge detection.
+# Used by the standalone canny method and as optional support for bounded_otsu_canny.
+canny_enabled = false
+canny_low_threshold = 60
+canny_high_threshold = 120
 canny_blur_kernel = 5
-# Final dilation kernel applied by combined threshold methods.
-dilate_kernel_w = 2
-dilate_kernel_h = 2
+
 # Adaptive threshold window size and constant offset.
 adaptive_block_size = 31
 adaptive_c = 5
+
 # Percentile-background threshold estimates background brightness, then adds contrast.
 percentile_background_percentile = 50
 percentile_min_contrast = 50
+
 # Hysteresis keeps weak pixels only when connected to strong pixels.
 hysteresis_low_threshold = 30
 hysteresis_high_threshold = 80
 hysteresis_connectivity = 8
-# Sobel edge thresholding uses a gradient percentile unless an explicit threshold is supplied.
+
+# Sobel edge thresholding uses a gradient percentile unless sobel_threshold is set.
 sobel_percentile = 90
+sobel_threshold = null
 sobel_kernel_size = 3
 
 [processing.preprocessing]
@@ -112,7 +181,7 @@ crop_h = null
 
 [processing.frame_storage]
 # Stored frame payload encoding. Options: zstd, png, jpg, raw.
-image_encoding = "jpg"
+image_encoding = "zstd"
 
 [processing.thumbhash]
 # Maximum image dimension used before computing preview thumbhashes.

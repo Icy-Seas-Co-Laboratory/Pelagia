@@ -1,0 +1,960 @@
+{
+  "generated_at": "2026-06-10T01:20:09.996576+00:00",
+  "window": {
+    "since": "2026-06-01",
+    "until": null,
+    "run_id": null,
+    "asset_id": null,
+    "collection": null
+  },
+  "overview": {
+    "first_log_at": "2026-06-09 17:06:08.461230-08:00",
+    "last_log_at": "2026-06-09 17:20:09.501783-08:00",
+    "log_count": 5984,
+    "timed_log_count": 2099,
+    "error_log_count": 4,
+    "warning_log_count": 0,
+    "job_count": 56,
+    "succeeded_jobs": 56,
+    "failed_jobs": 0,
+    "queued_jobs": 0,
+    "timed_jobs": 56,
+    "worker_session_count": 8,
+    "asset_count": 8,
+    "frame_count": 2032,
+    "detection_candidate_count": 1610867
+  },
+  "duration_by_event": [
+    {
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "count": 56,
+      "avg_ms": 66081.5669680721,
+      "p50_ms": 39041.87297949102,
+      "p90_ms": 179730.12014603592,
+      "p95_ms": 185306.69188550377,
+      "max_ms": 244129.53337503131,
+      "total_ms": 3700567.750212038
+    },
+    {
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "count": 8,
+      "avg_ms": 162021.00676049304,
+      "p50_ms": 179377.50204201438,
+      "p90_ms": 180333.61538318568,
+      "p95_ms": 180414.63008758437,
+      "max_ms": 180495.64479198307,
+      "total_ms": 1296168.0540839443
+    },
+    {
+      "event_type": "segmentation.frame_completed",
+      "logger": "pelagia.processing.detection_candidate",
+      "count": 2032,
+      "avg_ms": 542.2292011073554,
+      "p50_ms": 261.67766700382344,
+      "p90_ms": 1502.2525708016476,
+      "p95_ms": 1822.125864381087,
+      "max_ms": 4837.954459013417,
+      "total_ms": 1101809.736650146
+    },
+    {
+      "event_type": "job.handler_failed",
+      "logger": "pelagia",
+      "count": 1,
+      "avg_ms": 162002.58141598897,
+      "p50_ms": 162002.58141598897,
+      "p90_ms": 162002.58141598897,
+      "p95_ms": 162002.58141598897,
+      "max_ms": 162002.58141598897,
+      "total_ms": 162002.58141598897
+    },
+    {
+      "event_type": "video_ingest.failed",
+      "logger": "pelagia.processing.ingest",
+      "count": 1,
+      "avg_ms": 161382.43295799475,
+      "p50_ms": 161382.43295799475,
+      "p90_ms": 161382.43295799475,
+      "p95_ms": 161382.43295799475,
+      "max_ms": 161382.43295799475,
+      "total_ms": 161382.43295799475
+    },
+    {
+      "event_type": "frame_store.store_failed",
+      "logger": "pelagia.processing.frame_store",
+      "count": 1,
+      "avg_ms": 6098.458541964646,
+      "p50_ms": 6098.458541964646,
+      "p90_ms": 6098.458541964646,
+      "p95_ms": 6098.458541964646,
+      "max_ms": 6098.458541964646,
+      "total_ms": 6098.458541964646
+    }
+  ],
+  "job_lifecycle": [
+    {
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "count": 8,
+      "avg_queue_ms": "788.4252500000000000",
+      "p50_queue_ms": 633.9114999999999,
+      "avg_run_ms": "183526.110500000000",
+      "p50_run_ms": 179736.69650000002,
+      "p95_run_ms": 199918.5152,
+      "max_run_ms": "210364.093000"
+    },
+    {
+      "stage": "segment",
+      "status": "succeeded",
+      "count": 24,
+      "avg_queue_ms": "30638.418875000000",
+      "p50_queue_ms": 21023.9195,
+      "avg_run_ms": "66677.943250000000",
+      "p50_run_ms": 34830.374500000005,
+      "p95_run_ms": 225240.89209999997,
+      "max_run_ms": "242730.451000"
+    },
+    {
+      "stage": "preprocess_frames",
+      "status": "succeeded",
+      "count": 24,
+      "avg_queue_ms": "35331.133916666667",
+      "p50_queue_ms": 40234.2975,
+      "avg_run_ms": "33140.897125000000",
+      "p50_run_ms": 38601.3235,
+      "p95_run_ms": 40648.619300000006,
+      "max_run_ms": "40744.131000"
+    }
+  ],
+  "worker_handlers": [
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-1",
+      "count": 1,
+      "avg_ms": 180517.19124999363,
+      "p50_ms": 180517.19124999363,
+      "p95_ms": 180517.19124999363,
+      "max_ms": 180517.19124999363
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-7",
+      "count": 1,
+      "avg_ms": 180282.9769590171,
+      "p50_ms": 180282.9769590171,
+      "p95_ms": 180282.9769590171,
+      "max_ms": 180282.9769590171
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-4",
+      "count": 1,
+      "avg_ms": 179972.00483304914,
+      "p50_ms": 179972.00483304914,
+      "p95_ms": 179972.00483304914,
+      "max_ms": 179972.00483304914
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-2",
+      "count": 1,
+      "avg_ms": 179488.2354590227,
+      "p50_ms": 179488.2354590227,
+      "p95_ms": 179488.2354590227,
+      "max_ms": 179488.2354590227
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-6",
+      "count": 1,
+      "avg_ms": 179315.2983750333,
+      "p50_ms": 179315.2983750333,
+      "p95_ms": 179315.2983750333,
+      "max_ms": 179315.2983750333
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-8",
+      "count": 1,
+      "avg_ms": 179193.21249995846,
+      "p50_ms": 179193.21249995846,
+      "p95_ms": 179193.21249995846,
+      "max_ms": 179193.21249995846
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-5",
+      "count": 1,
+      "avg_ms": 179038.14750001766,
+      "p50_ms": 179038.14750001766,
+      "p95_ms": 179038.14750001766,
+      "max_ms": 179038.14750001766
+    },
+    {
+      "stage": "extract_frames",
+      "worker_id": "general-3",
+      "count": 1,
+      "avg_ms": 38547.908458975144,
+      "p50_ms": 38547.908458975144,
+      "p95_ms": 38547.908458975144,
+      "max_ms": 38547.908458975144
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-8",
+      "count": 3,
+      "avg_ms": 39873.64851400101,
+      "p50_ms": 39715.939500019886,
+      "p95_ms": 40367.080162494676,
+      "max_ms": 40439.429124991875
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-5",
+      "count": 3,
+      "avg_ms": 39485.27781964125,
+      "p50_ms": 39544.753708993085,
+      "p95_ms": 40553.85748336557,
+      "max_ms": 40665.980124962516
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-2",
+      "count": 3,
+      "avg_ms": 33666.33262465863,
+      "p50_ms": 39456.67300000787,
+      "p95_ms": 40614.59649938624,
+      "max_ms": 40743.25466598384
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-1",
+      "count": 3,
+      "avg_ms": 32843.50402800677,
+      "p50_ms": 36477.475417021196,
+      "p95_ms": 40106.3578416768,
+      "max_ms": 40509.56699997187
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-3",
+      "count": 3,
+      "avg_ms": 32420.078639309697,
+      "p50_ms": 38627.07295897417,
+      "p95_ms": 39518.602946493775,
+      "max_ms": 39617.66183399595
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-7",
+      "count": 3,
+      "avg_ms": 31994.716708334938,
+      "p50_ms": 36255.060707975645,
+      "p95_ms": 38346.44680858473,
+      "max_ms": 38578.82304198574
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-6",
+      "count": 3,
+      "avg_ms": 27573.838249993667,
+      "p50_ms": 21667.994207993615,
+      "p95_ms": 37758.60813332256,
+      "max_ms": 39546.454125025775
+    },
+    {
+      "stage": "preprocess_frames",
+      "worker_id": "general-4",
+      "count": 3,
+      "avg_ms": 27235.575166647322,
+      "p50_ms": 21319.68583294656,
+      "p95_ms": 37811.29277108703,
+      "max_ms": 39643.693541991524
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-1",
+      "count": 2,
+      "avg_ms": 118518.47147953231,
+      "p50_ms": 118518.47147953231,
+      "p95_ms": 191559.5215607842,
+      "max_ms": 199675.1937920344
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-7",
+      "count": 3,
+      "avg_ms": 92141.30122199033,
+      "p50_ms": 24044.06929097604,
+      "p95_ms": 210582.64222879076,
+      "max_ms": 231309.15033299243
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-2",
+      "count": 3,
+      "avg_ms": 77157.67144433146,
+      "p50_ms": 69026.77270799177,
+      "p95_ms": 144174.80650859652,
+      "max_ms": 152524.58804199705
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-3",
+      "count": 4,
+      "avg_ms": 71856.12320851942,
+      "p50_ms": 16591.860208514845,
+      "p95_ms": 210566.1564499838,
+      "max_ms": 244129.53337503131
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-4",
+      "count": 2,
+      "avg_ms": 66812.2465625056,
+      "p50_ms": 66812.2465625056,
+      "p95_ms": 72090.0536187226,
+      "max_ms": 72676.47662496893
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-5",
+      "count": 3,
+      "avg_ms": 52769.09356901888,
+      "p50_ms": 35556.15604104241,
+      "p95_ms": 96910.7053163345,
+      "max_ms": 103727.87745803362
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-6",
+      "count": 3,
+      "avg_ms": 52187.75338898801,
+      "p50_ms": 34447.74358399445,
+      "p95_ms": 94867.03712060116,
+      "max_ms": 101580.29195800191
+    },
+    {
+      "stage": "segment",
+      "worker_id": "general-8",
+      "count": 4,
+      "avg_ms": 32020.117958512856,
+      "p50_ms": 24371.707833517576,
+      "p95_ms": 56912.570141910684,
+      "max_ms": 61682.838917011395
+    }
+  ],
+  "throughput": [
+    {
+      "event_type": "segmentation.frame_completed",
+      "count": 2032,
+      "unit_count": 1610867.0,
+      "total_ms": 1101809.736650146,
+      "avg_ms": 542.2292011073554,
+      "units_per_second": 1462.0192093215212
+    },
+    {
+      "event_type": "video_ingest.completed",
+      "count": 8,
+      "unit_count": 8104.0,
+      "total_ms": 1296168.0540839443,
+      "avg_ms": 162021.00676049304,
+      "units_per_second": 6.252275678656062
+    },
+    {
+      "event_type": "video_ingest.failed",
+      "count": 1,
+      "unit_count": 807.0,
+      "total_ms": 161382.43295799475,
+      "avg_ms": 161382.43295799475,
+      "units_per_second": 5.000544267479529
+    }
+  ],
+  "slow_logs": [
+    {
+      "created_at": "2026-06-09 17:18:55.171536-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 244129.53337503131,
+      "worker_id": "general-3",
+      "job_id": "f834b54a-c63c-41b6-9551-825cfd552a73",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97621,
+        "stage": "segment",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "detection_count",
+          "detection_ids",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:18:44.134094-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 231309.15033299243,
+      "worker_id": "general-7",
+      "job_id": "10fca388-c5e0-4ac6-81cb-10d6a3c75787",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97668,
+        "stage": "segment",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "detection_count",
+          "detection_ids",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:18:05.388311-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 199675.1937920344,
+      "worker_id": "general-1",
+      "job_id": "e406324a-6527-4036-80a4-339b20eb4858",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97599,
+        "stage": "segment",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "detection_count",
+          "detection_ids",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:43.439893-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 180517.19124999363,
+      "worker_id": "general-1",
+      "job_id": "deb364e5-da50-464f-b4da-12c4982995e9",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97599,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:43.428083-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 180495.64479198307,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 20.5159,
+        "pid": 97599,
+        "n_tile": 4,
+        "filename": "Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:49.284226-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 180282.9769590171,
+      "worker_id": "general-7",
+      "job_id": "1b90dfab-3fa4-4cde-8a05-5720e491a091",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97668,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:49.271217-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 180264.1742079868,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 20.5159,
+        "pid": 97668,
+        "n_tile": 4,
+        "filename": "Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:35.864333-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 179972.00483304914,
+      "worker_id": "general-4",
+      "job_id": "dfb73e68-619e-4b8d-88c3-ef7b6063bae8",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97632,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:35.848487-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 179948.67458299268,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 19.5311,
+        "pid": 97632,
+        "n_tile": 4,
+        "filename": "camera1-101-2025-06-27 00-05-29.471.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/camera1-101-2025-06-27 00-05-29.471.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:42.774997-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 179488.2354590227,
+      "worker_id": "general-2",
+      "job_id": "161ff8ca-d38f-4b94-8984-9969298fdd6b",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97610,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:42.761995-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 179463.43170898035,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 20.5159,
+        "pid": 97610,
+        "n_tile": 4,
+        "filename": "Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:39.913925-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 179315.2983750333,
+      "worker_id": "general-6",
+      "job_id": "1efeee8e-bd5d-43fa-9a8b-17a22537a19c",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97656,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:39.898663-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 179291.57237504842,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 20.5159,
+        "pid": 97656,
+        "n_tile": 4,
+        "filename": "Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:44.521174-08:00",
+      "event_type": "job.handler_completed",
+      "logger": "pelagia",
+      "level": "info",
+      "duration_ms": 179193.21249995846,
+      "worker_id": "general-8",
+      "job_id": "3d6a3ff1-8f13-4a14-8378-1bd172a75281",
+      "message": "Worker completed job handler",
+      "payload": {
+        "pid": 97680,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "result_keys": [
+          "asset_id",
+          "frame_count",
+          "frame_ids",
+          "run_id",
+          "source_path",
+          "stage"
+        ]
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:44.503365-08:00",
+      "event_type": "video_ingest.completed",
+      "logger": "pelagia.processing.ingest",
+      "level": "info",
+      "duration_ms": 179168.01312501775,
+      "worker_id": null,
+      "job_id": null,
+      "message": "Video ingest completed",
+      "payload": {
+        "fps": 20.5159,
+        "pid": 97680,
+        "n_tile": 4,
+        "filename": "Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "stored_tile_count": 254,
+        "source_frame_count": 1013,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    }
+  ],
+  "slow_jobs": [
+    {
+      "id": "f834b54a-c63c-41b6-9551-825cfd552a73",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "44197.546000",
+      "run_ms": "242730.451000",
+      "summary": "segment queued for asset 27b45d1d-8778-48cb-ac17-d23b28cea516",
+      "error_message": null
+    },
+    {
+      "id": "10fca388-c5e0-4ac6-81cb-10d6a3c75787",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "45964.343000",
+      "run_ms": "229957.862000",
+      "summary": "segment queued for asset 27b45d1d-8778-48cb-ac17-d23b28cea516",
+      "error_message": null
+    },
+    {
+      "id": "42d80131-7300-4e8c-b9c6-310272ddba2c",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "158.866000",
+      "run_ms": "210364.093000",
+      "summary": "extract_frames queued for 2022-07-22-22-00-05.292.avi",
+      "error_message": null
+    },
+    {
+      "id": "e406324a-6527-4036-80a4-339b20eb4858",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "38882.868000",
+      "run_ms": "198511.396000",
+      "summary": "segment queued for asset 27b45d1d-8778-48cb-ac17-d23b28cea516",
+      "error_message": null
+    },
+    {
+      "id": "deb364e5-da50-464f-b4da-12c4982995e9",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "1642.544000",
+      "run_ms": "180519.585000",
+      "summary": "extract_frames queued for Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+      "error_message": null
+    },
+    {
+      "id": "1b90dfab-3fa4-4cde-8a05-5720e491a091",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "1809.561000",
+      "run_ms": "180284.795000",
+      "summary": "extract_frames queued for Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+      "error_message": null
+    },
+    {
+      "id": "dfb73e68-619e-4b8d-88c3-ef7b6063bae8",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "351.653000",
+      "run_ms": "179980.140000",
+      "summary": "extract_frames queued for camera1-101-2025-06-27 00-05-29.471.avi",
+      "error_message": null
+    },
+    {
+      "id": "161ff8ca-d38f-4b94-8984-9969298fdd6b",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "59.995000",
+      "run_ms": "179493.253000",
+      "summary": "extract_frames queued for Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+      "error_message": null
+    },
+    {
+      "id": "1efeee8e-bd5d-43fa-9a8b-17a22537a19c",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "1245.190000",
+      "run_ms": "179321.510000",
+      "summary": "extract_frames queued for Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+      "error_message": null
+    },
+    {
+      "id": "3d6a3ff1-8f13-4a14-8378-1bd172a75281",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "123.423000",
+      "run_ms": "179198.432000",
+      "summary": "extract_frames queued for Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+      "error_message": null
+    },
+    {
+      "id": "a2ee12e3-76db-41d4-87f0-31c7c3d66fa2",
+      "stage": "extract_frames",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "916.170000",
+      "run_ms": "179047.076000",
+      "summary": "extract_frames queued for camera1-15-2025-06-26 22-51-08.753.avi",
+      "error_message": null
+    },
+    {
+      "id": "37313a3c-d35a-4aad-8940-c56025f062c1",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "80404.808000",
+      "run_ms": "151391.641000",
+      "summary": "segment queued for asset 67363146-8e42-4230-b034-b496d24952ad",
+      "error_message": null
+    },
+    {
+      "id": "74629bc7-b2fb-4323-9588-c659058b8fba",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "56064.193000",
+      "run_ms": "103145.433000",
+      "summary": "segment queued for asset 62d39eea-2db0-4658-b03d-bd8250f26acd",
+      "error_message": null
+    },
+    {
+      "id": "763f64c3-f62a-4301-81d6-b0f9b8e96f07",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "55828.945000",
+      "run_ms": "101032.837000",
+      "summary": "segment queued for asset 62d39eea-2db0-4658-b03d-bd8250f26acd",
+      "error_message": null
+    },
+    {
+      "id": "e9beced0-ee80-47fc-bf63-f90293d77cb9",
+      "stage": "segment",
+      "status": "succeeded",
+      "worker_id": null,
+      "queue_ms": "1615.194000",
+      "run_ms": "72321.919000",
+      "summary": "segment queued for asset c2a81265-905b-4859-b244-adf28b8501b9",
+      "error_message": null
+    }
+  ],
+  "warnings_errors": [
+    {
+      "created_at": "2026-06-09 17:10:19.394672-08:00",
+      "level": "error",
+      "event_type": "job.failed_retryable",
+      "message": "Job event job.failed_retryable",
+      "worker_id": null,
+      "job_id": "42d80131-7300-4e8c-b9c6-310272ddba2c",
+      "payload": {
+        "result": {},
+        "retryable": true,
+        "next_status": "queued",
+        "error_message": "connection timeout expired"
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:16.475842-08:00",
+      "level": "error",
+      "event_type": "job.handler_failed",
+      "message": "Worker failed job handler",
+      "worker_id": "general-3",
+      "job_id": "42d80131-7300-4e8c-b9c6-310272ddba2c",
+      "payload": {
+        "pid": 97621,
+        "stage": "extract_frames",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "error_type": "ConnectionTimeout",
+        "error_message": "connection timeout expired"
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:15.807485-08:00",
+      "level": "error",
+      "event_type": "video_ingest.failed",
+      "message": "Video ingest failed",
+      "worker_id": null,
+      "job_id": null,
+      "payload": {
+        "pid": 97621,
+        "n_tile": 4,
+        "filename": "2022-07-22-22-00-05.292.avi",
+        "hostname": "Thomass-MacBook-Pro.local",
+        "mask_path": null,
+        "apply_mask": false,
+        "error_type": "ConnectionTimeout",
+        "input_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1/2022-07-22-22-00-05.292.avi",
+        "source_path": "/Users/tbkelly/Documents/DPI/raw/camera0/test1",
+        "error_message": "connection timeout expired",
+        "stored_tile_count": 201,
+        "source_frame_count": 807,
+        "adaptive_background_period": 50,
+        "adaptive_background_subtraction": false
+      }
+    },
+    {
+      "created_at": "2026-06-09 17:10:13.838414-08:00",
+      "level": "error",
+      "event_type": "frame_store.store_failed",
+      "message": "Frame storage failed",
+      "worker_id": null,
+      "job_id": null,
+      "payload": {
+        "pid": 97621,
+        "hostname": "Thomass-MacBook-Pro.local",
+        "error_type": "ConnectionTimeout",
+        "frame_index": 202,
+        "tile_number": 202,
+        "frame_number": 808,
+        "error_message": "connection timeout expired"
+      }
+    }
+  ]
+}

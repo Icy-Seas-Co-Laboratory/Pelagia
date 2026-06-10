@@ -133,20 +133,6 @@ worker_name_for_stage() {
     echo "pelagia-${stage//_/-}-$index"
 }
 
-process_name_for_stage() {
-    local stage="$1"
-    local index="$2"
-    local total="$3"
-    local legacy_name="worker-$stage"
-    if [[ "$index" == "1" && -f "$PID_DIR/$legacy_name.pid" ]]; then
-        echo "$legacy_name"
-    elif [[ "$total" == "1" ]]; then
-        echo "$legacy_name"
-    else
-        echo "worker-$stage-$index"
-    fi
-}
-
 storage_is_ready() {
     python -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
@@ -211,8 +197,7 @@ start_stack() {
         worker_count="$(worker_count_for_stage "$stage")"
         for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
             worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
-            process_name="$(process_name_for_stage "$stage" "$worker_index" "$worker_count")"
-            start_process "$process_name" \
+            start_process "$worker_id" \
                 python -m Pelagia.cli.app worker_run \
                 --database-dsn "$PELAGIA_DATABASE_DSN" \
                 --schema "$PELAGIA_DATABASE_SCHEMA" \
@@ -239,25 +224,11 @@ stop_stack() {
         worker_count="$(worker_count_for_stage "$stage")"
         for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
             worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
-            process_name="$(process_name_for_stage "$stage" "$worker_index" "$worker_count")"
             python -m Pelagia.cli.app worker_shutdown "$worker_id" \
                 --database-dsn "$PELAGIA_DATABASE_DSN" \
                 --schema "$PELAGIA_DATABASE_SCHEMA" \
-                --reason "dev stack stop" >"$LOG_DIR/$process_name.shutdown.log" 2>&1 || true
-            stop_pid_file "$process_name"
-        done
-        for pid_file in "$PID_DIR/worker-$stage-"*.pid "$PID_DIR/worker-$stage.pid"; do
-            [[ -e "$pid_file" ]] || continue
-            process_name="$(basename "$pid_file" .pid)"
-            worker_index="${process_name##worker-$stage-}"
-            if is_positive_integer "$worker_index"; then
-                worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
-                python -m Pelagia.cli.app worker_shutdown "$worker_id" \
-                    --database-dsn "$PELAGIA_DATABASE_DSN" \
-                    --schema "$PELAGIA_DATABASE_SCHEMA" \
-                    --reason "dev stack stop" >"$LOG_DIR/$process_name.shutdown.log" 2>&1 || true
-            fi
-            stop_pid_file "$process_name"
+                --reason "dev stack stop" >"$LOG_DIR/$worker_id.shutdown.log" 2>&1 || true
+            stop_pid_file "$worker_id"
         done
     done
     stop_pid_file api

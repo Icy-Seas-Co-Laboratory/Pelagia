@@ -18,7 +18,7 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
         return encoded.tobytes(), "png", "png"
 
     if requested in {"jpg", "image/jpeg"}:
-        ok, encoded = cv2.imencode(".jpg", array, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        ok, encoded = cv2.imencode(".jpg", array, [cv2.IMWRITE_JPEG_QUALITY, 96])
         if not ok:
             raise ValueError(
                 f"Frame array with dtype {array.dtype} and shape {array.shape} cannot be encoded as JPG."
@@ -32,7 +32,7 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
             raise RuntimeError("zstandard is required to encode frame arrays as zstd.") from exc
 
         return (
-            zstd.ZstdCompressor(level=1).compress(array.tobytes(order="C")),
+            zstd.ZstdCompressor(level=3).compress(array.tobytes(order="C")),
             "zstd",
             "zstd_ndarray_c_order",
         )

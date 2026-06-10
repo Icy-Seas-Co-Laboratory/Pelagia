@@ -1,0 +1,206 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R /F2 10 0 R /F3 11 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 7651 >>
+stream
+BT /F2 20 Tf 1 0 0 1 48.00 744.00 Tm (Pelagia Benchmark Report) Tj ET
+BT /F1 9 Tf 1 0 0 1 48.00 718.00 Tm (Generated: 2026-06-10T01:04:14.103443+00:00) Tj ET
+BT /F1 9 Tf 1 0 0 1 48.00 706.00 Tm (Schema: pelagia) Tj ET
+BT /F1 9 Tf 1 0 0 1 48.00 694.00 Tm (Filters: since=2026-06-01) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 676.00 Tm (Summary) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 658.00 Tm (Metric                        Value                                                       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 648.00 Tm (------------------            ------------------                                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 638.00 Tm (First log                     2026-06-09 16:47:14.003192-08:00                            ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 628.00 Tm (Last log                      2026-06-09 17:04:13.309772-08:00                            ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 618.00 Tm (Logs                          6507                                                        ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 608.00 Tm (Timed logs                    2328                                                        ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 598.00 Tm (Warnings                      3                                                           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 588.00 Tm (Errors                        0                                                           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 578.00 Tm (Jobs                          56                                                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 568.00 Tm (Succeeded jobs                56                                                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 558.00 Tm (Failed jobs                   0                                                           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 548.00 Tm (Queued jobs                   0                                                           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 538.00 Tm (Timed jobs                    56                                                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 528.00 Tm (Assets                        8                                                           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 518.00 Tm (Frames                        2032                                                        ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 508.00 Tm (Candidate detections          1610867                                                     ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 498.00 Tm (Worker sessions               8                                                           ) Tj ET
+BT /F1 10 Tf 1 0 0 1 48.00 482.00 Tm (Timing comes from logs.duration_ms for processing and worker events, plus processing_jobs) Tj ET
+BT /F1 10 Tf 1 0 0 1 48.00 469.00 Tm (created_at/started_at/finished_at for queue wait and job runtime. Percentiles are computed in) Tj ET
+BT /F1 10 Tf 1 0 0 1 48.00 456.00 Tm (PostgreSQL.) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 437.00 Tm (Duration by Event) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 419.00 Tm (event_type                  logger                    n      avg       p50       p90       p95       max       total    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 409.00 Tm (------------------          ------------------        -----  --------  --------  --------  --------  --------  ---------) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 399.00 Tm (job.handler_completed       pelagia                   56     79.89s    59.73s    143.44s   287.09s   388.85s   4473.92s ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 389.00 Tm (segmentation.frame_complet  pelagia.processing.detec  2264   1.07s     456.6ms   2.71s     4.03s     8.81s     2431.07s ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 379.00 Tm (ed                          tion_candidate                                                                              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 369.00 Tm (video_ingest.completed      pelagia.processing.inges  8      42.63s    42.58s    43.13s    43.22s    43.31s    341.07s  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 359.00 Tm (                            t                                                                                           ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 337.00 Tm (Job Lifecycle by Stage) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 319.00 Tm (stage               status        n      avg wait    p50 wait    avg run     p50 run     p95 run     max run   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 309.00 Tm (------------------  ------------  -----  ----------  ----------  ----------  ----------  ----------  ----------) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 299.00 Tm (extract_frames      succeeded     8      544.0ms     286.2ms     42.66s      42.62s      43.25s      43.33s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 289.00 Tm (segment             succeeded     24     50.76s      36.91s      111.67s     59.50s      365.07s     387.43s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 279.00 Tm (preprocess_frames   succeeded     24     62.98s      72.11s      60.13s      70.32s      73.90s      74.01s    ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 257.00 Tm (Worker Handler Timing) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 239.00 Tm (stage               worker                  n      avg         p50         p95         max       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 229.00 Tm (------------------  ------------------      -----  ----------  ----------  ----------  ----------) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 219.00 Tm (extract_frames      general-8               1      43.33s      43.33s      43.33s      43.33s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 209.00 Tm (extract_frames      general-7               1      43.08s      43.08s      43.08s      43.08s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 199.00 Tm (extract_frames      general-5               1      43.01s      43.01s      43.01s      43.01s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 189.00 Tm (extract_frames      general-3               1      42.70s      42.70s      42.70s      42.70s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 179.00 Tm (extract_frames      general-4               1      42.52s      42.52s      42.52s      42.52s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 169.00 Tm (extract_frames      general-2               1      42.49s      42.49s      42.49s      42.49s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 159.00 Tm (extract_frames      general-1               1      42.31s      42.31s      42.31s      42.31s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 149.00 Tm (extract_frames      general-6               1      41.82s      41.82s      41.82s      41.82s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 139.00 Tm (preprocess_frames   general-5               3      72.59s      72.62s      73.20s      73.27s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 129.00 Tm (preprocess_frames   general-8               3      71.91s      71.83s      72.88s      72.99s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 119.00 Tm (preprocess_frames   general-6               3      61.32s      70.18s      73.63s      74.01s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 109.00 Tm (preprocess_frames   general-4               3      60.07s      67.64s      73.37s      74.01s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 99.00 Tm (preprocess_frames   general-7               3      59.12s      70.47s      70.87s      70.91s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 89.00 Tm (preprocess_frames   general-1               3      58.10s      65.87s      70.97s      71.53s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 79.00 Tm (preprocess_frames   general-2               3      49.54s      39.25s      68.00s      71.19s    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 69.00 Tm (preprocess_frames   general-3               3      48.38s      37.84s      66.36s      69.53s    ) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R /F2 10 0 R /F3 11 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 10375 >>
+stream
+BT /F3 8 Tf 1 0 0 1 48.00 744.00 Tm (segment             general-8               2      196.15s     196.15s     320.01s     333.77s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 734.00 Tm (segment             general-1               3      150.67s     41.72s      339.28s     372.34s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 724.00 Tm (segment             general-2               3      134.08s     112.37s     255.61s     271.53s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 714.00 Tm (segment             general-6               4      115.24s     26.92s      335.29s     388.85s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 704.00 Tm (segment             general-7               2      104.14s     104.14s     106.77s     107.06s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 694.00 Tm (segment             general-5               3      91.57s      60.94s      166.55s     178.29s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 684.00 Tm (segment             general-3               3      91.24s      61.95s      163.25s     174.51s   ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 674.00 Tm (segment             general-4               4      56.32s      45.60s      93.97s      100.71s   ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 652.00 Tm (Throughput Estimates) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 634.00 Tm (event_type                      n      units       total time    units/s     avg event ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 624.00 Tm (------------------              -----  ----------  ------------  ----------  ----------) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 614.00 Tm (segmentation.frame_completed    2264   2273218     2431.07s      935.07      1.07s     ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 604.00 Tm (video_ingest.completed          8      8104        341.07s       23.76       42.63s    ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 582.00 Tm (Slowest Timed Logs) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 564.00 Tm (created_at          event                       logger                  duration    worker          message                            ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 554.00 Tm (------------------  ------------------          ------------------      ----------  --------------  ------------------                 ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 544.00 Tm (2026-06-09          job.handler_completed       pelagia                 388.85s     general-6       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 534.00 Tm (17:01:32                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 524.00 Tm (2026-06-09          job.handler_completed       pelagia                 372.34s     general-1       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 514.00 Tm (17:01:23                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 504.00 Tm (2026-06-09          job.handler_completed       pelagia                 333.77s     general-8       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 494.00 Tm (17:00:25                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 484.00 Tm (2026-06-09          job.handler_completed       pelagia                 271.53s     general-2       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 474.00 Tm (17:00:34                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 464.00 Tm (2026-06-09          job.handler_completed       pelagia                 178.29s     general-5       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 454.00 Tm (16:58:27                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 444.00 Tm (2026-06-09          job.handler_completed       pelagia                 174.51s     general-3       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 434.00 Tm (16:58:25                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 424.00 Tm (2026-06-09          job.handler_completed       pelagia                 112.37s     general-2       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 414.00 Tm (16:56:03                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 404.00 Tm (2026-06-09          job.handler_completed       pelagia                 107.06s     general-7       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 394.00 Tm (16:55:40                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 384.00 Tm (2026-06-09          job.handler_completed       pelagia                 101.22s     general-7       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 374.00 Tm (16:57:21                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 364.00 Tm (2026-06-09          job.handler_completed       pelagia                 100.71s     general-4       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 354.00 Tm (16:56:06                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 344.00 Tm (2026-06-09          job.handler_completed       pelagia                 74.01s      general-6       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 334.00 Tm (16:50:54                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 324.00 Tm (2026-06-09          job.handler_completed       pelagia                 74.01s      general-4       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 314.00 Tm (16:50:54                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 304.00 Tm (2026-06-09          job.handler_completed       pelagia                 73.27s      general-5       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 294.00 Tm (16:53:17                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 284.00 Tm (2026-06-09          job.handler_completed       pelagia                 72.99s      general-8       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 274.00 Tm (16:53:16                                                                                                                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 264.00 Tm (2026-06-09          job.handler_completed       pelagia                 72.62s      general-5       Worker completed job handler       ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 254.00 Tm (16:52:03                                                                                                                               ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 232.00 Tm (Slowest Jobs) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 214.00 Tm (job_id              stage             status      worker          queue       runtime     summary                               ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 204.00 Tm (------------------  ----------------  ----------  --------------  ----------  ----------  ------------------                    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 194.00 Tm (17ac5014-531a-47e9  segment           succeeded   -               72.61s      387.43s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 184.00 Tm (-98de-135361e4f114                                                                        45b8a2cb-bcac-4c7b-9b3c-ccd388bb0bcc  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 174.00 Tm (1c6e8eab-64df-4ffa  segment           succeeded   -               79.76s      370.88s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 164.00 Tm (-99a5-c9d48dc2ae54                                                                        45b8a2cb-bcac-4c7b-9b3c-ccd388bb0bcc  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 154.00 Tm (8e825e3b-86bf-462d  segment           succeeded   -               60.13s      332.13s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 144.00 Tm (-9725-c005eb75dae1                                                                        45b8a2cb-bcac-4c7b-9b3c-ccd388bb0bcc  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 134.00 Tm (107d2664-f7d1-4840  segment           succeeded   -               131.86s     270.60s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 124.00 Tm (-b092-a0a4f9762a42                                                                        397b5bf0-f84a-4a61-b626-f626e0f76f90  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 114.00 Tm (b880e679-ee4e-4d5c  segment           succeeded   -               97.27s      177.72s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 104.00 Tm (-bb9c-426dc57acaf5                                                                        4697c7de-918f-40ce-b216-a7ebfe3f883d  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 94.00 Tm (afa647e5-c288-4aef  segment           succeeded   -               99.30s      173.79s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 84.00 Tm (-b99b-c1abab889b6c                                                                        4697c7de-918f-40ce-b216-a7ebfe3f883d  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 74.00 Tm (d9a27b94-86de-4fb5  segment           succeeded   -               19.62s      111.97s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 64.00 Tm (-952b-0472cf73d186                                                                        aa711af4-8697-4edd-9465-7330786200f2  ) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R /F2 10 0 R /F3 11 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 4191 >>
+stream
+BT /F3 8 Tf 1 0 0 1 48.00 744.00 Tm (14baddad-eec1-45bd  segment           succeeded   -               1.72s       106.76s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 734.00 Tm (-960e-66a9f5176d34                                                                        b456fbfe-a3da-494f-a2f2-0f568edd2a1a  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 724.00 Tm (8d87d709-eb52-4ab1  segment           succeeded   -               108.61s     100.87s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 714.00 Tm (-a5c9-0e2883545380                                                                        4697c7de-918f-40ce-b216-a7ebfe3f883d  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 704.00 Tm (cf22d91c-1c2e-4a6b  segment           succeeded   -               34.27s      100.40s     segment queued for asset              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 694.00 Tm (-870b-b16a28075bd5                                                                        aa711af4-8697-4edd-9465-7330786200f2  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 684.00 Tm (d65d5c81-5ae9-461c  preprocess_frame  succeeded   -               1.37s       74.01s      preprocess queued for asset           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 674.00 Tm (-8be4-d42a3d97284a  s                                                                     b456fbfe-a3da-494f-a2f2-0f568edd2a1a  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 664.00 Tm (2223748c-a786-4eb7  preprocess_frame  succeeded   -               1.36s       74.01s      preprocess queued for asset           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 654.00 Tm (-a5d1-a825d4eeee26  s                                                                     b456fbfe-a3da-494f-a2f2-0f568edd2a1a  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 644.00 Tm (2ecea0fe-e7f3-4d74  preprocess_frame  succeeded   -               144.78s     73.27s      preprocess queued for asset           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 634.00 Tm (-b9aa-e84ef182b74b  s                                                                     397b5bf0-f84a-4a61-b626-f626e0f76f90  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 624.00 Tm (3984004b-82dd-456d  preprocess_frame  succeeded   -               143.91s     73.00s      preprocess queued for asset           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 614.00 Tm (-a7c5-67b1d7dda115  s                                                                     397b5bf0-f84a-4a61-b626-f626e0f76f90  ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 604.00 Tm (5ba7ed55-4dbc-43dc  preprocess_frame  succeeded   -               72.31s      72.62s      preprocess queued for asset           ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 594.00 Tm (-b463-9c04ef920827  s                                                                     1cedaa0e-4673-4b28-8b8d-1e9a4c00ad7f  ) Tj ET
+BT /F2 14 Tf 1 0 0 1 48.00 572.00 Tm (Recent Warnings and Errors) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 554.00 Tm (created_at          level     event                         worker          message                                         ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 544.00 Tm (------------------  --------  ------------------            --------------  ------------------                              ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 534.00 Tm (2026-06-09          warning   job.requeued                  -               Job event job.requeued                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 524.00 Tm (17:00:23                                                                                                                    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 514.00 Tm (2026-06-09          warning   job.requeued                  -               Job event job.requeued                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 504.00 Tm (17:00:23                                                                                                                    ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 494.00 Tm (2026-06-09          warning   job.requeued                  -               Job event job.requeued                          ) Tj ET
+BT /F3 8 Tf 1 0 0 1 48.00 484.00 Tm (16:59:53                                                                                                                    ) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+10 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+11 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000133 00000 n 
+0000000281 00000 n 
+0000007984 00000 n 
+0000008132 00000 n 
+0000018560 00000 n 
+0000018708 00000 n 
+0000022951 00000 n 
+0000023021 00000 n 
+0000023097 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+23166
+%%EOF
