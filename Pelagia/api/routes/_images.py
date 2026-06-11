@@ -9,6 +9,99 @@ import cv2
 import numpy as np
 
 
+def pad_image_to_square(array, *, fill_value: int | float = 0) -> np.ndarray:
+    """Center an image on a square canvas using the longest image dimension."""
+    image = np.asarray(array)
+    if image.ndim < 2:
+        raise HTTPException(status_code=422, detail="Square padding requires at least 2D image data.")
+
+    height, width = image.shape[:2]
+    if height < 1 or width < 1:
+        raise HTTPException(status_code=422, detail="Square padding requires non-empty image data.")
+    side = max(height, width)
+    if height == side and width == side:
+        return np.ascontiguousarray(image)
+
+    canvas_shape = (side, side, *image.shape[2:])
+    canvas = np.full(canvas_shape, fill_value, dtype=image.dtype)
+    y0 = (side - height) // 2
+    x0 = (side - width) // 2
+    canvas[y0:y0 + height, x0:x0 + width, ...] = image
+    return np.ascontiguousarray(canvas)
+
+
+def invert_image(array) -> np.ndarray:
+    """Invert image intensity while preserving dtype."""
+    image = np.asarray(array)
+    if np.issubdtype(image.dtype, np.integer):
+        info = np.iinfo(image.dtype)
+        inverted = info.max - image
+    elif np.issubdtype(image.dtype, np.floating):
+        max_value = 1.0 if image.size == 0 else float(np.nanmax(image))
+        inverted = max_value - image
+    else:
+        raise HTTPException(status_code=422, detail="Image inversion requires numeric image data.")
+    return np.ascontiguousarray(inverted.astype(image.dtype, copy=False))
+
+
+def add_scale_bar(
+    array,
+    *,
+    length_px: int | None = None,
+    height_px: int = 4,
+    margin_px: int = 8,
+    color: str = "white",
+) -> np.ndarray:
+    """Draw a simple lower-left pixel scale bar onto an image."""
+    image = np.array(array, copy=True)
+    if image.ndim < 2:
+        raise HTTPException(status_code=422, detail="Scale bar requires at least 2D image data.")
+
+    image_height, image_width = image.shape[:2]
+    if image_height < 1 or image_width < 1:
+        raise HTTPException(status_code=422, detail="Scale bar requires non-empty image data.")
+    if height_px < 1:
+        raise HTTPException(status_code=422, detail="scale_bar_height_px must be >= 1.")
+    if margin_px < 0:
+        raise HTTPException(status_code=422, detail="scale_bar_margin_px must be >= 0.")
+
+    available_width = image_width - (2 * int(margin_px))
+    if available_width < 1:
+        raise HTTPException(status_code=422, detail="Image is too small for the requested scale bar margin.")
+    resolved_length = int(length_px) if length_px is not None else max(1, min(50, available_width // 4))
+    if resolved_length < 1:
+        raise HTTPException(status_code=422, detail="scale_bar_length_px must be >= 1.")
+    if resolved_length > available_width:
+        raise HTTPException(status_code=422, detail="scale_bar_length_px exceeds available image width.")
+
+    resolved_height = min(int(height_px), image_height)
+    x0 = int(margin_px)
+    y1 = image_height - int(margin_px)
+    if y1 <= 0:
+        y1 = image_height
+    y0 = max(0, y1 - resolved_height)
+    x1 = min(image_width, x0 + resolved_length)
+    image[y0:y1, x0:x1, ...] = _scale_bar_value(image, color)
+    return np.ascontiguousarray(image)
+
+
+def _scale_bar_value(image: np.ndarray, color: str):
+    normalized = str(color).strip().lower()
+    if normalized not in {"white", "black"}:
+        raise HTTPException(status_code=422, detail="scale_bar_color must be one of: white, black.")
+    if np.issubdtype(image.dtype, np.integer):
+        info = np.iinfo(image.dtype)
+        value = info.max if normalized == "white" else info.min
+    elif np.issubdtype(image.dtype, np.floating):
+        value = 1.0 if normalized == "white" else 0.0
+    else:
+        raise HTTPException(status_code=422, detail="Scale bar requires numeric image data.")
+    if image.ndim == 2:
+        return value
+    channels = image.shape[2]
+    return np.array([value] * channels, dtype=image.dtype)
+
+
 def preview_image(array, max_dim: int) -> np.ndarray:
     if max_dim < 1:
         raise HTTPException(status_code=422, detail="preview_max_dim must be >= 1.")

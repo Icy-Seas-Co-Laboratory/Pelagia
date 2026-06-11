@@ -11,33 +11,146 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     import numpy as np
 
+    from ..schemas import DetectionDetailResponse, DetectionImageMatrixResponse, DetectionsListResponse
     from ...processing.frame_codec import decode_array_payload
     from ._common import as_response, detection_summary, get_repository, page_metadata
-    from ._images import encode_image, scale_image
+    from ._images import (
+        add_scale_bar,
+        encode_image,
+        invert_image,
+        pad_image_to_square,
+        resize_image_to_dimension,
+        scale_image,
+    )
 
     router = APIRouter(prefix="/detections", tags=["detections"])
 
-    def _detection_image_array(detection: dict) -> np.ndarray:
-        payload = detection.get("roi_payload")
+    def _detection_payload_array(detection: dict, payload_kind: str) -> np.ndarray:
+        if payload_kind not in {"roi", "mask"}:
+            raise HTTPException(status_code=422, detail="payload_kind must be one of: roi, mask.")
+
+        payload = detection.get(f"{payload_kind}_payload")
         if payload is None:
+            label = "ROI image" if payload_kind == "roi" else "ROI mask"
             raise HTTPException(
                 status_code=404,
-                detail=f"Detection {detection.get('id')!r} has no ROI image payload.",
+                detail=f"Detection {detection.get('id')!r} has no {label} payload.",
             )
         try:
             return decode_array_payload(
                 payload,
                 {
-                    "kvstore_encoding": detection.get("roi_encoding"),
-                    "kvstore_format": detection.get("roi_format"),
-                    "dtype": detection.get("roi_dtype"),
-                    "shape": detection.get("roi_shape"),
+                    "kvstore_encoding": detection.get(f"{payload_kind}_encoding"),
+                    "kvstore_format": detection.get(f"{payload_kind}_format"),
+                    "dtype": detection.get(f"{payload_kind}_dtype"),
+                    "shape": detection.get(f"{payload_kind}_shape"),
                 },
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    @router.get("")
+    def _detection_payload_response(
+        *,
+        detection: dict,
+        detection_id: str,
+        payload_kind: str,
+        format: str,
+        scale: float,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        array = _detection_payload_array(detection, payload_kind)
+        requested = format.lower()
+        source_height, source_width = np.asarray(array).shape[:2]
+        transformed = np.asarray(array)
+        square_padding_requested = bool(pad_square or square)
+        if square_padding_requested:
+            transformed = pad_image_to_square(transformed)
+        if invert:
+            transformed = invert_image(transformed)
+        delivered = (
+            resize_image_to_dimension(transformed, width=width, height=height)
+            if width is not None or height is not None
+            else scale_image(transformed, scale)
+        )
+        if scale_bar:
+            delivered = add_scale_bar(
+                delivered,
+                length_px=scale_bar_length_px,
+                height_px=scale_bar_height_px,
+                margin_px=scale_bar_margin_px,
+                color=scale_bar_color,
+            )
+        delivered_height, delivered_width = np.asarray(delivered).shape[:2]
+        response_scale_x = delivered_width / source_width
+        response_scale_y = delivered_height / source_height
+
+        if requested == "matrix":
+            matrix = np.asarray(delivered)
+            return as_response(
+                {
+                    "detection_id": detection_id,
+                    "frame_id": detection.get("frame_id"),
+                    "asset_id": detection.get("asset_id"),
+                    "payload_kind": payload_kind,
+                    "dtype": str(matrix.dtype),
+                    "shape": list(matrix.shape),
+                    "scale": None if width is not None or height is not None else scale,
+                    "requested_width": width,
+                    "requested_height": height,
+                    "pad_square": square_padding_requested,
+                    "inverted": invert,
+                    "scale_bar": scale_bar,
+                    "data": matrix.tolist(),
+                }
+            )
+
+        payload, media_type = encode_image(delivered, requested)
+        extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="{detection_id}_{payload_kind}.{extension}"'
+                ),
+                "X-Pelagia-Detection-Id": str(detection_id),
+                "X-Pelagia-Payload-Kind": payload_kind,
+                "X-Pelagia-Source-Width": str(source_width),
+                "X-Pelagia-Source-Height": str(source_height),
+                "X-Pelagia-Image-Width": str(delivered_width),
+                "X-Pelagia-Image-Height": str(delivered_height),
+                "X-Pelagia-Scale-X": str(response_scale_x),
+                "X-Pelagia-Scale-Y": str(response_scale_y),
+                "X-Pelagia-Scale": str(scale),
+                "X-Pelagia-Pad-Square": str(square_padding_requested).lower(),
+                "X-Pelagia-Inverted": str(bool(invert)).lower(),
+                "X-Pelagia-Scale-Bar": str(bool(scale_bar)).lower(),
+            },
+        )
+
+    _IMAGE_RESPONSES = {
+        200: {
+            "content": {
+                "image/png": {},
+                "image/jpeg": {},
+                "application/json": {"schema": DetectionImageMatrixResponse.model_json_schema()},
+            },
+            "description": "Detection ROI/mask image bytes or matrix data.",
+        },
+        404: {"description": "Detection or requested payload was not found."},
+        422: {"description": "Unsupported image options."},
+    }
+
+    @router.get("", response_model=DetectionsListResponse)
     def list_detections(
         request: Request,
         run_id: str | None = None,
@@ -103,51 +216,129 @@ if APIRouter is not None:
             "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
         }
 
-    @router.get("/{detection_id}")
+    @router.get("/{detection_id}", response_model=DetectionDetailResponse)
     def get_detection(request: Request, detection_id: str) -> dict:
         detection = get_repository(request).get_detection(detection_id)
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return {"detection": as_response(detection)}
 
-    @router.get("/{detection_id}/framedata")
+    @router.head("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)
+    @router.get("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)
     def get_detection_frame_data(
         request: Request,
         detection_id: str,
         format: str = "png",
         scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
     ):
         detection = get_repository(request).get_detection(detection_id)
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
 
-        array = _detection_image_array(detection)
-        requested = format.lower()
-        if requested == "matrix":
-            matrix = np.asarray(scale_image(array, scale))
-            return as_response(
-                {
-                    "detection_id": detection_id,
-                    "frame_id": detection.get("frame_id"),
-                    "asset_id": detection.get("asset_id"),
-                    "dtype": str(matrix.dtype),
-                    "shape": list(matrix.shape),
-                    "scale": scale,
-                    "data": matrix.tolist(),
-                }
-            )
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=detection_id,
+            payload_kind="roi",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
 
-        payload, media_type = encode_image(scale_image(array, scale), requested)
-        extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
-        return Response(
-            content=payload,
-            media_type=media_type,
-            headers={
-                "Content-Disposition": (
-                    f'inline; filename="{detection_id}_framedata.{extension}"'
-                ),
-                "X-Pelagia-Scale": str(scale),
-            },
+    @router.head("/{detection_id}/roi", responses=_IMAGE_RESPONSES)
+    @router.get("/{detection_id}/roi", responses=_IMAGE_RESPONSES)
+    def get_detection_roi(
+        request: Request,
+        detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_detection(detection_id)
+        if detection is None:
+            raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=detection_id,
+            payload_kind="roi",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
+
+    @router.head("/{detection_id}/mask", responses=_IMAGE_RESPONSES)
+    @router.get("/{detection_id}/mask", responses=_IMAGE_RESPONSES)
+    def get_detection_mask(
+        request: Request,
+        detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_detection(detection_id)
+        if detection is None:
+            raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=detection_id,
+            payload_kind="mask",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
         )
 else:
     router = None

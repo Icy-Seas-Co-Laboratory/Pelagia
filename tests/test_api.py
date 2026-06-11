@@ -121,6 +121,10 @@ class FakeRepository:
             "roi_format": "raw_ndarray_c_order",
             "roi_dtype": "uint8",
             "roi_shape": [2, 2],
+            "mask_encoding": "raw",
+            "mask_format": "raw_ndarray_c_order",
+            "mask_dtype": "uint8",
+            "mask_shape": [2, 2],
         }
         row.update(overrides)
         return row
@@ -131,9 +135,23 @@ class FakeRepository:
         ]
 
     def get_detection(self, detection_id):
-        if detection_id != "det-1":
-            return None
-        return self._detection_row()
+        if detection_id == "det-wide":
+            return self._detection_row(
+                id=detection_id,
+                roi_payload=np.array(
+                    [[0, 10, 20], [30, 40, 50]],
+                    dtype=np.uint8,
+                ).tobytes(order="C"),
+                roi_shape=[2, 3],
+                mask_payload=np.array(
+                    [[0, 255, 0], [255, 0, 255]],
+                    dtype=np.uint8,
+                ).tobytes(order="C"),
+                mask_shape=[2, 3],
+            )
+        if detection_id == "det-1":
+            return self._detection_row()
+        return None
 
     def list_asset_detection_stats(self, **kwargs):
         return {
@@ -1028,6 +1046,116 @@ def test_api_detection_framedata_returns_matrix_and_png():
     assert png_response.content.startswith(b"\x89PNG")
 
 
+def test_api_detection_roi_endpoint_returns_matrix_and_images():
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/detections/det-1/roi?format=matrix")
+    png_response = client.get("/detections/det-1/roi?format=png")
+    jpg_response = client.get("/detections/det-1/roi?format=jpg&width=1")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["payload_kind"] == "roi"
+    assert matrix_response.json()["shape"] == [2, 2]
+    assert matrix_response.json()["data"] == [[0, 128], [255, 64]]
+    assert png_response.status_code == 200
+    assert png_response.headers["content-type"] == "image/png"
+    assert png_response.headers["x-pelagia-payload-kind"] == "roi"
+    assert png_response.headers["x-pelagia-source-width"] == "2"
+    assert png_response.headers["x-pelagia-image-width"] == "2"
+    assert png_response.content.startswith(b"\x89PNG")
+    assert jpg_response.status_code == 200
+    assert jpg_response.headers["content-type"] == "image/jpeg"
+    assert jpg_response.headers["x-pelagia-image-width"] == "1"
+
+
+def test_api_detection_roi_mask_and_framedata_support_head():
+    client, _, _ = make_client()
+
+    for path, payload_kind in [
+        ("/detections/det-1/framedata", "roi"),
+        ("/detections/det-1/roi", "roi"),
+        ("/detections/det-1/mask", "mask"),
+    ]:
+        response = client.head(f"{path}?format=png")
+
+        assert response.status_code == 200
+        assert response.content == b""
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["x-pelagia-payload-kind"] == payload_kind
+        assert response.headers["x-pelagia-source-width"] == "2"
+        assert response.headers["x-pelagia-image-width"] == "2"
+
+
+def test_api_detection_mask_endpoint_returns_matrix_and_png():
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/detections/det-1/mask?format=matrix")
+    png_response = client.get("/detections/det-1/mask?format=png&height=1")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["payload_kind"] == "mask"
+    assert matrix_response.json()["shape"] == [2, 2]
+    assert matrix_response.json()["data"] == [[109, 97], [115, 107]]
+    assert png_response.status_code == 200
+    assert png_response.headers["content-type"] == "image/png"
+    assert png_response.headers["x-pelagia-payload-kind"] == "mask"
+    assert png_response.headers["x-pelagia-image-height"] == "1"
+    assert png_response.content.startswith(b"\x89PNG")
+
+
+def test_api_detection_roi_can_pad_square_then_invert():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/detections/det-wide/roi?format=matrix&pad_square=true&invert=true"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payload_kind"] == "roi"
+    assert body["shape"] == [3, 3]
+    assert body["pad_square"] is True
+    assert body["inverted"] is True
+    assert body["data"] == [
+        [255, 245, 235],
+        [225, 215, 205],
+        [255, 255, 255],
+    ]
+
+
+def test_api_detection_roi_can_add_scale_bar_after_padding_and_inversion():
+    client, _, _ = make_client()
+
+    matrix_response = client.get(
+        "/detections/det-wide/roi"
+        "?format=matrix&square=true&invert=true"
+        "&scale_bar=true&scale_bar_length_px=2&scale_bar_height_px=1"
+        "&scale_bar_margin_px=0&scale_bar_color=black"
+    )
+    png_response = client.get(
+        "/detections/det-wide/roi"
+        "?format=png&square=true&invert=true&scale_bar=true"
+        "&scale_bar_length_px=2&scale_bar_height_px=1"
+        "&scale_bar_margin_px=0&scale_bar_color=black"
+    )
+
+    assert matrix_response.status_code == 200
+    body = matrix_response.json()
+    assert body["shape"] == [3, 3]
+    assert body["scale_bar"] is True
+    assert body["data"] == [
+        [255, 245, 235],
+        [225, 215, 205],
+        [0, 0, 255],
+    ]
+    assert png_response.status_code == 200
+    assert png_response.headers["x-pelagia-pad-square"] == "true"
+    assert png_response.headers["x-pelagia-inverted"] == "true"
+    assert png_response.headers["x-pelagia-scale-bar"] == "true"
+    assert png_response.headers["x-pelagia-image-width"] == "3"
+    assert png_response.headers["x-pelagia-image-height"] == "3"
+
+
 def test_api_detection_framedata_accepts_scale():
     client, _, _ = make_client()
 
@@ -1041,6 +1169,23 @@ def test_api_detection_framedata_accepts_scale():
     assert png_response.headers["x-pelagia-scale"] == "0.5"
     decoded = cv2.imdecode(np.frombuffer(png_response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     assert decoded.shape == (1, 1)
+
+
+def test_openapi_documents_core_response_schemas_and_head_routes():
+    client, _, _ = make_client()
+
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    spec = response.json()
+    assert "DetectionsListResponse" in spec["components"]["schemas"]
+    assert "DetectionSummary" in spec["components"]["schemas"]
+    assert "FrameContextResponse" in spec["components"]["schemas"]
+    assert "SystemCapabilitiesResponse" in spec["components"]["schemas"]
+    assert "head" in spec["paths"]["/detections/{detection_id}/roi"]
+    assert "head" in spec["paths"]["/detections/{detection_id}/mask"]
+    assert "head" in spec["paths"]["/detections/{detection_id}/framedata"]
+    assert "head" in spec["paths"]["/assets/{asset_id}/framedata/{frame_num}"]
 
 
 def test_api_reports_asset_detection_stats():
@@ -1146,6 +1291,24 @@ def test_api_framedata_returns_matrix_and_png(monkeypatch):
     assert png_response.status_code == 200
     assert png_response.headers["content-type"] == "image/png"
     assert png_response.content.startswith(b"\x89PNG")
+
+
+def test_api_asset_framedata_supports_head(monkeypatch):
+    from Pelagia.api.routes import assets
+
+    class FakeFrame:
+        def read(self):
+            return np.array([[0, 255], [128, 64]], dtype=np.uint8)
+
+    monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
+    client, _, _ = make_client()
+
+    response = client.head("/assets/asset-1/framedata/2?format=png")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["x-pelagia-scale"] == "1.0"
 
 
 def test_api_framedata_accepts_scale(monkeypatch):

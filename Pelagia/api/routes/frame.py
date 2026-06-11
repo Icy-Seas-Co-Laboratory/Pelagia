@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     import numpy as np
 
+    from ..schemas import FrameContextResponse
     from ...domain import PipelineStage
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
@@ -236,7 +237,7 @@ if APIRouter is not None:
             }
         )
 
-    @frames_router.get("/{frame_id}/context")
+    @frames_router.get("/{frame_id}/context", response_model=FrameContextResponse)
     def get_frame_context(
         request: Request,
         frame_id: str,

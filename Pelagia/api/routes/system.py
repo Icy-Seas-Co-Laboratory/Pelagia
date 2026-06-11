@@ -7,6 +7,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..schemas import OptionsResponse, SystemCapabilitiesResponse
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
@@ -67,11 +68,11 @@ if APIRouter is not None:
             }
         )
 
-    @router.get("/capabilities")
+    @router.get("/capabilities", response_model=SystemCapabilitiesResponse)
     def get_system_capabilities(request: Request) -> dict:
         return as_response(system_capabilities(get_context(request).config))
 
-    @preprocessing_router.get("/options")
+    @preprocessing_router.get("/options", response_model=OptionsResponse)
     def get_preprocessing_options(request: Request) -> dict:
         return as_response(preprocessing_capabilities(get_context(request).config.processing))
 

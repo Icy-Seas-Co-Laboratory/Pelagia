@@ -9,6 +9,7 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     import numpy as np
 
+    from ..schemas import AssetDetailResponse, AssetsListResponse, DetectionsListResponse, FramesListResponse
     from ...processing.frame_correction import flatfield_global_correction_for_framedata
     from ...processing.frame_store import retrieve_frame
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
@@ -16,7 +17,7 @@ if APIRouter is not None:
 
     router = APIRouter(prefix="/assets", tags=["assets"])
 
-    @router.get("")
+    @router.get("", response_model=AssetsListResponse)
     def list_assets(
         request: Request,
         run_id: str | None = None,
@@ -100,7 +101,7 @@ if APIRouter is not None:
             }
         )
 
-    @router.get("/{asset_id}")
+    @router.get("/{asset_id}", response_model=AssetDetailResponse)
     def get_asset(request: Request, asset_id: str) -> dict:
         repository = get_repository(request)
         asset = repository.get_asset(asset_id)
@@ -110,7 +111,7 @@ if APIRouter is not None:
         asset["frame_count"] = repository.count_frames(asset_id)
         return {"asset": as_response(asset)}
 
-    @router.get("/{asset_id}/frames")
+    @router.get("/{asset_id}/frames", response_model=FramesListResponse)
     def list_frames(
         request: Request,
         asset_id: str,
@@ -128,6 +129,7 @@ if APIRouter is not None:
         )
         return {"frames": [frame_summary(frame) for frame in frames]}
 
+    @router.head("/{asset_id}/framedata/{frame_num}")
     @router.get("/{asset_id}/framedata/{frame_num}")
     def get_frame_data(
         request: Request,
@@ -233,7 +235,7 @@ if APIRouter is not None:
             },
         )
 
-    @router.get("/{asset_id}/detections")
+    @router.get("/{asset_id}/detections", response_model=DetectionsListResponse)
     def list_detections(
         request: Request,
         asset_id: str,

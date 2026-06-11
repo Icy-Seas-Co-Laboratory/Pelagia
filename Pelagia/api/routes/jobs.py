@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..schemas import JobDetailResponse, JobsListResponse
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -40,7 +41,7 @@ if APIRouter is not None:
 
     router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-    @router.get("")
+    @router.get("", response_model=JobsListResponse, response_model_exclude_none=True)
     def list_jobs(
         request: Request,
         run_id: str | None = None,
@@ -68,7 +69,7 @@ if APIRouter is not None:
         )
         return {"jobs": as_response(jobs)}
 
-    @router.post("")
+    @router.post("", response_model=JobDetailResponse, response_model_exclude_none=True)
     def create_job(request: Request, body: CreateJobRequest) -> dict:
         repository = get_repository(request)
         job = repository.create_job(
@@ -103,7 +104,7 @@ if APIRouter is not None:
         )
         return {"events": as_response(events)}
 
-    @router.get("/{job_id}")
+    @router.get("/{job_id}", response_model=JobDetailResponse, response_model_exclude_none=True)
     def get_job(request: Request, job_id: str) -> dict:
         repository = get_repository(request)
         job = repository.get_job(job_id)
@@ -111,7 +112,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Job {job_id!r} was not found.")
         return {"job": as_response(job)}
 
-    @router.post("/{job_id}/pause")
+    @router.post("/{job_id}/pause", response_model=JobDetailResponse, response_model_exclude_none=True)
     def pause_job(request: Request, job_id: str, body: ReasonRequest | None = None) -> dict:
         repository = get_repository(request)
         job = repository.pause_job(job_id, reason=None if body is None else body.reason)
@@ -119,7 +120,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Job {job_id!r} was not found.")
         return {"job": as_response(job)}
 
-    @router.post("/{job_id}/resume")
+    @router.post("/{job_id}/resume", response_model=JobDetailResponse, response_model_exclude_none=True)
     def resume_job(request: Request, job_id: str, body: ReasonRequest | None = None) -> dict:
         repository = get_repository(request)
         job = repository.resume_job(job_id, reason=None if body is None else body.reason)
@@ -127,7 +128,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Paused job {job_id!r} was not found.")
         return {"job": as_response(job)}
 
-    @router.post("/{job_id}/retry")
+    @router.post("/{job_id}/retry", response_model=JobDetailResponse, response_model_exclude_none=True)
     def retry_job(request: Request, job_id: str) -> dict:
         repository = get_repository(request)
         job = repository.retry_job(job_id)
@@ -138,7 +139,7 @@ if APIRouter is not None:
             )
         return {"job": as_response(job)}
 
-    @router.post("/{job_id}/priority")
+    @router.post("/{job_id}/priority", response_model=JobDetailResponse, response_model_exclude_none=True)
     def set_job_priority(request: Request, job_id: str, body: PriorityRequest) -> dict:
         repository = get_repository(request)
         job = repository.set_job_priority(job_id, body.priority, reason=body.reason)

@@ -7,6 +7,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..schemas import AssetsListResponse, JobsListResponse, RunDetailResponse, RunsListResponse
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -17,7 +18,7 @@ if APIRouter is not None:
 
     router = APIRouter(prefix="/runs", tags=["runs"])
 
-    @router.get("")
+    @router.get("", response_model=RunsListResponse)
     def list_runs(
         request: Request,
         limit: int = 100,
@@ -44,14 +45,14 @@ if APIRouter is not None:
             )
         }
 
-    @router.get("/{run_id}")
+    @router.get("/{run_id}", response_model=RunDetailResponse)
     def get_run(request: Request, run_id: str) -> dict:
         run = get_repository(request).get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id!r} was not found.")
         return {"run": as_response(run)}
 
-    @router.get("/{run_id}/assets")
+    @router.get("/{run_id}/assets", response_model=AssetsListResponse)
     def list_run_assets(
         request: Request,
         run_id: str,
@@ -84,7 +85,7 @@ if APIRouter is not None:
             )
         }
 
-    @router.get("/{run_id}/jobs")
+    @router.get("/{run_id}/jobs", response_model=JobsListResponse)
     def list_run_jobs(
         request: Request,
         run_id: str,
@@ -103,14 +104,14 @@ if APIRouter is not None:
             )
         }
 
-    @router.post("/{run_id}/cancel")
+    @router.post("/{run_id}/cancel", response_model=RunDetailResponse)
     def cancel_run(request: Request, run_id: str) -> dict:
         run = get_repository(request).cancel_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id!r} was not found.")
         return {"run": as_response(run)}
 
-    @router.post("/{run_id}/reconcile")
+    @router.post("/{run_id}/reconcile", response_model=RunDetailResponse)
     def reconcile_run(request: Request, run_id: str) -> dict:
         run = get_repository(request).reconcile_run(run_id)
         if run is None:

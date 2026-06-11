@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..schemas import OptionsResponse
     from ...processing.frame_store import retrieve_frame
     from ...processing.detection_candidate import segment_frame
     from ...processing.segmentation_options import (
@@ -184,7 +185,7 @@ if APIRouter is not None:
             "stage_durations_ms": dict(metadata.get("stage_durations_ms") or {}),
         }
 
-    @router.get("/options")
+    @router.get("/options", response_model=OptionsResponse)
     def get_segmentation_options(request: Request) -> dict:
         return as_response(segmentation_capabilities(get_context(request).config.processing))
 
