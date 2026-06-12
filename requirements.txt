@@ -1,0 +1,3 @@
+# Core Pelagia package and the dependencies needed for the local API, CLI,
+# Postgres-backed queue/catalog, and blake3-backed cold frame storage.
+-e ".[api,cli,postgres,kvstore-blake3]"

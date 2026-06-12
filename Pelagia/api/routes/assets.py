@@ -10,7 +10,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ..schemas import AssetDetailResponse, AssetsListResponse, DetectionsListResponse, FramesListResponse
-    from ...processing.frame_correction import flatfield_global_correction_for_framedata
+    from ...processing.frame_correction import divide_background, flatfield_correction as apply_flatfield_array_correction
     from ...processing.frame_store import retrieve_frame
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
     from ._images import encode_image, preview_image, scale_image
@@ -141,14 +141,12 @@ if APIRouter is not None:
         flatfield_correction: bool = False,
         flatfield_q: float | None = None,
         flatfield_axis: int | None = None,
+        flatfield_min_field_value: float | None = None,
+        flatfield_max_field_value: float | None = None,
         background_correction: bool = False,
+        background_min_field_value: float | None = None,
+        background_max_field_value: float | None = None,
     ):
-        if background_correction:
-            raise HTTPException(
-                status_code=501,
-                detail="background_correction is not implemented for framedata yet.",
-            )
-
         context = get_context(request)
         repository = get_repository(request)
         row = repository.get_frame_by_asset_index(asset_id, frame_num)
@@ -167,17 +165,61 @@ if APIRouter is not None:
             defaults = context.config.processing.flatfield
             resolved_q = defaults.flatfield_q if flatfield_q is None else flatfield_q
             resolved_axis = defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+            resolved_flatfield_min = (
+                defaults.flatfield_min_field_value
+                if flatfield_min_field_value is None
+                else flatfield_min_field_value
+            )
+            resolved_flatfield_max = (
+                defaults.flatfield_max_field_value
+                if flatfield_max_field_value is None
+                else flatfield_max_field_value
+            )
             try:
-                array = flatfield_global_correction_for_framedata(
+                array = apply_flatfield_array_correction(
                     array,
                     q=resolved_q,
                     axis=resolved_axis,
+                    min_field_value=resolved_flatfield_min,
+                    max_field_value=resolved_flatfield_max,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
         else:
             resolved_q = None
             resolved_axis = None
+            resolved_flatfield_min = None
+            resolved_flatfield_max = None
+
+        if background_correction:
+            defaults = context.config.processing.preprocessing
+            resolved_background_min = (
+                defaults.background_min_field_value
+                if background_min_field_value is None
+                else background_min_field_value
+            )
+            resolved_background_max = (
+                defaults.background_max_field_value
+                if background_max_field_value is None
+                else background_max_field_value
+            )
+            try:
+                background = getattr(frame, "bkg", None)
+                if background is None:
+                    raise ValueError(
+                        "background_correction requires a generated background field for this frame."
+                    )
+                array = divide_background(
+                    array,
+                    background=background,
+                    min_field_value=resolved_background_min,
+                    max_field_value=resolved_background_max,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        else:
+            resolved_background_min = None
+            resolved_background_max = None
 
         processing_headers = {
             "X-Pelagia-Flatfield-Correction": str(flatfield_correction).lower(),
@@ -187,6 +229,14 @@ if APIRouter is not None:
             processing_headers["X-Pelagia-Flatfield-Q"] = str(resolved_q)
         if resolved_axis is not None:
             processing_headers["X-Pelagia-Flatfield-Axis"] = str(resolved_axis)
+        if resolved_flatfield_min is not None:
+            processing_headers["X-Pelagia-Flatfield-Min-Field-Value"] = str(resolved_flatfield_min)
+        if resolved_flatfield_max is not None:
+            processing_headers["X-Pelagia-Flatfield-Max-Field-Value"] = str(resolved_flatfield_max)
+        if resolved_background_min is not None:
+            processing_headers["X-Pelagia-Background-Min-Field-Value"] = str(resolved_background_min)
+        if resolved_background_max is not None:
+            processing_headers["X-Pelagia-Background-Max-Field-Value"] = str(resolved_background_max)
 
         requested = format.lower()
         if requested == "matrix":
@@ -202,7 +252,12 @@ if APIRouter is not None:
                     "flatfield_correction": flatfield_correction,
                     "flatfield_q": resolved_q,
                     "flatfield_axis": resolved_axis,
+                    "flatfield_min_field_value": resolved_flatfield_min,
+                    "flatfield_max_field_value": resolved_flatfield_max,
                     "background_correction": background_correction,
+                    "background_method": "divide" if background_correction else None,
+                    "background_min_field_value": resolved_background_min,
+                    "background_max_field_value": resolved_background_max,
                     "data": matrix.tolist(),
                 }
             )

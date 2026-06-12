@@ -149,6 +149,27 @@ Pelagia/default.config.toml < ./config.toml < environment variables < explicit C
 
 The packaged [default.config.toml](Pelagia/default.config.toml) contains development-friendly defaults. Create a local `config.toml` in the repository root for machine-specific overrides; it is ignored by git.
 
+Model and plugin artifacts are split between packaged assets under
+`Pelagia/assets/` and a local runtime library under `./.pelagia/`. See
+[docs/artifacts.md](docs/artifacts.md) for the manifest layout and discovery
+rules.
+
+## Python Environment
+
+Pelagia provides requirements files for the common backend environments:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Use `requirements-dev.txt` for test/development tools and `requirements-ml.txt`
+for optional TensorFlow/Keras U-Net refinement support. See
+[docs/python-environment.md](docs/python-environment.md) for the full setup
+walkthrough.
+
 ## Storage Strategy
 
 Pelagia treats storage as a replaceable adapter layer.

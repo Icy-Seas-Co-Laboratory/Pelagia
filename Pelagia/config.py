@@ -97,6 +97,33 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class ArtifactModelsConfig:
+    """Model artifact discovery settings."""
+
+    builtin_enabled: bool = True
+    local_path: Path = Path("./.pelagia/models")
+    metadata_filename: str = "metadata.toml"
+
+
+@dataclass(slots=True)
+class ArtifactPluginsConfig:
+    """Plugin artifact discovery settings."""
+
+    builtin_enabled: bool = True
+    local_path: Path = Path("./.pelagia/plugins")
+    metadata_filename: str = "metadata.toml"
+
+
+@dataclass(slots=True)
+class ArtifactsConfig:
+    """Packaged and local model/plugin artifact locations."""
+
+    local_root: Path = Path("./.pelagia")
+    models: ArtifactModelsConfig = field(default_factory=ArtifactModelsConfig)
+    plugins: ArtifactPluginsConfig = field(default_factory=ArtifactPluginsConfig)
+
+
+@dataclass(slots=True)
 class MaskAugmentationProcessingConfig:
     """Default binary-mask augmentation parameters."""
 
@@ -134,7 +161,7 @@ class RoiFilterProcessingConfig:
 
     min_area: float | None = None
     max_area: float | None = None
-    min_perimeter: float = 50.0
+    min_perimeter: float | None = None
     max_perimeter: float | None = None
     min_width: float | None = None
     max_width: float | None = None
@@ -172,6 +199,8 @@ class FlatfieldProcessingConfig:
     flatfield_correction: bool = True
     flatfield_q: float = 0.9
     flatfield_axis: int = 0
+    flatfield_min_field_value: float = 1.0
+    flatfield_max_field_value: float | None = None
 
 
 @dataclass(slots=True)
@@ -208,7 +237,8 @@ class PreprocessingConfig:
     adaptive_background_subtraction: bool = False
     adaptive_background_period: int = 50
     background_correction: bool = False
-    background_percentile: float = 50.0
+    background_min_field_value: float = 1.0
+    background_max_field_value: float | None = None
     invert_intensity: bool = True
     crop_enabled: bool = False
     crop_x: int | None = None
@@ -239,6 +269,37 @@ class ThumbhashProcessingConfig:
 
 
 @dataclass(slots=True)
+class RoiRefinementProcessingConfig:
+    """Default ROI-mask refinement parameters."""
+
+    enabled: bool = False
+    model_kind: str = "keras_artifact"
+    model_ref: str | None = "builtin:model/roi_refinement/example_model"
+    model_run_dir: str | None = None
+    model_artifact: str = "auto"
+    tile_size: int = 256
+    overlap_fraction: float = 0.25
+    max_iterations: int = 3
+    expansion_pixels: int | None = None
+    edge_touch_margin: int = 1
+    output_threshold: float = 0.5
+    batch_size: int | None = None
+    encoding: str | None = None
+    overlap_reconciliation_enabled: bool = True
+    overlap_iou_threshold: float = 0.5
+    overlap_containment_threshold: float = 0.8
+    residual_discovery_enabled: bool = False
+    residual_max_iterations: int = 1
+    residual_roi_assembly_method: str | None = None
+    residual_roi_assembly_connectivity: int = 8
+    residual_min_area: float | None = None
+    residual_min_width: float | None = None
+    residual_min_height: float | None = None
+    residual_min_width_plus_height: float | None = None
+    residual_padding: int | None = None
+
+
+@dataclass(slots=True)
 class ProcessingConfig:
     """Processing defaults shared by CLI, API, workers, and direct function calls."""
 
@@ -252,6 +313,7 @@ class ProcessingConfig:
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     frame_storage: FrameStorageProcessingConfig = field(default_factory=FrameStorageProcessingConfig)
     thumbhash: ThumbhashProcessingConfig = field(default_factory=ThumbhashProcessingConfig)
+    roi_refinement: RoiRefinementProcessingConfig = field(default_factory=RoiRefinementProcessingConfig)
 
 
 @dataclass(slots=True)
@@ -264,6 +326,7 @@ class CoreConfig:
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
 
     @classmethod
@@ -388,11 +451,21 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "logging", "max_bytes", "PELAGIA_LOG_MAX_BYTES", int)
     _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
 
+    _set_from_env(settings, "artifacts", "local_root", "PELAGIA_ARTIFACTS_LOCAL_ROOT", Path)
+    _set_from_env(settings, "artifacts.models", "builtin_enabled", "PELAGIA_ARTIFACT_MODELS_BUILTIN_ENABLED", _env_bool)
+    _set_from_env(settings, "artifacts.models", "local_path", "PELAGIA_ARTIFACT_MODELS_LOCAL_PATH", Path)
+    _set_from_env(settings, "artifacts.models", "metadata_filename", "PELAGIA_ARTIFACT_MODELS_METADATA_FILENAME")
+    _set_from_env(settings, "artifacts.plugins", "builtin_enabled", "PELAGIA_ARTIFACT_PLUGINS_BUILTIN_ENABLED", _env_bool)
+    _set_from_env(settings, "artifacts.plugins", "local_path", "PELAGIA_ARTIFACT_PLUGINS_LOCAL_PATH", Path)
+    _set_from_env(settings, "artifacts.plugins", "metadata_filename", "PELAGIA_ARTIFACT_PLUGINS_METADATA_FILENAME")
+
     _set_from_env(settings, "processing.video_ingest", "n_tile", "PELAGIA_VIDEO_INGEST_N_TILE", int)
 
     _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
     _set_from_env(settings, "processing.flatfield", "flatfield_q", "PELAGIA_FLATFIELD_Q", float)
     _set_from_env(settings, "processing.flatfield", "flatfield_axis", "PELAGIA_FLATFIELD_AXIS", int)
+    _set_from_env(settings, "processing.flatfield", "flatfield_min_field_value", "PELAGIA_FLATFIELD_MIN_FIELD_VALUE", float)
+    _set_from_env(settings, "processing.flatfield", "flatfield_max_field_value", "PELAGIA_FLATFIELD_MAX_FIELD_VALUE", float)
 
     _set_from_env(settings, "processing.thresholding", "method", "PELAGIA_THRESHOLDING_METHOD")
     _set_from_env(settings, "processing.thresholding", "manual_threshold", "PELAGIA_THRESHOLDING_MANUAL_THRESHOLD", float)
@@ -454,7 +527,8 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.preprocessing", "adaptive_background_subtraction", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_SUBTRACTION", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "adaptive_background_period", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_PERIOD", int)
     _set_from_env(settings, "processing.preprocessing", "background_correction", "PELAGIA_PREPROCESSING_BACKGROUND_CORRECTION", _env_bool)
-    _set_from_env(settings, "processing.preprocessing", "background_percentile", "PELAGIA_PREPROCESSING_BACKGROUND_PERCENTILE", float)
+    _set_from_env(settings, "processing.preprocessing", "background_min_field_value", "PELAGIA_PREPROCESSING_BACKGROUND_MIN_FIELD_VALUE", float)
+    _set_from_env(settings, "processing.preprocessing", "background_max_field_value", "PELAGIA_PREPROCESSING_BACKGROUND_MAX_FIELD_VALUE", float)
     _set_from_env(settings, "processing.preprocessing", "invert_intensity", "PELAGIA_PREPROCESSING_INVERT_INTENSITY", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "crop_enabled", "PELAGIA_PREPROCESSING_CROP_ENABLED", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "crop_x", "PELAGIA_PREPROCESSING_CROP_X", int)
@@ -465,6 +539,32 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.frame_storage", "image_encoding", "PELAGIA_FRAME_STORAGE_IMAGE_ENCODING")
 
     _set_from_env(settings, "processing.thumbhash", "max_dim", "PELAGIA_THUMBHASH_MAX_DIM", int)
+
+    _set_from_env(settings, "processing.roi_refinement", "enabled", "PELAGIA_ROI_REFINEMENT_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.roi_refinement", "model_kind", "PELAGIA_ROI_REFINEMENT_MODEL_KIND")
+    _set_from_env(settings, "processing.roi_refinement", "model_ref", "PELAGIA_ROI_REFINEMENT_MODEL_REF")
+    _set_from_env(settings, "processing.roi_refinement", "model_run_dir", "PELAGIA_ROI_REFINEMENT_MODEL_RUN_DIR")
+    _set_from_env(settings, "processing.roi_refinement", "model_artifact", "PELAGIA_ROI_REFINEMENT_MODEL_ARTIFACT")
+    _set_from_env(settings, "processing.roi_refinement", "tile_size", "PELAGIA_ROI_REFINEMENT_TILE_SIZE", int)
+    _set_from_env(settings, "processing.roi_refinement", "overlap_fraction", "PELAGIA_ROI_REFINEMENT_OVERLAP_FRACTION", float)
+    _set_from_env(settings, "processing.roi_refinement", "max_iterations", "PELAGIA_ROI_REFINEMENT_MAX_ITERATIONS", int)
+    _set_from_env(settings, "processing.roi_refinement", "expansion_pixels", "PELAGIA_ROI_REFINEMENT_EXPANSION_PIXELS", int)
+    _set_from_env(settings, "processing.roi_refinement", "edge_touch_margin", "PELAGIA_ROI_REFINEMENT_EDGE_TOUCH_MARGIN", int)
+    _set_from_env(settings, "processing.roi_refinement", "output_threshold", "PELAGIA_ROI_REFINEMENT_OUTPUT_THRESHOLD", float)
+    _set_from_env(settings, "processing.roi_refinement", "batch_size", "PELAGIA_ROI_REFINEMENT_BATCH_SIZE", int)
+    _set_from_env(settings, "processing.roi_refinement", "encoding", "PELAGIA_ROI_REFINEMENT_ENCODING")
+    _set_from_env(settings, "processing.roi_refinement", "overlap_reconciliation_enabled", "PELAGIA_ROI_REFINEMENT_OVERLAP_RECONCILIATION_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.roi_refinement", "overlap_iou_threshold", "PELAGIA_ROI_REFINEMENT_OVERLAP_IOU_THRESHOLD", float)
+    _set_from_env(settings, "processing.roi_refinement", "overlap_containment_threshold", "PELAGIA_ROI_REFINEMENT_OVERLAP_CONTAINMENT_THRESHOLD", float)
+    _set_from_env(settings, "processing.roi_refinement", "residual_discovery_enabled", "PELAGIA_ROI_REFINEMENT_RESIDUAL_DISCOVERY_ENABLED", _env_bool)
+    _set_from_env(settings, "processing.roi_refinement", "residual_max_iterations", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MAX_ITERATIONS", int)
+    _set_from_env(settings, "processing.roi_refinement", "residual_roi_assembly_method", "PELAGIA_ROI_REFINEMENT_RESIDUAL_ROI_ASSEMBLY_METHOD")
+    _set_from_env(settings, "processing.roi_refinement", "residual_roi_assembly_connectivity", "PELAGIA_ROI_REFINEMENT_RESIDUAL_ROI_ASSEMBLY_CONNECTIVITY", int)
+    _set_from_env(settings, "processing.roi_refinement", "residual_min_area", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_AREA", float)
+    _set_from_env(settings, "processing.roi_refinement", "residual_min_width", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_WIDTH", float)
+    _set_from_env(settings, "processing.roi_refinement", "residual_min_height", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_refinement", "residual_min_width_plus_height", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_WIDTH_PLUS_HEIGHT", float)
+    _set_from_env(settings, "processing.roi_refinement", "residual_padding", "PELAGIA_ROI_REFINEMENT_RESIDUAL_PADDING", int)
 
 
 def _env_bool(value: str) -> bool:
@@ -489,6 +589,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
     logging = _section(settings, "logging")
+    artifacts = _section(settings, "artifacts")
+    artifact_models = _section(settings, "artifacts.models")
+    artifact_plugins = _section(settings, "artifacts.plugins")
     mask_augmentation = _section(settings, "processing.mask_augmentation")
     roi_assembly = _section(settings, "processing.roi_assembly")
     roi_filter = _section(settings, "processing.roi_filter")
@@ -499,6 +602,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     preprocessing = _section(settings, "processing.preprocessing")
     frame_storage = _section(settings, "processing.frame_storage")
     thumbhash = _section(settings, "processing.thumbhash")
+    roi_refinement = _section(settings, "processing.roi_refinement")
     mask_defaults = MaskAugmentationProcessingConfig()
     assembly_defaults = RoiAssemblyProcessingConfig()
     filter_defaults = RoiFilterProcessingConfig()
@@ -544,6 +648,43 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             console=bool(logging.get("console", LoggingConfig.console)),
             max_bytes=int(logging.get("max_bytes", LoggingConfig.max_bytes)),
             backup_count=int(logging.get("backup_count", LoggingConfig.backup_count)),
+        ),
+        artifacts=ArtifactsConfig(
+            local_root=Path(artifacts.get("local_root", ArtifactsConfig.local_root)),
+            models=ArtifactModelsConfig(
+                builtin_enabled=bool(
+                    artifact_models.get(
+                        "builtin_enabled",
+                        ArtifactModelsConfig.builtin_enabled,
+                    )
+                ),
+                local_path=Path(
+                    artifact_models.get("local_path", ArtifactModelsConfig.local_path)
+                ),
+                metadata_filename=str(
+                    artifact_models.get(
+                        "metadata_filename",
+                        ArtifactModelsConfig.metadata_filename,
+                    )
+                ),
+            ),
+            plugins=ArtifactPluginsConfig(
+                builtin_enabled=bool(
+                    artifact_plugins.get(
+                        "builtin_enabled",
+                        ArtifactPluginsConfig.builtin_enabled,
+                    )
+                ),
+                local_path=Path(
+                    artifact_plugins.get("local_path", ArtifactPluginsConfig.local_path)
+                ),
+                metadata_filename=str(
+                    artifact_plugins.get(
+                        "metadata_filename",
+                        ArtifactPluginsConfig.metadata_filename,
+                    )
+                ),
+            ),
         ),
         processing=ProcessingConfig(
             mask_augmentation=MaskAugmentationProcessingConfig(
@@ -651,7 +792,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             roi_filter=RoiFilterProcessingConfig(
                 min_area=_optional_float(roi_filter.get("min_area", filter_defaults.min_area)),
                 max_area=_optional_float(roi_filter.get("max_area", filter_defaults.max_area)),
-                min_perimeter=float(
+                min_perimeter=_optional_float(
                     roi_filter.get("min_perimeter", filter_defaults.min_perimeter)
                 ),
                 max_perimeter=_optional_float(
@@ -724,6 +865,18 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 ),
                 flatfield_q=float(flatfield.get("flatfield_q", FlatfieldProcessingConfig.flatfield_q)),
                 flatfield_axis=int(flatfield.get("flatfield_axis", FlatfieldProcessingConfig.flatfield_axis)),
+                flatfield_min_field_value=float(
+                    flatfield.get(
+                        "flatfield_min_field_value",
+                        FlatfieldProcessingConfig.flatfield_min_field_value,
+                    )
+                ),
+                flatfield_max_field_value=_optional_float(
+                    flatfield.get(
+                        "flatfield_max_field_value",
+                        FlatfieldProcessingConfig.flatfield_max_field_value,
+                    )
+                ),
             ),
             thresholding=ThresholdingProcessingConfig(
                 method=str(thresholding.get("method", ThresholdingProcessingConfig.method)),
@@ -822,8 +975,17 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 background_correction=bool(
                     preprocessing.get("background_correction", PreprocessingConfig.background_correction)
                 ),
-                background_percentile=float(
-                    preprocessing.get("background_percentile", PreprocessingConfig.background_percentile)
+                background_min_field_value=float(
+                    preprocessing.get(
+                        "background_min_field_value",
+                        PreprocessingConfig.background_min_field_value,
+                    )
+                ),
+                background_max_field_value=_optional_float(
+                    preprocessing.get(
+                        "background_max_field_value",
+                        PreprocessingConfig.background_max_field_value,
+                    )
                 ),
                 invert_intensity=bool(
                     preprocessing.get("invert_intensity", PreprocessingConfig.invert_intensity)
@@ -842,6 +1004,136 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
             thumbhash=ThumbhashProcessingConfig(
                 max_dim=int(thumbhash.get("max_dim", ThumbhashProcessingConfig.max_dim)),
+            ),
+            roi_refinement=RoiRefinementProcessingConfig(
+                enabled=bool(roi_refinement.get("enabled", RoiRefinementProcessingConfig.enabled)),
+                model_kind=str(
+                    roi_refinement.get("model_kind", RoiRefinementProcessingConfig.model_kind)
+                ),
+                model_ref=roi_refinement.get(
+                    "model_ref",
+                    RoiRefinementProcessingConfig.model_ref,
+                ),
+                model_run_dir=roi_refinement.get(
+                    "model_run_dir",
+                    RoiRefinementProcessingConfig.model_run_dir,
+                ),
+                model_artifact=str(
+                    roi_refinement.get(
+                        "model_artifact",
+                        RoiRefinementProcessingConfig.model_artifact,
+                    )
+                ),
+                tile_size=int(
+                    roi_refinement.get("tile_size", RoiRefinementProcessingConfig.tile_size)
+                ),
+                overlap_fraction=float(
+                    roi_refinement.get(
+                        "overlap_fraction",
+                        RoiRefinementProcessingConfig.overlap_fraction,
+                    )
+                ),
+                max_iterations=int(
+                    roi_refinement.get(
+                        "max_iterations",
+                        RoiRefinementProcessingConfig.max_iterations,
+                    )
+                ),
+                expansion_pixels=_optional_int(
+                    roi_refinement.get(
+                        "expansion_pixels",
+                        RoiRefinementProcessingConfig.expansion_pixels,
+                    )
+                ),
+                edge_touch_margin=int(
+                    roi_refinement.get(
+                        "edge_touch_margin",
+                        RoiRefinementProcessingConfig.edge_touch_margin,
+                    )
+                ),
+                output_threshold=float(
+                    roi_refinement.get(
+                        "output_threshold",
+                        RoiRefinementProcessingConfig.output_threshold,
+                    )
+                ),
+                batch_size=_optional_int(
+                    roi_refinement.get(
+                        "batch_size",
+                        RoiRefinementProcessingConfig.batch_size,
+                    )
+                ),
+                encoding=roi_refinement.get("encoding", RoiRefinementProcessingConfig.encoding),
+                overlap_reconciliation_enabled=bool(
+                    roi_refinement.get(
+                        "overlap_reconciliation_enabled",
+                        RoiRefinementProcessingConfig.overlap_reconciliation_enabled,
+                    )
+                ),
+                overlap_iou_threshold=float(
+                    roi_refinement.get(
+                        "overlap_iou_threshold",
+                        RoiRefinementProcessingConfig.overlap_iou_threshold,
+                    )
+                ),
+                overlap_containment_threshold=float(
+                    roi_refinement.get(
+                        "overlap_containment_threshold",
+                        RoiRefinementProcessingConfig.overlap_containment_threshold,
+                    )
+                ),
+                residual_discovery_enabled=bool(
+                    roi_refinement.get(
+                        "residual_discovery_enabled",
+                        RoiRefinementProcessingConfig.residual_discovery_enabled,
+                    )
+                ),
+                residual_max_iterations=int(
+                    roi_refinement.get(
+                        "residual_max_iterations",
+                        RoiRefinementProcessingConfig.residual_max_iterations,
+                    )
+                ),
+                residual_roi_assembly_method=roi_refinement.get(
+                    "residual_roi_assembly_method",
+                    RoiRefinementProcessingConfig.residual_roi_assembly_method,
+                ),
+                residual_roi_assembly_connectivity=int(
+                    roi_refinement.get(
+                        "residual_roi_assembly_connectivity",
+                        RoiRefinementProcessingConfig.residual_roi_assembly_connectivity,
+                    )
+                ),
+                residual_min_area=_optional_float(
+                    roi_refinement.get(
+                        "residual_min_area",
+                        RoiRefinementProcessingConfig.residual_min_area,
+                    )
+                ),
+                residual_min_width=_optional_float(
+                    roi_refinement.get(
+                        "residual_min_width",
+                        RoiRefinementProcessingConfig.residual_min_width,
+                    )
+                ),
+                residual_min_height=_optional_float(
+                    roi_refinement.get(
+                        "residual_min_height",
+                        RoiRefinementProcessingConfig.residual_min_height,
+                    )
+                ),
+                residual_min_width_plus_height=_optional_float(
+                    roi_refinement.get(
+                        "residual_min_width_plus_height",
+                        RoiRefinementProcessingConfig.residual_min_width_plus_height,
+                    )
+                ),
+                residual_padding=_optional_int(
+                    roi_refinement.get(
+                        "residual_padding",
+                        RoiRefinementProcessingConfig.residual_padding,
+                    )
+                ),
             ),
         ),
     )

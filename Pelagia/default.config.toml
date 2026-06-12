@@ -33,7 +33,7 @@ encoding = "zstd"
 
 [processing.mask_augmentation]
 # Binary-mask cleanup after thresholding and before candidate assembly.
-enabled = true
+enabled = false
 # Ordered steps. Options: dilate, erode, open, close, fill_holes,
 # remove_small_components, clear_border, none.
 steps = ["dilate"]
@@ -65,11 +65,11 @@ connectivity = 8
 min_area = null
 max_area = null
 # Perimeter uses the candidate bounding-box perimeter.
-min_perimeter = 50
+min_perimeter = null
 max_perimeter = null
-min_width = null
+min_width = 10
 max_width = null
-min_height = null
+min_height = 10
 max_height = null
 # Width + height is often easier to reason about than box perimeter.
 min_width_plus_height = null
@@ -81,14 +81,14 @@ padding = 50
 # ROI and mask payload encoding. Options: zstd, png, raw, auto.
 roi_encoding = "zstd"
 # Minimum ROI byte size before auto encoding prefers zstd over png.
-zstd_min_bytes = 16384
+zstd_min_bytes = 8192
 # Store masks for every retained candidate, even when ROI image bytes are skipped.
 always_store_mask = true
 # ROI image blobs are only stored when all non-null thresholds are satisfied.
 store_roi_payload_min_area = null
-store_roi_payload_min_width = null
-store_roi_payload_min_height = null
-store_roi_payload_min_width_plus_height = null
+store_roi_payload_min_width = 10
+store_roi_payload_min_height = 10
+store_roi_payload_min_width_plus_height = 50
 
 [processing.video_ingest]
 # Video-to-frame extraction defaults. Frame storage preserves extracted pixels;
@@ -103,6 +103,9 @@ flatfield_correction = true
 flatfield_q = 0.5
 # Axis used by global flatfield correction. Options: 0, 1.
 flatfield_axis = 0
+# Clamp the estimated flatfield before division. Min must be > 0; max may be null.
+flatfield_min_field_value = 50
+flatfield_max_field_value = 255
 
 [processing.thresholding]
 # Candidate mask generation defaults.
@@ -166,9 +169,11 @@ mask_path = null
 # Future adaptive background-subtraction controls.
 adaptive_background_subtraction = false
 adaptive_background_period = 50
-# Subtract scalar/image background before inversion and thresholding.
+# Divide by a generated mean background field before inversion and thresholding.
 background_correction = false
-background_percentile = 50
+# Clamp the background field before division. Min must be > 0; max may be null.
+background_min_field_value = 50
+background_max_field_value = 255
 # Convert dark-foreground imagery to Pelagia's bright-foreground convention.
 invert_intensity = true
 # Crop uses x/y origin plus width/height in source-frame pixels. Leave disabled
@@ -187,6 +192,53 @@ image_encoding = "zstd"
 # Maximum image dimension used before computing preview thumbhashes.
 max_dim = 100
 
+[processing.roi_refinement]
+# Optional second-stage ROI mask refinement. The default identity model keeps
+# candidate masks unchanged; oracle_builder_unet loads an oracle-builder run.
+enabled = true
+# Options: identity, keras_artifact, oracle_builder_unet.
+model_kind = "keras_artifact"
+# Registry reference for bundled/imported models. Used by artifact-backed refiners.
+model_ref = "builtin:model/roi_refinement/example_model"
+# Path to an oracle-builder run directory, for example ../oracle-builder/runs/unet-test.
+model_run_dir = null
+# Options: auto, keras, savedmodel.
+model_artifact = "auto"
+# Tile geometry should match the model input shape for learned refiners.
+tile_size = 256
+overlap_fraction = 0.25
+max_iterations = 5
+# Null uses tile stride as the expansion distance when a mask touches an edge.
+expansion_pixels = 128
+edge_touch_margin = 2
+# Probability threshold used to convert model outputs into binary masks.
+output_threshold = 0.5
+# Tile prediction batch size. Null lets the model process all tiles for one ROI.
+batch_size = null
+# Null reuses candidate ROI encoding for refined records.
+encoding = null
+# Drop refined ROIs that substantially overlap a larger refined ROI on the same frame.
+overlap_reconciliation_enabled = true
+# Consume duplicate refined ROIs when mask IoU is at least this value.
+overlap_iou_threshold = 0.5
+# Consume duplicate refined ROIs when either mask is mostly contained by the other.
+overlap_containment_threshold = 0.8
+# Optionally discover additional valid targets left in the candidate mask after refinement.
+residual_discovery_enabled = false
+# Maximum recursive split generations to try.
+residual_max_iterations = 1
+# Null reuses the candidate's original assembly method when available.
+residual_roi_assembly_method = null
+# Connected-components connectivity for residual assembly. Options: 4, 8.
+residual_roi_assembly_connectivity = 8
+# Residual child filters. Null disables a given criterion.
+residual_min_area = null
+residual_min_width = null
+residual_min_height = null
+residual_min_width_plus_height = null
+# Null reuses the parent candidate padding, bounded by the current ROI crop.
+residual_padding = null
+
 [api]
 # FastAPI development server defaults.
 host = "127.0.0.1"
@@ -204,3 +256,21 @@ level = "INFO"
 console = true
 max_bytes = 10485760
 backup_count = 10
+
+[artifacts]
+# Local runtime library for imported models, plugin manifests, and future packs.
+local_root = "./.pelagia"
+
+[artifacts.models]
+# Search packaged Pelagia/assets/models in addition to local_path.
+builtin_enabled = true
+# Local user/imported model manifests and payloads.
+local_path = "./.pelagia/models"
+metadata_filename = "metadata.toml"
+
+[artifacts.plugins]
+# Search packaged Pelagia/assets/plugins in addition to local_path.
+builtin_enabled = true
+# Local plugin manifests. Plugin execution/loading is intentionally future work.
+local_path = "./.pelagia/plugins"
+metadata_filename = "metadata.toml"

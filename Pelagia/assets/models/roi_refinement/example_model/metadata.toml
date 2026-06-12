@@ -1,0 +1,14 @@
+# Copy this file to a model artifact directory as metadata.toml.
+name = "example_model"
+kind = "roi_refinement"
+version = "0.1.0"
+description = "Short model description."
+
+[artifact]
+framework = "keras"
+format = "keras"
+path = "model.keras"
+
+[io]
+input_shape = [256, 256, 2]
+output_shape = [256, 256, 1]

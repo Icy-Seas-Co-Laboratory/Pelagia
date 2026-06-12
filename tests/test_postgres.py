@@ -34,6 +34,9 @@ def test_render_schema_loads_sql_resource():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frames" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
     assert "payload_ref text" in rendered
+    assert "job_id uuid REFERENCES pelagia_unit.processing_jobs(id) ON DELETE SET NULL" in rendered
+    assert "UNIQUE (candidate_detection_id)" not in rendered
+    assert "DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key" in rendered
     assert "{schema}" not in rendered
 
 
@@ -308,6 +311,97 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert detection_record.roi_payload == b"roi-bytes"
     assert detection_record.mask_shape == [4, 5]
     assert postgres_repo.list_detection_records(asset_id)[1].mask_payload == b"mask-bytes"
+
+    refined = postgres_repo.upsert_refined_detections(
+        [
+            (
+                str(filtered_detections[0]["id"]),
+                DetectionRecord(
+                    run_id=run_id,
+                    frame_id=inserted_frames[0]["id"],
+                    roi_index=1,
+                    bbox_x=1,
+                    bbox_y=2,
+                    bbox_w=3,
+                    bbox_h=4,
+                    area=12.0,
+                    perimeter=14.0,
+                    major_axis_length=4.0,
+                    minor_axis_length=3.0,
+                    min_gray_value=5,
+                    mean_gray_value=6.5,
+                    roi_payload=b"refined-roi",
+                    mask_payload=b"refined-mask",
+                    crop_bbox_x=0,
+                    crop_bbox_y=1,
+                    crop_bbox_w=5,
+                    crop_bbox_h=6,
+                    roi_encoding="raw",
+                    roi_format="raw_ndarray_c_order",
+                    roi_dtype="uint8",
+                    roi_shape=[4, 5],
+                    mask_encoding="raw",
+                    mask_format="raw_ndarray_c_order",
+                    mask_dtype="uint8",
+                    mask_shape=[4, 5],
+                    metadata={"detection_stage": "refined", "refinement_method": "identity"},
+                ),
+            )
+        ]
+    )
+    assert len(refined) == 1
+    assert refined[0]["candidate_detection_id"] == filtered_detections[0]["id"]
+    assert refined[0]["roi_dtype"] == "uint8"
+    assert refined[0]["roi_shape"] == [4, 5]
+    assert refined[0]["mask_dtype"] == "uint8"
+    assert refined[0]["metadata"]["refinement_method"] == "identity"
+    refined_again = postgres_repo.upsert_refined_detections(
+        [
+            (
+                str(filtered_detections[0]["id"]),
+                DetectionRecord(
+                    run_id=run_id,
+                    frame_id=inserted_frames[0]["id"],
+                    roi_index=2,
+                    bbox_x=2,
+                    bbox_y=3,
+                    bbox_w=4,
+                    bbox_h=5,
+                    area=20.0,
+                    perimeter=18.0,
+                    major_axis_length=5.0,
+                    minor_axis_length=4.0,
+                    min_gray_value=7,
+                    mean_gray_value=8.5,
+                    roi_payload=b"refined-roi-child",
+                    mask_payload=b"refined-mask-child",
+                    crop_bbox_x=1,
+                    crop_bbox_y=2,
+                    crop_bbox_w=6,
+                    crop_bbox_h=7,
+                    roi_encoding="raw",
+                    roi_format="raw_ndarray_c_order",
+                    roi_dtype="uint8",
+                    roi_shape=[5, 4],
+                    mask_encoding="raw",
+                    mask_format="raw_ndarray_c_order",
+                    mask_dtype="uint8",
+                    mask_shape=[5, 4],
+                    metadata={
+                        "detection_stage": "refined",
+                        "refinement_method": "identity",
+                        "refinement_role": "residual_child",
+                    },
+                ),
+            )
+        ]
+    )
+    assert len(refined_again) == 1
+    assert refined_again[0]["candidate_detection_id"] == filtered_detections[0]["id"]
+    assert refined_again[0]["id"] != refined[0]["id"]
+    latest_refined = postgres_repo.get_refined_detection_for_candidate(str(filtered_detections[0]["id"]))
+    assert latest_refined is not None
+    assert latest_refined["candidate_detection_id"] == filtered_detections[0]["id"]
 
     detection_stats = postgres_repo.list_asset_detection_stats(collection="test", limit=10)
     assert detection_stats["summary"] == {

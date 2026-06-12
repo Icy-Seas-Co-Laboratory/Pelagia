@@ -116,12 +116,20 @@ stage_aliases = {
     "extract": "extract_frames",
     "extract_frame": "extract_frames",
     "extract_frames": "extract_frames",
+    "background": "background_frames",
+    "background_frame": "background_frames",
+    "background_frames": "background_frames",
+    "calculate_background": "background_frames",
     "preprocess": "preprocess_frames",
     "preprocess_frame": "preprocess_frames",
     "preprocess_frames": "preprocess_frames",
     "segment": "segment",
     "segmentation": "segment",
     "roi_detection": "segment",
+    "refine": "roi_refinement",
+    "refinement": "roi_refinement",
+    "roi_refinement": "roi_refinement",
+    "refine_rois": "roi_refinement",
 }
 
 stack = section("stack")

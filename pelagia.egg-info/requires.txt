@@ -1,0 +1,27 @@
+numpy
+opencv-python
+thumbhash>=0.1.2
+zstandard
+
+[:python_version < "3.11"]
+tomli
+
+[api]
+fastapi
+uvicorn
+
+[cli]
+typer
+
+[kvstore-blake3]
+blake3
+
+[ml]
+tensorflow
+keras
+
+[postgres]
+psycopg[binary]
+
+[test]
+pytest

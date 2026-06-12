@@ -86,6 +86,9 @@ def frame_summary(row: Any) -> dict[str, Any]:
     item["has_preprocessed_payload"] = bool(
         item.get("preprocessed_payload_ref") or item.get("preprocessed_kvstore_hash")
     )
+    item["has_background_payload"] = bool(
+        item.get("background_payload_ref") or item.get("background_kvstore_hash")
+    )
     return as_response(item)
 
 

@@ -39,31 +39,41 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
     assert config.image_data_storage.encoding == "zstd"
+    assert config.artifacts.local_root.as_posix() == ".pelagia"
+    assert config.artifacts.models.builtin_enabled is True
+    assert config.artifacts.models.local_path.as_posix() == ".pelagia/models"
+    assert config.artifacts.models.metadata_filename == "metadata.toml"
+    assert config.artifacts.plugins.builtin_enabled is True
+    assert config.artifacts.plugins.local_path.as_posix() == ".pelagia/plugins"
+    assert config.artifacts.plugins.metadata_filename == "metadata.toml"
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
+    assert config.processing.flatfield.flatfield_min_field_value == 50.0
+    assert config.processing.flatfield.flatfield_max_field_value == 255.0
     assert config.processing.thresholding.method == "bounded_otsu_canny"
     assert config.processing.thresholding.thresholding_maximum_value == 100.0
     assert config.processing.thresholding.bounded_otsu_min_contrast == 50.0
     assert config.processing.thresholding.canny_low_threshold == 60.0
     assert config.processing.thresholding.adaptive_block_size == 31
-    assert config.processing.mask_augmentation.enabled is True
+    assert config.processing.mask_augmentation.enabled is False
     assert config.processing.mask_augmentation.steps == ["dilate"]
     assert config.processing.roi_assembly.method == "connected_components"
     assert config.processing.roi_assembly.connectivity == 8
-    assert config.processing.roi_filter.min_perimeter == 50.0
+    assert config.processing.roi_filter.min_perimeter is None
     assert config.processing.roi_filter.min_area is None
     assert config.processing.roi_recording.padding == 50
     assert config.processing.roi_recording.roi_encoding == "zstd"
-    assert config.processing.roi_recording.zstd_min_bytes == 16384
+    assert config.processing.roi_recording.zstd_min_bytes == 8192
     assert config.processing.roi_recording.always_store_mask is True
     assert config.processing.preprocessing.apply_mask is False
     assert config.processing.preprocessing.mask_path is None
     assert config.processing.preprocessing.adaptive_background_subtraction is False
     assert config.processing.preprocessing.adaptive_background_period == 50
     assert config.processing.preprocessing.background_correction is False
-    assert config.processing.preprocessing.background_percentile == 50.0
+    assert config.processing.preprocessing.background_min_field_value == 50.0
+    assert config.processing.preprocessing.background_max_field_value == 255.0
     assert config.processing.preprocessing.invert_intensity is True
     assert config.processing.preprocessing.crop_enabled is False
     assert config.processing.preprocessing.crop_x is None
@@ -72,6 +82,28 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.preprocessing.crop_h is None
     assert config.processing.frame_storage.image_encoding == "zstd"
     assert config.processing.thumbhash.max_dim == 100
+    assert config.processing.roi_refinement.enabled is True
+    assert config.processing.roi_refinement.model_kind == "keras_artifact"
+    assert config.processing.roi_refinement.model_ref == "builtin:model/roi_refinement/example_model"
+    assert config.processing.roi_refinement.model_run_dir is None
+    assert config.processing.roi_refinement.model_artifact == "auto"
+    assert config.processing.roi_refinement.tile_size == 256
+    assert config.processing.roi_refinement.overlap_fraction == 0.25
+    assert config.processing.roi_refinement.max_iterations == 5
+    assert config.processing.roi_refinement.expansion_pixels == 128
+    assert config.processing.roi_refinement.edge_touch_margin == 2
+    assert config.processing.roi_refinement.output_threshold == 0.5
+    assert config.processing.roi_refinement.batch_size is None
+    assert config.processing.roi_refinement.encoding is None
+    assert config.processing.roi_refinement.overlap_reconciliation_enabled is True
+    assert config.processing.roi_refinement.overlap_iou_threshold == 0.5
+    assert config.processing.roi_refinement.overlap_containment_threshold == 0.8
+    assert config.processing.roi_refinement.residual_discovery_enabled is False
+    assert config.processing.roi_refinement.residual_max_iterations == 1
+    assert config.processing.roi_refinement.residual_roi_assembly_method is None
+    assert config.processing.roi_refinement.residual_roi_assembly_connectivity == 8
+    assert config.processing.roi_refinement.residual_min_area is None
+    assert config.processing.roi_refinement.residual_padding is None
     assert config.logging.log_path.as_posix() == "logs"
     assert config.logging.file_name == "pelagia.log"
     assert config.logging.level == "INFO"
@@ -93,6 +125,19 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         [image_data_storage]
         encoding = "raw"
 
+        [artifacts]
+        local_root = "/tmp/pelagia-artifacts"
+
+        [artifacts.models]
+        builtin_enabled = false
+        local_path = "/tmp/pelagia-artifacts/models"
+        metadata_filename = "model.toml"
+
+        [artifacts.plugins]
+        builtin_enabled = false
+        local_path = "/tmp/pelagia-artifacts/plugins"
+        metadata_filename = "plugin.toml"
+
         [processing.video_ingest]
         n_tile = 4
 
@@ -100,6 +145,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         flatfield_correction = false
         flatfield_q = 0.8
         flatfield_axis = 1
+        flatfield_min_field_value = 2
+        flatfield_max_field_value = 200
 
         [processing.thresholding]
         method = "bounded_otsu_canny"
@@ -133,7 +180,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         adaptive_background_subtraction = true
         adaptive_background_period = 12
         background_correction = true
-        background_percentile = 25
+        background_min_field_value = 3
+        background_max_field_value = 220
         invert_intensity = true
         crop_enabled = true
         crop_x = 10
@@ -146,6 +194,33 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [processing.thumbhash]
         max_dim = 64
+
+        [processing.roi_refinement]
+        enabled = true
+        model_kind = "oracle_builder_unet"
+        model_ref = "builtin:model/roi_refinement/example_model"
+        model_run_dir = "../oracle-builder/runs/unet-test"
+        model_artifact = "savedmodel"
+        tile_size = 128
+        overlap_fraction = 0.5
+        max_iterations = 4
+        expansion_pixels = 32
+        edge_touch_margin = 2
+        output_threshold = 0.6
+        batch_size = 6
+        encoding = "png"
+        overlap_reconciliation_enabled = false
+        overlap_iou_threshold = 0.3
+        overlap_containment_threshold = 0.7
+        residual_discovery_enabled = true
+        residual_max_iterations = 2
+        residual_roi_assembly_method = "contours"
+        residual_roi_assembly_connectivity = 4
+        residual_min_area = 3
+        residual_min_width = 2
+        residual_min_height = 2
+        residual_min_width_plus_height = 5
+        residual_padding = 1
         """,
         encoding="utf-8",
     )
@@ -157,10 +232,19 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.queue.lease_seconds == 42
     assert config.kvstore.root_path.as_posix() == "/tmp/pelagia-kv"
     assert config.image_data_storage.encoding == "raw"
+    assert config.artifacts.local_root.as_posix() == "/tmp/pelagia-artifacts"
+    assert config.artifacts.models.builtin_enabled is False
+    assert config.artifacts.models.local_path.as_posix() == "/tmp/pelagia-artifacts/models"
+    assert config.artifacts.models.metadata_filename == "model.toml"
+    assert config.artifacts.plugins.builtin_enabled is False
+    assert config.artifacts.plugins.local_path.as_posix() == "/tmp/pelagia-artifacts/plugins"
+    assert config.artifacts.plugins.metadata_filename == "plugin.toml"
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.8
     assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.flatfield.flatfield_min_field_value == 2.0
+    assert config.processing.flatfield.flatfield_max_field_value == 200.0
     assert config.processing.thresholding.method == "bounded_otsu_canny"
     assert config.processing.thresholding.thresholding_maximum_value == 180.0
     assert config.processing.thresholding.bounded_otsu_min_contrast == 22.0
@@ -182,7 +266,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.preprocessing.adaptive_background_subtraction is True
     assert config.processing.preprocessing.adaptive_background_period == 12
     assert config.processing.preprocessing.background_correction is True
-    assert config.processing.preprocessing.background_percentile == 25.0
+    assert config.processing.preprocessing.background_min_field_value == 3.0
+    assert config.processing.preprocessing.background_max_field_value == 220.0
     assert config.processing.preprocessing.invert_intensity is True
     assert config.processing.preprocessing.crop_enabled is True
     assert config.processing.preprocessing.crop_x == 10
@@ -191,6 +276,31 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.preprocessing.crop_h == 400
     assert config.processing.frame_storage.image_encoding == "png"
     assert config.processing.thumbhash.max_dim == 64
+    assert config.processing.roi_refinement.enabled is True
+    assert config.processing.roi_refinement.model_kind == "oracle_builder_unet"
+    assert config.processing.roi_refinement.model_ref == "builtin:model/roi_refinement/example_model"
+    assert config.processing.roi_refinement.model_run_dir == "../oracle-builder/runs/unet-test"
+    assert config.processing.roi_refinement.model_artifact == "savedmodel"
+    assert config.processing.roi_refinement.tile_size == 128
+    assert config.processing.roi_refinement.overlap_fraction == 0.5
+    assert config.processing.roi_refinement.max_iterations == 4
+    assert config.processing.roi_refinement.expansion_pixels == 32
+    assert config.processing.roi_refinement.edge_touch_margin == 2
+    assert config.processing.roi_refinement.output_threshold == 0.6
+    assert config.processing.roi_refinement.batch_size == 6
+    assert config.processing.roi_refinement.encoding == "png"
+    assert config.processing.roi_refinement.overlap_reconciliation_enabled is False
+    assert config.processing.roi_refinement.overlap_iou_threshold == 0.3
+    assert config.processing.roi_refinement.overlap_containment_threshold == 0.7
+    assert config.processing.roi_refinement.residual_discovery_enabled is True
+    assert config.processing.roi_refinement.residual_max_iterations == 2
+    assert config.processing.roi_refinement.residual_roi_assembly_method == "contours"
+    assert config.processing.roi_refinement.residual_roi_assembly_connectivity == 4
+    assert config.processing.roi_refinement.residual_min_area == 3.0
+    assert config.processing.roi_refinement.residual_min_width == 2.0
+    assert config.processing.roi_refinement.residual_min_height == 2.0
+    assert config.processing.roi_refinement.residual_min_width_plus_height == 5.0
+    assert config.processing.roi_refinement.residual_padding == 1
 
 
 def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
@@ -207,11 +317,18 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("PELAGIA_DATABASE_SCHEMA", "pelagia_from_env")
     monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_ENCODING", "zstd")
+    monkeypatch.setenv("PELAGIA_ARTIFACTS_LOCAL_ROOT", "/tmp/env-pelagia-artifacts")
+    monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_BUILTIN_ENABLED", "false")
+    monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/models")
+    monkeypatch.setenv("PELAGIA_ARTIFACT_PLUGINS_BUILTIN_ENABLED", "false")
+    monkeypatch.setenv("PELAGIA_ARTIFACT_PLUGINS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/plugins")
     monkeypatch.setenv("PELAGIA_ROI_FILTER_MIN_PERIMETER", "9")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_N_TILE", "5")
     monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
     monkeypatch.setenv("PELAGIA_FLATFIELD_AXIS", "1")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_MIN_FIELD_VALUE", "4")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_MAX_FIELD_VALUE", "210")
     monkeypatch.setenv("PELAGIA_THRESHOLDING_METHOD", "adaptive_mean")
     monkeypatch.setenv("PELAGIA_THRESHOLDING_MAXIMUM_VALUE", "170")
     monkeypatch.setenv("PELAGIA_THRESHOLDING_CANNY_LOW_THRESHOLD", "9")
@@ -221,7 +338,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_SUBTRACTION", "true")
     monkeypatch.setenv("PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_PERIOD", "20")
     monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_CORRECTION", "true")
-    monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_PERCENTILE", "30")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_MIN_FIELD_VALUE", "5")
+    monkeypatch.setenv("PELAGIA_PREPROCESSING_BACKGROUND_MAX_FIELD_VALUE", "230")
     monkeypatch.setenv("PELAGIA_PREPROCESSING_INVERT_INTENSITY", "true")
     monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_ENABLED", "true")
     monkeypatch.setenv("PELAGIA_PREPROCESSING_CROP_X", "1")
@@ -237,11 +355,18 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
 
     assert config.database.schema_name == "pelagia_from_env"
     assert config.image_data_storage.encoding == "zstd"
+    assert config.artifacts.local_root.as_posix() == "/tmp/env-pelagia-artifacts"
+    assert config.artifacts.models.builtin_enabled is False
+    assert config.artifacts.models.local_path.as_posix() == "/tmp/env-pelagia-artifacts/models"
+    assert config.artifacts.plugins.builtin_enabled is False
+    assert config.artifacts.plugins.local_path.as_posix() == "/tmp/env-pelagia-artifacts/plugins"
     assert config.processing.roi_filter.min_perimeter == 9.0
     assert config.processing.video_ingest.n_tile == 5
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.7
     assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.flatfield.flatfield_min_field_value == 4.0
+    assert config.processing.flatfield.flatfield_max_field_value == 210.0
     assert config.processing.thresholding.method == "adaptive_mean"
     assert config.processing.thresholding.thresholding_maximum_value == 170.0
     assert config.processing.thresholding.canny_low_threshold == 9.0
@@ -251,7 +376,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.processing.preprocessing.adaptive_background_subtraction is True
     assert config.processing.preprocessing.adaptive_background_period == 20
     assert config.processing.preprocessing.background_correction is True
-    assert config.processing.preprocessing.background_percentile == 30.0
+    assert config.processing.preprocessing.background_min_field_value == 5.0
+    assert config.processing.preprocessing.background_max_field_value == 230.0
     assert config.processing.preprocessing.invert_intensity is True
     assert config.processing.preprocessing.crop_enabled is True
     assert config.processing.preprocessing.crop_x == 1

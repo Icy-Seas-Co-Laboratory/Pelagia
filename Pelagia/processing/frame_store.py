@@ -305,6 +305,28 @@ def retrieve_frame(
     frame_data = FrameData.from_record(record, metadata=metadata)
     array = decode_array_payload(ctx.kvstore.get_store(kvstore_key), frame_data.metadata)
     frame_data.update(array)
+    background_key = record.background_payload_ref or record.background_kvstore_hash
+    if background_key:
+        background_metadata = {
+            **dict(record.background_metadata or {}),
+            "kvstore_key": background_key,
+        }
+        if record.background_payload_encoding is not None:
+            background_metadata["kvstore_encoding"] = record.background_payload_encoding
+        if record.background_payload_format is not None:
+            background_metadata["kvstore_format"] = record.background_payload_format
+        if record.background_payload_dtype is not None:
+            background_metadata["dtype"] = record.background_payload_dtype
+        if record.background_payload_shape:
+            background_metadata["shape"] = list(record.background_payload_shape)
+        frame_data.update_background(
+            decode_array_payload(ctx.kvstore.get_store(background_key), background_metadata)
+        )
+        frame_data.metadata["background_payload_ref"] = background_key
+        frame_data.metadata["background_payload_encoding"] = record.background_payload_encoding
+        frame_data.metadata["background_payload_format"] = record.background_payload_format
+        frame_data.metadata["background_payload_dtype"] = record.background_payload_dtype
+        frame_data.metadata["background_payload_shape"] = list(record.background_payload_shape)
     _CORE_LOGGER.debug(
         "Retrieved frame id=%s run_id=%s asset_id=%s shape=%s duration_ms=%.2f",
         id,

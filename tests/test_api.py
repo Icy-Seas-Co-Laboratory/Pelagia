@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 from Pelagia.api import create_app
 from Pelagia.config import CoreConfig
+from dataclasses import asdict
+
 from Pelagia.domain import FrameRecord, PipelineStage
 from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
@@ -152,6 +154,19 @@ class FakeRepository:
         if detection_id == "det-1":
             return self._detection_row()
         return None
+
+    def upsert_refined_detections(self, refined_detections, *, job_id=None):
+        rows = []
+        for candidate_detection_id, detection in refined_detections:
+            row = asdict(detection)
+            row["id"] = f"refined-{candidate_detection_id}"
+            row["candidate_detection_id"] = candidate_detection_id
+            row["job_id"] = job_id
+            row["asset_id"] = "asset-1"
+            row["frame_index"] = 2
+            row["asset_filename"] = "sample.mkv"
+            rows.append(row)
+        return rows
 
     def list_asset_detection_stats(self, **kwargs):
         return {
@@ -402,13 +417,174 @@ def test_api_exposes_system_capabilities():
     assert body["api"]["endpoints"]["segmentation_options"] == "/segmentation/options"
     assert body["api"]["endpoints"]["preprocessing_options"] == "/preprocessing/options"
     assert "extract_frames" in body["supported"]["pipeline_stages"]
+    assert "background_frames" in body["jobs"]["queueable_stages"]
     assert "preprocess_frames" in body["jobs"]["queueable_stages"]
+    assert "roi_refinement" in body["jobs"]["queueable_stages"]
+    assert body["api"]["endpoints"]["generate_background"] == "/frame/background"
+    assert body["api"]["endpoints"]["queue_background"] == "/frame/background/jobs"
     assert "jpg" in body["supported"]["image_encodings"]
     assert "preprocessed" in body["supported"]["frame_payload_kinds"]
     assert "segmentation" in body["processing"]
     assert "preprocessing" in body["processing"]
+    assert "background" in body["processing"]["groups"]
+    assert "roi_refinement" in body["processing"]
     assert "mask_augmentation" in body["processing"]["groups"]
+    assert "roi_refinement" in body["processing"]["groups"]
+    assert "builtin:model/roi_refinement/example_model" in body["processing"]["roi_refinement"]["supported"]["model_refs"]
     assert body["storage"]["kvstore"]["hash_algorithm_options"] == ["sha256", "blake3"]
+
+
+def test_api_roi_refinement_options_are_ui_ready():
+    client, _, _ = make_client()
+
+    response = client.get("/roi-refinement/options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pipeline_stage_order"] == [
+        "source",
+        "model_selection",
+        "tiling",
+        "prediction",
+        "expansion",
+        "residual_discovery",
+        "reconciliation",
+        "recording",
+    ]
+    assert "identity" in body["supported"]["model_kinds"]
+    assert "keras_artifact" in body["supported"]["model_kinds"]
+    assert "builtin:model/roi_refinement/example_model" in body["supported"]["model_refs"]
+    assert body["defaults"]["roi_refinement"]["model_ref"] == "builtin:model/roi_refinement/example_model"
+    fields = {field["key"]: field for field in body["fields"]["tiling"]}
+    assert fields["batch_size"]["type"] == "nullable-integer"
+    assert fields["tile_size"]["min"] == 1
+    reconciliation_fields = {field["key"]: field for field in body["fields"]["reconciliation"]}
+    assert reconciliation_fields["overlap_iou_threshold"]["max"] == 1
+    assert body["defaults"]["roi_refinement"]["overlap_reconciliation_enabled"] is True
+    residual_fields = {field["key"]: field for field in body["fields"]["residual_discovery"]}
+    assert residual_fields["residual_roi_assembly_connectivity"]["options"] == [4, 8]
+    assert body["defaults"]["roi_refinement"]["residual_discovery_enabled"] is False
+
+
+def test_api_roi_refinement_dry_run_resolves_builtin_model_ref():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "model_ref": "builtin:model/roi_refinement/example_model",
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["dry_run"] is True
+    assert body["candidate_count"] == 1
+    assert body["model"]["ref"] == "builtin:model/roi_refinement/example_model"
+    assert body["model"]["artifact_path"].endswith("/model.keras")
+
+
+def test_api_roi_refinement_identity_stores_refined_detection():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "model_kind": "identity",
+            "allow_frame_expansion": False,
+            "store": True,
+            "batch_size": 1,
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stored"] is True
+    assert body["refined_count"] == 1
+    assert body["stored_count"] == 1
+    refined = body["refined_detections"][0]
+    assert refined["candidate_detection_id"] == "det-1"
+    assert refined["metadata"]["detection_stage"] == "refined"
+    assert refined["metadata"]["refinement_method"] == "identity"
+
+
+def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "model_kind": "identity",
+            "allow_frame_expansion": False,
+            "store": True,
+            "batch_size": 1,
+            "encoding": "auto",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stored_count"] == 1
+    assert body["resolved_options"]["encoding"] is None
+
+
+def test_api_queue_roi_refinement_job():
+    client, repo, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement/jobs",
+        json={
+            "detection_ids": ["det-1"],
+            "model_kind": "identity",
+            "allow_frame_expansion": False,
+            "batch_size": 2,
+            "residual_discovery_enabled": True,
+            "residual_min_area": 4,
+            "residual_roi_assembly_connectivity": 4,
+            "priority": 7,
+            "depends_on": ["job-1"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"]["stage"] == PipelineStage.ROI_REFINEMENT.value
+    assert body["job"]["run_id"] == "run-1"
+    assert body["job"]["asset_id"] == "asset-1"
+    assert body["job"]["priority"] == 7
+    assert body["job"]["depends_on"] == ["job-1"]
+    assert body["job"]["payload"]["detection_ids"] == ["det-1"]
+    assert body["job"]["payload"]["model_kind"] == "identity"
+    assert body["job"]["payload"]["batch_size"] == 2
+    assert body["job"]["payload"]["residual_discovery_enabled"] is True
+    assert body["job"]["payload"]["residual_min_area"] == 4
+    assert body["job"]["payload"]["residual_roi_assembly_connectivity"] == 4
+    assert body["job"]["payload"]["allow_frame_expansion"] is False
+    assert repo.created_jobs[-1]["stage"] == PipelineStage.ROI_REFINEMENT.value
+
+
+def test_api_queue_roi_refinement_job_dry_run():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement/jobs",
+        json={
+            "detection_ids": ["det-1"],
+            "model_ref": "builtin:model/roi_refinement/example_model",
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["dry_run"] is True
+    assert body["payload"]["detection_ids"] == ["det-1"]
+    assert body["model"]["ref"] == "builtin:model/roi_refinement/example_model"
 
 
 def test_api_preprocessing_options_are_ui_ready():
@@ -434,6 +610,11 @@ def test_api_preprocessing_options_are_ui_ready():
     assert flatfield_fields["flatfield_q"]["min"] == 0
     assert flatfield_fields["flatfield_q"]["max"] == 1
     assert flatfield_fields["flatfield_axis"]["options"] == [0, 1]
+    assert flatfield_fields["flatfield_min_field_value"]["min"] == 0
+    assert flatfield_fields["flatfield_max_field_value"]["type"] == "nullable-number"
+    background_fields = {field["key"]: field for field in body["fields"]["background_correction"]}
+    assert background_fields["background_min_field_value"]["min"] == 0
+    assert background_fields["background_max_field_value"]["type"] == "nullable-number"
     recording_fields = {field["key"]: field for field in body["fields"]["recording"]}
     assert recording_fields["encoding"]["options"] == ["jpg", "png", "raw", "zstd"]
 
@@ -538,8 +719,14 @@ def test_api_segmentation_options_are_ui_ready():
     assert "bounded_otsu_canny" in body["supported"]["threshold_methods"]
     assert "erode" in body["supported"]["mask_augmentation_steps"]
     assert "connected_components" in body["supported"]["roi_assembly_methods"]
-    assert body["defaults"]["roi_filter"]["min_perimeter"] == 50.0
+    assert body["defaults"]["roi_filter"]["min_perimeter"] is None
     assert body["defaults"]["roi_recording"]["roi_encoding"] == "zstd"
+    assert body["defaults"]["preprocessing"]["flatfield_min_field_value"] == 1.0
+    assert body["defaults"]["preprocessing"]["background_min_field_value"] == 1.0
+    assert body["config_defaults"]["flatfield"]["flatfield_min_field_value"] == 1.0
+    preprocessing_fields = {field["key"]: field for field in body["fields"]["preprocessing"]}
+    assert preprocessing_fields["flatfield_max_field_value"]["type"] == "nullable-number"
+    assert preprocessing_fields["background_max_field_value"]["type"] == "nullable-number"
     threshold_fields = {field["key"]: field for field in body["fields"]["thresholding"]}
     assert threshold_fields["canny_low_threshold"]["threshold_methods"] == [
         "canny",
@@ -657,6 +844,8 @@ def test_api_can_queue_segmentation_job():
     assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is True
     assert repository.created_jobs[-1]["payload"]["flatfield_q"] == 0.9
     assert repository.created_jobs[-1]["payload"]["flatfield_axis"] == 0
+    assert repository.created_jobs[-1]["payload"]["flatfield_min_field_value"] == 1.0
+    assert repository.created_jobs[-1]["payload"]["background_min_field_value"] == 1.0
 
 
 def test_api_validate_segmentation_resolves_without_queueing():
@@ -731,6 +920,87 @@ def test_api_can_queue_frame_preprocess_job():
     assert repository.created_jobs[-1]["payload"]["encoding"] == "jpg"
 
 
+def test_api_can_generate_frame_background(monkeypatch):
+    from Pelagia.api.routes import frame
+
+    calls = []
+
+    def fake_generate_background_for_frames(frame_ids, **kwargs):
+        calls.append((frame_ids, kwargs))
+        return {
+            "background_payload_ref": "background-key",
+            "frame_ids": frame_ids,
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        }
+
+    monkeypatch.setattr(frame, "generate_background_for_frames", fake_generate_background_for_frames)
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/frame/background",
+        json={
+            "frame_ids": ["frame-1"],
+            "payload_kind": "original",
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stage"] == PipelineStage.BACKGROUND_FRAMES.value
+    assert body["run_id"] == "run-1"
+    assert body["asset_id"] == "asset-1"
+    assert body["background_payload_ref"] == "background-key"
+    assert calls[0][0] == ["frame-1"]
+    assert calls[0][1]["payload_kind"] == "original"
+    assert calls[0][1]["encoding"] == "raw"
+
+
+def test_api_can_queue_frame_background_job():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/frame/background/jobs",
+        json={
+            "frame_ids": ["frame-1"],
+            "payload_kind": "original",
+            "encoding": "zstd",
+            "priority": 7,
+            "depends_on": ["job-1"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"]["stage"] == PipelineStage.BACKGROUND_FRAMES.value
+    assert body["job"]["run_id"] == "run-1"
+    assert body["job"]["asset_id"] == "asset-1"
+    assert body["job"]["priority"] == 7
+    assert body["job"]["depends_on"] == ["job-1"]
+    assert repository.created_jobs[-1]["stage"] == PipelineStage.BACKGROUND_FRAMES.value
+    assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
+    assert repository.created_jobs[-1]["payload"]["payload_kind"] == "original"
+    assert repository.created_jobs[-1]["payload"]["encoding"] == "zstd"
+
+
+def test_api_queue_frame_background_job_dry_run_does_not_create_job():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/frame/background/jobs",
+        json={"asset_id": "asset-1", "start_frame": 2, "end_frame": 4, "dry_run": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["dry_run"] is True
+    assert body["asset_id"] == "asset-1"
+    assert body["payload"]["frame_ids"] == ["frame-1"]
+    assert body["payload"]["start_frame"] == 2
+    assert repository.created_jobs == []
+
+
 def test_api_frame_endpoints_accept_dimension_resize(monkeypatch):
     from Pelagia.api.routes import frame
 
@@ -802,6 +1072,34 @@ def test_api_frame_image_endpoints_accept_head_for_scale_headers(monkeypatch):
     assert preprocessed.headers["x-pelagia-scale-x"] == "0.4"
     assert preprocessed.headers["x-pelagia-scale-y"] == "0.4"
     assert preprocessed.content == b""
+
+
+def test_api_frame_image_endpoints_encode_float_preprocessed_frames(monkeypatch):
+    from Pelagia.api.routes import frame
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        if payload_kind == "preprocessed":
+            data = np.linspace(-2.0, 7.0, 10 * 20, dtype=np.float32).reshape((10, 20))
+        else:
+            data = np.arange(10 * 20, dtype=np.uint8).reshape((10, 20))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=2,
+            data=data,
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    monkeypatch.setattr(frame, "retrieve_frame", fake_retrieve_frame)
+    client, _, _ = make_client()
+
+    response = client.get("/frame/preprocessed?frame_id=frame-1&format=jpg&width=5")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    decoded = cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (2, 5)
+    assert decoded.dtype == np.uint8
 
 
 def test_api_frame_context_returns_ui_ready_contract():
@@ -1335,11 +1633,13 @@ def test_api_framedata_accepts_scale(monkeypatch):
 
 def test_api_framedata_accepts_flatfield_options(monkeypatch):
     from Pelagia.api.routes import assets
-    from Pelagia.processing.frame_correction import flatfield_global_correction_for_framedata
+    from Pelagia.processing.frame_correction import flatfield_correction
 
     data = np.array([[10, 20], [30, 40]], dtype=np.uint8)
 
     class FakeFrame:
+        bkg = None
+
         def read(self):
             return data
 
@@ -1349,40 +1649,69 @@ def test_api_framedata_accepts_flatfield_options(monkeypatch):
     matrix_response = client.get(
         "/assets/asset-1/framedata/2"
         "?format=matrix&flatfield_correction=true&flatfield_q=0.5&flatfield_axis=0"
+        "&flatfield_min_field_value=2&flatfield_max_field_value=100"
     )
     png_response = client.get(
         "/assets/asset-1/framedata/2"
         "?format=png&flatfield_correction=true&flatfield_q=0.5&flatfield_axis=0"
+        "&flatfield_min_field_value=2&flatfield_max_field_value=100"
     )
 
-    expected = flatfield_global_correction_for_framedata(data, q=0.5, axis=0)
+    expected = flatfield_correction(
+        data,
+        q=0.5,
+        axis=0,
+        min_field_value=2,
+        max_field_value=100,
+    )
     assert matrix_response.status_code == 200
     assert matrix_response.json()["flatfield_correction"] is True
     assert matrix_response.json()["flatfield_q"] == 0.5
     assert matrix_response.json()["flatfield_axis"] == 0
+    assert matrix_response.json()["flatfield_min_field_value"] == 2.0
+    assert matrix_response.json()["flatfield_max_field_value"] == 100.0
     assert matrix_response.json()["background_correction"] is False
     assert matrix_response.json()["data"] == expected.tolist()
     assert png_response.status_code == 200
     assert png_response.headers["x-pelagia-flatfield-correction"] == "true"
     assert png_response.headers["x-pelagia-flatfield-q"] == "0.5"
     assert png_response.headers["x-pelagia-flatfield-axis"] == "0"
+    assert png_response.headers["x-pelagia-flatfield-min-field-value"] == "2.0"
+    assert png_response.headers["x-pelagia-flatfield-max-field-value"] == "100.0"
     assert png_response.headers["x-pelagia-background-correction"] == "false"
 
 
-def test_api_framedata_background_correction_is_not_implemented(monkeypatch):
+def test_api_framedata_accepts_background_correction_options(monkeypatch):
     from Pelagia.api.routes import assets
+    from Pelagia.processing.frame_correction import divide_background
 
     class FakeFrame:
+        bkg = np.array([[10, 20], [10, 20]], dtype=np.uint8)
+
         def read(self):
-            return np.array([[0, 128], [255, 64]], dtype=np.uint8)
+            return np.array([[10, 40], [30, 80]], dtype=np.uint8)
 
     monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
     client, _, _ = make_client()
 
-    response = client.get("/assets/asset-1/framedata/2?background_correction=true")
+    response = client.get(
+        "/assets/asset-1/framedata/2"
+        "?format=matrix&background_correction=true"
+        "&background_min_field_value=2&background_max_field_value=100"
+    )
 
-    assert response.status_code == 501
-    assert "not implemented" in response.json()["detail"]
+    expected = divide_background(
+        FakeFrame().read(),
+        background=FakeFrame.bkg,
+        min_field_value=2,
+        max_field_value=100,
+    )
+    assert response.status_code == 200
+    assert response.json()["background_correction"] is True
+    assert response.json()["background_method"] == "divide"
+    assert response.json()["background_min_field_value"] == 2.0
+    assert response.json()["background_max_field_value"] == 100.0
+    assert response.json()["data"] == expected.tolist()
 
 
 def test_api_framedata_returns_small_preview(monkeypatch):

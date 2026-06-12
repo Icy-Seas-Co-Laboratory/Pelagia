@@ -93,6 +93,8 @@ if APIRouter is not None:
         flatfield_correction: bool | None = None
         flatfield_q: float | None = None
         flatfield_axis: int | None = None
+        flatfield_min_field_value: int | float | None = None
+        flatfield_max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
@@ -100,7 +102,8 @@ if APIRouter is not None:
         crop_w: int | None = None
         crop_h: int | None = None
         background_correction: bool | None = None
-        background_percentile: int | float | None = None
+        background_min_field_value: int | float | None = None
+        background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
         mask_augmentation_enabled: bool | None = None
         mask_augmentation_steps: list[MaskAugmentationStep] | None = None

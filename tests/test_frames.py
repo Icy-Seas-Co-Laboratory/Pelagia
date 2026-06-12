@@ -10,8 +10,8 @@ from Pelagia.processing import ingest as ingest_module
 from Pelagia.processing.frame_codec import decode_array_payload
 from Pelagia.processing.frame_correction import (
     apply_flatfield_correction,
-    flatfield_correction_for_framedata,
-    flatfield_global_correction_for_framedata,
+    flatfield_correction,
+    generate_background_for_frames,
 )
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_store import retrieve_frame, store_frame
@@ -136,11 +136,62 @@ def test_parse_filename_timestamp_utc_handles_camera_names(filename, expected):
 def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
-    corrected = flatfield_correction_for_framedata(data, q=0.5)
-    global_corrected = flatfield_global_correction_for_framedata(data, q=0.5, axis=0)
+    corrected = flatfield_correction(data, q=0.5, axis=0)
+    row_corrected = flatfield_correction(data, q=0.5, axis=1)
 
     np.testing.assert_array_equal(corrected, np.array([[25, 20], [75, 80]], dtype=np.uint8))
-    np.testing.assert_array_equal(corrected, global_corrected)
+    np.testing.assert_array_equal(row_corrected, np.array([[36, 73], [30, 80]], dtype=np.uint8))
+
+
+def test_generate_background_for_frames_stores_mean_field(monkeypatch):
+    class BackgroundKVStore:
+        def __init__(self):
+            self.payload = None
+
+        def put_store(self, payload):
+            self.payload = payload
+            return "background-key"
+
+    class BackgroundRepository:
+        def __init__(self):
+            self.updated = None
+
+        def update_frame_background_payloads(self, frame_ids, **kwargs):
+            self.updated = (frame_ids, kwargs)
+            return [{"id": frame_id, **kwargs} for frame_id in frame_ids]
+
+    class BackgroundContext:
+        def __init__(self):
+            self.kvstore = BackgroundKVStore()
+            self.repository = BackgroundRepository()
+            self.config = CoreConfig()
+
+    frames = {
+        "frame-1": FrameData("/tmp/", "a.png", 1, data=np.array([[10, 20], [30, 40]], dtype=np.uint8)),
+        "frame-2": FrameData("/tmp/", "b.png", 2, data=np.array([[30, 40], [50, 60]], dtype=np.uint8)),
+    }
+
+    def fake_retrieve_frame(frame_id, *, context, payload_kind):
+        assert payload_kind == "original"
+        return frames[frame_id]
+
+    monkeypatch.setattr("Pelagia.processing.frame_store.retrieve_frame", fake_retrieve_frame)
+    ctx = BackgroundContext()
+
+    result = generate_background_for_frames(["frame-1", "frame-2"], context=ctx)
+
+    assert result["background_payload_ref"] == "background-key"
+    assert result["updated_frame_count"] == 2
+    assert ctx.repository.updated[0] == ["frame-1", "frame-2"]
+    assert ctx.repository.updated[1]["payload_dtype"] == "float32"
+    decoded = decode_array_payload(
+        ctx.kvstore.payload,
+        {"kvstore_encoding": "zstd", "dtype": "float32", "shape": [2, 2]},
+    )
+    np.testing.assert_array_equal(
+        decoded,
+        np.array([[20, 30], [40, 50]], dtype=np.float32),
+    )
 
 
 def test_frame_infers_full_frame_geometry_from_data():

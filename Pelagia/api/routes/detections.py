@@ -176,6 +176,7 @@ if APIRouter is not None:
         roi_format: str | None = None,
         mask_encoding: str | None = None,
         mask_format: str | None = None,
+        refinement_state: Literal["any", "refined", "unrefined", "has-refinement", "needs-refinement"] = "any",
         sort_by: Literal["area", "byte_size", "id", "asset_frame"] = "asset_frame",
         sort_dir: Literal["asc", "desc"] = "desc",
         limit: int | None = 100,
@@ -205,6 +206,7 @@ if APIRouter is not None:
             roi_format=roi_format,
             mask_encoding=mask_encoding,
             mask_format=mask_format,
+            refinement_state=None if refinement_state == "any" else refinement_state,
             sort_by=sort_by,
             sort_dir=sort_dir,
             limit=limit,
@@ -323,6 +325,45 @@ if APIRouter is not None:
         detection = get_repository(request).get_detection(detection_id)
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=detection_id,
+            payload_kind="mask",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
+
+    @router.head("/{detection_id}/refined-mask", responses=_IMAGE_RESPONSES)
+    @router.get("/{detection_id}/refined-mask", responses=_IMAGE_RESPONSES)
+    def get_refined_detection_mask(
+        request: Request,
+        detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_refined_detection_for_candidate(detection_id)
+        if detection is None:
+            raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
         return _detection_payload_response(
             detection=detection,
             detection_id=detection_id,

@@ -8,8 +8,11 @@ version = "0.0.1"
 description = "Integrated image processing, storage, API, CLI, and worker tools."
 requires-python = ">=3.10"
 dependencies = [
+    "numpy",
+    "opencv-python",
     "tomli; python_version < '3.11'",
     "thumbhash>=0.1.2",
+    "zstandard",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +20,7 @@ api = ["fastapi", "uvicorn"]
 cli = ["typer"]
 postgres = ["psycopg[binary]"]
 kvstore-blake3 = ["blake3"]
+ml = ["tensorflow", "keras"]
 test = ["pytest"]
 
 [project.scripts]
@@ -26,5 +30,13 @@ pelagia = "Pelagia.cli.app:main"
 include = ["Pelagia*"]
 
 [tool.setuptools.package-data]
-"Pelagia" = ["default.config.toml"]
+"Pelagia" = [
+    "default.config.toml",
+    "assets/**/*",
+]
 "Pelagia.storage" = ["sql/*.sql"]
+
+[tool.setuptools.exclude-package-data]
+"Pelagia" = [
+    "assets/**/.DS_Store",
+]

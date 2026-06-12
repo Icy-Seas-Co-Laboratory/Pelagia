@@ -34,10 +34,18 @@ name = "preprocess-1"
 capabilities = ["preprocess"]
 
 [[worker]]
+name = "background-1"
+capabilities = ["background"]
+
+[[worker]]
 name = "segment-1"
 capabilities = ["segment"]
 
 [[worker]]
+name = "refine-1"
+capabilities = ["roi_refinement"]
+
+[[worker]]
 name = "allrounder"
-capabilities = ["ingest", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
 enabled = false

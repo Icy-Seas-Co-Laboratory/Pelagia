@@ -10,6 +10,7 @@ from .segmentation_options import (
     ROI_ENCODINGS,
     segmentation_capabilities,
 )
+from ..services.models import ModelService
 
 
 def system_capabilities(config: CoreConfig) -> dict[str, Any]:
@@ -25,10 +26,15 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "system_capabilities": "/system/capabilities",
                 "preprocessing_options": "/preprocessing/options",
                 "segmentation_options": "/segmentation/options",
+                "roi_refinement_options": "/roi-refinement/options",
+                "roi_refinement": "/roi-refinement",
+                "queue_roi_refinement": "/roi-refinement/jobs",
                 "live_segmentation": "/live/segmentation",
                 "frame_original": "/frame/original",
                 "frame_preprocessed": "/frame/preprocessed",
                 "frame_context": "/frames/{frame_id}/context",
+                "generate_background": "/frame/background",
+                "queue_background": "/frame/background/jobs",
                 "queue_preprocessing": "/frame/preprocess/jobs",
                 "queue_segmentation": "/segmentation/jobs",
             },
@@ -46,6 +52,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "video_ingest",
                 "preprocessing",
                 "flatfield",
+                "background",
                 "frame_storage",
                 "thumbhash",
                 "thresholding",
@@ -53,15 +60,19 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "roi_assembly",
                 "roi_filter",
                 "roi_recording",
+                "roi_refinement",
             ],
             "preprocessing": preprocessing_capabilities(processing),
             "segmentation": segmentation_capabilities(processing),
+            "roi_refinement": roi_refinement_capabilities(config),
         },
         "jobs": {
             "queueable_stages": [
                 PipelineStage.EXTRACT_FRAMES.value,
+                PipelineStage.BACKGROUND_FRAMES.value,
                 PipelineStage.PREPROCESS_FRAMES.value,
                 PipelineStage.SEGMENT.value,
+                PipelineStage.ROI_REFINEMENT.value,
             ],
             "worker_capabilities": [stage.value for stage in PipelineStage],
         },
@@ -72,6 +83,80 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "hash_algorithm_options": ["sha256", "blake3"],
                 "configured_hash_algorithm": config.kvstore.hash_algorithm,
             },
+        },
+    }
+
+
+def roi_refinement_capabilities(config: CoreConfig) -> dict[str, Any]:
+    """Return GUI-facing ROI refinement defaults, valid options, and model refs."""
+    models = ModelService.from_config(config).list_model_artifacts()
+    roi_models = [model for model in models if model.get("kind") == "roi_refinement"]
+    defaults = config.processing.roi_refinement
+    return {
+        "pipeline_stage_order": [
+            "source",
+            "model_selection",
+            "tiling",
+            "prediction",
+            "expansion",
+            "residual_discovery",
+            "reconciliation",
+            "recording",
+        ],
+        "supported": {
+            "model_kinds": ["identity", "keras_artifact", "oracle_builder_unet"],
+            "model_refs": [model["ref"] for model in roi_models],
+            "model_artifacts": roi_models,
+            "roi_encoding_options": ROI_ENCODINGS,
+        },
+        "defaults": {
+            "roi_refinement": _dataclass_dict(defaults),
+        },
+        "fields": {
+            "source": [
+                _field("detection_ids", "Detection IDs", "string-list", request_field_name="detection_ids"),
+            ],
+            "model_selection": [
+                _field("model_kind", "Model Kind", "enum", options=["identity", "keras_artifact", "oracle_builder_unet"], config_section="processing.roi_refinement"),
+                _field("model_ref", "Model Reference", "enum", options=[model["ref"] for model in roi_models], config_section="processing.roi_refinement"),
+                _field("model_run_dir", "Model Run Directory", "nullable-string", config_section="processing.roi_refinement"),
+                _field("model_artifact", "Model Artifact", "enum", options=["auto", "keras", "savedmodel"], config_section="processing.roi_refinement"),
+            ],
+            "tiling": [
+                _field("tile_size", "Tile Size", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+                _field("overlap_fraction", "Overlap Fraction", "number", minimum=0, maximum=0.99, step=0.01, config_section="processing.roi_refinement"),
+                _field("batch_size", "Batch Size", "nullable-integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+            ],
+            "prediction": [
+                _field("output_threshold", "Output Threshold", "number", minimum=0, maximum=1, step=0.01, config_section="processing.roi_refinement"),
+            ],
+            "expansion": [
+                _field("allow_frame_expansion", "Allow Frame Expansion", "boolean", default=True),
+                _field("max_iterations", "Max Iterations", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+                _field("expansion_pixels", "Expansion Pixels", "nullable-integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+                _field("edge_touch_margin", "Edge Touch Margin", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+            ],
+            "reconciliation": [
+                _field("overlap_reconciliation_enabled", "Overlap Reconciliation", "boolean", config_section="processing.roi_refinement"),
+                _field("overlap_iou_threshold", "Overlap IoU Threshold", "number", minimum=0, maximum=1, step=0.01, config_section="processing.roi_refinement"),
+                _field("overlap_containment_threshold", "Overlap Containment Threshold", "number", minimum=0, maximum=1, step=0.01, config_section="processing.roi_refinement"),
+            ],
+            "residual_discovery": [
+                _field("residual_discovery_enabled", "Residual Discovery", "boolean", config_section="processing.roi_refinement"),
+                _field("residual_max_iterations", "Residual Max Iterations", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
+                _field("residual_roi_assembly_method", "Residual Assembly Method", "enum", options=["connected_components", "contours"], config_section="processing.roi_refinement"),
+                _field("residual_roi_assembly_connectivity", "Residual Assembly Connectivity", "enum", options=[4, 8], config_section="processing.roi_refinement"),
+                _field("residual_min_area", "Residual Min Area", "nullable-number", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("residual_min_width", "Residual Min Width", "nullable-number", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("residual_min_height", "Residual Min Height", "nullable-number", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("residual_min_width_plus_height", "Residual Min Width + Height", "nullable-number", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("residual_padding", "Residual Padding", "nullable-integer", minimum=0, step=1, config_section="processing.roi_refinement"),
+            ],
+            "recording": [
+                _field("store", "Store Refined Detections", "boolean", default=True),
+                _field("encoding", "ROI Encoding", "enum", options=ROI_ENCODINGS, config_section="processing.roi_refinement"),
+                _field("dry_run", "Dry Run", "boolean", default=False),
+            ],
         },
     }
 
@@ -125,10 +210,13 @@ def preprocessing_capabilities(config: ProcessingConfig) -> dict[str, Any]:
                 _field("flatfield_correction", "Flatfield Correction", "boolean", config_section="processing.flatfield"),
                 _field("flatfield_q", "Flatfield Quantile", "number", minimum=0, maximum=1, step=0.01, config_section="processing.flatfield"),
                 _field("flatfield_axis", "Flatfield Axis", "enum", options=[0, 1], config_section="processing.flatfield"),
+                _field("flatfield_min_field_value", "Flatfield Min Field Value", "number", minimum=0, step=1, config_section="processing.flatfield"),
+                _field("flatfield_max_field_value", "Flatfield Max Field Value", "nullable-number", minimum=0, step=1, config_section="processing.flatfield"),
             ],
             "background_correction": [
                 _field("background_correction", "Background Correction", "boolean", config_section="processing.preprocessing"),
-                _field("background_percentile", "Background Percentile", "number", minimum=0, maximum=100, step=1, config_section="processing.preprocessing"),
+                _field("background_min_field_value", "Background Min Field Value", "number", minimum=0, step=1, config_section="processing.preprocessing"),
+                _field("background_max_field_value", "Background Max Field Value", "nullable-number", minimum=0, step=1, config_section="processing.preprocessing"),
                 _field("adaptive_background_subtraction", "Adaptive Background Subtraction", "boolean", config_section="processing.preprocessing"),
                 _field("adaptive_background_period", "Adaptive Background Period", "integer", minimum=1, step=1, config_section="processing.preprocessing"),
             ],

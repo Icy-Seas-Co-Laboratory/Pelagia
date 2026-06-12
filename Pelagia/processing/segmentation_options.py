@@ -89,6 +89,14 @@ def resolve_segmentation_options(
             ),
             "flatfield_q": float(_get(values, "flatfield_q", flatfield.flatfield_q)),
             "flatfield_axis": int(_get(values, "flatfield_axis", flatfield.flatfield_axis)),
+            "flatfield_min_field_value": float(
+                _get(values, "flatfield_min_field_value", flatfield.flatfield_min_field_value)
+            ),
+            "flatfield_max_field_value": _get(
+                values,
+                "flatfield_max_field_value",
+                flatfield.flatfield_max_field_value,
+            ),
             "apply_mask": bool(_get(values, "apply_mask", preprocessing.apply_mask)),
             "crop_enabled": bool(_get(values, "crop_enabled", preprocessing.crop_enabled)),
             "crop_x": _get(values, "crop_x", preprocessing.crop_x),
@@ -98,8 +106,17 @@ def resolve_segmentation_options(
             "background_correction": bool(
                 _get(values, "background_correction", preprocessing.background_correction)
             ),
-            "background_percentile": float(
-                _get(values, "background_percentile", preprocessing.background_percentile)
+            "background_min_field_value": float(
+                _get(
+                    values,
+                    "background_min_field_value",
+                    preprocessing.background_min_field_value,
+                )
+            ),
+            "background_max_field_value": _get(
+                values,
+                "background_max_field_value",
+                preprocessing.background_max_field_value,
             ),
             "invert_intensity": bool(
                 _get(values, "invert_intensity", preprocessing.invert_intensity)
@@ -210,7 +227,7 @@ def resolve_segmentation_options(
         "roi_filter": {
             "min_area": _get(values, "min_area", roi_filter.min_area),
             "max_area": _get(values, "max_area", roi_filter.max_area),
-            "min_perimeter": float(_get(values, "min_perimeter", roi_filter.min_perimeter)),
+            "min_perimeter": _get(values, "min_perimeter", roi_filter.min_perimeter),
             "max_perimeter": _get(values, "max_perimeter", roi_filter.max_perimeter),
             "min_width": _get(values, "min_width", roi_filter.min_width),
             "max_width": _get(values, "max_width", roi_filter.max_width),
@@ -293,6 +310,7 @@ def segmentation_capabilities(config: ProcessingConfig) -> dict[str, Any]:
         "fields": _field_groups(),
         "config_defaults": {
             "preprocessing": _dataclass_dict(config.preprocessing),
+            "flatfield": _dataclass_dict(config.flatfield),
             "thresholding": _dataclass_dict(config.thresholding),
             "mask_augmentation": _dataclass_dict(config.mask_augmentation),
             "roi_assembly": _dataclass_dict(config.roi_assembly),
@@ -368,6 +386,8 @@ def _field_groups() -> dict[str, list[dict[str, Any]]]:
             _field("flatfield_correction", "Flatfield Correction", "boolean"),
             _field("flatfield_q", "Flatfield Quantile", "number", minimum=0, maximum=1, step=0.01),
             _field("flatfield_axis", "Flatfield Axis", "integer", minimum=0, maximum=1, step=1),
+            _field("flatfield_min_field_value", "Flatfield Min Field Value", "number", minimum=0, step=1),
+            _field("flatfield_max_field_value", "Flatfield Max Field Value", "nullable-number", minimum=0, step=1),
             _field("apply_mask", "Apply Mask", "boolean"),
             _field("crop_enabled", "Crop", "boolean"),
             _field("crop_x", "Crop X", "nullable-number", minimum=0, step=1),
@@ -375,7 +395,8 @@ def _field_groups() -> dict[str, list[dict[str, Any]]]:
             _field("crop_w", "Crop Width", "nullable-number", minimum=1, step=1),
             _field("crop_h", "Crop Height", "nullable-number", minimum=1, step=1),
             _field("background_correction", "Background Correction", "boolean"),
-            _field("background_percentile", "Background Percentile", "number", minimum=0, maximum=100, step=1),
+            _field("background_min_field_value", "Background Min Field Value", "number", minimum=0, step=1),
+            _field("background_max_field_value", "Background Max Field Value", "nullable-number", minimum=0, step=1),
             _field("invert_intensity", "Invert Intensity", "boolean"),
         ],
         "thresholding": [
@@ -465,7 +486,7 @@ def _field(
         "key": key,
         "label": label,
         "type": field_type,
-        "config_section": f"processing.{group}",
+        "config_section": "processing.flatfield" if key.startswith("flatfield_") else f"processing.{group}",
         "request_field_name": key,
     }
     if options is not None:
@@ -488,6 +509,8 @@ def _group_for_key(key: str) -> str:
             "flatfield_correction",
             "flatfield_q",
             "flatfield_axis",
+            "flatfield_min_field_value",
+            "flatfield_max_field_value",
             "apply_mask",
             "crop_enabled",
             "crop_x",
@@ -495,7 +518,8 @@ def _group_for_key(key: str) -> str:
             "crop_w",
             "crop_h",
             "background_correction",
-            "background_percentile",
+            "background_min_field_value",
+            "background_max_field_value",
             "invert_intensity",
         ],
         "thresholding": [

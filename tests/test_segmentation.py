@@ -2,7 +2,15 @@ import numpy as np
 
 from Pelagia.domain import DetectionRecord
 from Pelagia.processing.frame_codec import decode_array_payload
-from Pelagia.processing.detection_refinement import refine_detection
+from Pelagia.processing.detection_refinement import (
+    IdentityRoiRefinementModel,
+    RoiRefinementOptions,
+    build_roi_tiles,
+    merge_refined_tiles,
+    predict_refined_tile_masks,
+    refine_detection,
+    refine_detections,
+)
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_preprocess import preprocess_frame_for_segmentation
 from Pelagia.processing.frame_threshold import (
@@ -36,6 +44,18 @@ class FakeDatabaseLogger:
     def log(self, **kwargs):
         self.events.append(kwargs)
         return {"id": len(self.events), **kwargs}
+
+
+class SplitOnceRefinementModel:
+    def __init__(self):
+        self.calls = 0
+
+    def predict(self, batch):
+        output = np.asarray(batch[..., 1]).copy()
+        if self.calls == 0:
+            output[:, :, output.shape[2] // 2:] = 0
+        self.calls += 1
+        return output
 
 
 class FakeContext:
@@ -221,9 +241,12 @@ def test_preprocess_frame_for_segmentation_applies_ordered_steps():
         "invert_intensity",
     ]
     assert processed.metadata["foreground_polarity"] == "bright"
+    assert processed.metadata["background_method"] == "divide"
+    assert processed.metadata["background_min_field_value"] == 50.0
+    assert processed.metadata["background_max_field_value"] == 255.0
     assert processed.read().shape == data.shape
     assert processed.read()[0, 0] == 255
-    assert processed.read()[1, 1] == 185
+    assert processed.read()[1, 1] == 175
 
 
 def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
@@ -300,7 +323,383 @@ def test_refine_detection_identity_uses_candidate_mask():
     np.testing.assert_array_equal(result.candidate_mask, mask)
     np.testing.assert_array_equal(result.refined_mask, mask)
     assert result.method == "identity"
-    assert result.as_detection_record().metadata["detection_stage"] == "refined"
+    refined_record = result.as_detection_record()
+    assert refined_record.metadata["detection_stage"] == "refined"
+    assert refined_record.metadata["refinement_tile_count"] == 1
+    assert refined_record.bbox_x == 0
+    assert refined_record.bbox_y == 0
+    assert refined_record.bbox_w == 2
+    assert refined_record.bbox_h == 2
+
+
+def test_refinement_builds_overlapping_padded_tiles():
+    roi = np.arange(30, dtype=np.uint8).reshape(5, 6)
+    mask = np.ones((5, 6), dtype=np.uint8) * 255
+    detection = DetectionRecord(
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=12,
+        bbox_y=20,
+        bbox_w=6,
+        bbox_h=5,
+        crop_bbox_x=10,
+        crop_bbox_y=18,
+        crop_bbox_w=6,
+        crop_bbox_h=5,
+        area=30,
+        perimeter=22,
+        major_axis_length=6,
+        minor_axis_length=5,
+        min_gray_value=0,
+        mean_gray_value=10,
+        roi_payload=roi.tobytes(order="C"),
+    )
+
+    tiles = build_roi_tiles(
+        detection,
+        roi,
+        mask,
+        options=RoiRefinementOptions(tile_size=4, overlap_fraction=0.5),
+    )
+
+    assert len(tiles) == 4
+    assert tiles[0].image.shape == (4, 4)
+    assert tiles[0].frame_bbox == (10, 18, 4, 4)
+    assert tiles[-1].local_bbox == (2, 1, 4, 4)
+    assert tiles[-1].frame_bbox == (12, 19, 4, 4)
+
+
+def test_identity_refinement_model_merges_tiles_to_candidate_mask():
+    roi = np.arange(30, dtype=np.uint8).reshape(5, 6)
+    mask = np.zeros((5, 6), dtype=np.uint8)
+    mask[1:4, 2:5] = 255
+    detection = DetectionRecord(
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=6,
+        bbox_h=5,
+        area=9,
+        perimeter=12,
+        major_axis_length=3,
+        minor_axis_length=3,
+        min_gray_value=0,
+        mean_gray_value=10,
+        roi_payload=roi.tobytes(order="C"),
+    )
+    options = RoiRefinementOptions(tile_size=4, overlap_fraction=0.5)
+    tiles = build_roi_tiles(detection, roi, mask, options=options)
+    tile_masks = predict_refined_tile_masks(
+        tiles,
+        model=IdentityRoiRefinementModel(),
+        options=options,
+    )
+
+    merged = merge_refined_tiles(tiles, tile_masks, roi.shape)
+
+    np.testing.assert_array_equal(merged, mask)
+
+
+def test_refine_detection_loads_frame_only_when_edge_expansion_is_needed():
+    roi = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1:3, 3] = 255
+    detection = DetectionRecord(
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=6,
+        bbox_y=3,
+        bbox_w=1,
+        bbox_h=2,
+        crop_bbox_x=3,
+        crop_bbox_y=2,
+        crop_bbox_w=4,
+        crop_bbox_h=4,
+        area=2,
+        perimeter=4,
+        major_axis_length=2,
+        minor_axis_length=1,
+        min_gray_value=20,
+        mean_gray_value=30,
+        roi_payload=roi.tobytes(order="C"),
+        mask_payload=mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(roi.dtype),
+        roi_shape=list(roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+        id="det-1",
+    )
+    loaded = []
+    frame = np.arange(64, dtype=np.uint8).reshape(8, 8)
+
+    def load_frame(frame_id):
+        loaded.append(frame_id)
+        return frame
+
+    result = refine_detection(
+        detection,
+        frame_loader=load_frame,
+        options=RoiRefinementOptions(tile_size=4, overlap_fraction=0, expansion_pixels=1),
+    )
+
+    assert loaded == [FRAME_ID]
+    assert result.metadata["refinement_frame_loaded"] is True
+    assert result.metadata["refinement_expansion_count"] == 1
+    assert result.crop_bbox == (3, 2, 5, 4)
+    refined_record = result.as_detection_record(encoding="raw")
+    assert refined_record.crop_bbox_w == 5
+    assert refined_record.crop_bbox_h == 4
+    assert refined_record.bbox_x == 6
+    assert refined_record.bbox_y == 3
+    assert refined_record.bbox_w == 1
+    assert refined_record.bbox_h == 2
+
+
+def test_refine_detection_does_not_load_frame_for_interior_mask():
+    roi = np.arange(25, dtype=np.uint8).reshape(5, 5)
+    mask = np.zeros((5, 5), dtype=np.uint8)
+    mask[2, 2] = 255
+    detection = DetectionRecord(
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=10,
+        bbox_y=10,
+        bbox_w=1,
+        bbox_h=1,
+        crop_bbox_x=8,
+        crop_bbox_y=8,
+        crop_bbox_w=5,
+        crop_bbox_h=5,
+        area=1,
+        perimeter=1,
+        major_axis_length=1,
+        minor_axis_length=1,
+        min_gray_value=12,
+        mean_gray_value=12,
+        roi_payload=roi.tobytes(order="C"),
+        mask_payload=mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(roi.dtype),
+        roi_shape=list(roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+    )
+
+    result = refine_detection(
+        detection,
+        frame_loader=lambda frame_id: (_ for _ in ()).throw(AssertionError("frame loaded")),
+        options=RoiRefinementOptions(tile_size=4, overlap_fraction=0.5),
+    )
+
+    assert result.metadata["refinement_frame_loaded"] is False
+    assert result.metadata["refinement_expansion_count"] == 0
+
+
+def test_refine_detections_reconciles_contained_overlaps():
+    large_roi = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    large_mask = np.ones((4, 4), dtype=np.uint8) * 255
+    small_roi = np.arange(4, dtype=np.uint8).reshape(2, 2)
+    small_mask = np.ones((2, 2), dtype=np.uint8) * 255
+    large = DetectionRecord(
+        id="det-large",
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=4,
+        bbox_h=4,
+        crop_bbox_x=0,
+        crop_bbox_y=0,
+        crop_bbox_w=4,
+        crop_bbox_h=4,
+        area=16,
+        perimeter=16,
+        major_axis_length=4,
+        minor_axis_length=4,
+        min_gray_value=0,
+        mean_gray_value=8,
+        roi_payload=large_roi.tobytes(order="C"),
+        mask_payload=large_mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(large_roi.dtype),
+        roi_shape=list(large_roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(large_mask.dtype),
+        mask_shape=list(large_mask.shape),
+    )
+    small = DetectionRecord(
+        id="det-small",
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=2,
+        bbox_x=1,
+        bbox_y=1,
+        bbox_w=2,
+        bbox_h=2,
+        crop_bbox_x=1,
+        crop_bbox_y=1,
+        crop_bbox_w=2,
+        crop_bbox_h=2,
+        area=4,
+        perimeter=8,
+        major_axis_length=2,
+        minor_axis_length=2,
+        min_gray_value=0,
+        mean_gray_value=2,
+        roi_payload=small_roi.tobytes(order="C"),
+        mask_payload=small_mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(small_roi.dtype),
+        roi_shape=list(small_roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(small_mask.dtype),
+        mask_shape=list(small_mask.shape),
+    )
+
+    results = refine_detections(
+        [small, large],
+        options=RoiRefinementOptions(tile_size=4, overlap_fraction=0),
+    )
+
+    assert len(results) == 1
+    assert results[0].candidate_detection.id == "det-large"
+    assert results[0].metadata["overlap_reconciliation_action"] == "kept"
+    assert results[0].metadata["consumed_candidate_detection_ids"] == ["det-small"]
+    consumed = results[0].metadata["overlap_reconciliation_consumed"][0]
+    assert consumed["candidate_detection_id"] == "det-small"
+    assert consumed["consumed_containment_fraction"] == 1.0
+    assert consumed["keeper_mask_area"] == 16
+
+
+def test_refine_detections_can_skip_overlap_reconciliation():
+    roi = np.ones((2, 2), dtype=np.uint8)
+    mask = np.ones((2, 2), dtype=np.uint8) * 255
+    detections = [
+        DetectionRecord(
+            id=f"det-{index}",
+            run_id="run-1",
+            frame_id=FRAME_ID,
+            roi_index=index,
+            bbox_x=0,
+            bbox_y=0,
+            bbox_w=2,
+            bbox_h=2,
+            area=4,
+            perimeter=8,
+            major_axis_length=2,
+            minor_axis_length=2,
+            min_gray_value=1,
+            mean_gray_value=1,
+            roi_payload=roi.tobytes(order="C"),
+            mask_payload=mask.tobytes(order="C"),
+            roi_encoding="raw",
+            roi_format="raw_ndarray_c_order",
+            roi_dtype=str(roi.dtype),
+            roi_shape=list(roi.shape),
+            mask_encoding="raw",
+            mask_format="raw_ndarray_c_order",
+            mask_dtype=str(mask.dtype),
+            mask_shape=list(mask.shape),
+        )
+        for index in (1, 2)
+    ]
+
+    results = refine_detections(
+        detections,
+        options=RoiRefinementOptions(
+            tile_size=4,
+            overlap_fraction=0,
+            overlap_reconciliation_enabled=False,
+        ),
+    )
+
+    assert len(results) == 2
+    assert all(result.metadata["overlap_reconciliation_enabled"] is False for result in results)
+
+
+def test_refine_detections_discovers_residual_split_children_without_loading_frame():
+    roi = np.zeros((6, 8), dtype=np.uint8)
+    roi[2:4, 1:3] = 80
+    roi[2:4, 5:7] = 90
+    mask = np.zeros_like(roi)
+    mask[2:4, 1:3] = 255
+    mask[2:4, 5:7] = 255
+    detection = DetectionRecord(
+        id="det-composite",
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=3,
+        bbox_x=11,
+        bbox_y=22,
+        bbox_w=6,
+        bbox_h=2,
+        crop_bbox_x=10,
+        crop_bbox_y=20,
+        crop_bbox_w=8,
+        crop_bbox_h=6,
+        area=8,
+        perimeter=16,
+        major_axis_length=6,
+        minor_axis_length=2,
+        min_gray_value=80,
+        mean_gray_value=85,
+        roi_payload=roi.tobytes(order="C"),
+        mask_payload=mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(roi.dtype),
+        roi_shape=list(roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+        metadata={"assembly_method": "connected_components", "padding": 0},
+    )
+
+    results = refine_detections(
+        [detection],
+        model=SplitOnceRefinementModel(),
+        frame_loader=lambda frame_id: (_ for _ in ()).throw(AssertionError("frame loaded")),
+        options=RoiRefinementOptions(
+            tile_size=8,
+            overlap_fraction=0,
+            residual_discovery_enabled=True,
+            residual_min_area=1,
+            residual_min_width=1,
+            residual_min_height=1,
+            overlap_reconciliation_enabled=False,
+        ),
+        method="split_once",
+    )
+
+    assert len(results) == 2
+    parent, child = results
+    assert parent.candidate_detection.id == "det-composite"
+    assert parent.metadata["residual_discovery_child_count"] == 1
+    assert child.candidate_detection.metadata["synthetic_candidate"] is True
+    assert child.metadata["residual_discovery_action"] == "split_child"
+    assert child.metadata["split_from_candidate_detection_id"] == "det-composite"
+    assert child.bbox == (15, 22, 2, 2)
+    child_record = child.as_detection_record(encoding="raw")
+    assert child_record.metadata["synthetic_candidate"] is True
+    assert child_record.metadata["split_from_candidate_detection_id"] == "det-composite"
 
 
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():
@@ -325,8 +724,13 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
         flatfield_correction=False,
         invert_intensity=False,
         min_perimeter=0,
+        min_width=0,
+        min_height=0,
         padding=0,
         roi_encoding="raw",
+        store_roi_payload_min_width=0,
+        store_roi_payload_min_height=0,
+        store_roi_payload_min_width_plus_height=0,
     )
 
     assert len(detections) == 1
@@ -386,6 +790,8 @@ def test_segment_frame_writes_structured_log_events():
         flatfield_correction=False,
         invert_intensity=False,
         min_perimeter=0,
+        min_width=0,
+        min_height=0,
         padding=0,
         roi_encoding="raw",
         context=context,
@@ -425,7 +831,12 @@ def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
         flatfield_correction=False,
         invert_intensity=False,
         min_perimeter=0,
+        min_width=0,
+        min_height=0,
         padding=0,
+        store_roi_payload_min_width=0,
+        store_roi_payload_min_height=0,
+        store_roi_payload_min_width_plus_height=0,
     )
 
     assert len(detections) == 1
@@ -456,8 +867,13 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
         flatfield_correction=False,
         invert_intensity=False,
         min_perimeter=0,
+        min_width=0,
+        min_height=0,
         padding=1,
         roi_encoding="raw",
+        store_roi_payload_min_width=0,
+        store_roi_payload_min_height=0,
+        store_roi_payload_min_width_plus_height=0,
     )
 
     assert len(detections) == 1

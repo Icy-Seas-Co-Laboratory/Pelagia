@@ -1,0 +1,10 @@
+# Copy this file to a plugin artifact directory as metadata.toml.
+name = "example_plugin"
+kind = "plugin"
+version = "0.1.0"
+description = "Short plugin description."
+
+[plugin]
+# Reserved for the future plugin loader design.
+entrypoint = ""
+capabilities = []

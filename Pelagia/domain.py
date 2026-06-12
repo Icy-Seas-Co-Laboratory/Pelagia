@@ -44,8 +44,10 @@ class AssetKind(str, Enum):
 class PipelineStage(str, Enum):
     INGEST_RUN = "ingest_run"
     EXTRACT_FRAMES = "extract_frames"
+    BACKGROUND_FRAMES = "background_frames"
     PREPROCESS_FRAMES = "preprocess_frames"
     SEGMENT = "segment"
+    ROI_REFINEMENT = "roi_refinement"
     CLASSIFY = "classify"
     PUBLISH = "publish"
     TRAIN_MODEL = "train_model"
@@ -141,6 +143,13 @@ class FrameRecord:
     preprocessed_payload_dtype: str | None = None
     preprocessed_payload_shape: list[int] = field(default_factory=list)
     preprocessed_metadata: dict[str, Any] = field(default_factory=dict)
+    background_kvstore_hash: str | None = None
+    background_payload_ref: str | None = None
+    background_payload_encoding: str | None = None
+    background_payload_format: str | None = None
+    background_payload_dtype: str | None = None
+    background_payload_shape: list[int] = field(default_factory=list)
+    background_metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
 
     @classmethod
@@ -183,6 +192,13 @@ class FrameRecord:
             preprocessed_payload_dtype=data.get("preprocessed_payload_dtype"),
             preprocessed_payload_shape=list(data.get("preprocessed_payload_shape") or []),
             preprocessed_metadata=dict(data.get("preprocessed_metadata") or {}),
+            background_kvstore_hash=data.get("background_kvstore_hash"),
+            background_payload_ref=data.get("background_payload_ref"),
+            background_payload_encoding=data.get("background_payload_encoding"),
+            background_payload_format=data.get("background_payload_format"),
+            background_payload_dtype=data.get("background_payload_dtype"),
+            background_payload_shape=list(data.get("background_payload_shape") or []),
+            background_metadata=dict(data.get("background_metadata") or {}),
             metadata=metadata,
             created_at=data.get("created_at"),
         )

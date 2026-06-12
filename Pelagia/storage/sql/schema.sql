@@ -7,7 +7,7 @@ BEGIN
         CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'preprocess_frames', 'segment', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
+        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
         CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
@@ -15,7 +15,9 @@ BEGIN
 END $$;
 
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'train_model';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'background_frames';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'preprocess_frames';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'roi_refinement';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_import';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_export';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
@@ -173,6 +175,13 @@ CREATE TABLE IF NOT EXISTS {schema}.frames (
     preprocessed_payload_dtype text,
     preprocessed_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
     preprocessed_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    background_kvstore_hash text,
+    background_payload_ref text,
+    background_payload_encoding text,
+    background_payload_format text,
+    background_payload_dtype text,
+    background_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    background_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     UNIQUE (asset_id, frame_index)
@@ -196,7 +205,14 @@ ALTER TABLE {schema}.frames
     ADD COLUMN IF NOT EXISTS preprocessed_payload_format text,
     ADD COLUMN IF NOT EXISTS preprocessed_payload_dtype text,
     ADD COLUMN IF NOT EXISTS preprocessed_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS preprocessed_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+    ADD COLUMN IF NOT EXISTS preprocessed_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS background_kvstore_hash text,
+    ADD COLUMN IF NOT EXISTS background_payload_ref text,
+    ADD COLUMN IF NOT EXISTS background_payload_encoding text,
+    ADD COLUMN IF NOT EXISTS background_payload_format text,
+    ADD COLUMN IF NOT EXISTS background_payload_dtype text,
+    ADD COLUMN IF NOT EXISTS background_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS background_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 UPDATE {schema}.frames
 SET
@@ -431,6 +447,7 @@ WHERE
 CREATE TABLE IF NOT EXISTS {schema}.detections_refined (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     candidate_detection_id uuid NOT NULL REFERENCES {schema}.detection_candidate(id) ON DELETE CASCADE,
+    job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
     roi_index integer NOT NULL,
@@ -460,9 +477,14 @@ CREATE TABLE IF NOT EXISTS {schema}.detections_refined (
     mask_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
     refinement_method text NOT NULL DEFAULT 'identity',
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT NOW(),
-    UNIQUE (candidate_detection_id)
+    created_at timestamptz NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE {schema}.detections_refined
+    ADD COLUMN IF NOT EXISTS job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL;
+
+ALTER TABLE {schema}.detections_refined
+    DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key;
 
 CREATE TABLE IF NOT EXISTS {schema}.models (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -564,6 +586,7 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_a
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detection_candidate_frame_id ON {schema}.detection_candidate (frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_candidate_id ON {schema}.detections_refined (candidate_detection_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_job_id ON {schema}.detections_refined (job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_frame_id ON {schema}.detections_refined (frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);

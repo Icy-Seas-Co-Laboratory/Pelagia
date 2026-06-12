@@ -109,7 +109,6 @@ if typer is not None:
         crop_w: Optional[int],
         crop_h: Optional[int],
         background_correction: Optional[bool],
-        background_percentile: Optional[float],
         invert_intensity: Optional[bool],
         min_perimeter: Optional[float],
         max_perimeter: Optional[float],
@@ -156,11 +155,6 @@ if typer is not None:
                 if background_correction is None
                 else background_correction
             ),
-            "background_percentile": (
-                preprocessing_defaults.background_percentile
-                if background_percentile is None
-                else background_percentile
-            ),
             "invert_intensity": (
                 preprocessing_defaults.invert_intensity
                 if invert_intensity is None
@@ -188,7 +182,6 @@ if typer is not None:
         crop_w: Optional[int],
         crop_h: Optional[int],
         background_correction: Optional[bool],
-        background_percentile: Optional[float],
         invert_intensity: Optional[bool],
         encoding: Optional[str],
         processing_defaults,
@@ -221,11 +214,6 @@ if typer is not None:
                 preprocessing_defaults.background_correction
                 if background_correction is None
                 else background_correction
-            ),
-            "background_percentile": (
-                preprocessing_defaults.background_percentile
-                if background_percentile is None
-                else background_percentile
             ),
             "invert_intensity": (
                 preprocessing_defaults.invert_intensity
@@ -631,7 +619,6 @@ if typer is not None:
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
         background_correction: Optional[bool] = None,
-        background_percentile: Optional[float] = None,
         invert_intensity: Optional[bool] = None,
         encoding: Optional[str] = None,
         kvstore_root: Optional[Path] = None,
@@ -659,7 +646,6 @@ if typer is not None:
             crop_w,
             crop_h,
             background_correction,
-            background_percentile,
             invert_intensity,
             encoding,
             context.config.processing,
@@ -700,7 +686,6 @@ if typer is not None:
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
         background_correction: Optional[bool] = None,
-        background_percentile: Optional[float] = None,
         invert_intensity: Optional[bool] = None,
         encoding: Optional[str] = None,
         priority: Optional[int] = None,
@@ -728,7 +713,6 @@ if typer is not None:
             crop_w,
             crop_h,
             background_correction,
-            background_percentile,
             invert_intensity,
             encoding,
             context.config.processing,
@@ -771,7 +755,6 @@ if typer is not None:
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
         background_correction: Optional[bool] = None,
-        background_percentile: Optional[float] = None,
         invert_intensity: Optional[bool] = None,
         min_perimeter: Optional[float] = None,
         max_perimeter: Optional[float] = None,
@@ -806,7 +789,6 @@ if typer is not None:
             crop_w,
             crop_h,
             background_correction,
-            background_percentile,
             invert_intensity,
             min_perimeter,
             max_perimeter,
@@ -854,7 +836,6 @@ if typer is not None:
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
         background_correction: Optional[bool] = None,
-        background_percentile: Optional[float] = None,
         invert_intensity: Optional[bool] = None,
         min_perimeter: Optional[float] = None,
         max_perimeter: Optional[float] = None,
@@ -889,7 +870,6 @@ if typer is not None:
             crop_w,
             crop_h,
             background_correction,
-            background_percentile,
             invert_intensity,
             min_perimeter,
             max_perimeter,

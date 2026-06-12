@@ -5,10 +5,12 @@ from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.services.context import AppContext
 from Pelagia.workers.handlers import (
+    background_frames_handler,
     default_handler_registry,
     extract_frames_handler,
     preprocess_frames_handler,
     roi_detection_handler,
+    roi_refinement_handler,
 )
 from Pelagia.workers.worker import Worker
 
@@ -27,6 +29,8 @@ class FakeRepository:
         self.failures = []
         self.created_jobs = []
         self.replaced_detections = []
+        self.refined_detections = []
+        self.background_calls = []
         self.touches = []
         self.requeued = 0
         self.shutdown_requested = False
@@ -73,6 +77,60 @@ class FakeRepository:
             for index, detection in enumerate(detections, start=1)
         ]
         self.replaced_detections.append((run_id, frame_ids, detections))
+        return rows
+
+    def get_detection(self, detection_id):
+        if detection_id != "det-1":
+            return None
+        roi = np.array([[0, 20], [40, 80]], dtype=np.uint8)
+        mask = np.array([[0, 255], [255, 0]], dtype=np.uint8)
+        return {
+            "id": detection_id,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "frame_id": "frame-1",
+            "roi_index": 1,
+            "bbox_x": 0,
+            "bbox_y": 0,
+            "bbox_w": 2,
+            "bbox_h": 2,
+            "crop_bbox_x": 0,
+            "crop_bbox_y": 0,
+            "crop_bbox_w": 2,
+            "crop_bbox_h": 2,
+            "area": 2,
+            "perimeter": 4,
+            "major_axis_length": 2,
+            "minor_axis_length": 2,
+            "min_gray_value": 20,
+            "mean_gray_value": 30,
+            "roi_payload": roi.tobytes(order="C"),
+            "mask_payload": mask.tobytes(order="C"),
+            "roi_encoding": "raw",
+            "roi_format": "raw_ndarray_c_order",
+            "roi_dtype": "uint8",
+            "roi_shape": [2, 2],
+            "mask_encoding": "raw",
+            "mask_format": "raw_ndarray_c_order",
+            "mask_dtype": "uint8",
+            "mask_shape": [2, 2],
+            "metadata": {},
+        }
+
+    def upsert_refined_detections(self, refined_detections, *, job_id=None):
+        rows = []
+        for candidate_detection_id, detection in refined_detections:
+            row = {
+                "id": f"refined-{candidate_detection_id}",
+                "candidate_detection_id": candidate_detection_id,
+                "job_id": job_id,
+                "run_id": detection.run_id,
+                "frame_id": detection.frame_id,
+                "roi_index": detection.roi_index,
+                "metadata": detection.metadata,
+            }
+            rows.append(row)
+        self.refined_detections.append(refined_detections)
         return rows
 
     def touch_worker(self, worker_id, **kwargs):
@@ -275,6 +333,52 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert stored[0][2]["encoding"] == "jpg"
 
 
+def test_background_frames_handler_generates_background_for_frame_batch(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    calls = []
+
+    def fake_generate_background_for_frames(frame_ids, **kwargs):
+        calls.append((frame_ids, kwargs))
+        return {
+            "background_payload_ref": "background-key",
+            "frame_ids": frame_ids,
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        }
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.generate_background_for_frames",
+        fake_generate_background_for_frames,
+    )
+
+    result = background_frames_handler(
+        {
+            "id": "job-background",
+            "stage": PipelineStage.BACKGROUND_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "frame_ids": ["frame-1"],
+                "payload_kind": "original",
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["stage"] == PipelineStage.BACKGROUND_FRAMES.value
+    assert result["run_id"] == "run-1"
+    assert result["asset_id"] == "asset-1"
+    assert result["background_payload_ref"] == "background-key"
+    assert calls == [
+        (
+            ["frame-1"],
+            {"context": context, "payload_kind": "original", "encoding": "raw"},
+        )
+    ]
+
+
 def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
@@ -362,6 +466,66 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
     assert repo.replaced_detections[0][1] == ["frame-1"]
 
 
+def test_roi_refinement_handler_refines_and_stores_candidate_rois():
+    repo = FakeRepository()
+    context = make_context(repo)
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-refine",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "model_kind": "identity",
+                "allow_frame_expansion": False,
+                "batch_size": 1,
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["stage"] == PipelineStage.ROI_REFINEMENT.value
+    assert result["run_id"] == "run-1"
+    assert result["asset_id"] == "asset-1"
+    assert result["detection_count"] == 1
+    assert result["refined_count"] == 1
+    assert result["detection_ids"] == ["det-1"]
+    assert result["refined_detection_ids"] == ["refined-det-1"]
+    assert result["refinement_method"] == "identity"
+    assert result["resolved_options"]["batch_size"] == 1
+    assert result["resolved_options"]["allow_frame_expansion"] is False
+    assert repo.refined_detections[0][0][0] == "det-1"
+    assert repo.refined_detections[0][0][1].metadata["detection_stage"] == "refined"
+
+
+def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
+    repo = FakeRepository()
+    context = make_context(repo)
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-refine-auto",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "model_kind": "identity",
+                "allow_frame_expansion": False,
+                "encoding": "auto",
+            },
+        },
+        context,
+    )
+
+    assert result["refined_count"] == 1
+    assert result["resolved_options"]["encoding"] is None
+    assert repo.refined_detections[0][0][1].roi_encoding == "raw"
+
+
 def test_default_registry_includes_roi_detection_handler(monkeypatch):
     repo = FakeRepository()
     repo.claimed_jobs = [
@@ -396,6 +560,67 @@ def test_default_registry_includes_roi_detection_handler(monkeypatch):
     assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
     assert repo.completed[0][1]["stage"] == PipelineStage.SEGMENT.value
     assert repo.completed[0][1]["detection_count"] == 0
+
+
+def test_default_registry_includes_roi_refinement_handler():
+    repo = FakeRepository()
+    repo.claimed_jobs = [
+        {
+            "id": "job-refine",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "model_kind": "identity",
+                "allow_frame_expansion": False,
+                "encoding": "raw",
+            },
+        }
+    ]
+    worker = Worker(
+        context=make_context(repo),
+        handlers=default_handler_registry(),
+        worker_id="pytest-worker",
+    )
+
+    assert worker.run_once(stages=[PipelineStage.ROI_REFINEMENT]) == 1
+    assert repo.completed[0][1]["stage"] == PipelineStage.ROI_REFINEMENT.value
+    assert repo.completed[0][1]["refined_count"] == 1
+
+
+def test_default_registry_includes_background_frames_handler(monkeypatch):
+    repo = FakeRepository()
+    repo.claimed_jobs = [
+        {
+            "id": "job-background",
+            "stage": PipelineStage.BACKGROUND_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"frame_ids": ["frame-1"], "payload_kind": "original"},
+        }
+    ]
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.generate_background_for_frames",
+        lambda frame_ids, **kwargs: {
+            "background_payload_ref": "background-key",
+            "frame_ids": frame_ids,
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        },
+    )
+
+    worker = Worker(
+        context=make_context(repo),
+        handlers=default_handler_registry(),
+        worker_id="pytest-worker",
+    )
+
+    assert worker.run_once(stages=[PipelineStage.BACKGROUND_FRAMES]) == 1
+    assert repo.completed[0][1]["stage"] == PipelineStage.BACKGROUND_FRAMES.value
+    assert repo.completed[0][1]["background_payload_ref"] == "background-key"
+    assert repo.completed[0][1]["frame_count"] == 1
 
 
 def test_worker_run_once_uses_default_extract_frames_handler(monkeypatch):

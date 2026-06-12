@@ -85,8 +85,11 @@ def live_segment_wrapper(
     flatfield_correction: bool | None = None,
     flatfield_q: float | None = None,
     flatfield_axis: int | None = None,
+    flatfield_min_field_value: int | float | None = None,
+    flatfield_max_field_value: int | float | None = None,
     background_correction: bool | None = None,
-    background_percentile: int | float | None = None,
+    background_min_field_value: int | float | None = None,
+    background_max_field_value: int | float | None = None,
     invert_intensity: bool | None = None,
     mask_augmentation_enabled: bool | None = None,
     mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
@@ -184,6 +187,8 @@ def live_segment_wrapper(
             flatfield_correction=flatfield_correction,
             flatfield_q=flatfield_q,
             flatfield_axis=flatfield_axis,
+            flatfield_min_field_value=flatfield_min_field_value,
+            flatfield_max_field_value=flatfield_max_field_value,
             apply_mask=apply_mask,
             crop_enabled=crop_enabled,
             crop_x=crop_x,
@@ -191,7 +196,8 @@ def live_segment_wrapper(
             crop_w=crop_w,
             crop_h=crop_h,
             background_correction=background_correction,
-            background_percentile=background_percentile,
+            background_min_field_value=background_min_field_value,
+            background_max_field_value=background_max_field_value,
             invert_intensity=invert_intensity,
             mask_augmentation_enabled=mask_augmentation_enabled,
             mask_augmentation_steps=mask_augmentation_steps,
@@ -305,9 +311,12 @@ def segment_frame(
     flatfield_correction: bool | None = None,
     flatfield_q: float | None = None,
     flatfield_axis: int | None = None,
+    flatfield_min_field_value: int | float | None = None,
+    flatfield_max_field_value: int | float | None = None,
     background_correction: bool | None = None,
     background: np.ndarray | int | float | None = None,
-    background_percentile: int | float | None = None,
+    background_min_field_value: int | float | None = None,
+    background_max_field_value: int | float | None = None,
     invert_intensity: bool | None = None,
     mask_augmentation_enabled: bool | None = None,
     mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
@@ -360,6 +369,16 @@ def segment_frame(
     resolved_flatfield_axis = (
         flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
     )
+    resolved_flatfield_min_field_value = (
+        flatfield_defaults.flatfield_min_field_value
+        if flatfield_min_field_value is None
+        else flatfield_min_field_value
+    )
+    resolved_flatfield_max_field_value = (
+        flatfield_defaults.flatfield_max_field_value
+        if flatfield_max_field_value is None
+        else flatfield_max_field_value
+    )
     resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
     resolved_crop_enabled = (
         preprocessing_defaults.crop_enabled if crop_enabled is None else crop_enabled
@@ -373,10 +392,15 @@ def segment_frame(
         if background_correction is None
         else background_correction
     )
-    resolved_background_percentile = (
-        preprocessing_defaults.background_percentile
-        if background_percentile is None
-        else background_percentile
+    resolved_background_min_field_value = (
+        preprocessing_defaults.background_min_field_value
+        if background_min_field_value is None
+        else background_min_field_value
+    )
+    resolved_background_max_field_value = (
+        preprocessing_defaults.background_max_field_value
+        if background_max_field_value is None
+        else background_max_field_value
     )
     resolved_invert_intensity = (
         preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
@@ -526,8 +550,11 @@ def segment_frame(
         "apply_preprocessing": bool(apply_preprocessing),
         "flatfield_q": resolved_flatfield_q,
         "flatfield_axis": resolved_flatfield_axis,
+        "flatfield_min_field_value": resolved_flatfield_min_field_value,
+        "flatfield_max_field_value": resolved_flatfield_max_field_value,
         "background_correction": bool(resolved_background_correction),
-        "background_percentile": resolved_background_percentile,
+        "background_min_field_value": resolved_background_min_field_value,
+        "background_max_field_value": resolved_background_max_field_value,
         "intensity_inverted": bool(resolved_invert_intensity),
         "apply_mask": bool(resolved_apply_mask),
         "crop_enabled": bool(resolved_crop_enabled),
@@ -594,6 +621,8 @@ def segment_frame(
                 flatfield_correction=resolved_flatfield_correction,
                 flatfield_q=resolved_flatfield_q,
                 flatfield_axis=resolved_flatfield_axis,
+                flatfield_min_field_value=resolved_flatfield_min_field_value,
+                flatfield_max_field_value=resolved_flatfield_max_field_value,
                 apply_mask=resolved_apply_mask,
                 crop_enabled=resolved_crop_enabled,
                 crop_x=resolved_crop_x,
@@ -602,7 +631,8 @@ def segment_frame(
                 crop_h=resolved_crop_h,
                 background_correction=resolved_background_correction,
                 background=background,
-                background_percentile=resolved_background_percentile,
+                background_min_field_value=resolved_background_min_field_value,
+                background_max_field_value=resolved_background_max_field_value,
                 invert_intensity=resolved_invert_intensity,
                 context=context,
             )

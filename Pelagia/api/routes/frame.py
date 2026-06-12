@@ -15,6 +15,7 @@ if APIRouter is not None:
 
     from ..schemas import FrameContextResponse
     from ...domain import PipelineStage
+    from ...processing.frame_correction import generate_background_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
@@ -35,6 +36,8 @@ if APIRouter is not None:
         flatfield_correction: bool | None = None
         flatfield_q: float | None = None
         flatfield_axis: int | None = None
+        flatfield_min_field_value: int | float | None = None
+        flatfield_max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
@@ -42,7 +45,8 @@ if APIRouter is not None:
         crop_w: int | None = None
         crop_h: int | None = None
         background_correction: bool | None = None
-        background_percentile: int | float | None = None
+        background_min_field_value: int | float | None = None
+        background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
         store: bool = True
         encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
@@ -59,6 +63,8 @@ if APIRouter is not None:
         flatfield_correction: bool | None = None
         flatfield_q: float | None = None
         flatfield_axis: int | None = None
+        flatfield_min_field_value: int | float | None = None
+        flatfield_max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
@@ -66,11 +72,28 @@ if APIRouter is not None:
         crop_w: int | None = None
         crop_h: int | None = None
         background_correction: bool | None = None
-        background_percentile: int | float | None = None
+        background_min_field_value: int | float | None = None
+        background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
         encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
         priority: int | None = None
         depends_on: list[str] | None = None
+
+    class FrameBackgroundRequest(BaseModel):
+        run_id: str | None = None
+        asset_id: str | None = None
+        frame_id: str | None = None
+        frame_ids: list[str] | None = None
+        start_frame: int | None = None
+        end_frame: int | None = None
+        limit: int | None = None
+        payload_kind: Literal["original", "raw", "preprocessed", "processed", "corrected"] = "original"
+        encoding: Literal["png", "jpg", "raw", "zstd"] = "zstd"
+
+    class QueueFrameBackgroundRequest(FrameBackgroundRequest):
+        priority: int | None = None
+        depends_on: list[str] | None = None
+        dry_run: bool = False
 
     def _resolve_frame_row(request: Request, frame_id: str | None, asset_id: str | None, frame_num: int | None) -> dict:
         repository = get_repository(request)
@@ -103,7 +126,7 @@ if APIRouter is not None:
         context = get_context(request)
         try:
             frame = retrieve_frame(str(row["id"]), context=context, payload_kind=payload_kind)
-        except ValueError as exc:
+        except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         array = frame.read()
         if array is None:
@@ -201,6 +224,47 @@ if APIRouter is not None:
 
     def _has_preprocessed_payload(row: dict) -> bool:
         return bool(row.get("preprocessed_payload_ref") or row.get("preprocessed_kvstore_hash"))
+
+    def _resolve_background_target(request: Request, body: FrameBackgroundRequest) -> tuple[str | None, str | None, list[str]]:
+        repository = get_repository(request)
+        frame_ids = list(body.frame_ids or [])
+        if body.frame_id is not None:
+            frame_ids.append(body.frame_id)
+        frame_ids = list(dict.fromkeys(str(frame_id) for frame_id in frame_ids))
+
+        run_id = body.run_id
+        asset_id = body.asset_id
+        if not frame_ids:
+            if asset_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Background generation requires asset_id, frame_id, or frame_ids.",
+                )
+            frames = repository.list_frames(
+                asset_id,
+                start_frame=body.start_frame,
+                end_frame=body.end_frame,
+                limit=body.limit,
+            )
+            frame_ids = [str(frame["id"]) for frame in frames]
+
+        if not frame_ids:
+            return run_id, asset_id, []
+
+        for frame_id in frame_ids:
+            frame_record = repository.get_frame_record(frame_id)
+            if frame_record is None:
+                raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
+            if asset_id is None:
+                asset_id = frame_record.asset_id
+            elif frame_record.asset_id != asset_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Background generation may only process frames from one asset.",
+                )
+            if run_id is None:
+                run_id = frame_record.run_id
+        return run_id, asset_id, frame_ids
 
     @frames_router.get("/processing-state")
     def list_frame_processing_state(
@@ -369,6 +433,8 @@ if APIRouter is not None:
             flatfield_correction=body.flatfield_correction,
             flatfield_q=body.flatfield_q,
             flatfield_axis=body.flatfield_axis,
+            flatfield_min_field_value=body.flatfield_min_field_value,
+            flatfield_max_field_value=body.flatfield_max_field_value,
             apply_mask=body.apply_mask,
             crop_enabled=body.crop_enabled,
             crop_x=body.crop_x,
@@ -376,7 +442,8 @@ if APIRouter is not None:
             crop_w=body.crop_w,
             crop_h=body.crop_h,
             background_correction=body.background_correction,
-            background_percentile=body.background_percentile,
+            background_min_field_value=body.background_min_field_value,
+            background_max_field_value=body.background_max_field_value,
             invert_intensity=body.invert_intensity,
             context=context,
         )
@@ -516,6 +583,16 @@ if APIRouter is not None:
             ),
             "flatfield_q": flatfield_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q,
             "flatfield_axis": flatfield_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis,
+            "flatfield_min_field_value": (
+                flatfield_defaults.flatfield_min_field_value
+                if body.flatfield_min_field_value is None
+                else body.flatfield_min_field_value
+            ),
+            "flatfield_max_field_value": (
+                flatfield_defaults.flatfield_max_field_value
+                if body.flatfield_max_field_value is None
+                else body.flatfield_max_field_value
+            ),
             "apply_mask": preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask,
             "crop_enabled": (
                 preprocessing_defaults.crop_enabled
@@ -531,10 +608,15 @@ if APIRouter is not None:
                 if body.background_correction is None
                 else body.background_correction
             ),
-            "background_percentile": (
-                preprocessing_defaults.background_percentile
-                if body.background_percentile is None
-                else body.background_percentile
+            "background_min_field_value": (
+                preprocessing_defaults.background_min_field_value
+                if body.background_min_field_value is None
+                else body.background_min_field_value
+            ),
+            "background_max_field_value": (
+                preprocessing_defaults.background_max_field_value
+                if body.background_max_field_value is None
+                else body.background_max_field_value
             ),
             "invert_intensity": (
                 preprocessing_defaults.invert_intensity
@@ -551,6 +633,74 @@ if APIRouter is not None:
             payload=payload,
             depends_on=body.depends_on or [],
             summary=f"preprocess queued for asset {asset_id}",
+        )
+        return {"job": as_response(job)}
+
+    @router.post("/background")
+    def generate_frame_background(request: Request, body: FrameBackgroundRequest) -> dict:
+        run_id, asset_id, frame_ids = _resolve_background_target(request, body)
+        if not frame_ids:
+            return as_response(
+                {
+                    "stage": PipelineStage.BACKGROUND_FRAMES.value,
+                    "run_id": run_id,
+                    "asset_id": asset_id,
+                    "frame_count": 0,
+                    "frame_ids": [],
+                }
+            )
+        try:
+            result = generate_background_for_frames(
+                frame_ids,
+                context=get_context(request),
+                payload_kind=body.payload_kind,
+                encoding=body.encoding,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        result.update(
+            {
+                "stage": PipelineStage.BACKGROUND_FRAMES.value,
+                "run_id": run_id,
+                "asset_id": asset_id,
+            }
+        )
+        return as_response(result)
+
+    @router.post("/background/jobs")
+    def queue_frame_background_job(request: Request, body: QueueFrameBackgroundRequest) -> dict:
+        repository = get_repository(request)
+        run_id, asset_id, frame_ids = _resolve_background_target(request, body)
+        payload = {
+            "frame_ids": frame_ids,
+            "start_frame": body.start_frame,
+            "end_frame": body.end_frame,
+            "limit": body.limit,
+            "payload_kind": body.payload_kind,
+            "encoding": body.encoding,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        if body.dry_run:
+            return as_response(
+                {
+                    "dry_run": True,
+                    "run_id": run_id,
+                    "asset_id": asset_id,
+                    "priority": body.priority,
+                    "depends_on": body.depends_on or [],
+                    "payload": payload,
+                }
+            )
+        if asset_id is None:
+            raise HTTPException(status_code=422, detail="Background jobs require an asset_id or resolvable frame_ids.")
+        job = repository.create_job(
+            PipelineStage.BACKGROUND_FRAMES,
+            run_id=run_id,
+            asset_id=asset_id,
+            priority=body.priority,
+            payload=payload,
+            depends_on=body.depends_on or [],
+            summary=f"background queued for asset {asset_id}",
         )
         return {"job": as_response(job)}
 else:

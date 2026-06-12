@@ -727,6 +727,56 @@ class PostgresRepository:
             raise KeyError(frame_id)
         return row
 
+    def update_frame_background_payloads(
+        self,
+        frame_ids: Sequence[str],
+        *,
+        kvstore_hash: str,
+        payload_ref: str,
+        payload_encoding: str,
+        payload_format: str,
+        payload_dtype: str,
+        payload_shape: Sequence[int],
+        metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
+        if not resolved_frame_ids:
+            return []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.frames
+                    SET
+                        background_kvstore_hash = %s,
+                        background_payload_ref = %s,
+                        background_payload_encoding = %s,
+                        background_payload_format = %s,
+                        background_payload_dtype = %s,
+                        background_payload_shape = %s::jsonb,
+                        background_metadata = %s::jsonb
+                    WHERE id = ANY(%s::uuid[])
+                    RETURNING *;
+                    """,
+                    (
+                        kvstore_hash,
+                        payload_ref,
+                        payload_encoding,
+                        payload_format,
+                        payload_dtype,
+                        json.dumps(json_ready(list(payload_shape))),
+                        json.dumps(json_ready(metadata or {})),
+                        resolved_frame_ids,
+                    ),
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        if len(rows) != len(resolved_frame_ids):
+            found_ids = {str(row["id"]) for row in rows}
+            missing = [frame_id for frame_id in resolved_frame_ids if frame_id not in found_ids]
+            raise KeyError(f"Frame(s) not found: {', '.join(missing)}")
+        return rows
+
     def _insert_detection_rows(
         self,
         cursor,
@@ -786,6 +836,8 @@ class PostgresRepository:
     def upsert_refined_detections(
         self,
         refined_detections: Sequence[tuple[str, DetectionRecord]],
+        *,
+        job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not refined_detections:
             return []
@@ -796,49 +848,20 @@ class PostgresRepository:
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.detections_refined
-                        (candidate_detection_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                        (candidate_detection_id, job_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
                          crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
                          area, perimeter, major_axis_length, minor_axis_length,
                          min_gray_value, mean_gray_value, roi_payload, mask_payload,
                          roi_encoding, roi_format, roi_dtype, roi_shape,
                          mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
-                                %s, %s::jsonb, %s, %s::jsonb)
-                        ON CONFLICT (candidate_detection_id) DO UPDATE SET
-                            run_id = EXCLUDED.run_id,
-                            frame_id = EXCLUDED.frame_id,
-                            roi_index = EXCLUDED.roi_index,
-                            bbox_x = EXCLUDED.bbox_x,
-                            bbox_y = EXCLUDED.bbox_y,
-                            bbox_w = EXCLUDED.bbox_w,
-                            bbox_h = EXCLUDED.bbox_h,
-                            crop_bbox_x = EXCLUDED.crop_bbox_x,
-                            crop_bbox_y = EXCLUDED.crop_bbox_y,
-                            crop_bbox_w = EXCLUDED.crop_bbox_w,
-                            crop_bbox_h = EXCLUDED.crop_bbox_h,
-                            area = EXCLUDED.area,
-                            perimeter = EXCLUDED.perimeter,
-                            major_axis_length = EXCLUDED.major_axis_length,
-                            minor_axis_length = EXCLUDED.minor_axis_length,
-                            min_gray_value = EXCLUDED.min_gray_value,
-                            mean_gray_value = EXCLUDED.mean_gray_value,
-                            roi_payload = EXCLUDED.roi_payload,
-                            mask_payload = EXCLUDED.mask_payload,
-                            roi_encoding = EXCLUDED.roi_encoding,
-                            roi_format = EXCLUDED.roi_format,
-                            roi_dtype = EXCLUDED.roi_dtype,
-                            roi_shape = EXCLUDED.roi_shape,
-                            mask_encoding = EXCLUDED.mask_encoding,
-                            mask_format = EXCLUDED.mask_format,
-                            mask_dtype = EXCLUDED.mask_dtype,
-                            mask_shape = EXCLUDED.mask_shape,
-                            refinement_method = EXCLUDED.refinement_method,
-                            metadata = EXCLUDED.metadata
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                                %s, %s, %s::jsonb, %s, %s::jsonb)
                         RETURNING *;
                         """,
                         (
                             candidate_detection_id,
+                            job_id,
                             detection.run_id,
                             detection.frame_id,
                             detection.roi_index,
@@ -936,6 +959,7 @@ class PostgresRepository:
         roi_format: str | None = None,
         mask_encoding: str | None = None,
         mask_format: str | None = None,
+        refinement_state: str | None = None,
         sort_by: str = "asset_frame",
         sort_dir: str = "desc",
         limit: int | None = 100,
@@ -995,6 +1019,29 @@ class PostgresRepository:
                 clauses.append(f"{column} = %s")
                 params.append(value)
 
+        normalized_refinement_state = str(refinement_state or "").replace("_", "-").lower()
+        if normalized_refinement_state in {"refined", "has-refinement", "has-refined"}:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM {self.schema}.detections_refined refined
+                    WHERE refined.candidate_detection_id = detections.id
+                )
+                """
+            )
+        elif normalized_refinement_state in {"unrefined", "needs-refinement", "needs-refined", "none"}:
+            clauses.append(
+                f"""
+                NOT EXISTS (
+                    SELECT 1
+                    FROM {self.schema}.detections_refined refined
+                    WHERE refined.candidate_detection_id = detections.id
+                )
+                """
+            )
+        refinement_join = ""
+
         direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
         sort_key = str(sort_by or "asset_frame").lower()
         order_by_options = {
@@ -1022,9 +1069,11 @@ class PostgresRepository:
                         frames.asset_id,
                         frames.frame_index,
                         assets.filename AS asset_filename
+                        {', refined.id AS refined_detection_id, refined.refinement_method' if refinement_join else ''}
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    {refinement_join}
                     {where}
                     ORDER BY {order_by}
                     {limit_sql}
@@ -1048,6 +1097,28 @@ class PostgresRepository:
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE detections.id = %s
+                    """,
+                    (detection_id,),
+                )
+                return cursor.fetchone()
+
+    def get_refined_detection_for_candidate(self, detection_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        refined.*,
+                        refined.candidate_detection_id,
+                        frames.asset_id,
+                        frames.frame_index,
+                        assets.filename AS asset_filename
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE refined.candidate_detection_id = %s
+                    ORDER BY refined.created_at DESC, refined.id DESC
+                    LIMIT 1
                     """,
                     (detection_id,),
                 )

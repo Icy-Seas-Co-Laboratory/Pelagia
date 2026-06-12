@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from .defaults import default_processing_config
-from .frame_correction import flatfield_global_correction_for_framedata
+from .frame_correction import divide_background, flatfield_correction
 from .frame_model import FrameData
 
 
@@ -113,27 +113,6 @@ def crop_frame_data(
     return np.ascontiguousarray(np.asarray(data)[y0:y1, x0:x1])
 
 
-def subtract_background(
-    data: np.ndarray,
-    *,
-    background: np.ndarray | int | float | None = None,
-    background_percentile: int | float = 50,
-) -> np.ndarray:
-    """Subtract scalar or image background and clip to the input dtype range."""
-    image = np.asarray(data)
-    resolved_background = (
-        float(np.percentile(image, background_percentile))
-        if background is None
-        else np.asarray(background)
-    )
-    corrected = image.astype(np.float32) - resolved_background
-
-    if np.issubdtype(image.dtype, np.integer):
-        info = np.iinfo(image.dtype)
-        corrected = np.clip(corrected, info.min, info.max).astype(image.dtype)
-    return np.ascontiguousarray(corrected)
-
-
 def invert_image_intensity(data: np.ndarray) -> np.ndarray:
     """Invert image intensity so downstream thresholding sees bright foreground."""
     image = np.asarray(data)
@@ -159,9 +138,12 @@ def preprocess_frame_for_segmentation(
     flatfield_correction: bool | None = None,
     flatfield_q: float | None = None,
     flatfield_axis: int | None = None,
+    flatfield_min_field_value: int | float | None = None,
+    flatfield_max_field_value: int | float | None = None,
     background_correction: bool | None = None,
     background: np.ndarray | int | float | None = None,
-    background_percentile: int | float | None = None,
+    background_min_field_value: int | float | None = None,
+    background_max_field_value: int | float | None = None,
     invert_intensity: bool | None = None,
     context: Any = None,
 ) -> FrameData:
@@ -200,10 +182,15 @@ def preprocess_frame_for_segmentation(
         if background_correction is None
         else background_correction
     )
-    resolved_background_percentile = (
-        processing_defaults.background_percentile
-        if background_percentile is None
-        else background_percentile
+    resolved_background_min_field_value = (
+        processing_defaults.background_min_field_value
+        if background_min_field_value is None
+        else background_min_field_value
+    )
+    resolved_background_max_field_value = (
+        processing_defaults.background_max_field_value
+        if background_max_field_value is None
+        else background_max_field_value
     )
     resolved_invert_intensity = (
         processing_defaults.invert_intensity if invert_intensity is None else invert_intensity
@@ -252,19 +239,36 @@ def preprocess_frame_for_segmentation(
     )
     resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
     resolved_flatfield_axis = flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    resolved_flatfield_min_field_value = (
+        flatfield_defaults.flatfield_min_field_value
+        if flatfield_min_field_value is None
+        else flatfield_min_field_value
+    )
+    resolved_flatfield_max_field_value = (
+        flatfield_defaults.flatfield_max_field_value
+        if flatfield_max_field_value is None
+        else flatfield_max_field_value
+    )
 
     if resolved_flatfield_correction:
-        image = flatfield_global_correction_for_framedata(
+        image = flatfield_correction(
             image,
             q=resolved_flatfield_q,
             axis=resolved_flatfield_axis,
+            min_field_value=resolved_flatfield_min_field_value,
+            max_field_value=resolved_flatfield_max_field_value,
         )
 
     if resolved_background_correction:
-        image = subtract_background(
+        if source_background is None:
+            raise ValueError(
+                "background_correction requires a generated background field on the frame."
+            )
+        image = divide_background(
             image,
             background=source_background,
-            background_percentile=resolved_background_percentile,
+            min_field_value=resolved_background_min_field_value,
+            max_field_value=resolved_background_max_field_value,
         )
 
     if resolved_invert_intensity:
@@ -300,8 +304,12 @@ def preprocess_frame_for_segmentation(
             "flatfield_correction": bool(resolved_flatfield_correction),
             "flatfield_q": resolved_flatfield_q,
             "flatfield_axis": resolved_flatfield_axis,
+            "flatfield_min_field_value": resolved_flatfield_min_field_value,
+            "flatfield_max_field_value": resolved_flatfield_max_field_value,
             "background_correction": bool(resolved_background_correction),
-            "background_percentile": resolved_background_percentile,
+            "background_method": "divide",
+            "background_min_field_value": resolved_background_min_field_value,
+            "background_max_field_value": resolved_background_max_field_value,
             "intensity_inverted": bool(resolved_invert_intensity),
         }
     )
