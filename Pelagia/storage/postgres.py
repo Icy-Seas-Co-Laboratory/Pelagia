@@ -241,29 +241,30 @@ class PostgresRepository:
         asset_id: str | None = None,
         status: str | None = None,
         stage: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
         worker_id: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
         include_details: bool = True,
+        include_progress: bool = True,
+        include_payload: bool = False,
+        include_result: bool = False,
+        sort: str = "created_at",
+        direction: str = "desc",
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        clauses = []
-        params: list[Any] = []
-        if run_id:
-            clauses.append("run_id = %s")
-            params.append(run_id)
-        if asset_id:
-            clauses.append("asset_id = %s")
-            params.append(asset_id)
-        if status:
-            clauses.append("status = %s")
-            params.append(status)
-        if stage:
-            clauses.append("stage = %s")
-            params.append(stage)
-        if worker_id:
-            clauses.append("worker_id = %s")
-            params.append(worker_id)
+        resolved_statuses = list(statuses or ([] if status is None else [status]))
+        resolved_stages = list(stages or ([] if stage is None else [stage]))
+        clauses, params = self._job_filter_clauses(
+            run_id=run_id,
+            asset_id=asset_id,
+            statuses=resolved_statuses,
+            stages=resolved_stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
         if cursor:
             try:
                 cursor_created_at, cursor_id = cursor.split("|", 1)
@@ -282,39 +283,239 @@ class PostgresRepository:
             params.append(max(0, int(offset)))
         select_sql = "*"
         if not include_details:
-            select_sql = """
-                id,
-                run_id,
-                asset_id,
-                stage,
-                status,
-                priority,
-                attempt_count,
-                max_attempts,
-                lease_expires_at,
-                worker_id,
-                summary,
-                control_reason,
-                error_message,
-                created_at,
-                updated_at,
-                started_at,
-                finished_at,
-                jsonb_typeof(payload) AS payload_type,
-                pg_column_size(payload) AS payload_bytes,
-                jsonb_typeof(result) AS result_type,
-                pg_column_size(result) AS result_bytes,
-                jsonb_typeof(progress) AS progress_type,
-                pg_column_size(progress) AS progress_bytes,
-                jsonb_array_length(logs_tail) AS logs_tail_count
-            """
+            selected_columns = [
+                "id",
+                "run_id",
+                "asset_id",
+                "stage",
+                "status",
+                "priority",
+                "attempt_count",
+                "max_attempts",
+                "lease_expires_at",
+                "worker_id",
+                "summary",
+                "control_reason",
+                "error_message",
+                "created_at",
+                "updated_at",
+                "started_at",
+                "finished_at",
+            ]
+            if include_progress:
+                selected_columns.append("progress")
+            if include_payload:
+                selected_columns.append("payload")
+            if include_result:
+                selected_columns.append("result")
+            selected_columns.extend(
+                [
+                    "jsonb_typeof(payload) AS payload_type",
+                    "pg_column_size(payload) AS payload_bytes",
+                    "jsonb_typeof(result) AS result_type",
+                    "pg_column_size(result) AS result_bytes",
+                    "jsonb_typeof(progress) AS progress_type",
+                    "pg_column_size(progress) AS progress_bytes",
+                    "jsonb_array_length(logs_tail) AS logs_tail_count",
+                ]
+            )
+            select_sql = ",\n                ".join(selected_columns)
+        order_column = self._job_sort_column(sort)
+        order_direction = "ASC" if str(direction).lower() == "asc" else "DESC"
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT {select_sql} FROM {self.schema}.processing_jobs {where} ORDER BY created_at DESC, id DESC {limit_sql} {offset_sql}",
+                    f"SELECT {select_sql} FROM {self.schema}.processing_jobs {where} ORDER BY {order_column} {order_direction}, id {order_direction} {limit_sql} {offset_sql}",
                     tuple(params),
                 )
                 return cursor.fetchall()
+
+    def _job_filter_clauses(
+        self,
+        *,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        def enum_in_clause(column: str, values: Sequence[str], enum_name: str) -> str:
+            placeholders = ", ".join([f"%s::{self.schema}.{enum_name}" for _ in values])
+            return f"{column} IN ({placeholders})"
+
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        if asset_id:
+            clauses.append("asset_id = %s")
+            params.append(asset_id)
+        resolved_statuses = [str(value) for value in statuses or [] if value]
+        if resolved_statuses:
+            clauses.append(enum_in_clause("status", resolved_statuses, "job_status"))
+            params.extend(resolved_statuses)
+        resolved_stages = [str(value) for value in stages or [] if value]
+        if resolved_stages:
+            clauses.append(enum_in_clause("stage", resolved_stages, "stage_name"))
+            params.extend(resolved_stages)
+        resolved_job_ids = [str(value) for value in job_ids or [] if value]
+        if resolved_job_ids:
+            placeholders = ", ".join(["%s::uuid" for _ in resolved_job_ids])
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(resolved_job_ids)
+        if worker_id:
+            clauses.append("worker_id = %s")
+            params.append(worker_id)
+        return clauses, params
+
+    def _job_sort_column(self, sort: str | None) -> str:
+        allowed = {
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "priority": "priority",
+            "stage": "stage",
+            "status": "status",
+        }
+        return allowed.get(str(sort or "").lower(), "created_at")
+
+    def summarize_jobs(
+        self,
+        *,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        include_recent: bool = False,
+        recent_limit: int = 5,
+    ) -> dict[str, Any]:
+        clauses, params = self._job_filter_clauses(
+            run_id=run_id,
+            asset_id=asset_id,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        progress_select = self._progress_aggregate_sql()
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COUNT(*)::bigint AS job_count,
+                        COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
+                        COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                        COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
+                        COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
+                        COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed,
+                        COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
+                        COUNT(*) FILTER (WHERE status = 'dead_lettered')::bigint AS dead_lettered,
+                        {progress_select}
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    """,
+                    tuple(params),
+                )
+                total = cursor.fetchone() or {}
+                cursor.execute(
+                    f"""
+                    SELECT
+                        stage,
+                        COUNT(*)::bigint AS job_count,
+                        COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
+                        COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                        COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
+                        COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
+                        COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed,
+                        COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
+                        COUNT(*) FILTER (WHERE status = 'dead_lettered')::bigint AS dead_lettered,
+                        {progress_select}
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    GROUP BY stage
+                    ORDER BY stage
+                    """,
+                    tuple(params),
+                )
+                by_stage = cursor.fetchall()
+                cursor.execute(
+                    f"""
+                    SELECT status, COUNT(*)::bigint AS job_count
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    GROUP BY status
+                    ORDER BY status
+                    """,
+                    tuple(params),
+                )
+                by_status = cursor.fetchall()
+                recent_jobs: list[dict[str, Any]] = []
+                if include_recent:
+                    recent_jobs = self.list_jobs(
+                        run_id=run_id,
+                        asset_id=asset_id,
+                        statuses=statuses,
+                        stages=stages,
+                        job_ids=job_ids,
+                        worker_id=worker_id,
+                        limit=recent_limit,
+                        include_details=False,
+                        include_progress=True,
+                        sort="updated_at",
+                        direction="desc",
+                    )
+        return {
+            "filters": {
+                "run_id": run_id,
+                "asset_id": asset_id,
+                "status": list(statuses or []),
+                "stage": list(stages or []),
+                "ids": list(job_ids or []),
+                "worker_id": worker_id,
+            },
+            "total": self._job_summary_row(total),
+            "by_stage": [self._job_summary_row(row) for row in by_stage],
+            "by_status": by_status,
+            "recent_jobs": recent_jobs,
+        }
+
+    def _progress_aggregate_sql(self) -> str:
+        def numeric_jsonb(key: str) -> str:
+            return f"""
+                CASE
+                    WHEN progress ? '{key}' AND progress->>'{key}' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                    THEN (progress->>'{key}')::numeric
+                    ELSE 0
+                END
+            """
+
+        return f"""
+            SUM({numeric_jsonb("total")}) AS known_total_units,
+            SUM({numeric_jsonb("completed")}) AS completed_units,
+            SUM({numeric_jsonb("failed")}) AS failed_units,
+            SUM({numeric_jsonb("skipped")}) AS skipped_units
+        """
+
+    def _job_summary_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        known_total = float(row.get("known_total_units") or 0)
+        completed = float(row.get("completed_units") or 0)
+        progress = {
+            "known_total_units": known_total,
+            "completed_units": completed,
+            "failed_units": float(row.get("failed_units") or 0),
+            "skipped_units": float(row.get("skipped_units") or 0),
+            "percent": (completed / known_total * 100.0) if known_total > 0 else None,
+        }
+        return {
+            **row,
+            "progress": progress,
+        }
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -1347,6 +1548,7 @@ class PostgresRepository:
         filename: str | None = None,
         preprocessing_state: str | None = None,
         detection_state: str | None = None,
+        refinement_state: str | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
         limit: int = 1000,
@@ -1395,6 +1597,16 @@ class PostgresRepository:
             state_clauses.append("detection_count > 0")
         elif detection_state in {"partially-detected", "partially_detected", "partial"}:
             state_clauses.append("FALSE")
+        if refinement_state in {"has-refinement", "has_refinement", "refined"}:
+            state_clauses.append("refined_candidate_detection_count > 0")
+        elif refinement_state in {"needs-refinement", "needs_refinement", "unrefined", "none"}:
+            state_clauses.append("unrefined_detection_count > 0")
+        elif refinement_state in {"fully-refined", "fully_refined", "complete"}:
+            state_clauses.append("detection_count > 0 AND unrefined_detection_count = 0")
+        elif refinement_state in {"partially-refined", "partially_refined", "partial"}:
+            state_clauses.append("refined_candidate_detection_count > 0 AND unrefined_detection_count > 0")
+        elif refinement_state in {"no-detections", "no_detections"}:
+            state_clauses.append("detection_count = 0")
         state_where = f"WHERE {' AND '.join(state_clauses)}" if state_clauses else ""
 
         query = f"""
@@ -1412,10 +1624,15 @@ class PostgresRepository:
                         frames.preprocessed_payload_ref IS NOT NULL
                         OR frames.preprocessed_kvstore_hash IS NOT NULL
                     ) AS has_preprocessed_payload,
-                    COUNT(detections.id) AS detection_count
+                    COUNT(DISTINCT detections.id) AS detection_count,
+                    COUNT(DISTINCT detections.id) FILTER (
+                        WHERE refined.candidate_detection_id IS NOT NULL
+                    ) AS refined_candidate_detection_count,
+                    COUNT(refined.id) AS refined_detection_count
                 FROM {self.schema}.frames frames
                 JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                 LEFT JOIN {self.schema}.detection_candidate detections ON detections.frame_id = frames.id
+                LEFT JOIN {self.schema}.detections_refined refined ON refined.candidate_detection_id = detections.id
                 {where}
                 GROUP BY
                     frames.id,
@@ -1439,7 +1656,14 @@ class PostgresRepository:
                     CASE
                         WHEN detection_count > 0 THEN 'fully-detected'
                         ELSE 'needs-detections'
-                    END AS detection_state
+                    END AS detection_state,
+                    GREATEST(detection_count - refined_candidate_detection_count, 0) AS unrefined_detection_count,
+                    CASE
+                        WHEN detection_count = 0 THEN 'no-detections'
+                        WHEN refined_candidate_detection_count = 0 THEN 'needs-refinement'
+                        WHEN refined_candidate_detection_count >= detection_count THEN 'fully-refined'
+                        ELSE 'partially-refined'
+                    END AS refinement_state
                 FROM frame_processing_counts
             )
         """
@@ -1452,7 +1676,10 @@ class PostgresRepository:
                         COUNT(*) AS total_frame_count,
                         COUNT(*) FILTER (WHERE has_preprocessed_payload) AS total_preprocessed_frame_count,
                         COUNT(*) FILTER (WHERE detection_count > 0) AS total_detected_frame_count,
-                        COALESCE(SUM(detection_count), 0) AS total_detection_count
+                        COALESCE(SUM(detection_count), 0) AS total_detection_count,
+                        COALESCE(SUM(refined_candidate_detection_count), 0) AS total_refined_candidate_detection_count,
+                        COALESCE(SUM(unrefined_detection_count), 0) AS total_unrefined_detection_count,
+                        COALESCE(SUM(refined_detection_count), 0) AS total_refined_detection_count
                     FROM frame_processing_state
                     {state_where}
                     """,
@@ -1478,6 +1705,9 @@ class PostgresRepository:
                 "total_preprocessed_frame_count": summary["total_preprocessed_frame_count"],
                 "total_detected_frame_count": summary["total_detected_frame_count"],
                 "total_detection_count": summary["total_detection_count"],
+                "total_refined_candidate_detection_count": summary["total_refined_candidate_detection_count"],
+                "total_unrefined_detection_count": summary["total_unrefined_detection_count"],
+                "total_refined_detection_count": summary["total_refined_detection_count"],
             },
             "frames": frames,
         }

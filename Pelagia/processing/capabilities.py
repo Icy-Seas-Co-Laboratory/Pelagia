@@ -37,6 +37,8 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "queue_background": "/frame/background/jobs",
                 "queue_preprocessing": "/frame/preprocess/jobs",
                 "queue_segmentation": "/segmentation/jobs",
+                "jobs": "/jobs",
+                "jobs_summary": "/jobs/summary",
             },
         },
         "supported": {
@@ -67,6 +69,33 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
             "roi_refinement": roi_refinement_capabilities(config),
         },
         "jobs": {
+            "stages": [
+                {
+                    "id": PipelineStage.EXTRACT_FRAMES.value,
+                    "label": "Ingestion",
+                    "unit": "frames",
+                    "queue_endpoint": "/ingestion/videos",
+                },
+                {
+                    "id": PipelineStage.PREPROCESS_FRAMES.value,
+                    "label": "Preprocessing",
+                    "unit": "frames",
+                    "queue_endpoint": "/frame/preprocess/jobs",
+                },
+                {
+                    "id": PipelineStage.SEGMENT.value,
+                    "label": "Candidate ROIs",
+                    "unit": "frames",
+                    "secondary_unit": "detections",
+                    "queue_endpoint": "/segmentation/jobs",
+                },
+                {
+                    "id": PipelineStage.ROI_REFINEMENT.value,
+                    "label": "ROI Refinement",
+                    "unit": "rois",
+                    "queue_endpoint": "/roi-refinement/jobs",
+                },
+            ],
             "queueable_stages": [
                 PipelineStage.EXTRACT_FRAMES.value,
                 PipelineStage.BACKGROUND_FRAMES.value,

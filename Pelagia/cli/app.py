@@ -38,6 +38,11 @@ if typer is not None:
             return path.stat().st_size
         return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
+    def _queued_path_size_bytes(path: Path, stat_size_bytes: int) -> int:
+        if path.is_file():
+            return int(stat_size_bytes)
+        return 0
+
     def _config_from_options(
         kvstore_root: Optional[Path],
         database_dsn: Optional[str],
@@ -290,6 +295,11 @@ if typer is not None:
         )
         if compute_checksum and resolved.is_dir():
             checksum = f"directory:size={_path_size_bytes(resolved)}:mtime_ns={stat.st_mtime_ns}"
+        size_bytes = (
+            _path_size_bytes(resolved)
+            if compute_checksum
+            else _queued_path_size_bytes(resolved, stat.st_size)
+        )
 
         planned_run = PlannedRun(
             manifest=RunManifest(
@@ -309,7 +319,7 @@ if typer is not None:
                         filename=filename,
                         path=str(resolved),
                         kind=asset_kind,
-                        size_bytes=_path_size_bytes(resolved),
+                        size_bytes=size_bytes,
                         checksum=checksum,
                         collections=normalized_collections,
                         metadata={

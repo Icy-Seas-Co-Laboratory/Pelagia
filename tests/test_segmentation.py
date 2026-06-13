@@ -245,8 +245,40 @@ def test_preprocess_frame_for_segmentation_applies_ordered_steps():
     assert processed.metadata["background_min_field_value"] == 50.0
     assert processed.metadata["background_max_field_value"] == 255.0
     assert processed.read().shape == data.shape
-    assert processed.read()[0, 0] == 255
-    assert processed.read()[1, 1] == 175
+    assert processed.read()[0, 0] == 0
+    assert processed.read()[1, 1] == 0
+
+
+def test_preprocess_frame_for_segmentation_applies_flatfield_when_enabled():
+    data = np.array(
+        [
+            [20, 40, 80],
+            [20, 40, 80],
+            [20, 40, 80],
+        ],
+        dtype=np.uint8,
+    )
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=1,
+        data=data,
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        flatfield_correction=True,
+        flatfield_q=0.5,
+        flatfield_axis=0,
+        flatfield_min_field_value=1,
+        flatfield_max_field_value=None,
+        background_correction=False,
+        invert_intensity=False,
+    )
+
+    assert processed.metadata["preprocessing_steps"] == ["flatfield"]
+    assert processed.metadata["flatfield_correction"] is True
+    assert processed.read().shape == data.shape
 
 
 def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
@@ -505,6 +537,54 @@ def test_refine_detection_does_not_load_frame_for_interior_mask():
 
     assert result.metadata["refinement_frame_loaded"] is False
     assert result.metadata["refinement_expansion_count"] == 0
+
+
+def test_refine_detection_loads_initial_roi_from_frame_when_payload_is_missing():
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[2, 2] = 255
+    detection = DetectionRecord(
+        id="det-no-roi",
+        run_id="run-1",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=4,
+        bbox_y=3,
+        bbox_w=1,
+        bbox_h=1,
+        crop_bbox_x=2,
+        crop_bbox_y=1,
+        crop_bbox_w=4,
+        crop_bbox_h=4,
+        area=1,
+        perimeter=1,
+        major_axis_length=1,
+        minor_axis_length=1,
+        min_gray_value=12,
+        mean_gray_value=12,
+        roi_payload=None,
+        mask_payload=mask.tobytes(order="C"),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+    )
+    frame = np.arange(49, dtype=np.uint8).reshape(7, 7)
+    loaded = []
+
+    def load_frame(frame_id):
+        loaded.append(frame_id)
+        return frame
+
+    result = refine_detection(
+        detection,
+        frame_loader=load_frame,
+        options=RoiRefinementOptions(tile_size=4, overlap_fraction=0.5),
+    )
+
+    assert loaded == [FRAME_ID]
+    np.testing.assert_array_equal(result.roi, frame[1:5, 2:6])
+    assert result.metadata["refinement_frame_loaded"] is True
+    assert result.metadata["refinement_initial_roi_source"] == "frame"
 
 
 def test_refine_detections_reconciles_contained_overlaps():

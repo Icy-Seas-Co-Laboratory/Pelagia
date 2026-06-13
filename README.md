@@ -166,7 +166,9 @@ python -m pip install -r requirements.txt
 ```
 
 Use `requirements-dev.txt` for test/development tools and `requirements-ml.txt`
-for optional TensorFlow/Keras U-Net refinement support. See
+for optional TensorFlow/Keras U-Net refinement support. On Linux x86_64,
+`requirements-ml.txt` prefers TensorFlow's CUDA-enabled pip extra. For Apple
+Metal acceleration on macOS, use `requirements-ml-apple-metal.txt`. See
 [docs/python-environment.md](docs/python-environment.md) for the full setup
 walkthrough.
 

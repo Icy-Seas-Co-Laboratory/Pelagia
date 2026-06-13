@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -120,12 +121,58 @@ class JobSummary(FlexibleModel):
     stage: str | None = None
     status: str | None = None
     priority: int | None = None
+    attempt_count: int | None = None
+    max_attempts: int | None = None
+    worker_id: str | None = None
+    summary: str | None = None
+    progress: dict[str, Any] | None = None
+    control_reason: str | None = None
+    error_message: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    payload_bytes: int | None = None
+    result_bytes: int | None = None
+    progress_bytes: int | None = None
+    logs_tail_count: int | None = None
     payload: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
 
 
 class JobsListResponse(FlexibleModel):
     jobs: list[JobSummary]
+
+
+class JobSummaryProgress(FlexibleModel):
+    known_total_units: float | None = None
+    completed_units: float | None = None
+    failed_units: float | None = None
+    skipped_units: float | None = None
+    percent: float | None = None
+
+
+class JobAggregateSummary(FlexibleModel):
+    stage: str | None = None
+    status: str | None = None
+    job_count: int = 0
+    queued: int | None = None
+    leased: int | None = None
+    paused: int | None = None
+    succeeded: int | None = None
+    failed: int | None = None
+    cancelled: int | None = None
+    dead_lettered: int | None = None
+    progress: JobSummaryProgress | None = None
+
+
+class JobsSummaryResponse(FlexibleModel):
+    filters: dict[str, Any]
+    total: JobAggregateSummary
+    by_stage: list[JobAggregateSummary] = Field(default_factory=list)
+    by_status: list[JobAggregateSummary] = Field(default_factory=list)
+    recent_jobs: list[JobSummary] = Field(default_factory=list)
 
 
 class JobDetailResponse(FlexibleModel):

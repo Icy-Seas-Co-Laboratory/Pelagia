@@ -1,0 +1,5 @@
+# Optional Apple Metal machine-learning dependencies for U-Net ROI refinement.
+# Use this on macOS machines where TensorFlow should use Apple's
+# tensorflow-metal PluggableDevice package when available.
+-r requirements.txt
+-e ".[ml-apple-metal]"

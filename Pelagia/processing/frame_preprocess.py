@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from .defaults import default_processing_config
-from .frame_correction import divide_background, flatfield_correction
+from .frame_correction import divide_background, flatfield_correction as correct_flatfield
 from .frame_model import FrameData
 
 
@@ -251,7 +251,7 @@ def preprocess_frame_for_segmentation(
     )
 
     if resolved_flatfield_correction:
-        image = flatfield_correction(
+        image = correct_flatfield(
             image,
             q=resolved_flatfield_q,
             axis=resolved_flatfield_axis,

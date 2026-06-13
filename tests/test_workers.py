@@ -80,7 +80,7 @@ class FakeRepository:
         return rows
 
     def get_detection(self, detection_id):
-        if detection_id != "det-1":
+        if detection_id not in {"det-1", "det-no-roi"}:
             return None
         roi = np.array([[0, 20], [40, 80]], dtype=np.uint8)
         mask = np.array([[0, 255], [255, 0]], dtype=np.uint8)
@@ -104,7 +104,7 @@ class FakeRepository:
             "minor_axis_length": 2,
             "min_gray_value": 20,
             "mean_gray_value": 30,
-            "roi_payload": roi.tobytes(order="C"),
+            "roi_payload": None if detection_id == "det-no-roi" else roi.tobytes(order="C"),
             "mask_payload": mask.tobytes(order="C"),
             "roi_encoding": "raw",
             "roi_format": "raw_ndarray_c_order",
@@ -524,6 +524,43 @@ def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
     assert result["refined_count"] == 1
     assert result["resolved_options"]["encoding"] is None
     assert repo.refined_detections[0][0][1].roi_encoding == "raw"
+
+
+def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    loaded = []
+
+    def fake_retrieve_frame(frame_id, *, context, payload_kind):
+        loaded.append((frame_id, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.array([[0, 20], [40, 80]], dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-refine-no-roi",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-no-roi"],
+                "model_kind": "identity",
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["refined_count"] == 1
+    assert loaded == [("frame-1", "preprocessed")]
+    assert repo.refined_detections[0][0][1].metadata["refinement_initial_roi_source"] == "frame"
 
 
 def test_default_registry_includes_roi_detection_handler(monkeypatch):

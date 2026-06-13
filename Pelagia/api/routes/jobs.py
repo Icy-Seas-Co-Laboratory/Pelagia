@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from ...domain import JobStatus, PipelineStage
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, HTTPException, Query, Request
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
 
 if APIRouter is not None:
-    from ..schemas import JobDetailResponse, JobsListResponse
+    from ..schemas import JobDetailResponse, JobsListResponse, JobsSummaryResponse
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -20,6 +21,40 @@ if APIRouter is not None:
 
     def _bounded_offset(offset: int | None) -> int:
         return max(0, 0 if offset is None else offset)
+
+    def _query_values(values: list[str] | None) -> list[str]:
+        if not values:
+            return []
+        resolved: list[str] = []
+        for value in values:
+            for item in str(value).split(","):
+                stripped = item.strip()
+                if stripped:
+                    resolved.append(stripped)
+        return resolved
+
+    def _enum_values(values: list[str] | None, enum_type: type[JobStatus] | type[PipelineStage], label: str) -> list[str]:
+        allowed = {item.value for item in enum_type}
+        resolved = _query_values(values)
+        invalid = [value for value in resolved if value not in allowed]
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {label}: {', '.join(invalid)}. Expected one of: {', '.join(sorted(allowed))}.",
+            )
+        return resolved
+
+    def _uuid_values(values: list[str] | None) -> list[str]:
+        resolved = _query_values(values)
+        invalid: list[str] = []
+        for value in resolved:
+            try:
+                UUID(value)
+            except ValueError:
+                invalid.append(value)
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid job id(s): {', '.join(invalid)}.")
+        return resolved
 
     class CreateJobRequest(BaseModel):
         stage: PipelineStage
@@ -46,28 +81,72 @@ if APIRouter is not None:
         request: Request,
         run_id: str | None = None,
         asset_id: str | None = None,
-        status: JobStatus | None = None,
-        stage: PipelineStage | None = None,
+        status: list[str] | None = Query(None),
+        stage: list[str] | None = Query(None),
+        ids: list[str] | None = Query(None),
         worker_id: str | None = None,
         limit: int | None = 100,
         offset: int = 0,
         cursor: str | None = None,
         include_details: bool = False,
+        include_progress: bool = True,
+        include_payload: bool = False,
+        include_result: bool = False,
+        sort: str = "created_at",
+        direction: str = "desc",
     ) -> dict[str, list]:
         repository = get_repository(request)
         resolved_limit = _bounded_limit(limit)
+        statuses = _enum_values(status, JobStatus, "status")
+        stages = _enum_values(stage, PipelineStage, "stage")
+        job_ids = _uuid_values(ids)
         jobs = repository.list_jobs(
             run_id=run_id,
             asset_id=asset_id,
-            status=None if status is None else status.value,
-            stage=None if stage is None else stage.value,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
             worker_id=worker_id,
             limit=resolved_limit,
             offset=_bounded_offset(offset),
             cursor=cursor,
             include_details=include_details,
+            include_progress=include_progress,
+            include_payload=include_payload,
+            include_result=include_result,
+            sort=sort,
+            direction=direction,
         )
         return {"jobs": as_response(jobs)}
+
+    @router.get("/summary", response_model=JobsSummaryResponse, response_model_exclude_none=True)
+    def summarize_jobs(
+        request: Request,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        status: list[str] | None = Query(None),
+        stage: list[str] | None = Query(None),
+        ids: list[str] | None = Query(None),
+        worker_id: str | None = None,
+        include_recent: bool = False,
+        recent_limit: int = 5,
+    ) -> dict[str, Any]:
+        repository = get_repository(request)
+        statuses = _enum_values(status, JobStatus, "status")
+        stages = _enum_values(stage, PipelineStage, "stage")
+        job_ids = _uuid_values(ids)
+        return as_response(
+            repository.summarize_jobs(
+                run_id=run_id,
+                asset_id=asset_id,
+                statuses=statuses,
+                stages=stages,
+                job_ids=job_ids,
+                worker_id=worker_id,
+                include_recent=include_recent,
+                recent_limit=_bounded_limit(recent_limit),
+            )
+        )
 
     @router.post("", response_model=JobDetailResponse, response_model_exclude_none=True)
     def create_job(request: Request, body: CreateJobRequest) -> dict:

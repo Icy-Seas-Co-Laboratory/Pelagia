@@ -9,6 +9,8 @@ from Pelagia.domain import FrameRecord
 from Pelagia.processing import ingest as ingest_module
 from Pelagia.processing.frame_codec import decode_array_payload
 from Pelagia.processing.frame_correction import (
+    _bounded_field,
+    _divide_by_field,
     apply_flatfield_correction,
     flatfield_correction,
     generate_background_for_frames,
@@ -139,8 +141,37 @@ def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     corrected = flatfield_correction(data, q=0.5, axis=0)
     row_corrected = flatfield_correction(data, q=0.5, axis=1)
 
-    np.testing.assert_array_equal(corrected, np.array([[25, 20], [75, 80]], dtype=np.uint8))
-    np.testing.assert_array_equal(row_corrected, np.array([[36, 73], [30, 80]], dtype=np.uint8))
+    np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
+    np.testing.assert_array_equal(row_corrected, np.array([[170, 255], [139, 255]], dtype=np.uint8))
+
+
+def test_bounded_field_marks_out_of_range_values_with_sentinel_divisors():
+    field = np.array([5, 20, 300], dtype=np.float32)
+
+    bounded = _bounded_field(field, min_field_value=10, max_field_value=200)
+
+    np.testing.assert_array_equal(
+        bounded,
+        np.array([0, 20, 255], dtype=np.float32),
+    )
+
+
+def test_divide_by_field_maps_zero_divisor_to_255():
+    data = np.array([[10, 10, 10]], dtype=np.uint8)
+    field = np.array([0, 10, 255], dtype=np.float32)
+
+    corrected = _divide_by_field(data, field)
+
+    np.testing.assert_array_equal(corrected, np.array([[255, 255, 10]], dtype=np.uint8))
+
+
+def test_divide_by_field_maps_zero_divisor_to_255_for_float_data():
+    corrected = _divide_by_field(
+        np.array([10.0], dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+    )
+
+    np.testing.assert_array_equal(corrected, np.array([255.0], dtype=np.float32))
 
 
 def test_generate_background_for_frames_stores_mean_field(monkeypatch):
@@ -475,7 +506,7 @@ def test_apply_flatfield_correction_returns_corrected_runtime_frame():
 
     np.testing.assert_array_equal(
         corrected.read(),
-        np.array([[25, 20], [75, 80]], dtype=np.uint8),
+        np.array([[127, 102], [255, 255]], dtype=np.uint8),
     )
     assert corrected.metadata["flatfield_correction"] is True
     assert corrected.metadata["flatfield_q"] == 0.5

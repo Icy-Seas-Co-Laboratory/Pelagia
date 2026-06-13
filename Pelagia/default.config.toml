@@ -103,8 +103,8 @@ flatfield_correction = true
 flatfield_q = 0.5
 # Axis used by global flatfield correction. Options: 0, 1.
 flatfield_axis = 0
-# Clamp the estimated flatfield before division. Min must be > 0; max may be null.
-flatfield_min_field_value = 50
+# Bound the estimated field before division: values below min become 0, values above max become 255.
+flatfield_min_field_value = 1
 flatfield_max_field_value = 255
 
 [processing.thresholding]
@@ -120,7 +120,7 @@ flatfield_max_field_value = 255
 # - percentile_background: background percentile plus minimum contrast.
 # - hysteresis: connected weak/strong thresholding.
 # - sobel_edges: Sobel gradient thresholding.
-method = "bounded_otsu_canny"
+method = "manual"
 
 # Manual threshold method.
 manual_threshold = 100

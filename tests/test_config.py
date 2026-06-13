@@ -50,9 +50,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
-    assert config.processing.flatfield.flatfield_min_field_value == 50.0
+    assert config.processing.flatfield.flatfield_min_field_value == 1.0
     assert config.processing.flatfield.flatfield_max_field_value == 255.0
-    assert config.processing.thresholding.method == "bounded_otsu_canny"
+    assert config.processing.thresholding.method == "manual"
     assert config.processing.thresholding.thresholding_maximum_value == 100.0
     assert config.processing.thresholding.bounded_otsu_min_contrast == 50.0
     assert config.processing.thresholding.canny_low_threshold == 60.0

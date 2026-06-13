@@ -27,15 +27,15 @@ requeue_interval_seconds = 30.0
 
 [[worker]]
 name = "general-1"
-capabilities = ["ingest", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
 
 [[worker]]
 name = "general-2"
-capabilities = ["ingest", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
 
 [[worker]]
 name = "general-3"
-capabilities = ["ingest", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
 
 [[worker]]
 name = "general-4"

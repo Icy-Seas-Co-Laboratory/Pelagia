@@ -216,7 +216,7 @@ def decode_detection_roi(detection: DetectionRecord) -> np.ndarray:
     return np.ascontiguousarray(decode_array_payload(detection.roi_payload, metadata))
 
 
-def decode_detection_candidate_mask(detection: DetectionRecord) -> np.ndarray:
+def decode_detection_candidate_mask(detection: DetectionRecord, roi: np.ndarray | None = None) -> np.ndarray:
     """Decode the candidate ROI mask, or derive one from non-zero ROI pixels."""
     if detection.mask_payload is not None:
         metadata = {
@@ -226,8 +226,31 @@ def decode_detection_candidate_mask(detection: DetectionRecord) -> np.ndarray:
         }
         return as_binary_mask(decode_array_payload(detection.mask_payload, metadata))
 
-    roi = decode_detection_roi(detection)
-    return as_binary_mask(as_grayscale_array(roi))
+    source_roi = roi if roi is not None else decode_detection_roi(detection)
+    return as_binary_mask(as_grayscale_array(source_roi))
+
+
+def load_detection_roi_from_frame(
+    detection: DetectionRecord,
+    *,
+    frame_loader: FrameLoader,
+) -> np.ndarray:
+    """Load the source frame and crop the candidate ROI when no ROI payload is stored."""
+    frame = as_grayscale_array(frame_loader(detection.frame_id))
+    return _crop_detection_roi_from_frame(detection, frame)
+
+
+def _crop_detection_roi_from_frame(detection: DetectionRecord, frame: np.ndarray) -> np.ndarray:
+    """Crop a detection ROI from an already-loaded grayscale source frame."""
+    crop_x, crop_y, crop_w, crop_h = _detection_crop_bbox(detection)
+    if crop_x < 0 or crop_y < 0 or crop_w < 1 or crop_h < 1:
+        raise ValueError(f"Detection {detection.id or detection.roi_index!r} has an invalid crop bbox.")
+    frame_h, frame_w = frame.shape[:2]
+    if crop_x + crop_w > frame_w or crop_y + crop_h > frame_h:
+        raise ValueError(
+            f"Detection crop bbox {(crop_x, crop_y, crop_w, crop_h)} exceeds frame bounds {(frame_w, frame_h)}."
+        )
+    return np.ascontiguousarray(frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w])
 
 
 def build_roi_tiles(
@@ -359,16 +382,27 @@ def refine_detection(
         "identity" if isinstance(resolved_model, IdentityRoiRefinementModel) else resolved_model.__class__.__name__
     )
 
-    roi = as_grayscale_array(decode_detection_roi(detection))
-    candidate_mask = decode_detection_candidate_mask(detection)
+    full_frame: np.ndarray | None = None
+    frame_loaded = False
+    roi_source = "payload"
+    if detection.roi_payload is None:
+        if frame_loader is None:
+            raise ValueError(
+                "Detection does not include ROI payload data and no frame_loader was supplied."
+            )
+        full_frame = as_grayscale_array(frame_loader(detection.frame_id))
+        frame_loaded = True
+        roi_source = "frame"
+        roi = _crop_detection_roi_from_frame(detection, full_frame)
+    else:
+        roi = as_grayscale_array(decode_detection_roi(detection))
+    candidate_mask = decode_detection_candidate_mask(detection, roi=roi)
     if candidate_mask.shape[:2] != roi.shape[:2]:
         raise ValueError(
             f"Candidate mask shape {candidate_mask.shape[:2]} does not match ROI shape {roi.shape[:2]}."
         )
 
     crop_bbox = _detection_crop_bbox(detection, roi.shape)
-    full_frame: np.ndarray | None = None
-    frame_loaded = False
     expansion_count = 0
     boundary_expansion_required = False
     last_tiles: list[RoiTile] = []
@@ -449,6 +483,7 @@ def refine_detection(
             "refinement_tile_count": len(last_tiles),
             "refinement_expansion_count": expansion_count,
             "refinement_frame_loaded": frame_loaded,
+            "refinement_initial_roi_source": roi_source,
             "refinement_boundary_expansion_required": boundary_expansion_required,
             "refinement_crop_bbox": crop_bbox,
             "refinement_bbox": bbox,

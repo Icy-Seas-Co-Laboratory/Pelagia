@@ -74,22 +74,33 @@ def _bounded_field(
     max_field_value: float | None = None,
 ) -> np.ndarray:
     resolved_min = float(min_field_value)
-    if resolved_min <= 0:
-        raise ValueError("min_field_value must be > 0.")
+    if resolved_min < 0:
+        raise ValueError("min_field_value must be >= 0.")
     if max_field_value is not None and float(max_field_value) < resolved_min:
         raise ValueError("max_field_value must be >= min_field_value.")
 
     bounded = np.asarray(field, dtype=np.float32)
-    bounded = np.maximum(bounded, resolved_min)
+    bounded = np.where(bounded < resolved_min, 0.0, bounded).astype(np.float32, copy=False)
     if max_field_value is not None:
-        bounded = np.minimum(bounded, float(max_field_value))
+        bounded = np.where(bounded > float(max_field_value), 255.0, bounded).astype(
+            np.float32,
+            copy=False,
+        )
     return bounded
 
 
 def _divide_by_field(data: np.ndarray, field: np.ndarray) -> np.ndarray:
     array = np.asarray(data)
-    scale = float(np.max(field)) if np.any(field > 0) else 255.0
-    corrected = array.astype(np.float32) / field * scale
+    field_array = np.asarray(field, dtype=np.float32)
+    output_shape = np.broadcast_shapes(array.shape, field_array.shape)
+    corrected = np.ones(output_shape, dtype=np.float32)
+    np.divide(
+        array.astype(np.float32),
+        field_array,
+        out=corrected,
+        where=field_array != 0,
+    )
+    corrected *= 255 # TODO Does this need to be hardcoded for 8bit grayscale?
 
     if np.issubdtype(array.dtype, np.integer):
         info = np.iinfo(array.dtype)

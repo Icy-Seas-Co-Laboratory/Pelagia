@@ -153,7 +153,27 @@ class FakeRepository:
             )
         if detection_id == "det-1":
             return self._detection_row()
+        if detection_id == "det-no-roi":
+            return self._detection_row(
+                id=detection_id,
+                roi_payload=None,
+                crop_bbox_x=1,
+                crop_bbox_y=2,
+                crop_bbox_w=2,
+                crop_bbox_h=2,
+            )
         return None
+
+    def get_refined_detection_for_candidate(self, detection_id):
+        if detection_id != "det-1":
+            return None
+        return self._detection_row(
+            id="refined-det-1",
+            candidate_detection_id=detection_id,
+            roi_payload=np.array([[5, 6], [7, 8]], dtype=np.uint8).tobytes(order="C"),
+            mask_payload=np.array([[0, 255], [255, 0]], dtype=np.uint8).tobytes(order="C"),
+            metadata={"detection_stage": "refined"},
+        )
 
     def upsert_refined_detections(self, refined_detections, *, job_id=None):
         rows = []
@@ -224,6 +244,9 @@ class FakeRepository:
                 "total_preprocessed_frame_count": 1,
                 "total_detected_frame_count": 1,
                 "total_detection_count": 7,
+                "total_refined_candidate_detection_count": 3,
+                "total_unrefined_detection_count": 4,
+                "total_refined_detection_count": 3,
             },
             "frames": [
                 {
@@ -236,8 +259,12 @@ class FakeRepository:
                     "collections": ["test"],
                     "has_preprocessed_payload": True,
                     "detection_count": 7,
+                    "refined_candidate_detection_count": 3,
+                    "unrefined_detection_count": 4,
+                    "refined_detection_count": 3,
                     "preprocessing_state": "fully-preprocessed",
                     "detection_state": "fully-detected",
+                    "refinement_state": "partially-refined",
                     **query_fields,
                 },
                 {
@@ -250,8 +277,12 @@ class FakeRepository:
                     "collections": ["test"],
                     "has_preprocessed_payload": False,
                     "detection_count": 0,
+                    "refined_candidate_detection_count": 0,
+                    "unrefined_detection_count": 0,
+                    "refined_detection_count": 0,
                     "preprocessing_state": "needs-preprocessed",
                     "detection_state": "needs-detections",
+                    "refinement_state": "no-detections",
                     **query_fields,
                 },
             ],
@@ -466,6 +497,20 @@ def test_api_roi_refinement_options_are_ui_ready():
     assert body["defaults"]["roi_refinement"]["residual_discovery_enabled"] is False
 
 
+def test_api_roi_refinement_get_describes_post_contract():
+    client, _, _ = make_client()
+
+    response = client.get("/roi-refinement")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["endpoint"] == "/roi-refinement"
+    assert body["methods"]["POST"]
+    assert body["options_url"] == "/roi-refinement/options"
+    assert body["jobs_url"] == "/roi-refinement/jobs"
+    assert "detection_ids" in body["required_payload"]
+
+
 def test_api_roi_refinement_dry_run_resolves_builtin_model_ref():
     client, _, _ = make_client()
 
@@ -510,6 +555,57 @@ def test_api_roi_refinement_identity_stores_refined_detection():
     assert refined["candidate_detection_id"] == "det-1"
     assert refined["metadata"]["detection_stage"] == "refined"
     assert refined["metadata"]["refinement_method"] == "identity"
+
+
+def test_api_roi_refinement_rejects_missing_roi_payload():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-no-roi"],
+            "model_kind": "identity",
+            "allow_frame_expansion": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "do not include ROI payload data" in response.json()["detail"]
+
+
+def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeypatch):
+    from Pelagia.api.routes import roi_refinement as roi_refinement_route
+
+    loaded = []
+
+    def fake_retrieve_frame(frame_id, *, context, payload_kind):
+        loaded.append((frame_id, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.arange(100, dtype=np.uint8).reshape(10, 10),
+        )
+
+    monkeypatch.setattr(roi_refinement_route, "retrieve_frame", fake_retrieve_frame)
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-no-roi"],
+            "model_kind": "identity",
+            "store": True,
+            "batch_size": 1,
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["refined_count"] == 1
+    assert loaded == [("frame-1", "preprocessed")]
+    assert body["refined_detections"][0]["metadata"]["refinement_initial_roi_source"] == "frame"
 
 
 def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
@@ -1366,6 +1462,47 @@ def test_api_detection_roi_endpoint_returns_matrix_and_images():
     assert jpg_response.headers["x-pelagia-image-width"] == "1"
 
 
+def test_api_detection_refined_roi_endpoint_returns_matrix_and_png():
+    client, _, _ = make_client()
+
+    matrix_response = client.get("/detections/det-1/refined-roi?format=matrix")
+    png_response = client.get("/detections/det-1/refined-roi?format=png")
+
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["payload_kind"] == "roi"
+    assert matrix_response.json()["shape"] == [2, 2]
+    assert matrix_response.json()["data"] == [[5, 6], [7, 8]]
+    assert png_response.status_code == 200
+    assert png_response.headers["content-type"] == "image/png"
+    assert png_response.headers["x-pelagia-payload-kind"] == "roi"
+    assert png_response.headers["x-pelagia-source-width"] == "2"
+    assert png_response.content.startswith(b"\x89PNG")
+
+
+def test_api_detection_roi_can_apply_mask():
+    client, _, _ = make_client()
+
+    response = client.get("/detections/det-wide/framedata?format=matrix&apply_mask=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payload_kind"] == "roi"
+    assert body["mask_applied"] is True
+    assert body["data"] == [[0, 10, 0], [30, 0, 50]]
+
+
+def test_api_detection_refined_roi_can_apply_mask():
+    client, _, _ = make_client()
+
+    response = client.get("/detections/det-1/refined-roi?format=matrix&apply_mask=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payload_kind"] == "roi"
+    assert body["mask_applied"] is True
+    assert body["data"] == [[0, 6], [7, 0]]
+
+
 def test_api_detection_roi_mask_and_framedata_support_head():
     client, _, _ = make_client()
 
@@ -1373,6 +1510,8 @@ def test_api_detection_roi_mask_and_framedata_support_head():
         ("/detections/det-1/framedata", "roi"),
         ("/detections/det-1/roi", "roi"),
         ("/detections/det-1/mask", "mask"),
+        ("/detections/det-1/refined-roi", "roi"),
+        ("/detections/det-1/refined-mask", "mask"),
     ]:
         response = client.head(f"{path}?format=png")
 
@@ -1547,12 +1686,16 @@ def test_api_reports_frame_processing_state():
     assert body["summary"]["total_preprocessed_frame_count"] == 1
     assert body["summary"]["total_detected_frame_count"] == 1
     assert body["summary"]["total_detection_count"] == 7
+    assert body["summary"]["total_refined_detection_count"] == 3
+    assert body["summary"]["total_unrefined_detection_count"] == 4
     assert body["frames"][0]["frame_id"] == "frame-1"
     assert body["frames"][0]["asset_id"] == "asset-1"
     assert body["frames"][0]["asset_filename"] == "sample.mkv"
     assert body["frames"][0]["frame_index"] == 2
     assert body["frames"][0]["preprocessing_state"] == "fully-preprocessed"
     assert body["frames"][0]["detection_state"] == "fully-detected"
+    assert body["frames"][0]["refinement_state"] == "partially-refined"
+    assert body["frames"][0]["refined_candidate_detection_count"] == 3
     assert body["frames"][0]["start_frame"] == 2
     assert body["frames"][0]["end_frame"] == 5
     assert body["page"] == {"limit": 5, "offset": 0, "count": 2, "next_offset": None}
@@ -1733,7 +1876,13 @@ def test_api_framedata_returns_small_preview(monkeypatch):
     assert decoded.shape == (8, 16)
 
 
-def test_api_queues_video_ingestion(tmp_path):
+def test_api_queues_video_ingestion(tmp_path, monkeypatch):
+    from Pelagia.api.routes import ingestion as ingestion_route
+
+    def fail_if_called(path):
+        raise AssertionError("queueing should not compute a full-file checksum by default")
+
+    monkeypatch.setattr(ingestion_route, "_sha256_file", fail_if_called)
     client, repository, _ = make_client()
     video_path = tmp_path / "sample.avi"
     video_path.write_bytes(b"not-a-real-video")
@@ -1752,9 +1901,12 @@ def test_api_queues_video_ingestion(tmp_path):
     body = response.json()
     assert body["asset_id"]
     assert body["run_id"]
+    assert body["checksum_status"] == "deferred"
     assert body["job"]["stage"] == "extract_frames"
     assert repository.registered_runs[0].manifest.assets[0].path == str(video_path.resolve())
     assert repository.registered_runs[0].manifest.assets[0].collections == ["none"]
+    assert repository.registered_runs[0].manifest.assets[0].metadata["checksum_status"] == "deferred"
+    assert repository.created_jobs[0]["payload"]["checksum_status"] == "deferred"
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
     assert "flatfield_correction" not in repository.created_jobs[0]["payload"]
     assert "flatfield_q" not in repository.created_jobs[0]["payload"]
@@ -1764,6 +1916,37 @@ def test_api_queues_video_ingestion(tmp_path):
     assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
     assert repository.created_jobs[0]["payload"]["apply_mask"] is False
     assert repository.created_jobs[0]["payload"]["mask_path"] is None
+
+
+def test_api_queues_video_ingestion_can_compute_checksum(tmp_path, monkeypatch):
+    from Pelagia.api.routes import ingestion as ingestion_route
+
+    calls = []
+
+    def fake_sha256(path):
+        calls.append(path)
+        return "digest"
+
+    monkeypatch.setattr(ingestion_route, "_sha256_file", fake_sha256)
+    client, repository, _ = make_client()
+    video_path = tmp_path / "sample.avi"
+    video_path.write_bytes(b"not-a-real-video")
+
+    response = client.post(
+        "/ingestion/videos",
+        json={
+            "source_path": str(video_path),
+            "compute_checksum": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [video_path.resolve()]
+    assert response.json()["checksum_status"] == "computed"
+    asset = repository.registered_runs[0].manifest.assets[0]
+    assert asset.checksum == "sha256:digest"
+    assert asset.metadata["checksum_status"] == "computed"
+    assert repository.created_jobs[0]["payload"]["checksum_status"] == "computed"
 
 
 def test_api_queues_video_ingestion_with_collections(tmp_path):

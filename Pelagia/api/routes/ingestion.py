@@ -41,6 +41,7 @@ if APIRouter is not None:
         asset_id: str | None = None
         run_key: str | None = None
         instrument: str = "api"
+        compute_checksum: bool = False
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     router = APIRouter(prefix="/ingestion", tags=["ingestion"])
@@ -92,6 +93,14 @@ if APIRouter is not None:
         metadata = dict(body.metadata)
         metadata.setdefault("api_endpoint", "POST /ingestion/videos")
         metadata.setdefault("collections", collections)
+        stat = source_path.stat()
+        if body.compute_checksum:
+            checksum = f"sha256:{_sha256_file(source_path)}"
+            checksum_status = "computed"
+        else:
+            checksum = f"uncomputed:size={stat.st_size}:mtime_ns={stat.st_mtime_ns}"
+            checksum_status = "deferred"
+        metadata.setdefault("checksum_status", checksum_status)
 
         planned_run = PlannedRun(
             manifest=RunManifest(
@@ -108,10 +117,14 @@ if APIRouter is not None:
                         filename=source_path.name,
                         path=str(source_path),
                         kind=AssetKind.VIDEO,
-                        size_bytes=source_path.stat().st_size,
-                        checksum=_sha256_file(source_path),
+                        size_bytes=stat.st_size,
+                        checksum=checksum,
                         collections=collections,
-                        metadata={"api_endpoint": "POST /ingestion/videos", "collections": collections},
+                        metadata={
+                            "api_endpoint": "POST /ingestion/videos",
+                            "collections": collections,
+                            "checksum_status": checksum_status,
+                        },
                     )
                 ],
             )
@@ -132,6 +145,7 @@ if APIRouter is not None:
                 "padding": roi_padding,
                 "roi_encoding": roi_encoding,
                 "collections": collections,
+                "checksum_status": checksum_status,
             },
             summary=f"extract_frames queued for {source_path.name}",
         )
@@ -141,6 +155,7 @@ if APIRouter is not None:
                 "asset_id": asset_id,
                 "run_key": run_key,
                 "collections": collections,
+                "checksum_status": checksum_status,
                 "registration": registration,
                 "job": job,
             }

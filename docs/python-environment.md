@@ -37,7 +37,28 @@ python -m pip install -r requirements-ml.txt
 ```
 
 The ML install includes TensorFlow/Keras and is intentionally separate because
-it is much heavier than the normal backend runtime.
+it is much heavier than the normal backend runtime. On Linux x86_64,
+`requirements-ml.txt` uses TensorFlow's `and-cuda` pip extra so NVIDIA GPU
+support is preferred when the driver/runtime can use it.
+
+For Apple Metal acceleration on macOS, use the separate Metal install target:
+
+```bash
+python -m pip install -r requirements-ml-apple-metal.txt
+```
+
+This target pins TensorFlow to the 2.18 series with `tensorflow-metal` 1.2.x,
+because newer TensorFlow releases may load incompatible plugin binaries before
+Apple publishes matching Metal wheels.
+
+Verify hardware visibility after installing either ML target:
+
+```bash
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+An empty list means TensorFlow installed successfully but did not discover a GPU
+backend in the current environment.
 
 ## 3. Configure Local Settings
 

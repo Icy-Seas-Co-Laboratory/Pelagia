@@ -49,6 +49,23 @@ if APIRouter is not None:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    def _apply_detection_mask(array: np.ndarray, detection: dict) -> np.ndarray:
+        mask = _detection_payload_array(detection, "mask")
+        image = np.asarray(array)
+        mask_array = np.asarray(mask)
+        if mask_array.shape[:2] != image.shape[:2]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "ROI mask shape does not match ROI image shape: "
+                    f"{list(mask_array.shape)} vs {list(image.shape)}."
+                ),
+            )
+        keep = mask_array > 0
+        if image.ndim > keep.ndim:
+            keep = keep[..., np.newaxis]
+        return np.where(keep, image, np.zeros((), dtype=image.dtype)).astype(image.dtype, copy=False)
+
     def _detection_payload_response(
         *,
         detection: dict,
@@ -61,6 +78,7 @@ if APIRouter is not None:
         pad_square: bool = False,
         square: bool = False,
         invert: bool = False,
+        apply_mask: bool = False,
         scale_bar: bool = False,
         scale_bar_length_px: int | None = None,
         scale_bar_height_px: int = 4,
@@ -68,6 +86,9 @@ if APIRouter is not None:
         scale_bar_color: Literal["white", "black"] = "white",
     ):
         array = _detection_payload_array(detection, payload_kind)
+        mask_applied = bool(apply_mask and payload_kind == "roi")
+        if mask_applied:
+            array = _apply_detection_mask(array, detection)
         requested = format.lower()
         source_height, source_width = np.asarray(array).shape[:2]
         transformed = np.asarray(array)
@@ -108,6 +129,7 @@ if APIRouter is not None:
                     "requested_height": height,
                     "pad_square": square_padding_requested,
                     "inverted": invert,
+                    "mask_applied": mask_applied,
                     "scale_bar": scale_bar,
                     "data": matrix.tolist(),
                 }
@@ -133,6 +155,7 @@ if APIRouter is not None:
                 "X-Pelagia-Scale": str(scale),
                 "X-Pelagia-Pad-Square": str(square_padding_requested).lower(),
                 "X-Pelagia-Inverted": str(bool(invert)).lower(),
+                "X-Pelagia-Mask-Applied": str(mask_applied).lower(),
                 "X-Pelagia-Scale-Bar": str(bool(scale_bar)).lower(),
             },
         )
@@ -237,6 +260,7 @@ if APIRouter is not None:
         pad_square: bool = False,
         square: bool = False,
         invert: bool = False,
+        apply_mask: bool = False,
         scale_bar: bool = False,
         scale_bar_length_px: int | None = None,
         scale_bar_height_px: int = 4,
@@ -258,6 +282,7 @@ if APIRouter is not None:
             pad_square=pad_square,
             square=square,
             invert=invert,
+            apply_mask=apply_mask,
             scale_bar=scale_bar,
             scale_bar_length_px=scale_bar_length_px,
             scale_bar_height_px=scale_bar_height_px,
@@ -277,6 +302,7 @@ if APIRouter is not None:
         pad_square: bool = False,
         square: bool = False,
         invert: bool = False,
+        apply_mask: bool = False,
         scale_bar: bool = False,
         scale_bar_length_px: int | None = None,
         scale_bar_height_px: int = 4,
@@ -297,6 +323,7 @@ if APIRouter is not None:
             pad_square=pad_square,
             square=square,
             invert=invert,
+            apply_mask=apply_mask,
             scale_bar=scale_bar,
             scale_bar_length_px=scale_bar_length_px,
             scale_bar_height_px=scale_bar_height_px,
@@ -375,6 +402,47 @@ if APIRouter is not None:
             pad_square=pad_square,
             square=square,
             invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
+
+    @router.head("/{detection_id}/refined-roi", responses=_IMAGE_RESPONSES)
+    @router.get("/{detection_id}/refined-roi", responses=_IMAGE_RESPONSES)
+    def get_refined_detection_roi(
+        request: Request,
+        detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        apply_mask: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_refined_detection_for_candidate(detection_id)
+        if detection is None:
+            raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=detection_id,
+            payload_kind="roi",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            apply_mask=apply_mask,
             scale_bar=scale_bar,
             scale_bar_length_px=scale_bar_length_px,
             scale_bar_height_px=scale_bar_height_px,

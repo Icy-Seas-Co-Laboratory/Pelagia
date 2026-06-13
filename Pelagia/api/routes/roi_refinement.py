@@ -214,10 +214,38 @@ if APIRouter is not None:
         except (ValueError, OracleUnetRefinerError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    def _missing_roi_payload_ids(rows: list[dict[str, Any]]) -> list[str]:
+        return [
+            str(row.get("id"))
+            for row in rows
+            if row.get("id") is not None and row.get("roi_payload") is None
+        ]
+
     @router.get("/options", response_model=OptionsResponse)
     def get_roi_refinement_options(request: Request) -> dict:
         context = get_context(request)
         return as_response(roi_refinement_capabilities(context.config))
+
+    @router.get("")
+    def get_roi_refinement_endpoint() -> dict:
+        return as_response(
+            {
+                "endpoint": "/roi-refinement",
+                "description": "Refine stored candidate detections using stored ROI payloads or frame crops.",
+                "methods": {
+                    "POST": "Run ROI refinement immediately for the supplied detection_ids.",
+                },
+                "options_url": "/roi-refinement/options",
+                "jobs_url": "/roi-refinement/jobs",
+                "required_payload": {
+                    "detection_ids": ["candidate detection UUID"],
+                },
+                "notes": [
+                    "Candidate detections without ROI payloads require frame loading to be enabled.",
+                    "Use POST /roi-refinement/jobs to queue longer refinement work.",
+                ],
+            }
+        )
 
     @router.post("")
     def refine_candidate_rois(request: Request, body: RoiRefinementRequest) -> dict:
@@ -254,6 +282,17 @@ if APIRouter is not None:
                 }
             )
 
+        missing_payload_ids = _missing_roi_payload_ids(candidate_rows)
+        if missing_payload_ids:
+            if not body.allow_frame_expansion:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Detection(s) do not include ROI payload data and frame loading is disabled: "
+                        f"{', '.join(missing_payload_ids)}"
+                    ),
+                )
+
         model = _resolve_model(request, body)
         method = (
             "identity"
@@ -264,7 +303,17 @@ if APIRouter is not None:
 
         frame_loader = None
         if body.allow_frame_expansion:
-            frame_loader = lambda frame_id: retrieve_frame(frame_id, context=context, payload_kind="preprocessed").read()
+            frame_cache: dict[str, Any] = {}
+
+            def frame_loader(frame_id: str):
+                resolved_frame_id = str(frame_id)
+                if resolved_frame_id not in frame_cache:
+                    frame_cache[resolved_frame_id] = retrieve_frame(
+                        resolved_frame_id,
+                        context=context,
+                        payload_kind="preprocessed",
+                    ).read()
+                return frame_cache[resolved_frame_id]
 
         try:
             results = refine_detections(

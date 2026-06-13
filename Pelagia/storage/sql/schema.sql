@@ -447,7 +447,7 @@ WHERE
 CREATE TABLE IF NOT EXISTS {schema}.detections_refined (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     candidate_detection_id uuid NOT NULL REFERENCES {schema}.detection_candidate(id) ON DELETE CASCADE,
-    job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    job_id uuid,
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
     roi_index integer NOT NULL,
@@ -481,7 +481,7 @@ CREATE TABLE IF NOT EXISTS {schema}.detections_refined (
 );
 
 ALTER TABLE {schema}.detections_refined
-    ADD COLUMN IF NOT EXISTS job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL;
+    ADD COLUMN IF NOT EXISTS job_id uuid;
 
 ALTER TABLE {schema}.detections_refined
     DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key;
@@ -534,6 +534,19 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     started_at timestamptz,
     finished_at timestamptz
 );
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'detections_refined_job_id_fkey'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.detections_refined
+            ADD CONSTRAINT detections_refined_job_id_fkey
+            FOREIGN KEY (job_id) REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS {schema}.processing_job_dependencies (
     job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
@@ -591,6 +604,9 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_frame_id ON {schema}.
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_stage_status_updated ON {schema}.processing_jobs (stage, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_updated ON {schema}.processing_jobs (updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_asset_stage ON {schema}.processing_jobs (asset_id, stage, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dependencies_depends_on ON {schema}.processing_job_dependencies (depends_on_job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);

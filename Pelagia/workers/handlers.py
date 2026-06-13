@@ -20,6 +20,7 @@ from ..processing.frame_store import retrieve_frame, store_preprocessed_frame
 from ..processing.oracle_unet_refiner import resolve_refinement_model
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..services.context import AppContext
+from .progress import JobProgressReporter
 
 
 JobHandler = Callable[[dict[str, Any], AppContext], dict[str, Any]]
@@ -91,6 +92,14 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
     ingest_defaults = context.config.processing.video_ingest
     preprocessing_defaults = context.config.processing.preprocessing
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.EXTRACT_FRAMES.value,
+        unit="frames",
+        total=0,
+    )
+    progress.start(f"Extracting frames from {Path(str(source_path)).name}")
 
     source_is_folder = Path(str(source_path)).expanduser().is_dir()
     asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
@@ -137,6 +146,11 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_count": len(frame_rows),
         "frame_ids": [row.get("id") for row in frame_rows],
     }
+    progress.total = len(frame_rows)
+    progress.finish(
+        completed=len(frame_rows),
+        message=f"Extracted {len(frame_rows)} frame{'s' if len(frame_rows) != 1 else ''}",
+    )
 
     if payload.get("enqueue_segment"):
         roi_recording_defaults = context.config.processing.roi_recording
@@ -223,8 +237,16 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
     encoding = payload.get("encoding")
     stored_rows = []
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.PREPROCESS_FRAMES.value,
+        unit="frames",
+        total=len(frame_ids),
+    )
+    progress.start(f"Preprocessing {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
 
-    for frame_id in frame_ids:
+    for index, frame_id in enumerate(frame_ids, start=1):
         frame_record = context.repository.get_frame_record(frame_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
@@ -263,10 +285,20 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
                 encoding=encoding,
             )
         )
+        progress.update(
+            index,
+            current={"frame_id": frame_id, "index": index},
+            message=f"Preprocessed {index}/{len(frame_ids)} frames",
+        )
 
     if resolved_run_id is None or resolved_asset_id is None:
         raise ValueError("Preprocess job could not resolve run_id and asset_id.")
 
+    progress.finish(
+        completed=len(stored_rows),
+        secondary={"preprocessed_frames": len(stored_rows)},
+        message=f"Preprocessed {len(stored_rows)} frame{'s' if len(stored_rows) != 1 else ''}",
+    )
     return {
         "stage": PipelineStage.PREPROCESS_FRAMES.value,
         "run_id": resolved_run_id,
@@ -308,6 +340,14 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
 
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.BACKGROUND_FRAMES.value,
+        unit="frames",
+        total=len(frame_ids),
+    )
+    progress.start(f"Generating background from {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
     for frame_id in frame_ids:
         frame_record = context.repository.get_frame_record(frame_id)
         if frame_record is None:
@@ -331,6 +371,10 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             "run_id": resolved_run_id,
             "asset_id": resolved_asset_id,
         }
+    )
+    progress.finish(
+        completed=len(frame_ids),
+        message=f"Generated background from {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}",
     )
     return result
 
@@ -372,8 +416,16 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     resolved_options = resolve_segmentation_options(payload, context.config.processing)
     frame_payload_kind = resolved_options["source"]["frame_payload_kind"]
     frame_kwargs = segment_frame_kwargs(resolved_options)
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.SEGMENT.value,
+        unit="frames",
+        total=len(frame_ids),
+    )
+    progress.start(f"Segmenting {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
 
-    for frame_id in frame_ids:
+    for index, frame_id in enumerate(frame_ids, start=1):
         frame_record = context.repository.get_frame_record(frame_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
@@ -398,6 +450,12 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
                 context=context,
             )
         )
+        progress.update(
+            index,
+            current={"frame_id": frame_id, "index": index},
+            secondary={"detections_created": len(detections)},
+            message=f"Segmented {index}/{len(frame_ids)} frames",
+        )
 
     if resolved_run_id is None or resolved_asset_id is None:
         raise ValueError("Segment job could not resolve run_id and asset_id.")
@@ -406,6 +464,11 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         resolved_run_id,
         frame_ids,
         detections,
+    )
+    progress.finish(
+        completed=len(frame_ids),
+        secondary={"detections_created": len(inserted)},
+        message=f"Segmented {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}; {len(inserted)} detections",
     )
     return {
         "stage": PipelineStage.SEGMENT.value,
@@ -492,6 +555,15 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     if not detection_ids:
         raise ValueError("ROI refinement job requires detection_ids.")
 
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.ROI_REFINEMENT.value,
+        unit="rois",
+        total=len(detection_ids),
+    )
+    progress.start(f"Refining {len(detection_ids)} ROI{'s' if len(detection_ids) != 1 else ''}")
+
     missing_ids = []
     candidate_rows = []
     for detection_id in detection_ids:
@@ -502,6 +574,13 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             candidate_rows.append(row)
     if missing_ids:
         raise KeyError(f"Detection(s) not found: {', '.join(missing_ids)}")
+    progress.update(
+        0,
+        current={"loaded_candidates": len(candidate_rows)},
+        secondary={"loaded_candidates": len(candidate_rows)},
+        message=f"Loaded {len(candidate_rows)} ROI candidate{'s' if len(candidate_rows) != 1 else ''}",
+        force=True,
+    )
 
     defaults = context.config.processing.roi_refinement
     model = resolve_refinement_model(
@@ -519,7 +598,17 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     expansion_payload_kind = str(payload.get("expansion_frame_payload_kind", "preprocessed"))
     frame_loader = None
     if allow_frame_expansion:
-        frame_loader = lambda frame_id: retrieve_frame(frame_id, context=context, payload_kind=expansion_payload_kind).read()
+        frame_cache: dict[str, Any] = {}
+
+        def frame_loader(frame_id: str):
+            resolved_frame_id = str(frame_id)
+            if resolved_frame_id not in frame_cache:
+                frame_cache[resolved_frame_id] = retrieve_frame(
+                    resolved_frame_id,
+                    context=context,
+                    payload_kind=expansion_payload_kind,
+                ).read()
+            return frame_cache[resolved_frame_id]
 
     detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
     results = refine_detections(
@@ -539,6 +628,17 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
     run_ids = sorted({record.run_id for record in detection_records})
     frame_ids = sorted({record.frame_id for record in detection_records})
+    progress.finish(
+        completed=len(detection_records),
+        secondary={
+            "refined_created": len(refined_records),
+            "stored_count": len(stored),
+            "synthetic_refined_count": sum(
+                1 for result in results if result.candidate_detection.metadata.get("synthetic_candidate")
+            ),
+        },
+        message=f"Refined {len(refined_records)} ROI{'s' if len(refined_records) != 1 else ''}",
+    )
     return {
         "stage": PipelineStage.ROI_REFINEMENT.value,
         "run_id": job.get("run_id") or payload.get("run_id") or (run_ids[0] if len(run_ids) == 1 else None),
