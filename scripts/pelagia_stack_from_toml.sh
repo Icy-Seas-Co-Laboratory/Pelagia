@@ -139,7 +139,10 @@ api = section("api")
 worker_defaults = section("worker_defaults")
 
 stack_name = stack_slug(str(stack.get("name") or config_path.stem))
-run_dir = path_value(stack.get("run_dir"), root_dir / ".pelagia" / "run" / stack_name)
+run_dir = path_value(
+    stack.get("run_dir", os.environ.get("PELAGIA_RUN_DIR")),
+    root_dir / ".pelagia" / "run" / stack_name,
+)
 
 config_rows = {
     "stack_name": stack_name,
@@ -231,9 +234,22 @@ for index, worker in enumerate(workers, start=1):
 PY
     )
 
+    if [[ -z "$RUN_DIR" || "$RUN_DIR" == "/" ]]; then
+        echo "resolved run_dir is unsafe: '$RUN_DIR'" >&2
+        echo "Set [stack].run_dir in $CONFIG_FILE or export PELAGIA_RUN_DIR to a writable directory." >&2
+        exit 2
+    fi
+    case "$RUN_DIR" in
+        *'$'*)
+            echo "resolved run_dir still contains an unresolved environment variable: $RUN_DIR" >&2
+            echo "Check [stack].run_dir in $CONFIG_FILE." >&2
+            exit 2
+            ;;
+    esac
+
     PID_DIR="$RUN_DIR/pids"
     LOG_DIR="$RUN_DIR/logs"
-    mkdir -p "$PID_DIR" "$LOG_DIR"
+    mkdir -p "$RUN_DIR" "$PID_DIR" "$LOG_DIR"
 }
 
 is_running() {
