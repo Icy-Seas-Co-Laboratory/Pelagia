@@ -18,8 +18,8 @@ root = "./data/kvstore"
 enabled = true
 host = "0.0.0.0"
 port = 8000
-# Allows PelagiaView from localhost and common private LAN IP origins.
-cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
+# Allows PelagiaView from localhost, common private LAN IP origins, and Pelagia Studio subdomains.
+cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2}|(?:[A-Za-z0-9-]+\\.)+pelagia\\.studio)(?::\\d+)?"
 
 [worker_defaults]
 idle_sleep_seconds = 2.0
@@ -35,7 +35,7 @@ capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement
 
 [[worker]]
 name = "general-3"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
 name = "general-4"
@@ -55,4 +55,20 @@ capabilities = ["ingest", "preprocess", "segment"]
 
 [[worker]]
 name = "general-8"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-9"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-10"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-11"
+capabilities = ["ingest", "preprocess", "segment"]
+
+[[worker]]
+name = "general-12"
 capabilities = ["ingest", "preprocess", "segment"]

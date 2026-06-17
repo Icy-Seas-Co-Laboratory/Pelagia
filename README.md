@@ -12,6 +12,185 @@ Pelagia is a scalable image-analysis system for extracting, segmenting, organizi
 
 Pelagia is designed for workflows where full source frames are large and mostly cold, while segmented ROIs are the primary unit of analysis. Full-frame payloads can live in external cold storage, while ROI crops, masks, measurements, classifications, and curation state remain close to the database-backed analysis workflow.
 
+## Quick Start
+
+Pelagia is split into a Python backend (`Pelagia`) and an optional SvelteKit
+frontend (`PelagiaView`). The backend owns storage, processing, the job queue,
+workers, and the HTTP API. PelagiaView connects to that API from a browser.
+
+### Prerequisites
+
+- Python 3.10 or newer. Python 3.11+ is preferred.
+- PostgreSQL reachable from the Pelagia machine.
+- A writable runtime directory for logs, pid files, and cold frame storage.
+- Node.js 18+ and npm if you will run PelagiaView.
+
+On Debian/Ubuntu systems, these packages are commonly useful before creating the
+Python environment:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip postgresql postgresql-client libgl1 libglib2.0-0
+```
+
+### Install The Backend
+
+From the Pelagia repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+For development and tests, install the dev target instead:
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+For machines that will run learned ROI refinement models, install the optional
+ML dependencies after the normal backend install:
+
+```bash
+python -m pip install -r requirements-ml.txt
+```
+
+Apple Metal users should use `requirements-ml-apple-metal.txt` instead of
+`requirements-ml.txt`.
+
+### Configure Storage
+
+Pelagia defaults to a local PostgreSQL database named `pelagia` with this DSN:
+
+```text
+postgresql://postgres:postgres@127.0.0.1:5432/pelagia
+```
+
+Either create/configure a database matching that DSN, or override the DSN in
+`config.toml`, environment variables, or the worker-stack TOML.
+
+Create a local `config.toml` for machine-specific backend settings:
+
+```toml
+[database]
+dsn = "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"
+schema_name = "pelagia"
+
+[kvstore]
+root_path = "./data/kvstore"
+
+[api]
+host = "0.0.0.0"
+port = 8000
+cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
+```
+
+`config.toml` is ignored by git. You can also use environment variables such as
+`PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`,
+`PELAGIA_API_HOST`, and `PELAGIA_API_PORT`.
+
+### Initialize And Run The Backend
+
+Initialize database tables and storage:
+
+```bash
+python -m Pelagia.cli.app init-system
+```
+
+For a local one-command backend stack, start the API and workers:
+
+```bash
+./scripts/pelagia_dev_stack.sh start
+./scripts/pelagia_dev_stack.sh status
+```
+
+Stop the stack when finished:
+
+```bash
+./scripts/pelagia_dev_stack.sh stop
+```
+
+The development stack can be adjusted with environment variables:
+
+```bash
+PELAGIA_API_HOST=0.0.0.0 \
+PELAGIA_API_PORT=8000 \
+PELAGIA_WORKER_COUNT=2 \
+./scripts/pelagia_dev_stack.sh start
+```
+
+For a more explicit worker layout, use the TOML-driven stack:
+
+```bash
+cp scripts/pelagia_workers.example.toml scripts/pelagia_workers.toml
+./scripts/pelagia_stack_from_toml.sh start scripts/pelagia_workers.toml
+./scripts/pelagia_stack_from_toml.sh status scripts/pelagia_workers.toml
+./scripts/pelagia_stack_from_toml.sh stop scripts/pelagia_workers.toml
+```
+
+Runtime logs and pid files are written under the stack run directory. By
+default, the TOML stack uses:
+
+```text
+<repo>/.pelagia/run/<stack-name>/
+```
+
+On shared Linux machines, set an explicit writable run directory. For example,
+if the repo is cloned at `/scratch/Pelagia`:
+
+```bash
+export PELAGIA_RUN_DIR=/scratch/Pelagia/.pelagia/run/dev-workers
+./scripts/pelagia_stack_from_toml.sh start scripts/pelagia_workers.toml
+```
+
+You can also put it in `scripts/pelagia_workers.toml`:
+
+```toml
+[stack]
+run_dir = "/scratch/Pelagia/.pelagia/run/dev-workers"
+```
+
+### Verify The API
+
+After the stack starts:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/system/status
+curl http://127.0.0.1:8000/jobs
+```
+
+To expose the API to another computer, bind to `0.0.0.0`, make sure the OS
+firewall allows the API port, and set `cors_allow_origin_regex` so the browser
+origin running PelagiaView is allowed.
+
+### Run PelagiaView
+
+From a sibling checkout named `PelagiaView`:
+
+```bash
+cd ../PelagiaView
+npm install
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
+Open the UI at:
+
+```text
+http://127.0.0.1:5173
+```
+
+Then connect to the backend API endpoint, for example:
+
+```text
+http://127.0.0.1:8000
+```
+
+On another computer, use the backend machine's IP address for both PelagiaView
+and the API endpoint.
+
 ## System Architecture
 
 Pelagia keeps interface code thin and moves reusable behavior into shared services and processing modules.
@@ -92,7 +271,7 @@ training workers           model training and evaluation jobs
 
 This architecture allows the system to grow from one local process to many specialized background daemons without changing the shape of the pipeline.
 
-## FastAPI Interface
+## HTTP API
 
 The v0 API exposes the same core workflows as the CLI and workers:
 
@@ -101,8 +280,7 @@ uvicorn Pelagia.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 For local end-to-end testing, the dev stack script initializes storage, starts
-the API, and starts workers for each currently runnable stage
-(`extract_frames` and `segment`):
+the API, and starts workers for currently runnable stages:
 
 ```bash
 ./scripts/pelagia_dev_stack.sh start
@@ -111,23 +289,30 @@ the API, and starts workers for each currently runnable stage
 ```
 
 Override defaults with environment variables such as `PELAGIA_DATABASE_DSN`,
-`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`, and
-`PELAGIA_WORKER_STAGES`. Use `PELAGIA_WORKER_COUNT=3` to start three workers
-for every configured stage, or `PELAGIA_WORKER_COUNTS=extract_frames=2,segment=4`
-for per-stage counts.
+`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`,
+`PELAGIA_RUN_DIR`, and `PELAGIA_WORKER_STAGES`. Use `PELAGIA_WORKER_COUNT=3` to
+start three workers for every configured stage, or
+`PELAGIA_WORKER_COUNTS=extract_frames=2,segment=4` for per-stage counts.
 
 Useful endpoint groups:
 
 - `GET /health`, `/health/postgres`, `/health/kvstore`
-- `GET /system`, `/system/status`, `/system/use`
+- `GET /system`, `/system/status`, `/system/use`, `/system/config`
 - `POST /system/initialize`
 - `POST /ingestion/videos`
+- `POST /frame/preprocess`, `POST /frame/preprocess/jobs`
+- `GET /frame/original`, `GET /frame/preprocessed`
 - `POST /segmentation/frames/{frame_id}`
-- `GET /jobs`, `POST /jobs`, `GET /jobs/events`
+- `GET /segmentation/options`, `POST /segmentation/jobs`
+- `GET /roi-refinement/options`, `POST /roi-refinement`, `POST /roi-refinement/jobs`
+- `GET /jobs`, `GET /jobs/summary`, `POST /jobs`, `GET /jobs/events`
 - `POST /jobs/{job_id}/pause`, `/resume`, `/retry`, `/priority`
 - `GET /workers`, `POST /workers/{worker_id}/shutdown`
-- `GET /runs`, `/assets`, `/models`, `/kvstore/status`
+- `GET /runs`, `/assets`, `/models`, `/kvstore`
 - `GET /collections`, `GET /assets?collection=test`, `GET /runs?collection=test`
+- `GET /frames/{frame_id}/context`
+- `GET /detections`, `/detections/{detection_id}/framedata`, `/mask`, `/refined-roi`, `/refined-mask`
+- `GET /logs`
 
 General list endpoints are intentionally shaped as limited searches. For example,
 `GET /assets` does not require a run id and can be narrowed with filters such as
@@ -156,7 +341,7 @@ rules.
 
 ## Python Environment
 
-Pelagia provides requirements files for the common backend environments:
+Pelagia provides requirements files for common backend environments:
 
 ```bash
 python3 -m venv .venv

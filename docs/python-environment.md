@@ -101,7 +101,7 @@ model_artifact = "auto"
 Initialize storage:
 
 ```bash
-python -m Pelagia.cli.app init_system
+python -m Pelagia.cli.app init-system
 ```
 
 Start the local development stack:
