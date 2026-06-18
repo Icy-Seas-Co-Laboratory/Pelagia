@@ -880,6 +880,220 @@ class PostgresRepository:
             return None
         return FrameRecord.from_row(row)
 
+    def create_live_frame_copy(
+        self,
+        frame_id: str,
+        *,
+        operation: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a sandbox frame row that shares the source payload but owns live outputs."""
+        live_metadata = {
+            "live_preview": {
+                "is_sandbox": True,
+                "source_frame_id": str(frame_id),
+                "operation": str(operation),
+                **dict(metadata or {}),
+            }
+        }
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT assets.id
+                    FROM {self.schema}.raw_assets assets
+                    JOIN {self.schema}.frames source ON source.asset_id = assets.id
+                    WHERE source.id = %s
+                    FOR UPDATE
+                    """,
+                    (frame_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise KeyError(frame_id)
+                cursor.execute(
+                    f"""
+                    WITH source AS (
+                        SELECT *
+                        FROM {self.schema}.frames
+                        WHERE id = %s
+                    ),
+                    next_index AS (
+                        SELECT
+                            CASE
+                                WHEN MIN(frame_index) FILTER (WHERE frame_index < 0) IS NULL THEN -1
+                                ELSE MIN(frame_index) FILTER (WHERE frame_index < 0) - 1
+                            END AS frame_index
+                        FROM {self.schema}.frames
+                        WHERE asset_id = (SELECT asset_id FROM source)
+                    )
+                    INSERT INTO {self.schema}.frames
+                    (run_id, asset_id, frame_index, captured_at, width, height,
+                     bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
+                     payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
+                    SELECT
+                        source.run_id,
+                        source.asset_id,
+                        next_index.frame_index,
+                        source.captured_at,
+                        source.width,
+                        source.height,
+                        source.bbox_x,
+                        source.bbox_y,
+                        source.id,
+                        source.source_ref,
+                        source.kvstore_hash,
+                        source.preview_thumbhash,
+                        source.payload_ref,
+                        source.payload_encoding,
+                        source.payload_format,
+                        source.payload_dtype,
+                        source.payload_shape,
+                        COALESCE(source.metadata, '{{}}'::jsonb) || %s::jsonb
+                    FROM source, next_index
+                    RETURNING *;
+                    """,
+                    (frame_id, json.dumps(json_ready(live_metadata))),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        if row is None:
+            raise KeyError(frame_id)
+        return row
+
+    def list_live_frame_copies(
+        self,
+        *,
+        source_frame_id: str | None = None,
+        operation: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses = ["metadata->'live_preview'->>'is_sandbox' = 'true'"]
+        params: list[Any] = []
+        if source_frame_id:
+            clauses.append("metadata->'live_preview'->>'source_frame_id' = %s")
+            params.append(str(source_frame_id))
+        if operation:
+            clauses.append("metadata->'live_preview'->>'operation' = %s")
+            params.append(str(operation))
+        params.extend([limit, max(0, int(offset))])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.frames
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def count_frame_payload_references(
+        self,
+        payload_ref: str,
+        *,
+        exclude_frame_id: str | None = None,
+    ) -> int:
+        clauses = [
+            """
+            (
+                kvstore_hash = %s
+                OR payload_ref = %s
+                OR preprocessed_kvstore_hash = %s
+                OR preprocessed_payload_ref = %s
+                OR background_kvstore_hash = %s
+                OR background_payload_ref = %s
+            )
+            """
+        ]
+        params: list[Any] = [payload_ref] * 6
+        if exclude_frame_id is not None:
+            clauses.append("id <> %s")
+            params.append(exclude_frame_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM {self.schema}.frames
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
+                row = cursor.fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def delete_live_frame_copy(self, frame_id: str) -> dict[str, Any] | None:
+        """Delete one live-preview sandbox frame and return generated payload refs."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.frames
+                    WHERE id = %s
+                      AND metadata->'live_preview'->>'is_sandbox' = 'true'
+                    """,
+                    (frame_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    connection.rollback()
+                    return None
+                generated_keys = sorted(
+                    {
+                        str(key)
+                        for key in (
+                            row.get("preprocessed_payload_ref"),
+                            row.get("preprocessed_kvstore_hash"),
+                            row.get("background_payload_ref"),
+                            row.get("background_kvstore_hash"),
+                        )
+                        if key
+                    }
+                )
+                unreferenced_keys = []
+                for key in generated_keys:
+                    cursor.execute(
+                        f"""
+                        SELECT COUNT(*) AS count
+                        FROM {self.schema}.frames
+                        WHERE id <> %s
+                          AND (
+                            kvstore_hash = %s
+                            OR payload_ref = %s
+                            OR preprocessed_kvstore_hash = %s
+                            OR preprocessed_payload_ref = %s
+                            OR background_kvstore_hash = %s
+                            OR background_payload_ref = %s
+                          )
+                        """,
+                        (frame_id, key, key, key, key, key, key),
+                    )
+                    ref_row = cursor.fetchone()
+                    if int(ref_row["count"] if ref_row is not None else 0) == 0:
+                        unreferenced_keys.append(key)
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.frames
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (frame_id,),
+                )
+                deleted = cursor.fetchone()
+            connection.commit()
+        if deleted is None:
+            return None
+        return {
+            "frame": deleted,
+            "generated_kvstore_keys": generated_keys,
+            "unreferenced_kvstore_keys": unreferenced_keys,
+        }
+
     def update_frame_preprocessed_payload(
         self,
         frame_id: str,

@@ -100,7 +100,7 @@ if APIRouter is not None:
         return {
             "capabilities": [
                 "register video assets and queue frame extraction",
-                "run synchronous segmentation for stored frames",
+                "run synchronous thresholding and candidate detection for stored frames",
                 "inspect and control queued jobs",
                 "monitor worker sessions and request worker shutdown",
                 "inspect KVStore and PostgreSQL health",
@@ -113,7 +113,10 @@ if APIRouter is not None:
                 "segmentation_options": "GET /segmentation/options",
                 "preprocess_frame_now": "POST /frame/preprocess",
                 "queue_preprocessing": "POST /frame/preprocess/jobs",
-                "live_segmentation": "GET /live/segmentation",
+                "live_threshold": "GET /live/threshold",
+                "live_detection_candidate": "GET /live/detection-candidate",
+                "live_sandbox": "GET /live/sandbox",
+                "delete_live_sandbox": "DELETE /live/sandbox/{sandbox_frame_id}",
                 "segment_frame_now": "POST /segmentation/frames/{frame_id}",
                 "queue_job": "POST /jobs",
                 "worker_status": "GET /workers",

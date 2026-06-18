@@ -24,7 +24,7 @@ root_path = "./data/kvstore"
 hash_algorithm = "blake3"
 # Number of hash-prefix characters used to shard object storage paths.
 prefix_length = 2
-max_db_bytes = 4294967296
+max_db_bytes = 42949672960
 max_rows = 1000000
 
 [image_data_storage]
@@ -104,7 +104,7 @@ flatfield_q = 0.5
 # Axis used by global flatfield correction. Options: 0, 1.
 flatfield_axis = 0
 # Bound the estimated field before division: values below min become 0, values above max become 255.
-flatfield_min_field_value = 1
+flatfield_min_field_value = 25
 flatfield_max_field_value = 255
 
 [processing.thresholding]
@@ -209,7 +209,7 @@ tile_size = 256
 overlap_fraction = 0.25
 max_iterations = 5
 # Null uses tile stride as the expansion distance when a mask touches an edge.
-expansion_pixels = 128
+expansion_pixels = 256
 edge_touch_margin = 2
 # Probability threshold used to convert model outputs into binary masks.
 output_threshold = 0.5
@@ -224,7 +224,7 @@ overlap_iou_threshold = 0.5
 # Consume duplicate refined ROIs when either mask is mostly contained by the other.
 overlap_containment_threshold = 0.8
 # Optionally discover additional valid targets left in the candidate mask after refinement.
-residual_discovery_enabled = false
+residual_discovery_enabled = true
 # Maximum recursive split generations to try.
 residual_max_iterations = 1
 # Null reuses the candidate's original assembly method when available.

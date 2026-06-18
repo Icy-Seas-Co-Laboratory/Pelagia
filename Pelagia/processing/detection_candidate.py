@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
@@ -24,6 +25,18 @@ ThresholdFn = Callable[[np.ndarray], np.ndarray]
 _CORE_LOGGER = processing_core_logger("detection_candidate")
 
 
+@dataclass(slots=True)
+class ThresholdFrameResult:
+    """Result of preprocessing and thresholding one frame into a binary mask."""
+
+    source_frame: FrameData
+    processed_frame: FrameData
+    gray: np.ndarray
+    threshold_mask: np.ndarray
+    stage_durations_ms: dict[str, float]
+    metadata: dict[str, Any]
+
+
 def _frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
     return frame_metadata_value(frame, key, default)
 
@@ -35,7 +48,7 @@ def _as_grayscale_array(frame: FrameData) -> np.ndarray:
     return as_grayscale_array(data)
 
 
-def live_segment_wrapper(
+def live_detection_candidate_wrapper(
     frame_id: str,
     *,
     threshold: int | float | ThresholdFn | None = None,
@@ -117,15 +130,15 @@ def live_segment_wrapper(
     max_detections: int | None = None,
     context: Any = None,
 ) -> list[DetectionRecord]:
-    """Load one frame, segment it, and return transient detection records."""
+    """Load one frame, run thresholding plus candidate detection, and return transient records."""
     from .frame_store import retrieve_frame
 
     started = time.perf_counter()
     log_processing_event(
         context,
         "debug",
-        "segmentation.live_started",
-        "Live frame segmentation started",
+        "detection_candidate.live_started",
+        "Live frame candidate detection started",
         payload={"frame_id": frame_id},
         logger="pelagia.processing.detection_candidate",
         core_logger=_CORE_LOGGER,
@@ -227,12 +240,12 @@ def live_segment_wrapper(
         )
     except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000
-        _CORE_LOGGER.exception("Live frame segmentation failed frame_id=%s", frame_id)
+        _CORE_LOGGER.exception("Live frame candidate detection failed frame_id=%s", frame_id)
         log_processing_event(
             context,
             "error",
-            "segmentation.live_failed",
-            "Live frame segmentation failed",
+            "detection_candidate.live_failed",
+            "Live frame candidate detection failed",
             run_id=_frame_metadata_value(frame, "run_id"),
             asset_id=_frame_metadata_value(frame, "asset_id"),
             duration_ms=duration_ms,
@@ -249,8 +262,8 @@ def live_segment_wrapper(
     log_processing_event(
         context,
         "info",
-        "segmentation.live_completed",
-        "Live frame segmentation completed",
+        "detection_candidate.live_completed",
+        "Live frame candidate detection completed",
         run_id=_frame_metadata_value(frame, "run_id"),
         asset_id=_frame_metadata_value(frame, "asset_id"),
         duration_ms=duration_ms,
@@ -259,6 +272,216 @@ def live_segment_wrapper(
         core_logger=_CORE_LOGGER,
     )
     return detections
+
+
+def live_segment_wrapper(*args, **kwargs) -> list[DetectionRecord]:
+    """Backward-compatible alias for live candidate detection."""
+    return live_detection_candidate_wrapper(*args, **kwargs)
+
+
+def threshold_frame(
+    frame: FrameData,
+    *,
+    threshold: int | float | ThresholdFn | None = None,
+    threshold_method: str | None = None,
+    manual_threshold: int | float | None = None,
+    thresholding_maximum_value: int | float | None = None,
+    bounded_otsu_min_contrast: int | float | None = None,
+    bounded_otsu_max_foreground_fraction: float | None = None,
+    canny_enabled: bool | None = None,
+    canny_low_threshold: int | float | None = None,
+    canny_high_threshold: int | float | None = None,
+    canny_blur_kernel: int | None = None,
+    adaptive_block_size: int | None = None,
+    adaptive_c: int | float | None = None,
+    percentile_background_percentile: int | float | None = None,
+    percentile_min_contrast: int | float | None = None,
+    hysteresis_low_threshold: int | float | None = None,
+    hysteresis_high_threshold: int | float | None = None,
+    hysteresis_connectivity: int | None = None,
+    sobel_percentile: int | float | None = None,
+    sobel_threshold: int | float | None = None,
+    sobel_kernel_size: int | None = None,
+    apply_preprocessing: bool = True,
+    apply_mask: bool | None = None,
+    crop_enabled: bool | None = None,
+    crop_x: int | None = None,
+    crop_y: int | None = None,
+    crop_w: int | None = None,
+    crop_h: int | None = None,
+    flatfield_correction: bool | None = None,
+    flatfield_q: float | None = None,
+    flatfield_axis: int | None = None,
+    flatfield_min_field_value: int | float | None = None,
+    flatfield_max_field_value: int | float | None = None,
+    background_correction: bool | None = None,
+    background: np.ndarray | int | float | None = None,
+    background_min_field_value: int | float | None = None,
+    background_max_field_value: int | float | None = None,
+    invert_intensity: bool | None = None,
+    context: Any = None,
+) -> ThresholdFrameResult:
+    """Preprocess one frame and generate its first-pass binary threshold mask."""
+    config = context.config.processing if context is not None and getattr(context, "config", None) is not None else default_processing_config()
+    preprocessing_defaults = config.preprocessing
+    thresholding_defaults = config.thresholding
+    flatfield_defaults = config.flatfield
+
+    resolved_flatfield_correction = (
+        flatfield_defaults.flatfield_correction
+        if flatfield_correction is None
+        else flatfield_correction
+    )
+    resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
+    resolved_flatfield_axis = flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    resolved_flatfield_min_field_value = (
+        flatfield_defaults.flatfield_min_field_value
+        if flatfield_min_field_value is None
+        else flatfield_min_field_value
+    )
+    resolved_flatfield_max_field_value = (
+        flatfield_defaults.flatfield_max_field_value
+        if flatfield_max_field_value is None
+        else flatfield_max_field_value
+    )
+    resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
+    resolved_crop_enabled = preprocessing_defaults.crop_enabled if crop_enabled is None else crop_enabled
+    resolved_crop_x = preprocessing_defaults.crop_x if crop_x is None else crop_x
+    resolved_crop_y = preprocessing_defaults.crop_y if crop_y is None else crop_y
+    resolved_crop_w = preprocessing_defaults.crop_w if crop_w is None else crop_w
+    resolved_crop_h = preprocessing_defaults.crop_h if crop_h is None else crop_h
+    resolved_background_correction = (
+        preprocessing_defaults.background_correction
+        if background_correction is None
+        else background_correction
+    )
+    resolved_background_min_field_value = (
+        preprocessing_defaults.background_min_field_value
+        if background_min_field_value is None
+        else background_min_field_value
+    )
+    resolved_background_max_field_value = (
+        preprocessing_defaults.background_max_field_value
+        if background_max_field_value is None
+        else background_max_field_value
+    )
+    resolved_invert_intensity = preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
+    explicit_manual_threshold = threshold is not None and threshold_method is None
+    resolved_threshold_method = str(
+        threshold_method or ("manual" if explicit_manual_threshold else thresholding_defaults.method)
+    ).lower()
+    resolved_manual_threshold = thresholding_defaults.manual_threshold if manual_threshold is None else manual_threshold
+    resolved_thresholding_maximum_value = (
+        thresholding_defaults.thresholding_maximum_value
+        if thresholding_maximum_value is None
+        else thresholding_maximum_value
+    )
+    resolved_bounded_otsu_min_contrast = (
+        thresholding_defaults.bounded_otsu_min_contrast
+        if bounded_otsu_min_contrast is None
+        else bounded_otsu_min_contrast
+    )
+    resolved_bounded_otsu_max_foreground_fraction = (
+        thresholding_defaults.bounded_otsu_max_foreground_fraction
+        if bounded_otsu_max_foreground_fraction is None
+        else bounded_otsu_max_foreground_fraction
+    )
+    resolved_canny_enabled = thresholding_defaults.canny_enabled if canny_enabled is None else canny_enabled
+    resolved_canny_low_threshold = thresholding_defaults.canny_low_threshold if canny_low_threshold is None else canny_low_threshold
+    resolved_canny_high_threshold = thresholding_defaults.canny_high_threshold if canny_high_threshold is None else canny_high_threshold
+    resolved_canny_blur_kernel = thresholding_defaults.canny_blur_kernel if canny_blur_kernel is None else canny_blur_kernel
+    resolved_adaptive_block_size = thresholding_defaults.adaptive_block_size if adaptive_block_size is None else adaptive_block_size
+    resolved_adaptive_c = thresholding_defaults.adaptive_c if adaptive_c is None else adaptive_c
+    resolved_percentile_background_percentile = (
+        thresholding_defaults.percentile_background_percentile
+        if percentile_background_percentile is None
+        else percentile_background_percentile
+    )
+    resolved_percentile_min_contrast = thresholding_defaults.percentile_min_contrast if percentile_min_contrast is None else percentile_min_contrast
+    resolved_hysteresis_low_threshold = thresholding_defaults.hysteresis_low_threshold if hysteresis_low_threshold is None else hysteresis_low_threshold
+    resolved_hysteresis_high_threshold = thresholding_defaults.hysteresis_high_threshold if hysteresis_high_threshold is None else hysteresis_high_threshold
+    resolved_hysteresis_connectivity = thresholding_defaults.hysteresis_connectivity if hysteresis_connectivity is None else hysteresis_connectivity
+    resolved_sobel_percentile = thresholding_defaults.sobel_percentile if sobel_percentile is None else sobel_percentile
+    resolved_sobel_threshold = thresholding_defaults.sobel_threshold if sobel_threshold is None else sobel_threshold
+    resolved_sobel_kernel_size = thresholding_defaults.sobel_kernel_size if sobel_kernel_size is None else sobel_kernel_size
+
+    stage_durations_ms: dict[str, float] = {}
+    source_frame = frame
+    if apply_preprocessing:
+        stage_started = time.perf_counter()
+        frame = preprocess_frame_for_segmentation(
+            frame,
+            flatfield_correction=resolved_flatfield_correction,
+            flatfield_q=resolved_flatfield_q,
+            flatfield_axis=resolved_flatfield_axis,
+            flatfield_min_field_value=resolved_flatfield_min_field_value,
+            flatfield_max_field_value=resolved_flatfield_max_field_value,
+            apply_mask=resolved_apply_mask,
+            crop_enabled=resolved_crop_enabled,
+            crop_x=resolved_crop_x,
+            crop_y=resolved_crop_y,
+            crop_w=resolved_crop_w,
+            crop_h=resolved_crop_h,
+            background_correction=resolved_background_correction,
+            background=background,
+            background_min_field_value=resolved_background_min_field_value,
+            background_max_field_value=resolved_background_max_field_value,
+            invert_intensity=resolved_invert_intensity,
+            context=context,
+        )
+        stage_durations_ms["preprocessing"] = (time.perf_counter() - stage_started) * 1000
+    else:
+        stage_durations_ms["preprocessing"] = 0.0
+
+    stage_started = time.perf_counter()
+    gray = _as_grayscale_array(frame)
+    stage_durations_ms["grayscale"] = (time.perf_counter() - stage_started) * 1000
+    stage_started = time.perf_counter()
+    threshold_mask = as_binary_mask(
+        calculate_threshold_mask(
+            gray,
+            threshold=threshold,
+            method=resolved_threshold_method,
+            manual_threshold=resolved_manual_threshold,
+            thresholding_maximum_value=resolved_thresholding_maximum_value,
+            bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
+            bounded_otsu_max_foreground_fraction=resolved_bounded_otsu_max_foreground_fraction,
+            canny_enabled=resolved_canny_enabled,
+            canny_low_threshold=resolved_canny_low_threshold,
+            canny_high_threshold=resolved_canny_high_threshold,
+            canny_blur_kernel=resolved_canny_blur_kernel,
+            adaptive_block_size=resolved_adaptive_block_size,
+            adaptive_c=resolved_adaptive_c,
+            percentile_background_percentile=resolved_percentile_background_percentile,
+            percentile_min_contrast=resolved_percentile_min_contrast,
+            hysteresis_low_threshold=resolved_hysteresis_low_threshold,
+            hysteresis_high_threshold=resolved_hysteresis_high_threshold,
+            hysteresis_connectivity=resolved_hysteresis_connectivity,
+            sobel_percentile=resolved_sobel_percentile,
+            sobel_threshold=resolved_sobel_threshold,
+            sobel_kernel_size=resolved_sobel_kernel_size,
+        )
+    )
+    stage_durations_ms["thresholding"] = (time.perf_counter() - stage_started) * 1000
+
+    metadata = {
+        "threshold_method": resolved_threshold_method,
+        "stage_counts": {
+            "threshold_foreground_pixels": int(np.count_nonzero(threshold_mask)),
+        },
+        "stage_durations_ms": {
+            key: round(value, 3) for key, value in stage_durations_ms.items()
+        },
+        "processed_frame_shape": list(gray.shape),
+    }
+    return ThresholdFrameResult(
+        source_frame=source_frame,
+        processed_frame=frame,
+        gray=gray,
+        threshold_mask=threshold_mask,
+        stage_durations_ms=stage_durations_ms,
+        metadata=metadata,
+    )
 
 
 def segment_frame(
@@ -612,41 +835,10 @@ def segment_frame(
         core_logger=_CORE_LOGGER,
     )
     try:
-        stage_durations_ms: dict[str, float] = {}
-        source_frame = frame
-        if apply_preprocessing:
-            stage_started = time.perf_counter()
-            frame = preprocess_frame_for_segmentation(
-                frame,
-                flatfield_correction=resolved_flatfield_correction,
-                flatfield_q=resolved_flatfield_q,
-                flatfield_axis=resolved_flatfield_axis,
-                flatfield_min_field_value=resolved_flatfield_min_field_value,
-                flatfield_max_field_value=resolved_flatfield_max_field_value,
-                apply_mask=resolved_apply_mask,
-                crop_enabled=resolved_crop_enabled,
-                crop_x=resolved_crop_x,
-                crop_y=resolved_crop_y,
-                crop_w=resolved_crop_w,
-                crop_h=resolved_crop_h,
-                background_correction=resolved_background_correction,
-                background=background,
-                background_min_field_value=resolved_background_min_field_value,
-                background_max_field_value=resolved_background_max_field_value,
-                invert_intensity=resolved_invert_intensity,
-                context=context,
-            )
-            stage_durations_ms["preprocessing"] = (time.perf_counter() - stage_started) * 1000
-        else:
-            stage_durations_ms["preprocessing"] = 0.0
-        stage_started = time.perf_counter()
-        gray = _as_grayscale_array(frame)
-        stage_durations_ms["grayscale"] = (time.perf_counter() - stage_started) * 1000
-        stage_started = time.perf_counter()
-        threshold_mask = calculate_threshold_mask(
-            gray,
+        threshold_result = threshold_frame(
+            frame,
             threshold=threshold,
-            method=resolved_threshold_method,
+            threshold_method=resolved_threshold_method,
             manual_threshold=resolved_manual_threshold,
             thresholding_maximum_value=resolved_thresholding_maximum_value,
             bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
@@ -665,9 +857,30 @@ def segment_frame(
             sobel_percentile=resolved_sobel_percentile,
             sobel_threshold=resolved_sobel_threshold,
             sobel_kernel_size=resolved_sobel_kernel_size,
+            apply_preprocessing=apply_preprocessing,
+            flatfield_correction=resolved_flatfield_correction,
+            flatfield_q=resolved_flatfield_q,
+            flatfield_axis=resolved_flatfield_axis,
+            flatfield_min_field_value=resolved_flatfield_min_field_value,
+            flatfield_max_field_value=resolved_flatfield_max_field_value,
+            apply_mask=resolved_apply_mask,
+            crop_enabled=resolved_crop_enabled,
+            crop_x=resolved_crop_x,
+            crop_y=resolved_crop_y,
+            crop_w=resolved_crop_w,
+            crop_h=resolved_crop_h,
+            background_correction=resolved_background_correction,
+            background=background,
+            background_min_field_value=resolved_background_min_field_value,
+            background_max_field_value=resolved_background_max_field_value,
+            invert_intensity=resolved_invert_intensity,
+            context=context,
         )
-        threshold_mask = as_binary_mask(threshold_mask)
-        stage_durations_ms["thresholding"] = (time.perf_counter() - stage_started) * 1000
+        source_frame = threshold_result.source_frame
+        frame = threshold_result.processed_frame
+        gray = threshold_result.gray
+        threshold_mask = threshold_result.threshold_mask
+        stage_durations_ms = dict(threshold_result.stage_durations_ms)
         stage_started = time.perf_counter()
         augmented_mask = augment_mask(
             threshold_mask,

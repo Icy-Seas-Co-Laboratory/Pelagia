@@ -304,6 +304,8 @@ Useful endpoint groups:
 - `GET /frame/original`, `GET /frame/preprocessed`
 - `POST /segmentation/frames/{frame_id}`
 - `GET /segmentation/options`, `POST /segmentation/jobs`
+- `GET /live/threshold`, `GET /live/detection-candidate`
+- `GET /live/sandbox`, `DELETE /live/sandbox/{sandbox_frame_id}`
 - `GET /roi-refinement/options`, `POST /roi-refinement`, `POST /roi-refinement/jobs`
 - `GET /jobs`, `GET /jobs/summary`, `POST /jobs`, `GET /jobs/events`
 - `POST /jobs/{job_id}/pause`, `/resume`, `/retry`, `/priority`

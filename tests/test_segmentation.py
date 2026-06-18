@@ -27,7 +27,7 @@ from Pelagia.processing.frame_threshold import (
     threshold_percentile_background,
     threshold_sobel_edges,
 )
-from Pelagia.processing.detection_candidate import live_segment_wrapper, segment_frame
+from Pelagia.processing.detection_candidate import live_detection_candidate_wrapper, live_segment_wrapper, segment_frame, threshold_frame
 from Pelagia.processing.detection_recording import build_candidate_detection_record
 from Pelagia.processing.mask_augmentation import augment_mask
 from Pelagia.processing.roi_assembly import assemble_candidate_rois
@@ -890,7 +890,34 @@ def test_segment_frame_writes_structured_log_events():
     assert completed["payload"]["source_component_count"] == 1
 
 
-def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
+def test_threshold_frame_returns_binary_mask():
+    data = np.zeros((10, 10), dtype=np.uint8)
+    data[2:5, 3:7] = 50
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "frame_id": FRAME_ID,
+        },
+    )
+
+    result = threshold_frame(
+        frame,
+        threshold=1,
+        apply_preprocessing=False,
+    )
+
+    assert result.threshold_mask.dtype == np.uint8
+    assert result.threshold_mask.shape == (10, 10)
+    assert int(np.count_nonzero(result.threshold_mask)) == 12
+    assert result.metadata["stage_counts"]["threshold_foreground_pixels"] == 12
+    assert result.metadata["threshold_method"] == "manual"
+
+
+def test_live_detection_candidate_wrapper_returns_transient_detection_records(monkeypatch):
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
     frame = FrameData(
@@ -905,7 +932,7 @@ def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
     )
     monkeypatch.setattr("Pelagia.processing.frame_store.retrieve_frame", lambda frame_id, context: frame)
 
-    detections = live_segment_wrapper(
+    detections = live_detection_candidate_wrapper(
         FRAME_ID,
         threshold=1,
         flatfield_correction=False,
@@ -923,6 +950,19 @@ def test_live_segment_wrapper_returns_transient_detection_records(monkeypatch):
     assert detections[0].roi_payload.startswith(b"\x89PNG\r\n\x1a\n")
     assert detections[0].mask_payload.startswith(b"\x89PNG\r\n\x1a\n")
     assert detections[0].roi_encoding == "png"
+    assert live_segment_wrapper(
+        FRAME_ID,
+        threshold=1,
+        flatfield_correction=False,
+        invert_intensity=False,
+        min_perimeter=0,
+        min_width=0,
+        min_height=0,
+        padding=0,
+        store_roi_payload_min_width=0,
+        store_roi_payload_min_height=0,
+        store_roi_payload_min_width_plus_height=0,
+    )[0].roi_encoding == "png"
 
 
 def test_segment_frame_stores_padded_roi_context_and_mask():

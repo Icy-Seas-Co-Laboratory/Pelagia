@@ -29,6 +29,8 @@ class FakeRepository:
         self.priority_updates = []
         self.logs = []
         self.preprocessed_payload_ref = None
+        self.sandbox_frames = {}
+        self.deleted_sandbox_frames = []
 
     def list_runs(self, **kwargs):
         return [{"id": "run-1", **kwargs}]
@@ -63,6 +65,8 @@ class FakeRepository:
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 2, "preview_thumbhash": b"abc", **kwargs}]
 
     def get_frame(self, frame_id):
+        if frame_id in self.sandbox_frames:
+            return dict(self.sandbox_frames[frame_id])
         if frame_id not in {"frame-1", "frame-2"}:
             return None
         return {
@@ -84,6 +88,8 @@ class FakeRepository:
         return {"id": "frame-1", "asset_id": asset_id, "frame_index": frame_index}
 
     def get_frame_record(self, frame_id):
+        if frame_id in self.sandbox_frames:
+            return FrameRecord.from_row(self.sandbox_frames[frame_id])
         if frame_id not in {"frame-1", "frame-2"}:
             return None
         return FrameRecord(
@@ -99,6 +105,85 @@ class FakeRepository:
             preprocessed_kvstore_hash=self.preprocessed_payload_ref,
             metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": frame_id},
         )
+
+    def create_live_frame_copy(self, frame_id, *, operation, metadata=None):
+        source = self.get_frame_record(frame_id)
+        if source is None:
+            raise KeyError(frame_id)
+        sandbox_id = f"live-frame-{len(self.sandbox_frames) + 1}"
+        live_metadata = {
+            **dict(source.metadata or {}),
+            "frame_id": sandbox_id,
+            "live_preview": {
+                "is_sandbox": True,
+                "source_frame_id": frame_id,
+                "operation": operation,
+                **dict(metadata or {}),
+            },
+        }
+        row = {
+            "id": sandbox_id,
+            "run_id": source.run_id,
+            "asset_id": source.asset_id,
+            "frame_index": -len(self.sandbox_frames) - 1,
+            "captured_at": source.captured_at,
+            "width": source.width,
+            "height": source.height,
+            "bbox_x": source.bbox_x,
+            "bbox_y": source.bbox_y,
+            "parent_frame_id": source.id,
+            "source_ref": source.source_ref,
+            "kvstore_hash": source.kvstore_hash,
+            "preview_thumbhash": source.preview_thumbhash,
+            "payload_ref": source.payload_ref or source.kvstore_hash,
+            "payload_encoding": source.payload_encoding,
+            "payload_format": source.payload_format,
+            "payload_dtype": source.payload_dtype,
+            "payload_shape": source.payload_shape,
+            "metadata": live_metadata,
+            "preprocessed_payload_ref": None,
+            "preprocessed_kvstore_hash": None,
+            "preprocessed_preview_thumbhash": None,
+        }
+        self.sandbox_frames[sandbox_id] = row
+        return dict(row)
+
+    def count_frame_payload_references(self, payload_ref, *, exclude_frame_id=None):
+        return 0
+
+    def list_live_frame_copies(self, *, source_frame_id=None, operation=None, limit=100, offset=0):
+        rows = []
+        for row in self.sandbox_frames.values():
+            live_preview = (row.get("metadata") or {}).get("live_preview") or {}
+            if source_frame_id and live_preview.get("source_frame_id") != source_frame_id:
+                continue
+            if operation and live_preview.get("operation") != operation:
+                continue
+            rows.append(dict(row))
+        return rows[max(0, int(offset)):max(0, int(offset)) + int(limit)]
+
+    def delete_live_frame_copy(self, frame_id):
+        row = self.sandbox_frames.pop(frame_id, None)
+        if row is None:
+            return None
+        self.deleted_sandbox_frames.append(frame_id)
+        keys = sorted(
+            {
+                key
+                for key in (
+                    row.get("preprocessed_payload_ref"),
+                    row.get("preprocessed_kvstore_hash"),
+                    row.get("background_payload_ref"),
+                    row.get("background_kvstore_hash"),
+                )
+                if key
+            }
+        )
+        return {
+            "frame": row,
+            "generated_kvstore_keys": keys,
+            "unreferenced_kvstore_keys": keys,
+        }
 
     def _detection_row(self, **overrides):
         row = {
@@ -447,6 +532,11 @@ def test_api_exposes_system_capabilities():
     assert body["name"] == "Pelagia"
     assert body["api"]["endpoints"]["segmentation_options"] == "/segmentation/options"
     assert body["api"]["endpoints"]["preprocessing_options"] == "/preprocessing/options"
+    assert body["api"]["endpoints"]["live_threshold"] == "/live/threshold"
+    assert body["api"]["endpoints"]["live_detection_candidate"] == "/live/detection-candidate"
+    assert body["api"]["endpoints"]["live_sandbox"] == "/live/sandbox"
+    assert body["api"]["endpoints"]["delete_live_sandbox"] == "/live/sandbox/{sandbox_frame_id}"
+    assert "live_segmentation" not in body["api"]["endpoints"]
     assert "extract_frames" in body["supported"]["pipeline_stages"]
     assert "background_frames" in body["jobs"]["queueable_stages"]
     assert "preprocess_frames" in body["jobs"]["queueable_stages"]
@@ -753,7 +843,7 @@ def test_api_live_files_indexes_server_directory(tmp_path):
     assert {"frames", "sample.mkv", ".hidden"}.issubset(names)
 
 
-def test_api_live_segment_returns_transient_detections(monkeypatch):
+def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     data = np.zeros((10, 10), dtype=np.uint8)
     data[2:5, 3:7] = 50
     frame = FrameData(
@@ -763,11 +853,33 @@ def test_api_live_segment_returns_transient_detections(monkeypatch):
         data=data,
         metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
     )
-    monkeypatch.setattr(frame_store, "retrieve_frame", lambda frame_id, context: frame)
+    monkeypatch.setattr(frame_store, "retrieve_frame", lambda frame_id, context, payload_kind="original": frame)
+    monkeypatch.setattr("Pelagia.api.routes.live.retrieve_frame", lambda frame_id, context, payload_kind="original": frame)
     client, _, _ = make_client()
 
+    threshold_response = client.get(
+        "/live/threshold",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "apply_preprocessing": False,
+            "include_mask_payload": True,
+        },
+    )
+
+    assert threshold_response.status_code == 200
+    threshold_body = threshold_response.json()
+    assert threshold_body["saved"] is False
+    assert threshold_body["sandboxed"] is True
+    assert threshold_body["source_frame_id"] == "frame-1"
+    assert threshold_body["sandbox_frame_id"] == "live-frame-1"
+    assert threshold_body["mask"]["shape"] == [10, 10]
+    assert threshold_body["mask"]["foreground_pixels"] == 12
+    assert threshold_body["mask"]["mask_encoding"] == "png"
+    assert threshold_body["resolved_options"]["thresholding"]["threshold_method"] == "manual"
+
     response = client.get(
-        "/live/segmentation",
+        "/live/detection-candidate",
         params={
             "frame_id": "frame-1",
             "threshold": 1,
@@ -780,8 +892,12 @@ def test_api_live_segment_returns_transient_detections(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["saved"] is False
+    assert body["sandboxed"] is True
+    assert body["source_frame_id"] == "frame-1"
+    assert body["sandbox_frame_id"] == "live-frame-2"
+    assert body["candidate_detection_count"] == 1
     assert body["detection_count"] == 1
-    detection = body["detections"][0]
+    detection = body["candidate_detections"][0]
     assert detection["frame_id"] == "frame-1"
     assert detection["bbox_x"] == 3
     assert detection["bbox_y"] == 2
@@ -794,6 +910,9 @@ def test_api_live_segment_returns_transient_detections(monkeypatch):
     assert body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == []
     assert body["stage_counts"]["recorded_detection_count"] == 1
     assert "roi_assembly" in body["stage_durations_ms"]
+
+    removed = client.get("/live/segmentation", params={"frame_id": "frame-1"})
+    assert removed.status_code == 404
 
 
 def test_api_segmentation_options_are_ui_ready():
@@ -1976,7 +2095,7 @@ def test_api_queues_video_ingestion_with_collections(tmp_path):
     ]
 
 
-def test_live_preprocess_replaces_existing_preprocessed_payload(monkeypatch):
+def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):
     client, repository, kvstore = make_client()
     repository.preprocessed_payload_ref = "old-preprocessed-key"
     calls = []
@@ -1997,10 +2116,13 @@ def test_live_preprocess_replaces_existing_preprocessed_payload(monkeypatch):
 
     def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
         calls.append(("store", frame_id, kwargs.get("encoding")))
+        repository.sandbox_frames[frame_id]["preprocessed_payload_ref"] = "new-preprocessed-key"
+        repository.sandbox_frames[frame_id]["preprocessed_kvstore_hash"] = "new-preprocessed-key"
+        repository.sandbox_frames[frame_id]["preprocessed_preview_thumbhash"] = b"def"
         return {
             "id": frame_id,
             "asset_id": "asset-1",
-            "frame_index": 2,
+            "frame_index": -1,
             "preprocessed_payload_ref": "new-preprocessed-key",
             "preprocessed_kvstore_hash": "new-preprocessed-key",
             "preprocessed_preview_thumbhash": b"def",
@@ -2016,13 +2138,33 @@ def test_live_preprocess_replaces_existing_preprocessed_payload(monkeypatch):
     body = response.json()
     assert body["status"] == "stored"
     assert body["saved"] is True
-    assert body["old_preprocessed_key"] == "old-preprocessed-key"
+    assert body["sandboxed"] is True
+    assert body["sandbox_created"] is True
+    assert body["source_frame_id"] == "frame-1"
+    assert body["sandbox_frame_id"] == "live-frame-1"
+    assert body["frame_id"] == "live-frame-1"
+    assert body["old_preprocessed_key"] is None
     assert body["new_preprocessed_key"] == "new-preprocessed-key"
-    assert body["old_preprocessed_deleted"] is True
+    assert body["old_preprocessed_deleted"] is False
     assert body["old_preprocessed_missing"] is False
-    assert kvstore.deleted_keys == ["old-preprocessed-key"]
-    assert calls[0] == ("retrieve", "frame-1", "original")
-    assert calls[2] == ("store", "frame-1", "png")
+    assert kvstore.deleted_keys == []
+    assert calls[0] == ("retrieve", "live-frame-1", "original")
+    assert calls[2] == ("store", "live-frame-1", "png")
+
+    list_response = client.get("/live/sandbox", params={"source_frame_id": "frame-1"})
+
+    assert list_response.status_code == 200
+    assert list_response.json()["count"] == 1
+    assert list_response.json()["sandbox_frames"][0]["id"] == "live-frame-1"
+    assert list_response.json()["sandbox_frames"][0]["metadata"]["live_preview"]["operation"] == "preprocess"
+
+    delete_response = client.delete("/live/sandbox/live-frame-1")
+
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
+    assert delete_response.json()["deleted_kvstore_keys"][0]["key"] == "new-preprocessed-key"
+    assert kvstore.deleted_keys == ["new-preprocessed-key"]
+    assert repository.deleted_sandbox_frames == ["live-frame-1"]
 
 
 def test_api_lists_collections_and_filters_assets():
