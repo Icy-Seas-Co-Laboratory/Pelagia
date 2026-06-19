@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from uuid import UUID
+
 try:
     from fastapi import APIRouter, HTTPException, Request
 except ImportError:  # pragma: no cover
@@ -7,6 +10,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import require_auth
     from ..schemas import OptionsResponse, SystemCapabilitiesResponse
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
@@ -95,6 +99,55 @@ if APIRouter is not None:
             }
         )
 
+    def _is_uuid(value: str | None) -> bool:
+        if not value:
+            return False
+        try:
+            UUID(str(value))
+        except ValueError:
+            return False
+        return True
+
+    def _project_by_id_or_key(repository, project_ref: str) -> dict[str, Any] | None:
+        if _is_uuid(project_ref):
+            project = repository.get_project(project_ref)
+            if project is not None:
+                return project
+        return repository.get_project_by_key(project_ref)
+
+    @router.get("/status/{project_ref}")
+    def get_project_system_status(request: Request, project_ref: str) -> dict:
+        auth = require_auth(request)
+        context = get_context(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_ref)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_ref!r} was not found.")
+        if not project.get("is_active", True):
+            raise HTTPException(status_code=404, detail=f"Project {project_ref!r} was not found.")
+        project_id = str(project["id"])
+        if not auth.is_admin and repository.get_project_membership(auth.user_id, project_id) is None:
+            raise HTTPException(status_code=403, detail="Project read permission is required.")
+
+        kvstore = context.kvstore_for_project(project_id, initialize=False)
+        if kvstore is None:
+            raise HTTPException(status_code=503, detail="KVStore is not configured.")
+        postgres = {"healthy": False}
+        try:
+            postgres = postgres_ping(repository)
+        except Exception as exc:
+            postgres = {"healthy": False, "error": str(exc), "schema": repository.schema}
+        queue = repository.get_status_summary(project_id=project_id)
+        return as_response(
+            {
+                "project": project,
+                "postgres": postgres,
+                "kvstore": kvstore_status(kvstore),
+                "queue": queue.get("queue", {}),
+                "workers": queue.get("workers", {}),
+            }
+        )
+
     @router.get("/use")
     def get_system_use() -> dict:
         return {
@@ -121,6 +174,7 @@ if APIRouter is not None:
                 "queue_job": "POST /jobs",
                 "worker_status": "GET /workers",
                 "system_status": "GET /system/status",
+                "project_system_status": "GET /system/status/{project_id_or_key}",
             },
         }
 

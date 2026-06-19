@@ -71,6 +71,7 @@ class FakeRepository:
             "frame-1": "project-1",
             "frame-2": "project-1",
             "det-1": "project-1",
+            "refined-det-1": "project-1",
             "det-wide": "project-1",
             "det-no-roi": "project-1",
             "job-1": "project-1",
@@ -277,7 +278,11 @@ class FakeRepository:
 
     def list_detections(self, asset_id=None, **kwargs):
         return [
-            self._detection_row(asset_id=asset_id or "asset-1", **kwargs)
+            self._detection_row(
+                asset_id=asset_id or "asset-1",
+                refined_detection_id="refined-det-1",
+                **kwargs,
+            )
         ]
 
     def get_detection(self, detection_id, **kwargs):
@@ -313,9 +318,16 @@ class FakeRepository:
     def get_refined_detection_for_candidate(self, detection_id, **kwargs):
         if detection_id != "det-1":
             return None
+        return self.get_refined_detection("refined-det-1", **kwargs)
+
+    def get_refined_detection(self, refined_detection_id, **kwargs):
+        if not self._visible(refined_detection_id, kwargs.get("project_id")):
+            return None
+        if refined_detection_id != "refined-det-1":
+            return None
         return self._detection_row(
-            id="refined-det-1",
-            candidate_detection_id=detection_id,
+            id=refined_detection_id,
+            candidate_detection_id="det-1",
             roi_payload=np.array([[5, 6], [7, 8]], dtype=np.uint8).tobytes(order="C"),
             mask_payload=np.array([[0, 255], [255, 0]], dtype=np.uint8).tobytes(order="C"),
             metadata={"detection_stage": "refined"},
@@ -540,7 +552,9 @@ class FakeRepository:
         self.shutdown_requests.append((worker_id, reason))
         return {"worker_id": worker_id, "shutdown_requested": True, "reason": reason}
 
-    def get_status_summary(self):
+    def get_status_summary(self, **kwargs):
+        if kwargs.get("project_id") == "project-2":
+            return {"queue": {"queued": 5}, "workers": {"total": 1, "online": 1, "busy": 0}}
         return {"queue": {"queued": 2}, "workers": {"total": 1, "online": 1, "busy": 0}}
 
     def register_planned_run(self, planned_run, **kwargs):
@@ -564,6 +578,78 @@ class FakeRepository:
                 return dict(user)
         return None
 
+    def get_user_by_username(self, username):
+        user = self.users.get(str(username).lower())
+        return None if user is None else dict(user)
+
+    def list_users(self, *, project_id=None, active_only=True, limit=100, offset=0):
+        rows = []
+        for user in self.users.values():
+            if active_only and not user.get("is_active", True):
+                continue
+            row = dict(user)
+            if project_id is not None:
+                role = self.memberships.get((user["id"], project_id))
+                if role is None:
+                    continue
+                row["project_id"] = project_id
+                row["project_role"] = role
+            rows.append(row)
+        rows.sort(key=lambda item: item["username"])
+        return rows[max(0, int(offset)):max(0, int(offset)) + int(limit)]
+
+    def create_user(self, username, **kwargs):
+        normalized = str(username).strip().lower()
+        if normalized in self.users:
+            raise ValueError("duplicate user")
+        user = {
+            "id": f"user-{len(self.users) + 1}",
+            "username": normalized,
+            "display_name": kwargs.get("display_name"),
+            "is_admin": bool(kwargs.get("is_admin", False)),
+            "is_active": bool(kwargs.get("is_active", True)),
+            "password": kwargs.get("password"),
+            "metadata": dict(kwargs.get("metadata") or {}),
+        }
+        self.users[normalized] = user
+        return dict(user)
+
+    def deactivate_user(self, user_id, *, metadata=None):
+        for user in self.users.values():
+            if user["id"] == user_id:
+                user["is_active"] = False
+                user["metadata"] = {**dict(user.get("metadata") or {}), **dict(metadata or {})}
+                for session in self.sessions.values():
+                    if session["user_id"] == user_id:
+                        session["revoked_at"] = "now"
+                return dict(user)
+        return None
+
+    def reset_user_password(self, user_id, password, *, metadata=None):
+        for user in self.users.values():
+            if user["id"] == user_id:
+                user["password"] = password
+                user["metadata"] = {**dict(user.get("metadata") or {}), **dict(metadata or {})}
+                for session in self.sessions.values():
+                    if session["user_id"] == user_id:
+                        session["revoked_at"] = "now"
+                return dict(user)
+        return None
+
+    def delete_user(self, user_id):
+        for username, user in list(self.users.items()):
+            if user["id"] == user_id:
+                self.memberships = {
+                    key: role
+                    for key, role in self.memberships.items()
+                    if key[0] != user_id
+                }
+                for session in self.sessions.values():
+                    if session["user_id"] == user_id:
+                        session["revoked_at"] = "now"
+                return self.users.pop(username)
+        return None
+
     def get_project(self, project_id):
         project = self.projects.get(project_id)
         return None if project is None else dict(project)
@@ -574,6 +660,52 @@ class FakeRepository:
                 return dict(project)
         return None
 
+    def create_project(self, project_key, **kwargs):
+        normalized_key = str(project_key).strip().lower()
+        project = {
+            "id": f"project-{len(self.projects) + 1}",
+            "project_key": normalized_key,
+            "project_name": kwargs.get("project_name") or normalized_key,
+            "description": kwargs.get("description"),
+            "kvstore_root_path": kwargs.get("kvstore_root_path"),
+            "is_active": bool(kwargs.get("is_active", True)),
+            "metadata": dict(kwargs.get("metadata") or {}),
+        }
+        self.projects[project["id"]] = project
+        return dict(project)
+
+    def add_project_member(self, user_id, project_id, *, role="viewer", metadata=None):
+        self.memberships[(user_id, project_id)] = role
+        return {
+            "user_id": user_id,
+            "project_id": project_id,
+            "role": role,
+            "metadata": dict(metadata or {}),
+        }
+
+    def get_project_membership(self, user_id, project_id):
+        role = self.memberships.get((user_id, project_id))
+        if role is None:
+            return None
+        project = self.get_project(project_id)
+        user = self.get_user(user_id)
+        return {
+            "user_id": user_id,
+            "project_id": project_id,
+            "role": role,
+            "username": None if user is None else user["username"],
+            "project_key": None if project is None else project["project_key"],
+            "project_name": None if project is None else project["project_name"],
+        }
+
+    def deactivate_project(self, project_id, *, metadata=None):
+        project = self.projects.get(project_id)
+        if project is None:
+            return None
+        project["is_active"] = False
+        project["metadata"] = {**dict(project.get("metadata") or {}), **dict(metadata or {})}
+        return dict(project)
+
     def list_user_projects(self, user_id, **kwargs):
         return [
             {**self.projects[project_id], "membership_role": role}
@@ -582,7 +714,12 @@ class FakeRepository:
         ]
 
     def list_projects(self, **kwargs):
-        return list(self.projects.values())
+        active_only = kwargs.get("active_only", True)
+        return [
+            dict(project)
+            for project in self.projects.values()
+            if not active_only or project.get("is_active")
+        ]
 
     def create_session(self, user_id, project_id, **kwargs):
         user = self.get_user(user_id)
@@ -611,6 +748,8 @@ class FakeRepository:
             return None
         user = self.get_user(session["user_id"])
         project = self.get_project(session["project_id"])
+        if project is None or not project.get("is_active", True):
+            return None
         role = self.memberships.get((session["user_id"], session["project_id"]))
         if user and user.get("is_admin") and role is None:
             role = "admin"
@@ -638,14 +777,16 @@ class FakeRepository:
 class FakeKVStore:
     initialized = True
 
-    def __init__(self):
+    def __init__(self, root_path="/tmp/pelagia-kv", total_stored_blobs=3):
         self.deleted_keys = []
+        self.root_path = root_path
+        self.total_stored_blobs = total_stored_blobs
 
     def status(self):
         return {
-            "root_path": "/tmp/pelagia-kv",
+            "root_path": self.root_path,
             "initialized": True,
-            "total_stored_blobs": 3,
+            "total_stored_blobs": self.total_stored_blobs,
         }
 
     def check_health(self):
@@ -685,6 +826,63 @@ def test_api_lists_system_status_without_live_database():
     assert body["queue"] == {"queued": 2}
     assert body["workers"]["online"] == 1
     assert body["kvstore"]["initialized"] is True
+
+
+def test_api_lists_project_system_status_with_project_kvstore():
+    client, repo, _ = make_client(auth_enabled=True)
+    client.app.state.context._project_kvstores["project-2"] = FakeKVStore(
+        root_path="/tmp/pelagia-kv/projects/project-2",
+        total_stored_blobs=8,
+    )
+    repo.memberships[("user-1", "project-2")] = "viewer"
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    unauthenticated = client.get("/system/status/other")
+    response = client.get("/system/status/other", headers=headers)
+
+    assert unauthenticated.status_code == 401
+    assert response.status_code == 200
+    body = response.json()
+    assert body["project"]["project_key"] == "other"
+    assert body["kvstore"]["root_path"] == "/tmp/pelagia-kv/projects/project-2"
+    assert body["kvstore"]["total_stored_blobs"] == 8
+    assert body["queue"] == {"queued": 5}
+    assert body["workers"]["online"] == 1
+
+
+def test_api_project_system_status_requires_project_membership_or_admin():
+    client, _, _ = make_client(auth_enabled=True)
+    client.app.state.context._project_kvstores["project-2"] = FakeKVStore(
+        root_path="/tmp/pelagia-kv/projects/project-2",
+        total_stored_blobs=8,
+    )
+    user_headers = auth_headers(client, username="ada", project_key="default")
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+
+    denied = client.get("/system/status/other", headers=user_headers)
+    admin_response = client.get("/system/status/other", headers=admin_headers)
+    missing = client.get("/system/status/missing-project", headers=admin_headers)
+
+    assert denied.status_code == 403
+    assert admin_response.status_code == 200
+    assert admin_response.json()["project"]["project_key"] == "other"
+    assert missing.status_code == 404
+
+
+def test_api_project_system_status_does_not_initialize_missing_project_kvstore():
+    client, repo, _ = make_client(auth_enabled=True)
+    repo.projects["project-2"]["kvstore_root_path"] = "/storage/cruise-1"
+    repo.memberships[("user-1", "project-2")] = "viewer"
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    response = client.get("/system/status/other", headers=headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["project"]["project_key"] == "other"
+    assert body["kvstore"]["root_path"] == "/storage/cruise-1"
+    assert body["kvstore"]["initialized"] is False
+    assert body["queue"] == {"queued": 5}
 
 
 def test_api_exposes_system_config():
@@ -781,6 +979,301 @@ def test_api_auth_login_me_projects_and_logout():
     assert logout.status_code == 200
     assert logout.json()["revoked"] is True
     assert client.get("/auth/me", headers=headers).status_code == 401
+
+
+def test_api_admin_can_create_project_and_non_admin_cannot():
+    client, repo, _ = make_client()
+    user_headers = auth_headers(client, username="ada", project_key="default")
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+
+    denied = client.post(
+        "/projects",
+        headers=user_headers,
+        json={"project_key": "survey", "project_name": "Survey"},
+    )
+    created = client.post(
+        "/projects",
+        headers=admin_headers,
+        json={
+            "project_key": "survey",
+            "project_name": "Survey",
+            "description": "Field survey data.",
+            "kvstore_root_path": "/tmp/pelagia/survey",
+        },
+    )
+    duplicate = client.post(
+        "/projects",
+        headers=admin_headers,
+        json={"project_key": "survey"},
+    )
+
+    assert denied.status_code == 403
+    assert created.status_code == 200
+    body = created.json()
+    assert body["project"]["project_key"] == "survey"
+    assert body["project"]["project_name"] == "Survey"
+    assert body["project"]["kvstore_root_path"] == "/tmp/pelagia/survey"
+    assert body["membership"]["role"] == "admin"
+    assert repo.memberships[("user-admin", body["project"]["id"])] == "admin"
+    assert duplicate.status_code == 409
+
+
+def test_api_project_delete_is_soft_delete_and_requires_manager():
+    client, repo, _ = make_client()
+    repo.memberships[("user-1", "project-2")] = "editor"
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+    editor_headers = auth_headers(client, username="ada", project_key="other")
+
+    denied = client.delete("/projects/other", headers=editor_headers)
+    assert denied.status_code == 403
+    assert repo.projects["project-2"]["is_active"] is True
+
+    repo.memberships[("user-1", "project-2")] = "manager"
+    manager_headers = auth_headers(client, username="ada", project_key="other")
+    deleted = client.delete("/projects/other", headers=manager_headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["project"]["is_active"] is False
+    assert repo.projects["project-2"]["is_active"] is False
+    assert repo.projects["project-2"]["metadata"]["deleted_by_user_id"] == "user-1"
+
+    default_delete = client.delete("/projects/default", headers=admin_headers)
+    assert default_delete.status_code == 422
+
+
+def test_api_logged_in_users_can_list_active_project_users():
+    client, repo, _ = make_client(auth_enabled=True)
+    repo.users["ben"] = {
+        "id": "user-ben",
+        "username": "ben",
+        "display_name": "Ben",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+        "metadata": {"lab": "A"},
+    }
+    repo.users["inactive"] = {
+        "id": "user-inactive",
+        "username": "inactive",
+        "display_name": "Inactive",
+        "is_admin": False,
+        "is_active": False,
+        "password": "secret",
+    }
+    repo.users["other"] = {
+        "id": "user-other",
+        "username": "other",
+        "display_name": "Other",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.memberships[("user-ben", "project-1")] = "viewer"
+    repo.memberships[("user-inactive", "project-1")] = "viewer"
+    repo.memberships[("user-other", "project-2")] = "editor"
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    unauthenticated = client.get("/users")
+    response = client.get("/users", headers=headers)
+    inactive_response = client.get("/users?active_only=false", headers=headers)
+
+    assert unauthenticated.status_code == 401
+    assert response.status_code == 200
+    users = response.json()["users"]
+    assert [user["username"] for user in users] == ["ada", "ben"]
+    assert users[0]["project_role"] == "editor"
+    assert users[1]["project_role"] == "viewer"
+    assert all("password" not in user and "password_hash" not in user for user in users)
+    assert [user["username"] for user in inactive_response.json()["users"]] == ["ada", "ben", "inactive"]
+
+
+def test_api_user_admin_can_request_global_user_list():
+    client, repo, _ = make_client()
+    repo.users["ben"] = {
+        "id": "user-ben",
+        "username": "ben",
+        "display_name": "Ben",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.users["other"] = {
+        "id": "user-other",
+        "username": "other",
+        "display_name": "Other",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.memberships[("user-ben", "project-1")] = "viewer"
+    repo.memberships[("user-other", "project-2")] = "editor"
+    user_headers = auth_headers(client, username="ada", project_key="default")
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+
+    denied = client.get("/users?include_all_projects=true", headers=user_headers)
+    global_response = client.get("/users?include_all_projects=true", headers=admin_headers)
+
+    assert denied.status_code == 403
+    assert global_response.status_code == 200
+    assert [user["username"] for user in global_response.json()["users"]] == ["ada", "admin", "ben", "other"]
+    assert all("project_role" not in user for user in global_response.json()["users"])
+
+
+def test_api_admin_can_create_user_and_reset_password():
+    client, repo, _ = make_client()
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+
+    created = client.post(
+        "/users",
+        headers=admin_headers,
+        json={
+            "username": "Grace",
+            "password": "initial",
+            "display_name": "Grace Hopper",
+            "project_key": "default",
+            "role": "manager",
+        },
+    )
+    duplicate = client.post(
+        "/users",
+        headers=admin_headers,
+        json={"username": "Grace", "project_key": "default"},
+    )
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["user"]["username"] == "grace"
+    assert "password" not in body["user"]
+    assert body["membership"]["role"] == "manager"
+    assert repo.memberships[(body["user"]["id"], "project-1")] == "manager"
+    assert duplicate.status_code == 409
+
+    reset = client.post(
+        "/users/grace/reset-password",
+        headers=admin_headers,
+        json={"password": "changed"},
+    )
+    assert reset.status_code == 200
+    assert repo.users["grace"]["password"] == "changed"
+    relogin = client.post(
+        "/auth/login",
+        json={"username": "grace", "password": "changed", "project_key": "default"},
+    )
+    assert relogin.status_code == 200
+
+
+def test_api_project_manager_can_manage_users_in_active_project_only():
+    client, repo, _ = make_client()
+    repo.memberships[("user-1", "project-1")] = "manager"
+    manager_headers = auth_headers(client, username="ada", project_key="default")
+
+    created = client.post(
+        "/users",
+        headers=manager_headers,
+        json={
+            "username": "Ben",
+            "password": "secret",
+            "project_key": "default",
+            "role": "editor",
+        },
+    )
+    assert created.status_code == 200
+    user_id = created.json()["user"]["id"]
+    assert repo.memberships[(user_id, "project-1")] == "editor"
+
+    make_admin = client.post(
+        "/users",
+        headers=manager_headers,
+        json={"username": "Root", "is_admin": True, "project_key": "default"},
+    )
+    other_project = client.post(
+        "/users",
+        headers=manager_headers,
+        json={"username": "OtherUser", "project_key": "other"},
+    )
+    manager_role = client.post(
+        "/users",
+        headers=manager_headers,
+        json={"username": "Lead", "project_key": "default", "role": "manager"},
+    )
+    assert make_admin.status_code == 403
+    assert other_project.status_code == 403
+    assert manager_role.status_code == 403
+
+    user_headers = auth_headers(client, username="ben", project_key="default")
+    reset = client.post(
+        "/users/ben/reset-password",
+        headers=manager_headers,
+        json={"password": "changed"},
+    )
+    assert reset.status_code == 200
+    assert client.get("/auth/me", headers=user_headers).status_code == 401
+    relogin = client.post(
+        "/auth/login",
+        json={"username": "ben", "password": "changed", "project_key": "default"},
+    )
+    assert relogin.status_code == 200
+
+    deactivate = client.post("/users/ben/deactivate", headers=manager_headers)
+    assert deactivate.status_code == 200
+    assert repo.users["ben"]["is_active"] is False
+    assert repo.users["ben"]["metadata"]["deactivated_by_user_id"] == "user-1"
+    failed_login = client.post(
+        "/auth/login",
+        json={"username": "ben", "password": "changed", "project_key": "default"},
+    )
+    assert failed_login.status_code == 401
+
+    repo.users["ben"]["is_active"] = True
+    delete = client.delete("/users/ben", headers=manager_headers)
+    assert delete.status_code == 200
+    assert "ben" not in repo.users
+
+
+def test_api_user_management_requires_manager_and_protects_admin_accounts():
+    client, repo, _ = make_client()
+    repo.memberships[("user-1", "project-1")] = "editor"
+    repo.users["ben"] = {
+        "id": "user-ben",
+        "username": "ben",
+        "display_name": "Ben",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.memberships[("user-ben", "project-2")] = "editor"
+    editor_headers = auth_headers(client, username="ada", project_key="default")
+
+    denied_create = client.post(
+        "/users",
+        headers=editor_headers,
+        json={"username": "Nope", "project_key": "default"},
+    )
+    denied_reset = client.post(
+        "/users/ben/reset-password",
+        headers=editor_headers,
+        json={"password": "changed"},
+    )
+    assert denied_create.status_code == 403
+    assert denied_reset.status_code == 403
+
+    repo.memberships[("user-1", "project-1")] = "manager"
+    manager_headers = auth_headers(client, username="ada", project_key="default")
+    out_of_project = client.post(
+        "/users/ben/reset-password",
+        headers=manager_headers,
+        json={"password": "changed"},
+    )
+    admin_reset = client.post(
+        "/users/admin/reset-password",
+        headers=manager_headers,
+        json={"password": "changed"},
+    )
+    self_delete = client.delete("/users/ada", headers=manager_headers)
+
+    assert out_of_project.status_code == 404
+    assert admin_reset.status_code == 403
+    assert self_delete.status_code == 422
 
 
 def test_api_auth_login_clamps_requested_session_ttl():
@@ -888,6 +1381,11 @@ def test_api_roi_refinement_identity_stores_refined_detection():
     assert body["stored_count"] == 1
     refined = body["refined_detections"][0]
     assert refined["candidate_detection_id"] == "det-1"
+    assert refined["primary_candidate_detection_id"] == "det-1"
+    assert refined["candidate_detection_ids"] == ["det-1"]
+    assert refined["refinement_relationship"] == "one_to_one"
+    assert refined["refined_roi_url"] == "/refined-detections/refined-det-1/roi"
+    assert refined["refined_mask_url"] == "/refined-detections/refined-det-1/mask"
     assert refined["metadata"]["detection_stage"] == "refined"
     assert refined["metadata"]["refinement_method"] == "identity"
 
@@ -1953,6 +2451,31 @@ def test_api_detection_refined_roi_endpoint_returns_matrix_and_png():
     assert png_response.content.startswith(b"\x89PNG")
 
 
+def test_api_refined_detection_id_endpoints_return_contract_and_payloads():
+    client, _, _ = make_client()
+
+    detail_response = client.get("/refined-detections/refined-det-1")
+    matrix_response = client.get("/refined-detections/refined-det-1/roi?format=matrix")
+    mask_response = client.get("/refined-detections/refined-det-1/mask?format=matrix")
+
+    assert detail_response.status_code == 200
+    refined = detail_response.json()["detection"]
+    assert refined["id"] == "refined-det-1"
+    assert refined["candidate_detection_id"] == "det-1"
+    assert refined["primary_candidate_detection_id"] == "det-1"
+    assert refined["candidate_detection_ids"] == ["det-1"]
+    assert refined["refinement_relationship"] == "one_to_one"
+    assert refined["refined_roi_url"] == "/refined-detections/refined-det-1/roi"
+    assert refined["refined_mask_url"] == "/refined-detections/refined-det-1/mask"
+    assert matrix_response.status_code == 200
+    assert matrix_response.json()["detection_id"] == "refined-det-1"
+    assert matrix_response.json()["payload_kind"] == "roi"
+    assert matrix_response.json()["data"] == [[5, 6], [7, 8]]
+    assert mask_response.status_code == 200
+    assert mask_response.json()["payload_kind"] == "mask"
+    assert mask_response.json()["data"] == [[0, 255], [255, 0]]
+
+
 def test_api_detection_roi_can_apply_mask():
     client, _, _ = make_client()
 
@@ -1986,6 +2509,8 @@ def test_api_detection_roi_mask_and_framedata_support_head():
         ("/detections/det-1/mask", "mask"),
         ("/detections/det-1/refined-roi", "roi"),
         ("/detections/det-1/refined-mask", "mask"),
+        ("/refined-detections/refined-det-1/roi", "roi"),
+        ("/refined-detections/refined-det-1/mask", "mask"),
     ]:
         response = client.head(f"{path}?format=png")
 

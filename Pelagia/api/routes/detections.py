@@ -25,6 +25,8 @@ if APIRouter is not None:
     )
 
     router = APIRouter(prefix="/detections", tags=["detections"])
+    refined_router = APIRouter(prefix="/refined-detections", tags=["refined-detections"])
+    routers = [refined_router]
 
     def _detection_payload_array(detection: dict, payload_kind: str) -> np.ndarray:
         if payload_kind not in {"roi", "mask"}:
@@ -243,12 +245,117 @@ if APIRouter is not None:
             "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
         }
 
+    @refined_router.get("/{refined_detection_id}", response_model=DetectionDetailResponse)
+    def get_refined_detection(request: Request, refined_detection_id: str) -> dict:
+        detection = get_repository(request).get_refined_detection(
+            refined_detection_id,
+            project_id=scoped_project_id(request),
+        )
+        if detection is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Refined detection {refined_detection_id!r} was not found.",
+            )
+        return {"detection": detection_summary(detection, include_payload=True)}
+
+    @refined_router.head("/{refined_detection_id}/roi", responses=_IMAGE_RESPONSES)
+    @refined_router.get("/{refined_detection_id}/roi", responses=_IMAGE_RESPONSES)
+    def get_refined_detection_roi_by_id(
+        request: Request,
+        refined_detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        apply_mask: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_refined_detection(
+            refined_detection_id,
+            project_id=scoped_project_id(request),
+        )
+        if detection is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Refined detection {refined_detection_id!r} was not found.",
+            )
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=refined_detection_id,
+            payload_kind="roi",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            apply_mask=apply_mask,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
+
+    @refined_router.head("/{refined_detection_id}/mask", responses=_IMAGE_RESPONSES)
+    @refined_router.get("/{refined_detection_id}/mask", responses=_IMAGE_RESPONSES)
+    def get_refined_detection_mask_by_id(
+        request: Request,
+        refined_detection_id: str,
+        format: str = "png",
+        scale: float = 1.0,
+        width: int | None = None,
+        height: int | None = None,
+        pad_square: bool = False,
+        square: bool = False,
+        invert: bool = False,
+        scale_bar: bool = False,
+        scale_bar_length_px: int | None = None,
+        scale_bar_height_px: int = 4,
+        scale_bar_margin_px: int = 8,
+        scale_bar_color: Literal["white", "black"] = "white",
+    ):
+        detection = get_repository(request).get_refined_detection(
+            refined_detection_id,
+            project_id=scoped_project_id(request),
+        )
+        if detection is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Refined detection {refined_detection_id!r} was not found.",
+            )
+        return _detection_payload_response(
+            detection=detection,
+            detection_id=refined_detection_id,
+            payload_kind="mask",
+            format=format,
+            scale=scale,
+            width=width,
+            height=height,
+            pad_square=pad_square,
+            square=square,
+            invert=invert,
+            scale_bar=scale_bar,
+            scale_bar_length_px=scale_bar_length_px,
+            scale_bar_height_px=scale_bar_height_px,
+            scale_bar_margin_px=scale_bar_margin_px,
+            scale_bar_color=scale_bar_color,
+        )
+
     @router.get("/{detection_id}", response_model=DetectionDetailResponse)
     def get_detection(request: Request, detection_id: str) -> dict:
         detection = get_repository(request).get_detection(detection_id, project_id=scoped_project_id(request))
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
-        return {"detection": as_response(detection)}
+        return {"detection": detection_summary(detection, include_payload=True)}
 
     @router.head("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)
     @router.get("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)
@@ -356,7 +463,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return _detection_payload_response(
             detection=detection,
-            detection_id=detection_id,
+            detection_id=str(detection.get("id") or detection_id),
             payload_kind="mask",
             format=format,
             scale=scale,
@@ -398,7 +505,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
         return _detection_payload_response(
             detection=detection,
-            detection_id=detection_id,
+            detection_id=str(detection.get("id") or detection_id),
             payload_kind="mask",
             format=format,
             scale=scale,
@@ -441,7 +548,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
         return _detection_payload_response(
             detection=detection,
-            detection_id=detection_id,
+            detection_id=str(detection.get("id") or detection_id),
             payload_kind="roi",
             format=format,
             scale=scale,
@@ -459,3 +566,4 @@ if APIRouter is not None:
         )
 else:
     router = None
+    routers = []

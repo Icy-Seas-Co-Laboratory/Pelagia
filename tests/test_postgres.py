@@ -451,6 +451,9 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     queued = postgres_repo.get_job(job_id)
     assert queued is not None
     assert queued["status"] == "queued"
+    project_status = postgres_repo.get_status_summary(project_id=DEFAULT_PROJECT_ID)
+    assert project_status["queue"] == {"queued": 1, "succeeded": 1}
+    assert postgres_repo.get_status_summary(project_id=str(uuid.uuid4()))["queue"] == {}
     events = postgres_repo.list_job_events(job_id=job_id)
     assert [event["event_type"] for event in events] == ["job.created"]
     assert events[0]["payload"]["stage"] == PipelineStage.EXTRACT_FRAMES.value
@@ -558,6 +561,11 @@ def test_postgres_repository_manages_users_projects_memberships_and_sessions(pos
     assert [row["project_key"] for row in user_projects] == ["ocean lab"]
     assert user_projects[0]["membership_role"] == "editor"
 
+    project_users = postgres_repo.list_users(project_id=str(project["id"]))
+    assert [row["username"] for row in project_users] == ["ada"]
+    assert project_users[0]["project_role"] == "editor"
+    assert "password_hash" not in project_users[0]
+
     session_result = postgres_repo.create_session(
         str(user["id"]),
         str(project["id"]),
@@ -589,6 +597,41 @@ def test_postgres_repository_manages_users_projects_memberships_and_sessions(pos
     admin = postgres_repo.create_user("Admin", password="secret", is_admin=True)
     admin_session = postgres_repo.create_session(str(admin["id"]), str(other_project["id"]))
     assert postgres_repo.get_session(admin_session["token"])["is_admin"] is True
+    deactivated = postgres_repo.deactivate_project(
+        str(other_project["id"]),
+        metadata={"deleted_by_user_id": str(admin["id"])},
+    )
+    assert deactivated["is_active"] is False
+    assert deactivated["metadata"]["deleted_by_user_id"] == str(admin["id"])
+    assert postgres_repo.get_session(admin_session["token"]) is None
+
+    managed_user = postgres_repo.create_user("Managed", password="old-password")
+    postgres_repo.add_project_member(str(managed_user["id"]), str(project["id"]), role="viewer")
+    managed_session = postgres_repo.create_session(str(managed_user["id"]), str(project["id"]))
+    reset_user = postgres_repo.reset_user_password(
+        str(managed_user["id"]),
+        "new-password",
+        metadata={"password_reset_by_user_id": str(admin["id"])},
+    )
+    assert reset_user["password_hash"] != managed_user["password_hash"]
+    assert reset_user["metadata"]["password_reset_by_user_id"] == str(admin["id"])
+    assert postgres_repo.verify_user_password("managed", "new-password")["id"] == managed_user["id"]
+    assert postgres_repo.get_session(managed_session["token"]) is None
+
+    active_session = postgres_repo.create_session(str(managed_user["id"]), str(project["id"]))
+    inactive_user = postgres_repo.deactivate_user(
+        str(managed_user["id"]),
+        metadata={"deactivated_by_user_id": str(admin["id"])},
+    )
+    assert inactive_user["is_active"] is False
+    assert inactive_user["metadata"]["deactivated_by_user_id"] == str(admin["id"])
+    assert postgres_repo.verify_user_password("managed", "new-password") is None
+    assert postgres_repo.get_session(active_session["token"]) is None
+
+    deleted_user = postgres_repo.create_user("Deleted", password="secret")
+    postgres_repo.add_project_member(str(deleted_user["id"]), str(project["id"]), role="viewer")
+    assert postgres_repo.delete_user(str(deleted_user["id"]))["username"] == "deleted"
+    assert postgres_repo.get_user(str(deleted_user["id"])) is None
 
 
 def test_postgres_repository_filters_core_reads_by_project(postgres_repo):

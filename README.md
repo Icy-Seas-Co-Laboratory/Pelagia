@@ -177,6 +177,7 @@ After the stack starts:
 ```bash
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/system/status
+curl -H "Authorization: Bearer $PELAGIA_TOKEN" http://127.0.0.1:8000/system/status/default
 curl -H "Authorization: Bearer $PELAGIA_TOKEN" http://127.0.0.1:8000/jobs
 ```
 
@@ -215,6 +216,16 @@ PelagiaView should log in before loading project resources:
 5. Use `GET /projects` and `POST /auth/switch-project` to move between projects.
    `GET /projects?include_all_names=true` also includes `all_project_names`
    for global project-name pickers while leaving `projects` scoped to the user.
+6. User admins can create projects with `POST /projects`. User admins and
+   project managers/admins can soft-delete non-default projects with
+   `DELETE /projects/{project_id_or_key}`.
+7. Logged-in users can list users in their active project with `GET /users`.
+   User admins can pass `include_all_projects=true` for a global user list.
+8. User admins and project managers/admins can manage user accounts with
+   `POST /users`, `POST /users/{user_id_or_username}/reset-password`,
+   `POST /users/{user_id_or_username}/deactivate`, and
+   `DELETE /users/{user_id_or_username}`. Project managers/admins are scoped
+   to users in their active project; user admins can manage accounts globally.
 
 With `auth.enabled=false`, the backend accepts requests without a token for
 single-user local development, but still scopes all resource access to
@@ -331,8 +342,10 @@ Useful endpoint groups:
 
 - `GET /health`, `/health/postgres`, `/health/kvstore`
 - `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`, `POST /auth/switch-project`
-- `GET /projects`
-- `GET /system`, `/system/status`, `/system/use`, `/system/config`
+- `GET /projects`, `POST /projects`, `DELETE /projects/{project_id_or_key}`
+- `GET /users`, `POST /users`, `POST /users/{user_id_or_username}/reset-password`,
+  `POST /users/{user_id_or_username}/deactivate`, `DELETE /users/{user_id_or_username}`
+- `GET /system`, `/system/status`, `/system/status/{project_id_or_key}`, `/system/use`, `/system/config`
 - `POST /system/initialize`
 - `POST /ingestion/videos`
 - `POST /frame/preprocess`, `POST /frame/preprocess/jobs`

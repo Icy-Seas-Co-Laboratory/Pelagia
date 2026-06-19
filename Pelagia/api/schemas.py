@@ -71,6 +71,13 @@ class DetectionSummary(FlexibleModel):
     mask_encoding: str | None = None
     mask_format: str | None = None
     mask_payload_bytes: int | None = None
+    candidate_detection_id: str | None = None
+    refined_detection_id: str | None = None
+    primary_candidate_detection_id: str | None = None
+    candidate_detection_ids: list[str] | None = None
+    refinement_relationship: str | None = None
+    refined_roi_url: str | None = None
+    refined_mask_url: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

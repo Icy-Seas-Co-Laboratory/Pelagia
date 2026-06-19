@@ -29,7 +29,7 @@ class AppContext:
         logger = DatabaseLogger(repository)
         return cls(config=resolved, repository=repository, kvstore=kvstore, logger=logger)
 
-    def kvstore_for_project(self, project_id: str | None) -> KVStore | None:
+    def kvstore_for_project(self, project_id: str | None, *, initialize: bool = True) -> KVStore | None:
         """Return the physical KVStore for a project."""
         if self.kvstore is None:
             return None
@@ -44,7 +44,7 @@ class AppContext:
             return cached
 
         store = KVStore(self._kvstore_root_for_project(resolved_project_id))
-        if not store.initialized:
+        if initialize and not store.initialized:
             config = self.config.kvstore
             store.initialize(
                 hash_algorithm=config.hash_algorithm,

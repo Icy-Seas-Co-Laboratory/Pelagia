@@ -133,6 +133,10 @@ class DetectionRefinementResult:
 
     def as_detection_record(self, *, encoding: str | None = None) -> DetectionRecord:
         """Return a copy of the candidate record annotated as refined metadata."""
+        if _refined_mask_area(self) <= 0:
+            raise ValueError(
+                f"Refined detection for candidate {_detection_identifier(self.candidate_detection)!r} has an empty mask."
+            )
         metadata = dict(self.candidate_detection.metadata or {})
         metadata.update(self.metadata)
         metadata.update(
@@ -464,6 +468,7 @@ def refine_detection(
             )
 
     bbox = _mask_bbox_in_frame(refined_mask, crop_bbox)
+    refined_foreground_pixels = int(np.count_nonzero(as_binary_mask(refined_mask)))
     return DetectionRefinementResult(
         candidate_detection=detection,
         roi=roi,
@@ -478,6 +483,7 @@ def refine_detection(
             "refined_mask_kind": "refined",
             "candidate_shape": list(candidate_mask.shape),
             "refined_shape": list(refined_mask.shape),
+            "refined_foreground_pixels": refined_foreground_pixels,
             "refinement_tile_size": resolved_options.tile_size,
             "refinement_overlap_fraction": resolved_options.overlap_fraction,
             "refinement_tile_count": len(last_tiles),
@@ -522,6 +528,7 @@ def refine_detections(
             options=resolved_options,
             method=method,
         )
+    results = _non_empty_refinement_results(results)
     return reconcile_overlapping_refinements(results, options=resolved_options)
 
 
@@ -717,7 +724,7 @@ def _residual_candidate_detections(
 
     crop_bbox = result.crop_bbox or _detection_crop_bbox(result.candidate_detection, result.roi.shape)
     crop_x, crop_y, _, _ = crop_bbox
-    residual_image = np.where(residual_mask > 0, as_grayscale_array(result.roi), 0).astype(result.roi.dtype)
+    residual_image = as_grayscale_array(result.roi)
     frame = FrameData(
         sourcePath="",
         filename=f"residual-{_detection_identifier(result.candidate_detection)}",
@@ -973,7 +980,7 @@ def _mask_slice_for_frame_rect(
 
 
 def _reconciliation_sort_key(result: DetectionRefinementResult) -> tuple[int, int, int, str]:
-    refined_area = int(np.count_nonzero(as_binary_mask(result.refined_mask)))
+    refined_area = _refined_mask_area(result)
     candidate_area = int(result.candidate_detection.area or 0)
     return (
         -refined_area,
@@ -985,6 +992,22 @@ def _reconciliation_sort_key(result: DetectionRefinementResult) -> tuple[int, in
 
 def _detection_identifier(detection: DetectionRecord) -> str:
     return str(detection.id or f"{detection.frame_id}:{detection.roi_index}")
+
+
+def _refined_mask_area(result: DetectionRefinementResult) -> int:
+    return int(np.count_nonzero(as_binary_mask(result.refined_mask)))
+
+
+def _non_empty_refinement_results(
+    results: Iterable[DetectionRefinementResult],
+) -> list[DetectionRefinementResult]:
+    kept = []
+    for result in results:
+        foreground_pixels = _refined_mask_area(result)
+        result.metadata["refined_foreground_pixels"] = foreground_pixels
+        if foreground_pixels > 0:
+            kept.append(result)
+    return kept
 
 
 def refined_storage_candidate_detection_id(result: DetectionRefinementResult) -> str:

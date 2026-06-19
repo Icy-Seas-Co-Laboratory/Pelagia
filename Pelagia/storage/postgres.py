@@ -291,6 +291,128 @@ class PostgresRepository:
                 )
                 return cursor.fetchone()
 
+    def list_users(
+        self,
+        *,
+        project_id: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        join = ""
+        select_membership = ""
+        if project_id:
+            join = f"JOIN {self.schema}.project_memberships memberships ON memberships.user_id = users.id"
+            clauses.append("memberships.project_id = %s")
+            params.append(project_id)
+            select_membership = ", memberships.project_id, memberships.role AS project_role"
+        if active_only:
+            clauses.append("users.is_active")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend([limit, max(0, int(offset))])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        users.id,
+                        users.username,
+                        users.display_name,
+                        users.is_active,
+                        users.is_admin,
+                        users.metadata,
+                        users.created_at,
+                        users.updated_at
+                        {select_membership}
+                    FROM {self.schema}.users users
+                    {join}
+                    {where}
+                    ORDER BY users.username ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def deactivate_user(
+        self,
+        user_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.users
+                    SET
+                        is_active = false,
+                        metadata = metadata || %s::jsonb
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (json.dumps(json_ready(metadata or {})), user_id),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.user_sessions
+                        SET revoked_at = COALESCE(revoked_at, NOW())
+                        WHERE user_id = %s;
+                        """,
+                        (user_id,),
+                    )
+            connection.commit()
+        return row
+
+    def reset_user_password(
+        self,
+        user_id: str,
+        password: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        password_hash = hash_password(password)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.users
+                    SET
+                        password_hash = %s,
+                        metadata = metadata || %s::jsonb
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (password_hash, json.dumps(json_ready(metadata or {})), user_id),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.user_sessions
+                        SET revoked_at = COALESCE(revoked_at, NOW())
+                        WHERE user_id = %s;
+                        """,
+                        (user_id,),
+                    )
+            connection.commit()
+        return row
+
+    def delete_user(self, user_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"DELETE FROM {self.schema}.users WHERE id = %s RETURNING *;",
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
     def verify_user_password(self, username: str, password: str) -> dict[str, Any] | None:
         user = self.get_user_by_username(username)
         if user is None or not user.get("is_active"):
@@ -383,6 +505,29 @@ class PostgresRepository:
                     (self._normalize_project_key(project_key),),
                 )
                 return cursor.fetchone()
+
+    def deactivate_project(
+        self,
+        project_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.projects
+                    SET
+                        is_active = false,
+                        metadata = metadata || %s::jsonb
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (json.dumps(json_ready(metadata or {})), project_id),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
 
     def add_project_member(
         self,
@@ -2156,7 +2301,15 @@ class PostgresRepository:
                 )
                 """
             )
-        refinement_join = ""
+        refinement_join = f"""
+                    LEFT JOIN LATERAL (
+                        SELECT refined.id, refined.refinement_method
+                        FROM {self.schema}.detections_refined refined
+                        WHERE refined.candidate_detection_id = detections.id
+                        ORDER BY refined.created_at DESC, refined.id DESC
+                        LIMIT 1
+                    ) refined ON TRUE
+        """
 
         direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
         sort_key = str(sort_by or "asset_frame").lower()
@@ -2184,8 +2337,9 @@ class PostgresRepository:
                         detections.*,
                         frames.asset_id,
                         frames.frame_index,
-                        assets.filename AS asset_filename
-                        {', refined.id AS refined_detection_id, refined.refinement_method' if refinement_join else ''}
+                        assets.filename AS asset_filename,
+                        refined.id AS refined_detection_id,
+                        refined.refinement_method AS refined_detection_method
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
@@ -2213,10 +2367,19 @@ class PostgresRepository:
                         detections.*,
                         frames.asset_id,
                         frames.frame_index,
-                        assets.filename AS asset_filename
+                        assets.filename AS asset_filename,
+                        refined.id AS refined_detection_id,
+                        refined.refinement_method AS refined_detection_method
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    LEFT JOIN LATERAL (
+                        SELECT refined.id, refined.refinement_method
+                        FROM {self.schema}.detections_refined refined
+                        WHERE refined.candidate_detection_id = detections.id
+                        ORDER BY refined.created_at DESC, refined.id DESC
+                        LIMIT 1
+                    ) refined ON TRUE
                     WHERE {' AND '.join(clauses)}
                     """,
                     tuple(params),
@@ -2250,6 +2413,36 @@ class PostgresRepository:
                     WHERE {' AND '.join(clauses)}
                     ORDER BY refined.created_at DESC, refined.id DESC
                     LIMIT 1
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchone()
+
+    def get_refined_detection(
+        self,
+        refined_detection_id: str,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                clauses = ["refined.id = %s"]
+                params: list[Any] = [refined_detection_id]
+                if project_id:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"""
+                    SELECT
+                        refined.*,
+                        refined.candidate_detection_id,
+                        frames.asset_id,
+                        frames.frame_index,
+                        assets.filename AS asset_filename
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
                     """,
                     tuple(params),
                 )
@@ -3380,15 +3573,23 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def get_status_summary(self) -> dict[str, Any]:
+    def get_status_summary(self, *, project_id: str | None = None) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                job_clauses: list[str] = []
+                job_params: list[Any] = []
+                if project_id:
+                    job_clauses.append("project_id = %s")
+                    job_params.append(project_id)
+                job_where = f"WHERE {' AND '.join(job_clauses)}" if job_clauses else ""
                 cursor.execute(
                     f"""
                     SELECT status, COUNT(*) AS count
                     FROM {self.schema}.processing_jobs
+                    {job_where}
                     GROUP BY status
-                    """
+                    """,
+                    tuple(job_params),
                 )
                 job_counts = {row["status"]: row["count"] for row in cursor.fetchall()}
                 cursor.execute(f"SELECT COUNT(*) AS count FROM {self.schema}.worker_sessions")

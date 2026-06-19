@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from Pelagia.domain import DetectionRecord
 from Pelagia.processing.frame_codec import decode_array_payload
@@ -56,6 +57,11 @@ class SplitOnceRefinementModel:
             output[:, :, output.shape[2] // 2:] = 0
         self.calls += 1
         return output
+
+
+class EmptyRefinementModel:
+    def predict(self, batch):
+        return np.zeros(np.asarray(batch).shape[:3], dtype=np.float32)
 
 
 class FakeContext:
@@ -362,6 +368,44 @@ def test_refine_detection_identity_uses_candidate_mask():
     assert refined_record.bbox_y == 0
     assert refined_record.bbox_w == 2
     assert refined_record.bbox_h == 2
+
+
+def test_refine_detections_drops_empty_refined_masks():
+    roi = np.array([[0, 20], [40, 80]], dtype=np.uint8)
+    mask = np.array([[0, 255], [255, 0]], dtype=np.uint8)
+    detection = DetectionRecord(
+        run_id="00000000-0000-0000-0000-000000000001",
+        frame_id=FRAME_ID,
+        roi_index=1,
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=2,
+        bbox_h=2,
+        area=2,
+        perimeter=4,
+        major_axis_length=2,
+        minor_axis_length=2,
+        min_gray_value=20,
+        mean_gray_value=30,
+        roi_payload=roi.tobytes(order="C"),
+        mask_payload=mask.tobytes(order="C"),
+        roi_encoding="raw",
+        roi_format="raw_ndarray_c_order",
+        roi_dtype=str(roi.dtype),
+        roi_shape=list(roi.shape),
+        mask_encoding="raw",
+        mask_format="raw_ndarray_c_order",
+        mask_dtype=str(mask.dtype),
+        mask_shape=list(mask.shape),
+        id="00000000-0000-7000-8000-000000000099",
+    )
+
+    result = refine_detection(detection, model=EmptyRefinementModel())
+
+    assert result.metadata["refined_foreground_pixels"] == 0
+    with pytest.raises(ValueError, match="empty mask"):
+        result.as_detection_record()
+    assert refine_detections([detection], model=EmptyRefinementModel()) == []
 
 
 def test_refinement_builds_overlapping_padded_tiles():
@@ -715,7 +759,7 @@ def test_refine_detections_can_skip_overlap_reconciliation():
 
 
 def test_refine_detections_discovers_residual_split_children_without_loading_frame():
-    roi = np.zeros((6, 8), dtype=np.uint8)
+    roi = np.full((6, 8), 10, dtype=np.uint8)
     roi[2:4, 1:3] = 80
     roi[2:4, 5:7] = 90
     mask = np.zeros_like(roi)
@@ -764,6 +808,7 @@ def test_refine_detections_discovers_residual_split_children_without_loading_fra
             residual_min_area=1,
             residual_min_width=1,
             residual_min_height=1,
+            residual_padding=1,
             overlap_reconciliation_enabled=False,
         ),
         method="split_once",
@@ -777,9 +822,19 @@ def test_refine_detections_discovers_residual_split_children_without_loading_fra
     assert child.metadata["residual_discovery_action"] == "split_child"
     assert child.metadata["split_from_candidate_detection_id"] == "det-composite"
     assert child.bbox == (15, 22, 2, 2)
+    assert child.crop_bbox == (14, 21, 4, 4)
     child_record = child.as_detection_record(encoding="raw")
     assert child_record.metadata["synthetic_candidate"] is True
     assert child_record.metadata["split_from_candidate_detection_id"] == "det-composite"
+    decoded_child_roi = decode_array_payload(
+        child_record.roi_payload,
+        {
+            "array_encoding": child_record.roi_encoding,
+            "dtype": child_record.roi_dtype,
+            "shape": child_record.roi_shape,
+        },
+    )
+    np.testing.assert_array_equal(decoded_child_roi, roi[1:5, 4:8])
 
 
 def test_segment_frame_returns_roi_detection_records_with_raw_payload():

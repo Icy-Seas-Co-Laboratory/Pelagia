@@ -92,8 +92,12 @@ def frame_summary(row: Any) -> dict[str, Any]:
     return as_response(item)
 
 
-def detection_summary(row: Any) -> dict[str, Any]:
-    item = without_payload_bytes(row, ("roi_payload", "mask_payload"))
+def detection_summary(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
+    item = as_response(_as_dict(row)) if include_payload else without_payload_bytes(row, ("roi_payload", "mask_payload"))
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    item["metadata"] = metadata
     bbox_values = [item.get("bbox_x"), item.get("bbox_y"), item.get("bbox_w"), item.get("bbox_h")]
     if all(value is not None for value in bbox_values):
         item["bbox"] = {
@@ -115,7 +119,64 @@ def detection_summary(row: Any) -> dict[str, Any]:
             "w": item.get("crop_bbox_w"),
             "h": item.get("crop_bbox_h"),
         }
+    _add_refined_detection_contract(item)
     return as_response(item)
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _refinement_relationship(metadata: dict[str, Any]) -> str:
+    has_split_parent = bool(metadata.get("split_from_candidate_detection_id"))
+    consumed_ids = metadata.get("consumed_candidate_detection_ids") or []
+    has_consumed = bool(consumed_ids)
+    if has_split_parent and has_consumed:
+        return "many_to_many"
+    if has_split_parent:
+        return "split_child"
+    if has_consumed:
+        return "merge_keeper"
+    return "one_to_one"
+
+
+def _add_refined_detection_contract(item: dict[str, Any]) -> None:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    refined_detection_id = item.get("refined_detection_id")
+    if refined_detection_id is not None:
+        item.setdefault("refined_roi_url", f"/refined-detections/{refined_detection_id}/roi")
+        item.setdefault("refined_mask_url", f"/refined-detections/{refined_detection_id}/mask")
+
+    candidate_detection_id = item.get("candidate_detection_id")
+    if candidate_detection_id is None:
+        return
+
+    primary_candidate_detection_id = (
+        metadata.get("split_from_candidate_detection_id")
+        or metadata.get("primary_candidate_detection_id")
+        or candidate_detection_id
+    )
+    consumed_ids = metadata.get("consumed_candidate_detection_ids") or []
+    if not isinstance(consumed_ids, list):
+        consumed_ids = [consumed_ids]
+    candidate_detection_ids = _unique_strings([primary_candidate_detection_id, candidate_detection_id, *consumed_ids])
+
+    item["primary_candidate_detection_id"] = str(primary_candidate_detection_id)
+    item["candidate_detection_ids"] = candidate_detection_ids
+    item["refinement_relationship"] = _refinement_relationship(metadata)
+    if item.get("id") is not None:
+        item.setdefault("refined_roi_url", f"/refined-detections/{item['id']}/roi")
+        item.setdefault("refined_mask_url", f"/refined-detections/{item['id']}/mask")
 
 
 def postgres_ping(repository) -> dict[str, Any]:
