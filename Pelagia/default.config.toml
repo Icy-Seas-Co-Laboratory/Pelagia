@@ -31,6 +31,20 @@ max_rows = 1000000
 # Default image payload encoding. Options: zstd, png, jpg, raw.
 encoding = "zstd"
 
+[auth]
+# Enable bearer-token authentication for API clients. Set false for single-user
+# local development; requests then run as an admin-scoped dev session against
+# dev_project_key instead of seeing all projects.
+enabled = true
+# Default session lifetime for login and project-switch tokens.
+session_ttl_seconds = 604800
+# Project used when auth.enabled=false.
+dev_project_key = "default"
+# Optional bootstrap credentials for scripted local setup.
+bootstrap_admin_username = null
+bootstrap_admin_password = null
+bootstrap_admin_display_name = null
+
 [processing.mask_augmentation]
 # Binary-mask cleanup after thresholding and before candidate assembly.
 enabled = false

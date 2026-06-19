@@ -61,6 +61,8 @@ class Worker:
         self._touch("idle", stages=stages)
         jobs = self.context.repository.claim_jobs(self.worker_id, stages=stages)
         for job in jobs:
+            project_id = None if job.get("project_id") is None else str(job.get("project_id"))
+            job_context = self.context.for_project(project_id)
             self._touch("working", stages=stages, leased_job_id=str(job["id"]))
             started = time.perf_counter()
             job_id = str(job["id"])
@@ -78,7 +80,7 @@ class Worker:
                     payload={"stage": stage},
                 )
             try:
-                result = self.handlers.handle(job, self.context)
+                result = self.handlers.handle(job, job_context)
                 self.context.repository.complete_job(job["id"], result=result)
                 duration_ms = (time.perf_counter() - started) * 1000
                 if self.context.logger is not None:

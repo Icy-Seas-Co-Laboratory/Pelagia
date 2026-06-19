@@ -10,6 +10,6 @@ class RunService:
     def __init__(self, repository: PostgresRepository):
         self.repository = repository
 
-    def register_planned_run(self, planned_run: PlannedRun) -> dict:
+    def register_planned_run(self, planned_run: PlannedRun, *, project_id: str) -> dict:
         """Persist a planned run, its assets, and its initial jobs."""
-        return self.repository.register_planned_run(planned_run)
+        return self.repository.register_planned_run(planned_run, project_id=project_id)

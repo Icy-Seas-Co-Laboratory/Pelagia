@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
     from ...processing.frame_store import retrieve_frame
     from ...processing.detection_candidate import segment_frame
@@ -169,6 +170,62 @@ if APIRouter is not None:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    def _has_preprocessed_payload(row: dict[str, Any]) -> bool:
+        return bool(row.get("preprocessed_payload_ref") or row.get("preprocessed_kvstore_hash"))
+
+    def _requested_segmentation_frames(
+        repository,
+        body: QueueSegmentationRequest,
+        *,
+        asset_id: str | None,
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        if body.frame_ids:
+            frames = []
+            for frame_id in dict.fromkeys(str(frame_id) for frame_id in body.frame_ids):
+                frame = repository.get_frame(frame_id, project_id=project_id)
+                if frame is None:
+                    raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
+                frames.append(frame)
+            return frames
+        if asset_id is None:
+            return []
+        return repository.list_frames(
+            asset_id,
+            project_id=project_id,
+            start_frame=body.start_frame,
+            end_frame=body.end_frame,
+            limit=body.limit,
+        )
+
+    def _validate_preprocessed_source(
+        repository,
+        body: QueueSegmentationRequest,
+        *,
+        asset_id: str | None,
+        project_id: str,
+        frame_payload_kind: str,
+    ) -> None:
+        if frame_payload_kind not in {"preprocessed", "processed", "corrected"}:
+            return
+        frames = _requested_segmentation_frames(
+            repository,
+            body,
+            asset_id=asset_id,
+            project_id=project_id,
+        )
+        missing = [str(frame["id"]) for frame in frames if not _has_preprocessed_payload(frame)]
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = "" if len(missing) <= 5 else f", and {len(missing) - 5} more"
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Segmentation requested {frame_payload_kind!r} frame payloads, "
+                    f"but {len(missing)} selected frame(s) lack preprocessed payloads: {preview}{suffix}."
+                ),
+            )
+
     def _stage_metadata(detections: list[Any], *, fallback_detection_count: int) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
         if detections:
@@ -222,9 +279,10 @@ if APIRouter is not None:
         )
 
     def _segment_resolved_frame(request: Request, frame_id: str, body: SegmentFrameRequest) -> dict:
-        context = get_context(request)
         repository = get_repository(request)
-        frame_record = repository.get_frame_record(frame_id)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
+        frame_record = repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
         if not frame_record.run_id:
@@ -251,6 +309,7 @@ if APIRouter is not None:
                 frame_record.run_id,
                 [frame_id],
                 detections,
+                project_id=project_id,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -284,6 +343,7 @@ if APIRouter is not None:
                 )
             frames = repository.list_frames(
                 body.asset_id,
+                project_id=scoped_project_id(request),
                 start_frame=body.start_frame,
                 end_frame=body.end_frame,
                 limit=body.limit,
@@ -303,12 +363,14 @@ if APIRouter is not None:
     @router.post("/jobs")
     def queue_segmentation_job(request: Request, body: QueueSegmentationRequest) -> dict:
         repository = get_repository(request)
+        auth = require_project_write(request)
         resolved_options = _resolve_options(request, body)
+        flat_options = flatten_segmentation_options(resolved_options)
         run_id = body.run_id
         asset_id = body.asset_id
 
         if asset_id is None and body.frame_ids:
-            first_frame = repository.get_frame_record(body.frame_ids[0])
+            first_frame = repository.get_frame_record(body.frame_ids[0], project_id=auth.project_id)
             if first_frame is None:
                 raise HTTPException(
                     status_code=404,
@@ -324,17 +386,25 @@ if APIRouter is not None:
             )
 
         if run_id is None:
-            asset = repository.get_asset(asset_id)
+            asset = repository.get_asset(asset_id, project_id=auth.project_id)
             if asset is None:
                 raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
             run_id = asset.get("run_id")
+
+        _validate_preprocessed_source(
+            repository,
+            body,
+            asset_id=asset_id,
+            project_id=auth.project_id,
+            frame_payload_kind=flat_options["frame_payload_kind"],
+        )
 
         payload = {
             "frame_ids": body.frame_ids or [],
             "start_frame": body.start_frame,
             "end_frame": body.end_frame,
             "limit": body.limit,
-            **flatten_segmentation_options(resolved_options),
+            **flat_options,
         }
         if body.dry_run:
             return as_response(
@@ -348,15 +418,19 @@ if APIRouter is not None:
                     "payload": payload,
                 }
             )
-        job = repository.create_job(
-            "segment",
-            run_id=run_id,
-            asset_id=asset_id,
-            priority=body.priority,
-            payload=payload,
-            depends_on=body.depends_on or [],
-            summary=f"segment queued for asset {asset_id}",
-        )
+        try:
+            job = repository.create_job(
+                "segment",
+                project_id=auth.project_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                priority=body.priority,
+                payload=payload,
+                depends_on=body.depends_on or [],
+                summary=f"segment queued for asset {asset_id}",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"job": as_response(job)}
 else:
     router = None

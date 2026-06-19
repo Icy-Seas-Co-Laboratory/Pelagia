@@ -85,6 +85,18 @@ class APIConfig:
 
 
 @dataclass(slots=True)
+class AuthConfig:
+    """Authentication and dev bootstrap settings."""
+
+    enabled: bool = True
+    session_ttl_seconds: int = 7 * 24 * 60 * 60
+    dev_project_key: str = "default"
+    bootstrap_admin_username: str | None = None
+    bootstrap_admin_password: str | None = None
+    bootstrap_admin_display_name: str | None = None
+
+
+@dataclass(slots=True)
 class LoggingConfig:
     """Operational file logging settings."""
 
@@ -325,6 +337,7 @@ class CoreConfig:
     kvstore: KVStoreConfig = field(default_factory=KVStoreConfig)
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
@@ -443,6 +456,13 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "api", "host", "PELAGIA_API_HOST")
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
     _set_from_env(settings, "api", "cors_allow_origin_regex", "PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX")
+
+    _set_from_env(settings, "auth", "enabled", "PELAGIA_AUTH_ENABLED", _env_bool)
+    _set_from_env(settings, "auth", "session_ttl_seconds", "PELAGIA_AUTH_SESSION_TTL_SECONDS", int)
+    _set_from_env(settings, "auth", "dev_project_key", "PELAGIA_AUTH_DEV_PROJECT_KEY")
+    _set_from_env(settings, "auth", "bootstrap_admin_username", "PELAGIA_AUTH_BOOTSTRAP_ADMIN_USERNAME")
+    _set_from_env(settings, "auth", "bootstrap_admin_password", "PELAGIA_AUTH_BOOTSTRAP_ADMIN_PASSWORD")
+    _set_from_env(settings, "auth", "bootstrap_admin_display_name", "PELAGIA_AUTH_BOOTSTRAP_ADMIN_DISPLAY_NAME")
 
     _set_from_env(settings, "logging", "log_path", "PELAGIA_LOG_PATH", Path)
     _set_from_env(settings, "logging", "file_name", "PELAGIA_LOG_FILE")
@@ -588,6 +608,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     kvstore = _section(settings, "kvstore")
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
+    auth = _section(settings, "auth")
     logging = _section(settings, "logging")
     artifacts = _section(settings, "artifacts")
     artifact_models = _section(settings, "artifacts.models")
@@ -639,6 +660,25 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             port=int(api.get("port", APIConfig.port)),
             cors_allow_origin_regex=str(
                 api.get("cors_allow_origin_regex", APIConfig.cors_allow_origin_regex)
+            ),
+        ),
+        auth=AuthConfig(
+            enabled=bool(auth.get("enabled", AuthConfig.enabled)),
+            session_ttl_seconds=int(
+                auth.get("session_ttl_seconds", AuthConfig.session_ttl_seconds)
+            ),
+            dev_project_key=str(auth.get("dev_project_key", AuthConfig.dev_project_key)),
+            bootstrap_admin_username=auth.get(
+                "bootstrap_admin_username",
+                AuthConfig.bootstrap_admin_username,
+            ),
+            bootstrap_admin_password=auth.get(
+                "bootstrap_admin_password",
+                AuthConfig.bootstrap_admin_password,
+            ),
+            bootstrap_admin_display_name=auth.get(
+                "bootstrap_admin_display_name",
+                AuthConfig.bootstrap_admin_display_name,
             ),
         ),
         logging=LoggingConfig(

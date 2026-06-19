@@ -19,7 +19,7 @@ from Pelagia.domain import (
     WorkItem,
 )
 from Pelagia.storage import postgres
-from Pelagia.storage.postgres import PostgresRepository
+from Pelagia.storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository, hash_session_token
 
 
 POSTGRES_TEST_DSN = os.getenv(
@@ -31,13 +31,42 @@ POSTGRES_TEST_DSN = os.getenv(
 def test_render_schema_loads_sql_resource():
     rendered = postgres.render_schema("pelagia_unit")
 
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.users" in rendered
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.projects" in rendered
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.project_memberships" in rendered
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.user_sessions" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frames" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
+    assert "project_id uuid" in rendered
     assert "payload_ref text" in rendered
     assert "job_id uuid REFERENCES pelagia_unit.processing_jobs(id) ON DELETE SET NULL" in rendered
     assert "UNIQUE (candidate_detection_id)" not in rendered
     assert "DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key" in rendered
     assert "{schema}" not in rendered
+
+
+def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT table_name, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND column_name = 'project_id'
+                  AND table_name = ANY(%s)
+                """,
+                (
+                    postgres_repo.schema,
+                    ["runs", "raw_assets", "models", "processing_jobs", "logs"],
+                ),
+            )
+            rows = {row["table_name"]: row for row in cursor.fetchall()}
+
+    assert set(rows) == {"runs", "raw_assets", "models", "processing_jobs", "logs"}
+    for row in rows.values():
+        assert row["is_nullable"] == "NO"
+        assert row["column_default"] is None
 
 
 @pytest.fixture()
@@ -119,16 +148,19 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         ],
     )
 
-    run_row = postgres_repo.register_planned_run(planned_run)
+    run_row = postgres_repo.register_planned_run(planned_run, project_id=DEFAULT_PROJECT_ID)
     assert str(run_row["run"]["id"]) == run_id
+    assert str(run_row["run"]["project_id"]) == DEFAULT_PROJECT_ID
     assert run_row["asset_count"] == 1
     assert run_row["job_count"] == 1
     summary_job = postgres_repo.create_job(
         PipelineStage.SEGMENT,
+        project_id=DEFAULT_PROJECT_ID,
         run_id=run_id,
         asset_id=asset_id,
-        payload={"frame_ids": [str(uuid.uuid4()) for _ in range(20)]},
+        payload={"requested_frame_ids": [str(uuid.uuid4()) for _ in range(20)]},
     )
+    assert str(summary_job["project_id"]) == DEFAULT_PROJECT_ID
     completed_summary_job = postgres_repo.complete_job(
         str(summary_job["id"]),
         result={"detection_ids": [str(uuid.uuid4()) for _ in range(20)]},
@@ -140,12 +172,13 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert summary_jobs[0]["payload_bytes"] > 0
     assert summary_jobs[0]["result_bytes"] > 0
     detail_jobs = postgres_repo.list_jobs(stage=PipelineStage.SEGMENT.value, limit=1, include_details=True)
-    assert len(detail_jobs[0]["payload"]["frame_ids"]) == 20
+    assert len(detail_jobs[0]["payload"]["requested_frame_ids"]) == 20
     assert len(detail_jobs[0]["result"]["detection_ids"]) == 20
 
     assets = postgres_repo.list_assets(run_id)
     assert len(assets) == 1
     assert str(assets[0]["id"]) == asset_id
+    assert str(assets[0]["project_id"]) == DEFAULT_PROJECT_ID
     assert assets[0]["filename"] == "example.avi"
     assert assets[0]["collections"] == ["skq202510S-T1", "test"]
     assert postgres_repo.list_collections() == [
@@ -430,6 +463,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     claimed = postgres_repo.claim_jobs("pytest-worker", stages=[PipelineStage.EXTRACT_FRAMES], limit=1)
     assert len(claimed) == 1
     assert str(claimed[0]["id"]) == job_id
+    assert str(claimed[0]["project_id"]) == DEFAULT_PROJECT_ID
     assert claimed[0]["status"] == "leased"
     events = postgres_repo.list_job_events(job_id=job_id)
     assert [event["event_type"] for event in events] == ["job.leased", "job.created"]
@@ -474,6 +508,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         payload={"frame_count": 2},
     )
     assert log_row["event_type"] == "pipeline.extract_timed"
+    assert str(log_row["project_id"]) == DEFAULT_PROJECT_ID
     assert log_row["duration_ms"] == 42.5
     logs = postgres_repo.list_logs(
         run_id=run_id,
@@ -482,6 +517,274 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     )
     assert logs[0]["payload"] == {"frame_count": 2}
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
+
+
+def test_postgres_repository_manages_users_projects_memberships_and_sessions(postgres_repo):
+    default_project = postgres_repo.get_project_by_key("default")
+    assert default_project is not None
+    assert str(default_project["id"]) == DEFAULT_PROJECT_ID
+
+    user = postgres_repo.create_user(
+        "Ada",
+        password="secret-passphrase",
+        display_name="Ada Lovelace",
+    )
+    assert user["username"] == "ada"
+    assert user["password_hash"] != "secret-passphrase"
+    assert postgres_repo.verify_user_password("ada", "secret-passphrase")["id"] == user["id"]
+    assert postgres_repo.verify_user_password("ada", "wrong") is None
+
+    project = postgres_repo.create_project(
+        "Ocean Lab",
+        project_name="Ocean Lab",
+        description="Shared analysis project",
+        kvstore_root_path="./data/kvstore/projects/ocean-lab",
+        metadata={"collection": "lab"},
+    )
+    assert project["project_key"] == "ocean lab"
+    assert project["kvstore_root_path"].endswith("ocean-lab")
+
+    membership = postgres_repo.add_project_member(
+        str(user["id"]),
+        str(project["id"]),
+        role="editor",
+        metadata={"invited_by": "pytest"},
+    )
+    assert membership["role"] == "editor"
+    assert membership["metadata"]["invited_by"] == "pytest"
+    assert postgres_repo.get_project_membership(str(user["id"]), str(project["id"]))["role"] == "editor"
+
+    user_projects = postgres_repo.list_user_projects(str(user["id"]))
+    assert [row["project_key"] for row in user_projects] == ["ocean lab"]
+    assert user_projects[0]["membership_role"] == "editor"
+
+    session_result = postgres_repo.create_session(
+        str(user["id"]),
+        str(project["id"]),
+        ttl_seconds=3600,
+        user_agent="pytest",
+        remote_addr="127.0.0.1",
+    )
+    token = session_result["token"]
+    session = session_result["session"]
+    assert token
+    assert session["token_hash"] == hash_session_token(token)
+    assert token != session["token_hash"]
+
+    resolved = postgres_repo.get_session(token)
+    assert resolved is not None
+    assert resolved["username"] == "ada"
+    assert resolved["project_key"] == "ocean lab"
+    assert resolved["project_role"] == "editor"
+    assert resolved["user_agent"] == "pytest"
+
+    revoked = postgres_repo.revoke_session(token)
+    assert revoked is not None
+    assert postgres_repo.get_session(token) is None
+
+    other_project = postgres_repo.create_project("other-project")
+    with pytest.raises(PermissionError):
+        postgres_repo.create_session(str(user["id"]), str(other_project["id"]))
+
+    admin = postgres_repo.create_user("Admin", password="secret", is_admin=True)
+    admin_session = postgres_repo.create_session(str(admin["id"]), str(other_project["id"]))
+    assert postgres_repo.get_session(admin_session["token"])["is_admin"] is True
+
+
+def test_postgres_repository_filters_core_reads_by_project(postgres_repo):
+    project = postgres_repo.create_project(f"scope-{uuid.uuid4().hex}")
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    planned_run = PlannedRun(
+        manifest=RunManifest(
+            run_id=run_id,
+            run_key=f"scope-run-{uuid.uuid4().hex}",
+            instrument="pytest",
+            source_path="/tmp/scope.avi",
+            source_type=AssetKind.VIDEO.value,
+            created_at=datetime.now(timezone.utc),
+            assets=[
+                RawAssetManifest(
+                    asset_id=asset_id,
+                    filename="scope.avi",
+                    path="/tmp/scope.avi",
+                    kind=AssetKind.VIDEO,
+                    size_bytes=123,
+                    checksum="sha256:scope",
+                    collections=["scope"],
+                )
+            ],
+        ),
+        jobs=[
+            WorkItem(
+                job_id=job_id,
+                run_id=run_id,
+                stage=PipelineStage.EXTRACT_FRAMES,
+                asset_id=asset_id,
+            )
+        ],
+    )
+    postgres_repo.register_planned_run(planned_run, project_id=str(project["id"]))
+    model = postgres_repo.register_model(
+        ModelRecord(
+            model_key=f"scope-model-{uuid.uuid4().hex}",
+            model_name="Scope Model",
+            version="1",
+        ),
+        project_id=str(project["id"]),
+    )
+    log = postgres_repo.append_log(
+        project_id=str(project["id"]),
+        event_type="scope.test",
+        message="scoped",
+    )
+
+    assert [str(row["id"]) for row in postgres_repo.list_runs(project_id=str(project["id"]))] == [run_id]
+    assert postgres_repo.list_runs(project_id=DEFAULT_PROJECT_ID) == []
+    assert [str(row["id"]) for row in postgres_repo.list_assets(project_id=str(project["id"]))] == [asset_id]
+    assert postgres_repo.list_assets(project_id=DEFAULT_PROJECT_ID) == []
+    assert [str(row["id"]) for row in postgres_repo.list_jobs(project_id=str(project["id"]))] == [job_id]
+    assert postgres_repo.list_jobs(project_id=DEFAULT_PROJECT_ID) == []
+    assert postgres_repo.get_run(run_id, project_id=DEFAULT_PROJECT_ID) is None
+    assert postgres_repo.get_asset(asset_id, project_id=DEFAULT_PROJECT_ID) is None
+    assert postgres_repo.get_job(job_id, project_id=DEFAULT_PROJECT_ID) is None
+    assert postgres_repo.get_model(str(model["id"]), project_id=str(project["id"])) is not None
+    assert postgres_repo.get_model(str(model["id"]), project_id=DEFAULT_PROJECT_ID) is None
+    assert postgres_repo.list_logs(project_id=str(project["id"]))[0]["id"] == log["id"]
+    assert postgres_repo.list_logs(project_id=DEFAULT_PROJECT_ID) == []
+
+
+def test_postgres_repository_creates_and_deletes_project_scoped_live_frame_copy(postgres_repo):
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    planned_run = PlannedRun(
+        manifest=RunManifest(
+            run_id=run_id,
+            run_key=f"live-sandbox-{uuid.uuid4().hex}",
+            instrument="pytest",
+            source_path="/tmp/live.avi",
+            source_type=AssetKind.VIDEO.value,
+            created_at=datetime.now(timezone.utc),
+            assets=[
+                RawAssetManifest(
+                    asset_id=asset_id,
+                    filename="live.avi",
+                    path="/tmp/live.avi",
+                    kind=AssetKind.VIDEO,
+                    size_bytes=123,
+                    checksum="sha256:live",
+                    media_count=1,
+                )
+            ],
+        ),
+        jobs=[],
+    )
+    postgres_repo.register_planned_run(planned_run, project_id=DEFAULT_PROJECT_ID)
+    frame = postgres_repo.replace_frames(
+        run_id,
+        [
+            FrameRecord(
+                asset_id=asset_id,
+                frame_index=1,
+                width=4,
+                height=3,
+                kvstore_hash="live-frame-key",
+                preview_thumbhash=b"thumb",
+                payload_ref="live-frame-key",
+                payload_encoding="zstd",
+                payload_format="zstd_ndarray_c_order",
+                payload_dtype="uint8",
+                payload_shape=[3, 4],
+            )
+        ],
+    )[0]
+
+    sandbox = postgres_repo.create_live_frame_copy(
+        str(frame["id"]),
+        operation="preprocess",
+        project_id=DEFAULT_PROJECT_ID,
+    )
+
+    assert sandbox["frame_index"] == -1
+    assert str(sandbox["parent_frame_id"]) == str(frame["id"])
+    assert sandbox["metadata"]["live_preview"]["is_sandbox"] is True
+    assert sandbox["metadata"]["live_preview"]["operation"] == "preprocess"
+    assert sandbox["payload_ref"] == "live-frame-key"
+
+    deleted = postgres_repo.delete_live_frame_copy(str(sandbox["id"]), project_id=DEFAULT_PROJECT_ID)
+    assert deleted is not None
+    assert str(deleted["frame"]["id"]) == str(sandbox["id"])
+
+
+def test_postgres_repository_enforces_project_scope_on_job_creation(postgres_repo):
+    project = postgres_repo.create_project(f"write-scope-{uuid.uuid4().hex}")
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    planned_run = PlannedRun(
+        manifest=RunManifest(
+            run_id=run_id,
+            run_key=f"write-scope-run-{uuid.uuid4().hex}",
+            instrument="pytest",
+            source_path="/tmp/write-scope.avi",
+            source_type=AssetKind.VIDEO.value,
+            created_at=datetime.now(timezone.utc),
+            assets=[
+                RawAssetManifest(
+                    asset_id=asset_id,
+                    filename="write-scope.avi",
+                    path="/tmp/write-scope.avi",
+                    kind=AssetKind.VIDEO,
+                    size_bytes=123,
+                    checksum="sha256:write-scope",
+                    collections=["write-scope"],
+                )
+            ],
+        ),
+    )
+    postgres_repo.register_planned_run(planned_run, project_id=str(project["id"]))
+    frame = FrameRecord(
+        run_id=run_id,
+        asset_id=asset_id,
+        frame_index=1,
+        width=2,
+        height=2,
+        kvstore_hash="frame-key",
+        preview_thumbhash=b"thumb",
+        payload_ref="frame-key",
+        payload_encoding="raw",
+        payload_format="raw_ndarray_c_order",
+        payload_dtype="uint8",
+        payload_shape=[2, 2],
+    )
+    frame_row = postgres_repo.replace_frames(run_id, [frame])[0]
+
+    job = postgres_repo.create_job(
+        PipelineStage.PREPROCESS_FRAMES,
+        project_id=str(project["id"]),
+        run_id=run_id,
+        asset_id=asset_id,
+        payload={"frame_ids": [str(frame_row["id"])]},
+    )
+
+    assert str(job["project_id"]) == str(project["id"])
+    assert str(postgres_repo.claim_jobs("project-worker", stages=[PipelineStage.PREPROCESS_FRAMES], limit=1)[0]["project_id"]) == str(project["id"])
+    with pytest.raises(KeyError):
+        postgres_repo.create_job(
+            PipelineStage.PREPROCESS_FRAMES,
+            project_id=DEFAULT_PROJECT_ID,
+            run_id=run_id,
+            asset_id=asset_id,
+            payload={"frame_ids": [str(frame_row["id"])]},
+        )
+    with pytest.raises(KeyError):
+        postgres_repo.create_job(
+            PipelineStage.PREPROCESS_FRAMES,
+            project_id=str(project["id"]),
+            run_id=run_id,
+            asset_id=asset_id,
+            payload={"frame_ids": [str(uuid.uuid4())]},
+        )
 
 
 def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
@@ -518,7 +821,7 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
             )
         ],
     )
-    postgres_repo.register_planned_run(planned_run)
+    postgres_repo.register_planned_run(planned_run, project_id=DEFAULT_PROJECT_ID)
     postgres_repo.touch_worker(
         "purge-worker",
         status="idle",
@@ -530,7 +833,8 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
             model_key=f"purge-model-{uuid.uuid4().hex}",
             model_name="Purge Model",
             version="0",
-        )
+        ),
+        project_id=DEFAULT_PROJECT_ID,
     )
 
     result = postgres_repo.purge_all()

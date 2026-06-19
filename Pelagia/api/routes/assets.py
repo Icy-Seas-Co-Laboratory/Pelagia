@@ -10,6 +10,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ..schemas import AssetDetailResponse, AssetsListResponse, DetectionsListResponse, FramesListResponse
+    from ..auth import scoped_project_id
     from ...processing.frame_correction import divide_background, flatfield_correction as apply_flatfield_array_correction
     from ...processing.frame_store import retrieve_frame
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
@@ -36,6 +37,7 @@ if APIRouter is not None:
             "assets": as_response(
                 get_repository(request).list_assets(
                     run_id=run_id,
+                    project_id=scoped_project_id(request),
                     collection=collection,
                     kind=kind,
                     filename=filename,
@@ -62,6 +64,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> dict:
         stats = get_repository(request).list_asset_detection_stats(
+            project_id=scoped_project_id(request),
             run_id=run_id,
             collection=collection,
             kind=kind,
@@ -85,6 +88,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> dict:
         stats = get_repository(request).list_asset_processing_state(
+            project_id=scoped_project_id(request),
             run_id=run_id,
             collection=collection,
             kind=kind,
@@ -104,11 +108,12 @@ if APIRouter is not None:
     @router.get("/{asset_id}", response_model=AssetDetailResponse)
     def get_asset(request: Request, asset_id: str) -> dict:
         repository = get_repository(request)
-        asset = repository.get_asset(asset_id)
+        project_id = scoped_project_id(request)
+        asset = repository.get_asset(asset_id, project_id=project_id)
         if asset is None:
             raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
         asset = dict(asset)
-        asset["frame_count"] = repository.count_frames(asset_id)
+        asset["frame_count"] = repository.count_frames(asset_id, project_id=project_id)
         return {"asset": as_response(asset)}
 
     @router.get("/{asset_id}/frames", response_model=FramesListResponse)
@@ -122,6 +127,7 @@ if APIRouter is not None:
     ) -> dict[str, list]:
         frames = get_repository(request).list_frames(
             asset_id,
+            project_id=scoped_project_id(request),
             start_frame=start_frame,
             end_frame=end_frame,
             limit=limit,
@@ -149,7 +155,7 @@ if APIRouter is not None:
     ):
         context = get_context(request)
         repository = get_repository(request)
-        row = repository.get_frame_by_asset_index(asset_id, frame_num)
+        row = repository.get_frame_by_asset_index(asset_id, frame_num, project_id=scoped_project_id(request))
         if row is None:
             raise HTTPException(
                 status_code=404,
@@ -319,6 +325,7 @@ if APIRouter is not None:
     ) -> dict:
         detections = get_repository(request).list_detections(
             asset_id,
+            project_id=scoped_project_id(request),
             frame_id=frame_id,
             start_frame=start_frame,
             end_frame=end_frame,

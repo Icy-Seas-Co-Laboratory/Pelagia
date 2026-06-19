@@ -24,6 +24,18 @@ def test_core_config_load_applies_image_data_storage_encoding_env(monkeypatch):
     assert config.image_data_storage.encoding == "zstd"
 
 
+def test_core_config_load_applies_auth_env(monkeypatch):
+    monkeypatch.setenv("PELAGIA_AUTH_ENABLED", "false")
+    monkeypatch.setenv("PELAGIA_AUTH_SESSION_TTL_SECONDS", "3600")
+    monkeypatch.setenv("PELAGIA_AUTH_DEV_PROJECT_KEY", "sandbox")
+
+    config = CoreConfig.load(local_config_path=None)
+
+    assert config.auth.enabled is False
+    assert config.auth.session_ttl_seconds == 3600
+    assert config.auth.dev_project_key == "sandbox"
+
+
 def test_logging_config_defaults_to_core_file_logger():
     config = LoggingConfig()
 
@@ -39,6 +51,11 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
     assert config.image_data_storage.encoding == "zstd"
+    assert config.auth.enabled is True
+    assert config.auth.session_ttl_seconds == 604800
+    assert config.auth.dev_project_key == "default"
+    assert config.auth.bootstrap_admin_username is None
+    assert config.auth.bootstrap_admin_password is None
     assert config.artifacts.local_root.as_posix() == ".pelagia"
     assert config.artifacts.models.builtin_enabled is True
     assert config.artifacts.models.local_path.as_posix() == ".pelagia/models"
@@ -50,7 +67,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
-    assert config.processing.flatfield.flatfield_min_field_value == 1.0
+    assert config.processing.flatfield.flatfield_min_field_value == 25.0
     assert config.processing.flatfield.flatfield_max_field_value == 255.0
     assert config.processing.thresholding.method == "manual"
     assert config.processing.thresholding.thresholding_maximum_value == 100.0
@@ -90,7 +107,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_refinement.tile_size == 256
     assert config.processing.roi_refinement.overlap_fraction == 0.25
     assert config.processing.roi_refinement.max_iterations == 5
-    assert config.processing.roi_refinement.expansion_pixels == 128
+    assert config.processing.roi_refinement.expansion_pixels == 256
     assert config.processing.roi_refinement.edge_touch_margin == 2
     assert config.processing.roi_refinement.output_threshold == 0.5
     assert config.processing.roi_refinement.batch_size is None
@@ -98,7 +115,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_refinement.overlap_reconciliation_enabled is True
     assert config.processing.roi_refinement.overlap_iou_threshold == 0.5
     assert config.processing.roi_refinement.overlap_containment_threshold == 0.8
-    assert config.processing.roi_refinement.residual_discovery_enabled is False
+    assert config.processing.roi_refinement.residual_discovery_enabled is True
     assert config.processing.roi_refinement.residual_max_iterations == 1
     assert config.processing.roi_refinement.residual_roi_assembly_method is None
     assert config.processing.roi_refinement.residual_roi_assembly_connectivity == 8

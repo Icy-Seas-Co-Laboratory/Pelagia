@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ..schemas import JobDetailResponse, JobsListResponse, JobsSummaryResponse
+    from ..auth import require_project_write, scoped_project_id
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -103,6 +104,7 @@ if APIRouter is not None:
         jobs = repository.list_jobs(
             run_id=run_id,
             asset_id=asset_id,
+            project_id=scoped_project_id(request),
             statuses=statuses,
             stages=stages,
             job_ids=job_ids,
@@ -137,6 +139,7 @@ if APIRouter is not None:
         job_ids = _uuid_values(ids)
         return as_response(
             repository.summarize_jobs(
+                project_id=scoped_project_id(request),
                 run_id=run_id,
                 asset_id=asset_id,
                 statuses=statuses,
@@ -151,17 +154,22 @@ if APIRouter is not None:
     @router.post("", response_model=JobDetailResponse, response_model_exclude_none=True)
     def create_job(request: Request, body: CreateJobRequest) -> dict:
         repository = get_repository(request)
-        job = repository.create_job(
-            body.stage,
-            run_id=body.run_id,
-            asset_id=body.asset_id,
-            status=body.status,
-            priority=body.priority,
-            max_attempts=body.max_attempts,
-            payload=body.payload,
-            depends_on=body.depends_on,
-            summary=body.summary,
-        )
+        auth = require_project_write(request)
+        try:
+            job = repository.create_job(
+                body.stage,
+                project_id=auth.project_id,
+                run_id=body.run_id,
+                asset_id=body.asset_id,
+                status=body.status,
+                priority=body.priority,
+                max_attempts=body.max_attempts,
+                payload=body.payload,
+                depends_on=body.depends_on,
+                summary=body.summary,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"job": as_response(job)}
 
     @router.get("/events")
@@ -175,6 +183,7 @@ if APIRouter is not None:
     ) -> dict[str, list]:
         repository = get_repository(request)
         events = repository.list_job_events(
+            project_id=scoped_project_id(request),
             after_id=after_id,
             run_id=run_id,
             job_id=job_id,
@@ -186,7 +195,7 @@ if APIRouter is not None:
     @router.get("/{job_id}", response_model=JobDetailResponse, response_model_exclude_none=True)
     def get_job(request: Request, job_id: str) -> dict:
         repository = get_repository(request)
-        job = repository.get_job(job_id)
+        job = repository.get_job(job_id, project_id=scoped_project_id(request))
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id!r} was not found.")
         return {"job": as_response(job)}
@@ -194,7 +203,8 @@ if APIRouter is not None:
     @router.post("/{job_id}/pause", response_model=JobDetailResponse, response_model_exclude_none=True)
     def pause_job(request: Request, job_id: str, body: ReasonRequest | None = None) -> dict:
         repository = get_repository(request)
-        job = repository.pause_job(job_id, reason=None if body is None else body.reason)
+        auth = require_project_write(request)
+        job = repository.pause_job(job_id, reason=None if body is None else body.reason, project_id=auth.project_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id!r} was not found.")
         return {"job": as_response(job)}
@@ -202,7 +212,8 @@ if APIRouter is not None:
     @router.post("/{job_id}/resume", response_model=JobDetailResponse, response_model_exclude_none=True)
     def resume_job(request: Request, job_id: str, body: ReasonRequest | None = None) -> dict:
         repository = get_repository(request)
-        job = repository.resume_job(job_id, reason=None if body is None else body.reason)
+        auth = require_project_write(request)
+        job = repository.resume_job(job_id, reason=None if body is None else body.reason, project_id=auth.project_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Paused job {job_id!r} was not found.")
         return {"job": as_response(job)}
@@ -210,7 +221,8 @@ if APIRouter is not None:
     @router.post("/{job_id}/retry", response_model=JobDetailResponse, response_model_exclude_none=True)
     def retry_job(request: Request, job_id: str) -> dict:
         repository = get_repository(request)
-        job = repository.retry_job(job_id)
+        auth = require_project_write(request)
+        job = repository.retry_job(job_id, project_id=auth.project_id)
         if job is None:
             raise HTTPException(
                 status_code=404,
@@ -221,7 +233,8 @@ if APIRouter is not None:
     @router.post("/{job_id}/priority", response_model=JobDetailResponse, response_model_exclude_none=True)
     def set_job_priority(request: Request, job_id: str, body: PriorityRequest) -> dict:
         repository = get_repository(request)
-        job = repository.set_job_priority(job_id, body.priority, reason=body.reason)
+        auth = require_project_write(request)
+        job = repository.set_job_priority(job_id, body.priority, reason=body.reason, project_id=auth.project_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id!r} was not found.")
         return {"job": as_response(job)}

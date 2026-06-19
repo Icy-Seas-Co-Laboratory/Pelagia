@@ -96,6 +96,17 @@ if typer is not None:
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
 
+    def _project_id_from_key(context: AppContext, project_key: Optional[str] = None) -> str:
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required for project lookup.")
+        resolved_key = project_key or context.config.auth.dev_project_key
+        project = context.repository.get_project_by_key(resolved_key)
+        if project is None:
+            raise RuntimeError(
+                f"Project {resolved_key!r} was not found. Create it with `create-project` or `create-dev-login`."
+            )
+        return str(project["id"])
+
     def _segment_payload(
         frame_ids: Optional[str],
         start_frame: Optional[int],
@@ -233,12 +244,14 @@ if typer is not None:
         run_id: Optional[str],
         asset_id: Optional[str],
         payload: dict,
+        *,
+        project_id: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         resolved_run_id = run_id
         resolved_asset_id = asset_id
 
         if resolved_asset_id is None and payload["frame_ids"]:
-            first_frame = repository.get_frame_record(payload["frame_ids"][0])
+            first_frame = repository.get_frame_record(payload["frame_ids"][0], project_id=project_id)
             if first_frame is None:
                 raise RuntimeError(f"Frame {payload['frame_ids'][0]!r} was not found.")
             resolved_run_id = resolved_run_id or first_frame.run_id
@@ -248,7 +261,7 @@ if typer is not None:
             raise RuntimeError("Segmentation requires --asset-id or --frame-ids.")
 
         if resolved_run_id is None:
-            asset = repository.get_asset(resolved_asset_id)
+            asset = repository.get_asset(resolved_asset_id, project_id=project_id)
             if asset is None:
                 raise RuntimeError(f"Asset {resolved_asset_id!r} was not found.")
             resolved_run_id = asset.get("run_id")
@@ -272,11 +285,13 @@ if typer is not None:
         collections: Optional[str],
         *,
         cli_command: str,
+        project_key: Optional[str] = None,
         compute_checksum: bool = True,
     ) -> tuple[str, str, str]:
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to register video assets.")
 
+        project_id = _project_id_from_key(context, project_key)
         resolved = input_path.expanduser().resolve()
         resolved_run_id = run_id or str(uuid.uuid4())
         resolved_asset_id = asset_id or str(uuid.uuid4())
@@ -312,6 +327,7 @@ if typer is not None:
                 metadata={
                     "cli_command": cli_command,
                     "checksum_status": "computed" if compute_checksum else "deferred",
+                    "project_id": project_id,
                 },
                 assets=[
                     RawAssetManifest(
@@ -325,12 +341,13 @@ if typer is not None:
                         metadata={
                             "cli_command": cli_command,
                             "checksum_status": "computed" if compute_checksum else "deferred",
+                            "project_id": project_id,
                         },
                     )
                 ],
             )
         )
-        context.repository.register_planned_run(planned_run)
+        context.repository.register_planned_run(planned_run, project_id=project_id)
         return resolved_run_id, resolved_asset_id, resolved_run_key
 
     def _extract_frames_common(
@@ -348,6 +365,7 @@ if typer is not None:
         adaptive_background_period: Optional[int] = None,
         apply_mask: Optional[bool] = None,
         mask_path: Optional[str] = None,
+        project_key: Optional[str] = None,
     ) -> tuple[AppContext, dict]:
         from ..processing.ingest import ingest_image_folder, ingest_video_file
 
@@ -362,6 +380,7 @@ if typer is not None:
             instrument,
             collections,
             cli_command="extract_frames",
+            project_key=project_key,
             compute_checksum=True,
         )
         normalized_collections = normalize_collections(collections)
@@ -440,6 +459,149 @@ if typer is not None:
             "kvstore": context.kvstore.status() if context.kvstore is not None else None,
         }
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
+
+    @app.command("create-user")
+    def create_user(
+        username: str,
+        password: Optional[str] = None,
+        display_name: Optional[str] = None,
+        admin: bool = False,
+        inactive: bool = False,
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to create users.")
+        user = context.repository.create_user(
+            username,
+            password=password,
+            display_name=display_name,
+            is_admin=admin,
+            is_active=not inactive,
+        )
+        _echo_json({"user": user})
+
+    @app.command("create-project")
+    def create_project(
+        project_key: str,
+        project_name: Optional[str] = None,
+        description: Optional[str] = None,
+        kvstore_root_path: Optional[Path] = None,
+        inactive: bool = False,
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to create projects.")
+        project = context.repository.create_project(
+            project_key,
+            project_name=project_name,
+            description=description,
+            kvstore_root_path=None if kvstore_root_path is None else str(kvstore_root_path),
+            is_active=not inactive,
+        )
+        _echo_json({"project": project})
+
+    @app.command("add-project-user")
+    def add_project_user(
+        username: str,
+        project_key: str,
+        role: str = "editor",
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to update project membership.")
+        user = context.repository.get_user_by_username(username)
+        if user is None:
+            raise RuntimeError(f"User {username!r} was not found.")
+        project = context.repository.get_project_by_key(project_key)
+        if project is None:
+            raise RuntimeError(f"Project {project_key!r} was not found.")
+        membership = context.repository.add_project_member(str(user["id"]), str(project["id"]), role=role)
+        _echo_json({"user": user, "project": project, "membership": membership})
+
+    @app.command("list-projects")
+    def list_projects(
+        username: Optional[str] = None,
+        all_projects: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to list projects.")
+        user = context.repository.get_user_by_username(username) if username else None
+        if username and user is None:
+            raise RuntimeError(f"User {username!r} was not found.")
+        projects = (
+            context.repository.list_user_projects(str(user["id"]))
+            if user is not None and not all_projects
+            else context.repository.list_projects(active_only=not all_projects, limit=limit, offset=offset)
+        )
+        _echo_json({"count": len(projects), "projects": projects})
+
+    @app.command("create-dev-login")
+    def create_dev_login(
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        project_key: Optional[str] = None,
+        project_name: Optional[str] = None,
+        role: str = "admin",
+        ttl_seconds: Optional[int] = None,
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required to create a dev login.")
+        auth_config = context.config.auth
+        resolved_username = username or auth_config.bootstrap_admin_username or "dev-admin"
+        resolved_password = password or auth_config.bootstrap_admin_password or "pelagia-dev"
+        resolved_project_key = project_key or auth_config.dev_project_key
+        user = context.repository.get_user_by_username(resolved_username)
+        user_created = user is None
+        if user is None:
+            user = context.repository.create_user(
+                resolved_username,
+                password=resolved_password,
+                display_name=auth_config.bootstrap_admin_display_name or "Pelagia Dev Admin",
+                is_admin=True,
+            )
+        project = context.repository.get_project_by_key(resolved_project_key)
+        if project is None:
+            project = context.repository.create_project(
+                resolved_project_key,
+                project_name=project_name or resolved_project_key.title(),
+            )
+        membership = context.repository.add_project_member(str(user["id"]), str(project["id"]), role=role)
+        session = context.repository.create_session(
+            str(user["id"]),
+            str(project["id"]),
+            ttl_seconds=ttl_seconds or auth_config.session_ttl_seconds,
+            metadata={"cli_command": "create-dev-login"},
+        )
+        _echo_json(
+            {
+                "username": resolved_username,
+                "password": resolved_password if user_created else None,
+                "password_applied": user_created,
+                "project": project,
+                "membership": membership,
+                "token": session["token"],
+                "session": session,
+            }
+        )
 
     @app.command("check-system")
     def check_system(
@@ -588,6 +750,7 @@ if typer is not None:
         run_key: Optional[str] = None,
         instrument: str = "cli",
         collections: Optional[str] = None,
+        project_key: Optional[str] = None,
         adaptive_background_subtraction: Optional[bool] = None,
         adaptive_background_period: Optional[int] = None,
         apply_mask: Optional[bool] = None,
@@ -608,6 +771,7 @@ if typer is not None:
             adaptive_background_period,
             apply_mask,
             mask_path,
+            project_key,
         )
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
 
@@ -634,12 +798,14 @@ if typer is not None:
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
+        project_key: Optional[str] = None,
     ) -> None:
         from ..workers.handlers import preprocess_frames_handler
 
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to run preprocessing.")
+        project_id = _project_id_from_key(context, project_key)
 
         payload = _preprocess_payload(
             frame_ids,
@@ -665,16 +831,19 @@ if typer is not None:
             run_id,
             asset_id,
             payload,
+            project_id=project_id,
         )
+        project_context = context.for_project(project_id)
         result = preprocess_frames_handler(
             {
                 "id": "cli-preprocess",
+                "project_id": project_id,
                 "stage": PipelineStage.PREPROCESS_FRAMES.value,
                 "run_id": resolved_run_id,
                 "asset_id": resolved_asset_id,
                 "payload": payload,
             },
-            context,
+            project_context,
         )
         _echo_json(result)
 
@@ -703,10 +872,12 @@ if typer is not None:
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
+        project_key: Optional[str] = None,
     ) -> None:
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue preprocessing.")
+        project_id = _project_id_from_key(context, project_key)
 
         payload = _preprocess_payload(
             frame_ids,
@@ -732,9 +903,11 @@ if typer is not None:
             run_id,
             asset_id,
             payload,
+            project_id=project_id,
         )
         job = context.repository.create_job(
             PipelineStage.PREPROCESS_FRAMES,
+            project_id=project_id,
             run_id=resolved_run_id,
             asset_id=resolved_asset_id,
             priority=priority,
@@ -774,12 +947,14 @@ if typer is not None:
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
+        project_key: Optional[str] = None,
     ) -> None:
         from ..workers.handlers import roi_detection_handler
 
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to run segmentation.")
+        project_id = _project_id_from_key(context, project_key)
 
         payload = _segment_payload(
             frame_ids,
@@ -812,16 +987,19 @@ if typer is not None:
             run_id,
             asset_id,
             payload,
+            project_id=project_id,
         )
+        project_context = context.for_project(project_id)
         result = roi_detection_handler(
             {
                 "id": "cli-segment",
+                "project_id": project_id,
                 "stage": PipelineStage.SEGMENT.value,
                 "run_id": resolved_run_id,
                 "asset_id": resolved_asset_id,
                 "payload": payload,
             },
-            context,
+            project_context,
         )
         _echo_json(result)
 
@@ -857,10 +1035,12 @@ if typer is not None:
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
+        project_key: Optional[str] = None,
     ) -> None:
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue segmentation.")
+        project_id = _project_id_from_key(context, project_key)
 
         payload = _segment_payload(
             frame_ids,
@@ -893,9 +1073,11 @@ if typer is not None:
             run_id,
             asset_id,
             payload,
+            project_id=project_id,
         )
         job = context.repository.create_job(
             PipelineStage.SEGMENT,
+            project_id=project_id,
             run_id=resolved_run_id,
             asset_id=resolved_asset_id,
             priority=priority,
@@ -920,6 +1102,7 @@ if typer is not None:
         run_key: Optional[str] = None,
         instrument: str = "cli",
         collections: Optional[str] = None,
+        project_key: Optional[str] = None,
         adaptive_background_subtraction: Optional[bool] = None,
         adaptive_background_period: Optional[int] = None,
         apply_mask: Optional[bool] = None,
@@ -958,12 +1141,15 @@ if typer is not None:
             instrument,
             collections,
             cli_command="queue_extract_frames",
+            project_key=project_key,
             compute_checksum=compute_checksum,
         )
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue frame extraction.")
+        project_id = _project_id_from_key(context, project_key)
         job = context.repository.create_job(
             PipelineStage.EXTRACT_FRAMES,
+            project_id=project_id,
             run_id=resolved_run_id,
             asset_id=resolved_asset_id,
             payload={
@@ -1006,6 +1192,7 @@ if typer is not None:
         schema: Optional[str] = None,
         instrument: str = "cli",
         collections: Optional[str] = None,
+        project_key: Optional[str] = None,
         adaptive_background_subtraction: Optional[bool] = None,
         adaptive_background_period: Optional[int] = None,
         apply_mask: Optional[bool] = None,
@@ -1019,6 +1206,7 @@ if typer is not None:
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue ingestion.")
+        project_id = _project_id_from_key(context, project_key)
 
         ingest_defaults = context.config.processing.video_ingest
         preprocessing_defaults = context.config.processing.preprocessing
@@ -1054,10 +1242,12 @@ if typer is not None:
                 instrument,
                 collections,
                 cli_command="queue_ingest",
+                project_key=project_key,
                 compute_checksum=compute_checksum,
             )
             job = context.repository.create_job(
                 PipelineStage.EXTRACT_FRAMES,
+                project_id=project_id,
                 run_id=resolved_run_id,
                 asset_id=resolved_asset_id,
                 payload={

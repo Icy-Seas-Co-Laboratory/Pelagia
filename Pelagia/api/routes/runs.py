@@ -8,6 +8,7 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ..schemas import AssetsListResponse, JobsListResponse, RunDetailResponse, RunsListResponse
+    from ..auth import require_project_write, scoped_project_id
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -35,6 +36,7 @@ if APIRouter is not None:
                 get_repository(request).list_runs(
                     limit=limit,
                     offset=offset,
+                    project_id=scoped_project_id(request),
                     collection=collection,
                     run_key=run_key,
                     instrument=instrument,
@@ -47,7 +49,7 @@ if APIRouter is not None:
 
     @router.get("/{run_id}", response_model=RunDetailResponse)
     def get_run(request: Request, run_id: str) -> dict:
-        run = get_repository(request).get_run(run_id)
+        run = get_repository(request).get_run(run_id, project_id=scoped_project_id(request))
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id!r} was not found.")
         return {"run": as_response(run)}
@@ -71,6 +73,7 @@ if APIRouter is not None:
             "assets": as_response(
                 get_repository(request).list_assets(
                     run_id=run_id,
+                    project_id=scoped_project_id(request),
                     collection=collection,
                     kind=kind,
                     filename=filename,
@@ -97,6 +100,7 @@ if APIRouter is not None:
             "jobs": as_response(
                 get_repository(request).list_jobs(
                     run_id=run_id,
+                    project_id=scoped_project_id(request),
                     limit=_bounded_limit(limit),
                     offset=_bounded_offset(offset),
                     include_details=include_details,
@@ -106,14 +110,16 @@ if APIRouter is not None:
 
     @router.post("/{run_id}/cancel", response_model=RunDetailResponse)
     def cancel_run(request: Request, run_id: str) -> dict:
-        run = get_repository(request).cancel_run(run_id)
+        auth = require_project_write(request)
+        run = get_repository(request).cancel_run(run_id, project_id=auth.project_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id!r} was not found.")
         return {"run": as_response(run)}
 
     @router.post("/{run_id}/reconcile", response_model=RunDetailResponse)
     def reconcile_run(request: Request, run_id: str) -> dict:
-        run = get_repository(request).reconcile_run(run_id)
+        auth = require_project_write(request)
+        run = get_repository(request).reconcile_run(run_id, project_id=auth.project_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id!r} was not found.")
         return {"run": as_response(run)}

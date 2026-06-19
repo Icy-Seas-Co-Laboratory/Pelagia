@@ -85,11 +85,17 @@ root_path = "./data/kvstore"
 host = "0.0.0.0"
 port = 8000
 cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
+
+[auth]
+enabled = true
+session_ttl_seconds = 604800
+dev_project_key = "default"
 ```
 
 `config.toml` is ignored by git. You can also use environment variables such as
 `PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`,
-`PELAGIA_API_HOST`, and `PELAGIA_API_PORT`.
+`PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_AUTH_ENABLED`,
+`PELAGIA_AUTH_SESSION_TTL_SECONDS`, and `PELAGIA_AUTH_DEV_PROJECT_KEY`.
 
 ### Initialize And Run The Backend
 
@@ -97,6 +103,18 @@ Initialize database tables and storage:
 
 ```bash
 python -m Pelagia.cli.app init-system
+python -m Pelagia.cli.app create-dev-login --username dev-admin --password pelagia-dev
+```
+
+`create-dev-login` creates the default project if needed, creates or reuses the
+admin user, adds project membership, and prints a JSON response containing a
+session token. For manual setup use:
+
+```bash
+python -m Pelagia.cli.app create-user ada --password secret --admin
+python -m Pelagia.cli.app create-project field-survey --project-name "Field Survey"
+python -m Pelagia.cli.app add-project-user ada field-survey --role editor
+python -m Pelagia.cli.app list-projects --username ada
 ```
 
 For a local one-command backend stack, start the API and workers:
@@ -159,7 +177,7 @@ After the stack starts:
 ```bash
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/system/status
-curl http://127.0.0.1:8000/jobs
+curl -H "Authorization: Bearer $PELAGIA_TOKEN" http://127.0.0.1:8000/jobs
 ```
 
 To expose the API to another computer, bind to `0.0.0.0`, make sure the OS
@@ -187,6 +205,21 @@ Then connect to the backend API endpoint, for example:
 ```text
 http://127.0.0.1:8000
 ```
+
+PelagiaView should log in before loading project resources:
+
+1. `POST /auth/login` with `username`, `password`, and either `project_key` or `project_id`.
+2. Store the returned `token` for the browser session.
+3. Send `Authorization: Bearer <token>` on API calls.
+4. Use `GET /auth/me` to restore the active user/project after refresh.
+5. Use `GET /projects` and `POST /auth/switch-project` to move between projects.
+   `GET /projects?include_all_names=true` also includes `all_project_names`
+   for global project-name pickers while leaving `projects` scoped to the user.
+
+With `auth.enabled=false`, the backend accepts requests without a token for
+single-user local development, but still scopes all resource access to
+`auth.dev_project_key`. New runs, assets, jobs, models, logs, and generated
+artifacts are project-owned.
 
 On another computer, use the backend machine's IP address for both PelagiaView
 and the API endpoint.
@@ -297,6 +330,8 @@ start three workers for every configured stage, or
 Useful endpoint groups:
 
 - `GET /health`, `/health/postgres`, `/health/kvstore`
+- `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`, `POST /auth/switch-project`
+- `GET /projects`
 - `GET /system`, `/system/status`, `/system/use`, `/system/config`
 - `POST /system/initialize`
 - `POST /ingestion/videos`

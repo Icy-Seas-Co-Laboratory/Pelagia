@@ -148,11 +148,11 @@ class ModelService:
         """Create a model service for DB registration and artifact discovery."""
         return cls(repository=repository, config=config or CoreConfig.load())
 
-    def register_model(self, model: ModelRecord) -> dict:
+    def register_model(self, model: ModelRecord, *, project_id: str) -> dict:
         """Register or update model metadata."""
         if self.repository is None:
             raise RuntimeError("A PostgresRepository is required to register model metadata.")
-        return self.repository.register_model(model)
+        return self.repository.register_model(model, project_id=project_id)
 
     def list_model_artifacts(self) -> list[dict[str, Any]]:
         """List packaged and local model manifests."""

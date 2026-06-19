@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import secrets
+from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
 from typing import Any, Sequence
@@ -22,6 +26,10 @@ except ImportError:  # pragma: no cover - exercised only when postgres extras ar
 
 
 REQUIRED_SCHEMA_TABLES = (
+    "users",
+    "projects",
+    "project_memberships",
+    "user_sessions",
     "runs",
     "raw_assets",
     "frames",
@@ -35,6 +43,12 @@ REQUIRED_SCHEMA_TABLES = (
     "job_events",
     "logs",
 )
+
+DEFAULT_PROJECT_ID = "00000000-0000-0000-0000-000000000001"
+DEFAULT_PROJECT_KEY = "default"
+PROJECT_ROLES = {"viewer", "editor", "manager", "admin"}
+PASSWORD_HASH_ITERATIONS = 260_000
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def render_schema(schema: str = "seasight") -> str:
@@ -69,6 +83,44 @@ def _event_message(event_type: str, payload: dict[str, Any]) -> str:
         suffix = f" for {worker_id}" if worker_id else ""
         return f"Worker event {event_type}{suffix}"
     return event_type.replace(".", " ")
+
+
+def hash_password(password: str, *, iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
+    """Hash a password using only stdlib primitives for the initial auth foundation."""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("ascii"),
+        int(iterations),
+    )
+    return f"pbkdf2_sha256${int(iterations)}${salt}${digest.hex()}"
+
+
+def verify_password(password: str, password_hash: str | None) -> bool:
+    if not password_hash:
+        return False
+    try:
+        algorithm, iterations, salt, expected = password_hash.split("$", 3)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    try:
+        iteration_count = int(iterations)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("ascii"),
+        iteration_count,
+    ).hex()
+    return hmac.compare_digest(digest, expected)
+
+
+def hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 class PostgresRepository:
@@ -117,6 +169,38 @@ class PostgresRepository:
                 cursor.execute(render_schema(self.schema))
             connection.commit()
 
+    def ensure_default_project(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                row = self._ensure_default_project(cursor)
+            connection.commit()
+        return row
+
+    def _ensure_default_project(self, cursor) -> dict[str, Any]:
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.projects (id, project_key, project_name, description, metadata)
+            VALUES (
+                %s,
+                %s,
+                'Default',
+                'Default project for existing Pelagia data.',
+                %s::jsonb
+            )
+            ON CONFLICT (project_key) DO UPDATE SET
+                project_name = COALESCE({self.schema}.projects.project_name, EXCLUDED.project_name),
+                description = COALESCE({self.schema}.projects.description, EXCLUDED.description),
+                metadata = {self.schema}.projects.metadata || EXCLUDED.metadata
+            RETURNING *;
+            """,
+            (
+                DEFAULT_PROJECT_ID,
+                DEFAULT_PROJECT_KEY,
+                json.dumps({"system_default": True}),
+            ),
+        )
+        return cursor.fetchone()
+
     def schema_status(self) -> dict[str, Any]:
         required = list(REQUIRED_SCHEMA_TABLES)
         with self.connect() as connection:
@@ -150,12 +234,479 @@ class PostgresRepository:
                     before[table] = cursor.fetchone()["count"]
                 table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
                 cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
+                self._ensure_default_project(cursor)
             connection.commit()
         return {
             "schema": self.schema,
             "tables": before,
             "total_rows_deleted": sum(before.values()),
         }
+
+    def create_user(
+        self,
+        username: str,
+        *,
+        password: str | None = None,
+        display_name: str | None = None,
+        is_admin: bool = False,
+        is_active: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_username = self._normalize_username(username)
+        password_hash = hash_password(password) if password is not None else None
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.users
+                    (username, display_name, password_hash, is_active, is_admin, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    RETURNING *;
+                    """,
+                    (
+                        normalized_username,
+                        display_name,
+                        password_hash,
+                        is_active,
+                        is_admin,
+                        json.dumps(json_ready(metadata or {})),
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {self.schema}.users WHERE id = %s", (user_id,))
+                return cursor.fetchone()
+
+    def get_user_by_username(self, username: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.users WHERE username = %s",
+                    (self._normalize_username(username),),
+                )
+                return cursor.fetchone()
+
+    def verify_user_password(self, username: str, password: str) -> dict[str, Any] | None:
+        user = self.get_user_by_username(username)
+        if user is None or not user.get("is_active"):
+            return None
+        return user if verify_password(password, user.get("password_hash")) else None
+
+    def create_project(
+        self,
+        project_key: str,
+        *,
+        project_name: str | None = None,
+        description: str | None = None,
+        kvstore_root_path: str | None = None,
+        is_active: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_key = self._normalize_project_key(project_key)
+        resolved_name = project_name or normalized_key
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.projects
+                    (project_key, project_name, description, kvstore_root_path, is_active, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    RETURNING *;
+                    """,
+                    (
+                        normalized_key,
+                        resolved_name,
+                        description,
+                        kvstore_root_path,
+                        is_active,
+                        json.dumps(json_ready(metadata or {})),
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def list_projects(
+        self,
+        *,
+        user_id: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        join = ""
+        if user_id:
+            join = f"JOIN {self.schema}.project_memberships memberships ON memberships.project_id = projects.id"
+            clauses.append("memberships.user_id = %s")
+            params.append(user_id)
+        if active_only:
+            clauses.append("projects.is_active")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend([limit, max(0, int(offset))])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT projects.*
+                           {', memberships.role AS membership_role' if user_id else ''}
+                    FROM {self.schema}.projects projects
+                    {join}
+                    {where}
+                    ORDER BY projects.project_key ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def list_user_projects(self, user_id: str, *, active_only: bool = True) -> list[dict[str, Any]]:
+        return self.list_projects(user_id=user_id, active_only=active_only)
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {self.schema}.projects WHERE id = %s", (project_id,))
+                return cursor.fetchone()
+
+    def get_project_by_key(self, project_key: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.projects WHERE project_key = %s",
+                    (self._normalize_project_key(project_key),),
+                )
+                return cursor.fetchone()
+
+    def add_project_member(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        role: str = "viewer",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_role = self._normalize_project_role(role)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.project_memberships
+                    (user_id, project_id, role, metadata)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (user_id, project_id) DO UPDATE SET
+                        role = EXCLUDED.role,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    RETURNING *;
+                    """,
+                    (
+                        user_id,
+                        project_id,
+                        resolved_role,
+                        json.dumps(json_ready(metadata or {})),
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def get_project_membership(self, user_id: str, project_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT memberships.*, users.username, projects.project_key, projects.project_name
+                    FROM {self.schema}.project_memberships memberships
+                    JOIN {self.schema}.users users ON users.id = memberships.user_id
+                    JOIN {self.schema}.projects projects ON projects.id = memberships.project_id
+                    WHERE memberships.user_id = %s AND memberships.project_id = %s
+                    """,
+                    (user_id, project_id),
+                )
+                return cursor.fetchone()
+
+    def create_session(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
+        user_agent: str | None = None,
+        remote_addr: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user = self.get_user(user_id)
+        if user is None or not user.get("is_active"):
+            raise ValueError("Cannot create a session for an inactive or missing user.")
+        project = self.get_project(project_id)
+        if project is None or not project.get("is_active"):
+            raise ValueError("Cannot create a session for an inactive or missing project.")
+        if not user.get("is_admin") and self.get_project_membership(user_id, project_id) is None:
+            raise PermissionError("User is not a member of the requested project.")
+
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_seconds)))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.user_sessions
+                    (user_id, project_id, token_hash, user_agent, remote_addr, metadata, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                    RETURNING *;
+                    """,
+                    (
+                        user_id,
+                        project_id,
+                        hash_session_token(token),
+                        user_agent,
+                        remote_addr,
+                        json.dumps(json_ready(metadata or {})),
+                        expires_at,
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return {"token": token, "session": row}
+
+    def get_session(self, session_token: str, *, touch: bool = True) -> dict[str, Any] | None:
+        token_hash = hash_session_token(session_token)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if touch:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.user_sessions
+                        SET last_seen_at = NOW()
+                        WHERE token_hash = %s
+                          AND revoked_at IS NULL
+                          AND expires_at > NOW()
+                        RETURNING *;
+                        """,
+                        (token_hash,),
+                    )
+                    session = cursor.fetchone()
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT *
+                        FROM {self.schema}.user_sessions
+                        WHERE token_hash = %s
+                          AND revoked_at IS NULL
+                          AND expires_at > NOW()
+                        """,
+                        (token_hash,),
+                    )
+                    session = cursor.fetchone()
+                if session is None:
+                    connection.commit()
+                    return None
+                cursor.execute(
+                    f"""
+                    SELECT
+                        sessions.*,
+                        users.username,
+                        users.display_name,
+                        users.is_admin,
+                        projects.project_key,
+                        projects.project_name,
+                        COALESCE(memberships.role, CASE WHEN users.is_admin THEN 'admin' END) AS project_role
+                    FROM {self.schema}.user_sessions sessions
+                    JOIN {self.schema}.users users ON users.id = sessions.user_id
+                    JOIN {self.schema}.projects projects ON projects.id = sessions.project_id
+                    LEFT JOIN {self.schema}.project_memberships memberships
+                      ON memberships.user_id = sessions.user_id
+                     AND memberships.project_id = sessions.project_id
+                    WHERE sessions.id = %s
+                      AND users.is_active
+                      AND projects.is_active
+                    """,
+                    (session["id"],),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def revoke_session(self, session_token: str) -> dict[str, Any] | None:
+        token_hash = hash_session_token(session_token)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.user_sessions
+                    SET revoked_at = COALESCE(revoked_at, NOW())
+                    WHERE token_hash = %s
+                    RETURNING *;
+                    """,
+                    (token_hash,),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def revoke_user_sessions(self, user_id: str) -> int:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.user_sessions
+                    SET revoked_at = COALESCE(revoked_at, NOW())
+                    WHERE user_id = %s AND revoked_at IS NULL
+                    """,
+                    (user_id,),
+                )
+                count = cursor.rowcount
+            connection.commit()
+        return int(count)
+
+    @staticmethod
+    def _normalize_username(username: str) -> str:
+        normalized = str(username).strip().lower()
+        if not normalized:
+            raise ValueError("username must be non-empty.")
+        return normalized
+
+    @staticmethod
+    def _normalize_project_key(project_key: str) -> str:
+        normalized = str(project_key).strip().lower()
+        if not normalized:
+            raise ValueError("project_key must be non-empty.")
+        return normalized
+
+    @staticmethod
+    def _normalize_project_role(role: str) -> str:
+        normalized = str(role).strip().lower()
+        if normalized not in PROJECT_ROLES:
+            raise ValueError(
+                f"project role must be one of: {', '.join(sorted(PROJECT_ROLES))}."
+            )
+        return normalized
+
+    @staticmethod
+    def _required_project_id(project_id: str | None, context: str) -> str:
+        if project_id:
+            return str(project_id)
+        raise ValueError(f"project_id is required for {context}.")
+
+    def _resolve_project_id(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_id: str | None = None,
+    ) -> str:
+        if project_id:
+            return str(project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if run_id:
+                    cursor.execute(
+                        f"SELECT project_id FROM {self.schema}.runs WHERE id = %s",
+                        (run_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is not None and row.get("project_id"):
+                        return str(row["project_id"])
+                if asset_id:
+                    cursor.execute(
+                        f"SELECT project_id FROM {self.schema}.raw_assets WHERE id = %s",
+                        (asset_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is not None and row.get("project_id"):
+                        return str(row["project_id"])
+                if job_id:
+                    cursor.execute(
+                        f"SELECT project_id FROM {self.schema}.processing_jobs WHERE id = %s",
+                        (job_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is not None and row.get("project_id"):
+                        return str(row["project_id"])
+        raise ValueError("project_id is required when it cannot be derived from an existing resource.")
+
+    def _ensure_project_scope(
+        self,
+        cursor,
+        project_id: str | None,
+        *,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_ids: Sequence[str] | None = None,
+        frame_ids: Sequence[str] | None = None,
+        detection_ids: Sequence[str] | None = None,
+    ) -> None:
+        if not project_id:
+            return
+        resolved_project_id = str(project_id)
+        if run_id:
+            cursor.execute(
+                f"SELECT 1 FROM {self.schema}.runs WHERE id = %s AND project_id = %s",
+                (run_id, resolved_project_id),
+            )
+            if cursor.fetchone() is None:
+                raise KeyError(f"Run {run_id!r} was not found in project {resolved_project_id!r}.")
+        if asset_id:
+            cursor.execute(
+                f"SELECT 1 FROM {self.schema}.raw_assets WHERE id = %s AND project_id = %s",
+                (asset_id, resolved_project_id),
+            )
+            if cursor.fetchone() is None:
+                raise KeyError(f"Asset {asset_id!r} was not found in project {resolved_project_id!r}.")
+
+        def _missing_ids(values: Sequence[str] | None, query: str) -> list[str]:
+            resolved = [str(value) for value in values or [] if value]
+            if not resolved:
+                return []
+            cursor.execute(query, (resolved, resolved_project_id))
+            found = {str(row["id"]) for row in cursor.fetchall()}
+            return [value for value in resolved if value not in found]
+
+        missing_jobs = _missing_ids(
+            job_ids,
+            f"""
+            SELECT id
+            FROM {self.schema}.processing_jobs
+            WHERE id = ANY(%s::uuid[]) AND project_id = %s
+            """,
+        )
+        if missing_jobs:
+            raise KeyError(f"Job(s) not found in project {resolved_project_id!r}: {', '.join(missing_jobs)}")
+
+        missing_frames = _missing_ids(
+            frame_ids,
+            f"""
+            SELECT frames.id
+            FROM {self.schema}.frames frames
+            JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+            WHERE frames.id = ANY(%s::uuid[]) AND assets.project_id = %s
+            """,
+        )
+        if missing_frames:
+            raise KeyError(f"Frame(s) not found in project {resolved_project_id!r}: {', '.join(missing_frames)}")
+
+        missing_detections = _missing_ids(
+            detection_ids,
+            f"""
+            SELECT detections.id
+            FROM {self.schema}.detection_candidate detections
+            JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+            JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+            WHERE detections.id = ANY(%s::uuid[]) AND assets.project_id = %s
+            """,
+        )
+        if missing_detections:
+            raise KeyError(
+                f"Detection(s) not found in project {resolved_project_id!r}: {', '.join(missing_detections)}"
+            )
 
     def _dsn_fields(self) -> dict[str, Any]:
         fields = conninfo.conninfo_to_dict(self.config.database.dsn)
@@ -176,6 +727,7 @@ class PostgresRepository:
         self,
         limit: int = 100,
         offset: int = 0,
+        project_id: str | None = None,
         collection: str | None = None,
         run_key: str | None = None,
         instrument: str | None = None,
@@ -185,6 +737,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("runs.project_id = %s")
+            params.append(project_id)
         if collection:
             clauses.append(
                 f"""
@@ -221,10 +776,18 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_run(self, run_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.runs WHERE id = %s", (run_id,))
+                clauses = ["id = %s"]
+                params: list[Any] = [run_id]
+                if project_id:
+                    clauses.append("project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.runs WHERE {' AND '.join(clauses)}",
+                    tuple(params),
+                )
                 run_row = cursor.fetchone()
                 if run_row is None:
                     return None
@@ -239,6 +802,7 @@ class PostgresRepository:
         self,
         run_id: str | None = None,
         asset_id: str | None = None,
+        project_id: str | None = None,
         status: str | None = None,
         stage: str | None = None,
         statuses: Sequence[str] | None = None,
@@ -258,6 +822,7 @@ class PostgresRepository:
         resolved_statuses = list(statuses or ([] if status is None else [status]))
         resolved_stages = list(stages or ([] if stage is None else [stage]))
         clauses, params = self._job_filter_clauses(
+            project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             statuses=resolved_statuses,
@@ -333,6 +898,7 @@ class PostgresRepository:
     def _job_filter_clauses(
         self,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         statuses: Sequence[str] | None = None,
@@ -347,6 +913,9 @@ class PostgresRepository:
             placeholders = ", ".join([f"%s::{self.schema}.{enum_name}" for _ in values])
             return f"{column} IN ({placeholders})"
 
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
         if run_id:
             clauses.append("run_id = %s")
             params.append(run_id)
@@ -384,6 +953,7 @@ class PostgresRepository:
     def summarize_jobs(
         self,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         statuses: Sequence[str] | None = None,
@@ -394,6 +964,7 @@ class PostgresRepository:
         recent_limit: int = 5,
     ) -> dict[str, Any]:
         clauses, params = self._job_filter_clauses(
+            project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             statuses=statuses,
@@ -458,6 +1029,7 @@ class PostgresRepository:
                 recent_jobs: list[dict[str, Any]] = []
                 if include_recent:
                     recent_jobs = self.list_jobs(
+                        project_id=project_id,
                         run_id=run_id,
                         asset_id=asset_id,
                         statuses=statuses,
@@ -473,6 +1045,7 @@ class PostgresRepository:
         return {
             "filters": {
                 "run_id": run_id,
+                "project_id": project_id,
                 "asset_id": asset_id,
                 "status": list(statuses or []),
                 "stage": list(stages or []),
@@ -517,10 +1090,18 @@ class PostgresRepository:
             "progress": progress,
         }
 
-    def get_job(self, job_id: str) -> dict[str, Any] | None:
+    def get_job(self, job_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.processing_jobs WHERE id = %s", (job_id,))
+                clauses = ["id = %s"]
+                params: list[Any] = [job_id]
+                if project_id:
+                    clauses.append("project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.processing_jobs WHERE {' AND '.join(clauses)}",
+                    tuple(params),
+                )
                 return cursor.fetchone()
 
     def list_worker_sessions(
@@ -558,20 +1139,30 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def register_planned_run(self, planned_run: PlannedRun) -> dict[str, Any]:
+    def register_planned_run(
+        self,
+        planned_run: PlannedRun,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         manifest = planned_run.manifest
         schema = self.schema
+        resolved_project_id = self._required_project_id(
+            project_id or manifest.metadata.get("project_id"),
+            "register_planned_run",
+        )
 
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    INSERT INTO {schema}.runs (id, run_key, instrument, source_path, source_type, metadata, status)
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'registered')
-                    RETURNING id, run_key, source_path, source_type, status, created_at
+                    INSERT INTO {schema}.runs (id, project_id, run_key, instrument, source_path, source_type, metadata, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, 'registered')
+                    RETURNING id, project_id, run_key, source_path, source_type, status, created_at
                     """,
                     (
                         manifest.run_id,
+                        resolved_project_id,
                         manifest.run_key,
                         manifest.instrument,
                         manifest.source_path,
@@ -584,12 +1175,13 @@ class PostgresRepository:
                 cursor.executemany(
                     f"""
                     INSERT INTO {schema}.raw_assets
-                    (id, run_id, filename, path, kind, checksum, size_bytes, collections, media_count, metadata)
-                    VALUES (%s, %s, %s, %s, %s::{schema}.asset_kind, %s, %s, %s, %s, %s::jsonb)
+                    (id, project_id, run_id, filename, path, kind, checksum, size_bytes, collections, media_count, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::{schema}.asset_kind, %s, %s, %s, %s, %s::jsonb)
                     """,
                     [
                         (
                             asset.asset_id,
+                            resolved_project_id,
                             manifest.run_id,
                             asset.filename,
                             asset.path,
@@ -607,12 +1199,13 @@ class PostgresRepository:
                 cursor.executemany(
                     f"""
                     INSERT INTO {schema}.processing_jobs
-                    (id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload)
-                    VALUES (%s, %s, %s, %s::{schema}.stage_name, %s::{schema}.job_status, %s, 0, %s, %s::jsonb)
+                    (id, project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload)
+                    VALUES (%s, %s, %s, %s, %s::{schema}.stage_name, %s::{schema}.job_status, %s, 0, %s, %s::jsonb)
                     """,
                     [
                         (
                             job.job_id,
+                            resolved_project_id,
                             job.run_id,
                             job.asset_id,
                             job.stage.value,
@@ -661,6 +1254,7 @@ class PostgresRepository:
     def list_assets(
         self,
         run_id: str | None = None,
+        project_id: str | None = None,
         collection: str | None = None,
         kind: str | None = None,
         filename: str | None = None,
@@ -674,6 +1268,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
         if run_id:
             clauses.append("run_id = %s")
             params.append(run_id)
@@ -714,14 +1311,21 @@ class PostgresRepository:
     def list_collections(
         self,
         collection: str | None = None,
+        project_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        having = ""
+        inner_clauses = []
+        outer_clauses = []
         params: list[Any] = []
+        if project_id:
+            inner_clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if collection:
-            having = "WHERE collection ILIKE %s"
+            outer_clauses.append("collection ILIKE %s")
             params.append(f"%{collection}%")
+        inner_where = f"WHERE {' AND '.join(inner_clauses)}" if inner_clauses else ""
+        outer_where = f"WHERE {' AND '.join(outer_clauses)}" if outer_clauses else ""
         params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -732,9 +1336,10 @@ class PostgresRepository:
                         SELECT collection, COUNT(*) AS asset_count
                         FROM {self.schema}.raw_assets assets
                         CROSS JOIN LATERAL unnest(assets.collections) AS collection
+                        {inner_where}
                         GROUP BY collection
                     ) collections
-                    {having}
+                    {outer_where}
                     ORDER BY collection ASC
                     LIMIT %s OFFSET %s
                     """
@@ -743,16 +1348,37 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_asset(self, asset_id: str) -> dict[str, Any] | None:
+    def get_asset(self, asset_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.raw_assets WHERE id = %s", (asset_id,))
+                clauses = ["id = %s"]
+                params: list[Any] = [asset_id]
+                if project_id:
+                    clauses.append("project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.raw_assets WHERE {' AND '.join(clauses)}",
+                    tuple(params),
+                )
                 return cursor.fetchone()
 
-    def count_frames(self, asset_id: str) -> int:
+    def count_frames(self, asset_id: str, *, project_id: str | None = None) -> int:
+        clauses = ["frames.asset_id = %s"]
+        params: list[Any] = [asset_id]
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT COUNT(*) AS frame_count FROM {self.schema}.frames WHERE asset_id = %s", (asset_id,))
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) AS frame_count
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
                 row = cursor.fetchone()
         return int(row["frame_count"] if row is not None else 0)
 
@@ -802,13 +1428,17 @@ class PostgresRepository:
     def list_frames(
         self,
         asset_id: str,
+        project_id: str | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        clauses = ["asset_id = %s"]
+        clauses = ["frames.asset_id = %s"]
         params: list[Any] = [asset_id]
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if start_frame is not None:
             clauses.append("frame_index >= %s")
             params.append(start_frame)
@@ -825,10 +1455,11 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    SELECT *
-                    FROM {self.schema}.frames
+                    SELECT frames.*
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY frame_index DESC
+                    ORDER BY frames.frame_index DESC
                     {limit_sql}
                     {offset_sql}
                     """,
@@ -836,28 +1467,54 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_frame(self, frame_id: str) -> dict[str, Any] | None:
+    def get_frame(self, frame_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.frames WHERE id = %s", (frame_id,))
-                return cursor.fetchone()
-
-    def get_frame_by_asset_index(self, asset_id: str, frame_index: int) -> dict[str, Any] | None:
-        with self.connect() as connection:
-            with connection.cursor() as cursor:
+                clauses = ["frames.id = %s"]
+                params: list[Any] = [frame_id]
+                if project_id:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
                 cursor.execute(
                     f"""
-                    SELECT *
-                    FROM {self.schema}.frames
-                    WHERE asset_id = %s AND frame_index = %s
+                    SELECT frames.*
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
                     """,
-                    (asset_id, frame_index),
+                    tuple(params),
+                )
+                return cursor.fetchone()
+
+    def get_frame_by_asset_index(
+        self,
+        asset_id: str,
+        frame_index: int,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                clauses = ["frames.asset_id = %s", "frames.frame_index = %s"]
+                params: list[Any] = [asset_id, frame_index]
+                if project_id:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"""
+                    SELECT frames.*
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
                 )
                 return cursor.fetchone()
 
     def list_frame_records(
         self,
         asset_id: str,
+        project_id: str | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
         limit: int | None = None,
@@ -867,6 +1524,7 @@ class PostgresRepository:
             FrameRecord.from_row(row)
             for row in self.list_frames(
                 asset_id,
+                project_id=project_id,
                 start_frame=start_frame,
                 end_frame=end_frame,
                 limit=limit,
@@ -874,8 +1532,8 @@ class PostgresRepository:
             )
         ]
 
-    def get_frame_record(self, frame_id: str) -> FrameRecord | None:
-        row = self.get_frame(frame_id)
+    def get_frame_record(self, frame_id: str, *, project_id: str | None = None) -> FrameRecord | None:
+        row = self.get_frame(frame_id, project_id=project_id)
         if row is None:
             return None
         return FrameRecord.from_row(row)
@@ -885,6 +1543,7 @@ class PostgresRepository:
         frame_id: str,
         *,
         operation: str,
+        project_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a sandbox frame row that shares the source payload but owns live outputs."""
@@ -898,15 +1557,21 @@ class PostgresRepository:
         }
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                project_clause = ""
+                project_params: list[Any] = []
+                if project_id is not None:
+                    project_clause = "AND assets.project_id = %s"
+                    project_params.append(project_id)
                 cursor.execute(
                     f"""
                     SELECT assets.id
                     FROM {self.schema}.raw_assets assets
                     JOIN {self.schema}.frames source ON source.asset_id = assets.id
                     WHERE source.id = %s
+                      {project_clause}
                     FOR UPDATE
                     """,
-                    (frame_id,),
+                    (frame_id, *project_params),
                 )
                 if cursor.fetchone() is None:
                     raise KeyError(frame_id)
@@ -965,26 +1630,31 @@ class PostgresRepository:
         *,
         source_frame_id: str | None = None,
         operation: str | None = None,
+        project_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        clauses = ["metadata->'live_preview'->>'is_sandbox' = 'true'"]
+        clauses = ["frames.metadata->'live_preview'->>'is_sandbox' = 'true'"]
         params: list[Any] = []
         if source_frame_id:
-            clauses.append("metadata->'live_preview'->>'source_frame_id' = %s")
+            clauses.append("frames.metadata->'live_preview'->>'source_frame_id' = %s")
             params.append(str(source_frame_id))
         if operation:
-            clauses.append("metadata->'live_preview'->>'operation' = %s")
+            clauses.append("frames.metadata->'live_preview'->>'operation' = %s")
             params.append(str(operation))
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         params.extend([limit, max(0, int(offset))])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    SELECT *
+                    SELECT frames.*
                     FROM {self.schema}.frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY created_at DESC, id DESC
+                    ORDER BY frames.created_at DESC, frames.id DESC
                     LIMIT %s OFFSET %s
                     """,
                     tuple(params),
@@ -1026,18 +1696,25 @@ class PostgresRepository:
                 row = cursor.fetchone()
         return int(row["count"] if row is not None else 0)
 
-    def delete_live_frame_copy(self, frame_id: str) -> dict[str, Any] | None:
+    def delete_live_frame_copy(self, frame_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         """Delete one live-preview sandbox frame and return generated payload refs."""
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                project_clause = ""
+                project_params: list[Any] = []
+                if project_id is not None:
+                    project_clause = "AND assets.project_id = %s"
+                    project_params.append(project_id)
                 cursor.execute(
                     f"""
-                    SELECT *
+                    SELECT frames.*
                     FROM {self.schema}.frames
-                    WHERE id = %s
-                      AND metadata->'live_preview'->>'is_sandbox' = 'true'
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE frames.id = %s
+                      AND frames.metadata->'live_preview'->>'is_sandbox' = 'true'
+                      {project_clause}
                     """,
-                    (frame_id,),
+                    (frame_id, *project_params),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -1098,6 +1775,7 @@ class PostgresRepository:
         self,
         frame_id: str,
         *,
+        project_id: str | None = None,
         kvstore_hash: str,
         preview_thumbhash: bytes,
         payload_ref: str,
@@ -1109,6 +1787,7 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                self._ensure_project_scope(cursor, project_id, frame_ids=[frame_id])
                 cursor.execute(
                     f"""
                     UPDATE {self.schema}.frames
@@ -1146,6 +1825,7 @@ class PostgresRepository:
         self,
         frame_ids: Sequence[str],
         *,
+        project_id: str | None = None,
         kvstore_hash: str,
         payload_ref: str,
         payload_encoding: str,
@@ -1159,6 +1839,7 @@ class PostgresRepository:
             return []
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                self._ensure_project_scope(cursor, project_id, frame_ids=resolved_frame_ids)
                 cursor.execute(
                     f"""
                     UPDATE {self.schema}.frames
@@ -1253,12 +1934,20 @@ class PostgresRepository:
         refined_detections: Sequence[tuple[str, DetectionRecord]],
         *,
         job_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not refined_detections:
             return []
         inserted: list[dict[str, Any]] = []
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                self._ensure_project_scope(
+                    cursor,
+                    project_id,
+                    job_ids=[job_id] if job_id else None,
+                    detection_ids=[candidate_id for candidate_id, _ in refined_detections],
+                    frame_ids=[detection.frame_id for _, detection in refined_detections],
+                )
                 for candidate_detection_id, detection in refined_detections:
                     cursor.execute(
                         f"""
@@ -1331,12 +2020,20 @@ class PostgresRepository:
         run_id: str,
         frame_ids: Sequence[str],
         detections: Sequence[DetectionRecord],
+        *,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
         if not resolved_frame_ids:
             return []
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                self._ensure_project_scope(
+                    cursor,
+                    project_id,
+                    run_id=run_id,
+                    frame_ids=resolved_frame_ids,
+                )
                 cursor.execute(
                     f"""
                     DELETE FROM {self.schema}.detection_candidate
@@ -1352,6 +2049,7 @@ class PostgresRepository:
         self,
         asset_id: str | None = None,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         collection: str | None = None,
         frame_id: str | None = None,
@@ -1382,6 +2080,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if asset_id:
             clauses.append("frames.asset_id = %s")
             params.append(asset_id)
@@ -1498,9 +2199,14 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_detection(self, detection_id: str) -> dict[str, Any] | None:
+    def get_detection(self, detection_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                clauses = ["detections.id = %s"]
+                params: list[Any] = [detection_id]
+                if project_id:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
                 cursor.execute(
                     f"""
                     SELECT
@@ -1511,15 +2217,25 @@ class PostgresRepository:
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE detections.id = %s
+                    WHERE {' AND '.join(clauses)}
                     """,
-                    (detection_id,),
+                    tuple(params),
                 )
                 return cursor.fetchone()
 
-    def get_refined_detection_for_candidate(self, detection_id: str) -> dict[str, Any] | None:
+    def get_refined_detection_for_candidate(
+        self,
+        detection_id: str,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                clauses = ["refined.candidate_detection_id = %s"]
+                params: list[Any] = [detection_id]
+                if project_id:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
                 cursor.execute(
                     f"""
                     SELECT
@@ -1531,11 +2247,11 @@ class PostgresRepository:
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE refined.candidate_detection_id = %s
+                    WHERE {' AND '.join(clauses)}
                     ORDER BY refined.created_at DESC, refined.id DESC
                     LIMIT 1
                     """,
-                    (detection_id,),
+                    tuple(params),
                 )
                 return cursor.fetchone()
 
@@ -1545,6 +2261,7 @@ class PostgresRepository:
     def list_asset_detection_stats(
         self,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         collection: str | None = None,
         kind: str | None = None,
@@ -1555,6 +2272,9 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if run_id:
             clauses.append("assets.run_id = %s")
             params.append(run_id)
@@ -1627,6 +2347,7 @@ class PostgresRepository:
     def list_asset_processing_state(
         self,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         collection: str | None = None,
         kind: str | None = None,
@@ -1638,6 +2359,9 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if run_id:
             clauses.append("assets.run_id = %s")
             params.append(run_id)
@@ -1755,6 +2479,7 @@ class PostgresRepository:
     def list_frame_processing_state(
         self,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         collection: str | None = None,
@@ -1770,6 +2495,9 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
         if run_id:
             clauses.append("assets.run_id = %s")
             params.append(run_id)
@@ -1926,15 +2654,25 @@ class PostgresRepository:
             "frames": frames,
         }
 
-    def register_model(self, model: ModelRecord) -> dict[str, Any]:
+    def register_model(
+        self,
+        model: ModelRecord,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(
+            project_id or model.metadata.get("project_id"),
+            "register_model",
+        )
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.models
-                    (model_key, model_name, version, task, artifact_uri, labels, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                    (project_id, model_key, model_name, version, task, artifact_uri, labels, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                     ON CONFLICT (model_key) DO UPDATE SET
+                        project_id = EXCLUDED.project_id,
                         model_name = EXCLUDED.model_name,
                         version = EXCLUDED.version,
                         task = EXCLUDED.task,
@@ -1944,6 +2682,7 @@ class PostgresRepository:
                     RETURNING *;
                     """,
                     (
+                        resolved_project_id,
                         model.model_key,
                         model.model_name,
                         model.version,
@@ -1959,6 +2698,7 @@ class PostgresRepository:
 
     def list_models(
         self,
+        project_id: str | None = None,
         model_key: str | None = None,
         model_name: str | None = None,
         version: str | None = None,
@@ -1969,6 +2709,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
         if model_key:
             clauses.append("model_key ILIKE %s")
             params.append(f"%{model_key}%")
@@ -1994,16 +2737,32 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_model(self, model_id: str) -> dict[str, Any] | None:
+    def get_model(self, model_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.models WHERE id = %s", (model_id,))
+                clauses = ["id = %s"]
+                params: list[Any] = [model_id]
+                if project_id:
+                    clauses.append("project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.models WHERE {' AND '.join(clauses)}",
+                    tuple(params),
+                )
                 return cursor.fetchone()
 
-    def get_model_by_key(self, model_key: str) -> dict[str, Any] | None:
+    def get_model_by_key(self, model_key: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {self.schema}.models WHERE model_key = %s", (model_key,))
+                clauses = ["model_key = %s"]
+                params: list[Any] = [model_key]
+                if project_id:
+                    clauses.append("project_id = %s")
+                    params.append(project_id)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.models WHERE {' AND '.join(clauses)}",
+                    tuple(params),
+                )
                 return cursor.fetchone()
 
     def replace_classification_results(
@@ -2049,6 +2808,7 @@ class PostgresRepository:
         self,
         stage: PipelineStage | str,
         *,
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         status: JobStatus | str = JobStatus.QUEUED,
@@ -2060,23 +2820,47 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         stage_value = stage.value if isinstance(stage, PipelineStage) else stage
         status_value = status.value if isinstance(status, JobStatus) else status
+        resolved_project_id = self._required_project_id(project_id, "create_job")
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                resolved_payload = payload or {}
+                payload_frame_ids = [
+                    str(frame_id)
+                    for frame_id in (resolved_payload.get("frame_ids") or [])
+                    if frame_id
+                ]
+                if resolved_payload.get("frame_id"):
+                    payload_frame_ids.append(str(resolved_payload["frame_id"]))
+                payload_detection_ids = [
+                    str(detection_id)
+                    for detection_id in (resolved_payload.get("detection_ids") or [])
+                    if detection_id
+                ]
+                self._ensure_project_scope(
+                    cursor,
+                    resolved_project_id,
+                    run_id=run_id,
+                    asset_id=asset_id,
+                    job_ids=depends_on,
+                    frame_ids=list(dict.fromkeys(payload_frame_ids)),
+                    detection_ids=list(dict.fromkeys(payload_detection_ids)),
+                )
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.processing_jobs
-                    (run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, summary)
-                    VALUES (%s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s)
+                    (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, summary)
+                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s)
                     RETURNING *;
                     """,
                     (
+                        resolved_project_id,
                         run_id,
                         asset_id,
                         stage_value,
                         status_value,
                         priority if priority is not None else self.config.queue.default_priority,
                         max_attempts if max_attempts is not None else self.config.queue.max_attempts,
-                        json.dumps(json_ready(payload or {})),
+                        json.dumps(json_ready(resolved_payload)),
                         summary,
                     ),
                 )
@@ -2096,6 +2880,7 @@ class PostgresRepository:
                     {
                         "stage": row["stage"],
                         "status": row["status"],
+                        "project_id": row.get("project_id"),
                         "run_id": row.get("run_id"),
                         "asset_id": row.get("asset_id"),
                         "priority": row.get("priority"),
@@ -2193,6 +2978,7 @@ class PostgresRepository:
         message: str | None = None,
         level: str = "info",
         logger: str = "pelagia",
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         job_id: str | None = None,
@@ -2209,6 +2995,7 @@ class PostgresRepository:
                     message=message,
                     level=level,
                     logger=logger,
+                    project_id=project_id,
                     run_id=run_id,
                     asset_id=asset_id,
                     job_id=job_id,
@@ -2228,6 +3015,7 @@ class PostgresRepository:
         message: str | None = None,
         level: str = "info",
         logger: str = "pelagia",
+        project_id: str | None = None,
         run_id: str | None = None,
         asset_id: str | None = None,
         job_id: str | None = None,
@@ -2236,14 +3024,21 @@ class PostgresRepository:
         duration_ms: float | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        resolved_project_id = self._resolve_project_id(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            job_id=job_id,
+        )
         cursor.execute(
             f"""
             INSERT INTO {self.schema}.logs
-            (level, logger, event_type, message, run_id, asset_id, job_id, worker_id, request_id, duration_ms, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            (project_id, level, logger, event_type, message, run_id, asset_id, job_id, worker_id, request_id, duration_ms, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             RETURNING *;
             """,
             (
+                resolved_project_id,
                 str(level).lower(),
                 logger,
                 event_type,
@@ -2276,13 +3071,14 @@ class PostgresRepository:
         )
         row = cursor.fetchone()
         log_payload = dict(payload or {})
+        project_id = log_payload.get("project_id")
         run_id = log_payload.get("run_id")
         asset_id = log_payload.get("asset_id")
         worker_id = log_payload.get("worker_id")
-        if job_id is not None and (run_id is None or asset_id is None):
+        if job_id is not None and (project_id is None or run_id is None or asset_id is None):
             cursor.execute(
                 f"""
-                SELECT run_id, asset_id
+                SELECT project_id, run_id, asset_id
                 FROM {self.schema}.processing_jobs
                 WHERE id = %s
                 """,
@@ -2290,6 +3086,7 @@ class PostgresRepository:
             )
             job_row = cursor.fetchone()
             if job_row is not None:
+                project_id = project_id or job_row.get("project_id")
                 run_id = run_id or job_row.get("run_id")
                 asset_id = asset_id or job_row.get("asset_id")
         self._append_log(
@@ -2298,6 +3095,7 @@ class PostgresRepository:
             message=_event_message(event_type, log_payload),
             level=_event_level(event_type),
             logger="pelagia.jobs",
+            project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             job_id=job_id,
@@ -2315,11 +3113,13 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         resolved_payload = {"worker_id": worker_id}
         resolved_payload.update(payload or {})
+        resolved_payload.setdefault("project_id", DEFAULT_PROJECT_ID)
         return self._append_job_event(cursor, None, event_type, resolved_payload)
 
     def list_job_events(
         self,
         *,
+        project_id: str | None = None,
         after_id: int | None = None,
         run_id: str | None = None,
         job_id: str | None = None,
@@ -2329,6 +3129,10 @@ class PostgresRepository:
         clauses = []
         params: list[Any] = []
         joins = ""
+        if project_id:
+            joins = f"LEFT JOIN {self.schema}.processing_jobs jobs ON jobs.id = events.job_id"
+            clauses.append("(jobs.project_id = %s OR (events.job_id IS NULL AND events.payload->>'project_id' = %s))")
+            params.extend([project_id, project_id])
         if after_id is not None:
             clauses.append("events.id > %s")
             params.append(after_id)
@@ -2359,6 +3163,7 @@ class PostgresRepository:
     def list_logs(
         self,
         *,
+        project_id: str | None = None,
         after_id: int | None = None,
         before_id: int | None = None,
         level: str | None = None,
@@ -2374,6 +3179,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
         if after_id is not None:
             clauses.append("id > %s")
             params.append(after_id)
@@ -2420,7 +3228,20 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def set_job_priority(self, job_id: str, priority: int, reason: str | None = None) -> dict[str, Any] | None:
+    def set_job_priority(
+        self,
+        job_id: str,
+        priority: int,
+        reason: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        clauses = ["id = %s"]
+        params: list[Any] = [job_id]
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
+        params = [priority, reason, *params]
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2429,10 +3250,10 @@ class PostgresRepository:
                     SET priority = %s,
                         control_reason = COALESCE(%s, control_reason),
                         updated_at = NOW()
-                    WHERE id = %s
+                    WHERE {' AND '.join(clauses)}
                     RETURNING *;
                     """,
-                    (priority, reason, job_id),
+                    tuple(params),
                 )
                 row = cursor.fetchone()
                 if row is not None:
@@ -2445,8 +3266,14 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def pause_job(self, job_id: str, reason: str | None = None) -> dict[str, Any] | None:
-        current = self.get_job(job_id)
+    def pause_job(
+        self,
+        job_id: str,
+        reason: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        current = self.get_job(job_id, project_id=project_id)
         if current is None:
             return None
         with self.connect() as connection:
@@ -2458,10 +3285,10 @@ class PostgresRepository:
                         SET status = 'paused',
                             control_reason = %s,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
                         RETURNING *;
                         """,
-                        (reason, job_id),
+                        (reason, job_id, project_id, project_id),
                     )
                 elif current["status"] == JobStatus.LEASED.value:
                     cursor.execute(
@@ -2469,13 +3296,20 @@ class PostgresRepository:
                         UPDATE {self.schema}.processing_jobs
                         SET control_reason = %s,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
                         RETURNING *;
                         """,
-                        (f"pause_requested:{reason or 'user_requested'}", job_id),
+                        (f"pause_requested:{reason or 'user_requested'}", job_id, project_id, project_id),
                     )
                 else:
-                    cursor.execute(f"SELECT * FROM {self.schema}.processing_jobs WHERE id = %s", (job_id,))
+                    cursor.execute(
+                        f"""
+                        SELECT *
+                        FROM {self.schema}.processing_jobs
+                        WHERE id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
+                        """,
+                        (job_id, project_id, project_id),
+                    )
                 row = cursor.fetchone()
                 if row is not None:
                     if current["status"] == JobStatus.QUEUED.value:
@@ -2516,7 +3350,13 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def resume_job(self, job_id: str, reason: str | None = None) -> dict[str, Any] | None:
+    def resume_job(
+        self,
+        job_id: str,
+        reason: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2529,9 +3369,10 @@ class PostgresRepository:
                         finished_at = NULL,
                         updated_at = NOW()
                     WHERE id = %s AND status = 'paused'
+                      AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING *;
                     """,
-                    (reason, job_id),
+                    (reason, job_id, project_id, project_id),
                 )
                 row = cursor.fetchone()
                 if row is not None:
@@ -2928,7 +3769,7 @@ class PostgresRepository:
     def fail_job(self, job_id: str, error_message: str, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
         return self.record_failure(job_id=job_id, error_message=error_message, result=result, retryable=False)
 
-    def retry_job(self, job_id: str) -> dict[str, Any] | None:
+    def retry_job(self, job_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2943,9 +3784,10 @@ class PostgresRepository:
                         finished_at = NULL,
                         updated_at = NOW()
                     WHERE id = %s AND status IN ('failed', 'dead_lettered', 'cancelled')
+                      AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING *;
                     """,
-                    (job_id,),
+                    (job_id, project_id, project_id),
                 )
                 row = cursor.fetchone()
                 if row is not None:
@@ -2953,7 +3795,7 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def cancel_run(self, run_id: str) -> dict[str, Any]:
+    def cancel_run(self, run_id: str, *, project_id: str | None = None) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2966,9 +3808,10 @@ class PostgresRepository:
                         finished_at = NOW(),
                         updated_at = NOW()
                     WHERE run_id = %s AND status IN ('queued', 'leased', 'paused')
+                      AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING id, status
                     """,
-                    (run_id,),
+                    (run_id, project_id, project_id),
                 )
                 job_rows = cursor.fetchall()
                 for job_row in job_rows:
@@ -2982,26 +3825,26 @@ class PostgresRepository:
                     f"""
                     UPDATE {self.schema}.runs
                     SET status = 'cancelled', updated_at = NOW()
-                    WHERE id = %s
+                    WHERE id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING *;
                     """,
-                    (run_id,),
+                    (run_id, project_id, project_id),
                 )
                 run_row = cursor.fetchone()
             connection.commit()
         return run_row
 
-    def reconcile_run(self, run_id: str) -> dict[str, Any] | None:
+    def reconcile_run(self, run_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     SELECT status, COUNT(*) AS count
                     FROM {self.schema}.processing_jobs
-                    WHERE run_id = %s
+                    WHERE run_id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     GROUP BY status
                     """,
-                    (run_id,),
+                    (run_id, project_id, project_id),
                 )
                 counts = {row["status"]: row["count"] for row in cursor.fetchall()}
 
@@ -3024,10 +3867,10 @@ class PostgresRepository:
                     f"""
                     UPDATE {self.schema}.runs
                     SET status = %s, updated_at = NOW()
-                    WHERE id = %s
+                    WHERE id = %s AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING *;
                     """,
-                    (run_status, run_id),
+                    (run_status, run_id, project_id, project_id),
                 )
                 run_row = cursor.fetchone()
             connection.commit()

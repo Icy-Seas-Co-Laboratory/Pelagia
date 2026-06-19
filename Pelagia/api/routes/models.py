@@ -7,6 +7,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import scoped_project_id
     from ._common import as_response, get_repository
 
     router = APIRouter(prefix="/models", tags=["models"])
@@ -25,6 +26,7 @@ if APIRouter is not None:
         return {
             "models": as_response(
                 get_repository(request).list_models(
+                    project_id=scoped_project_id(request),
                     model_key=model_key,
                     model_name=model_name,
                     version=version,
@@ -38,7 +40,7 @@ if APIRouter is not None:
 
     @router.get("/{model_id}")
     def get_model(request: Request, model_id: str) -> dict:
-        model = get_repository(request).get_model(model_id)
+        model = get_repository(request).get_model(model_id, project_id=scoped_project_id(request))
         if model is None:
             raise HTTPException(status_code=404, detail=f"Model {model_id!r} was not found.")
         return {"model": as_response(model)}

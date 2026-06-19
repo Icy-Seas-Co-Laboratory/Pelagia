@@ -285,6 +285,7 @@ def generate_background_for_frames(
     }
     rows = ctx.repository.update_frame_background_payloads(
         resolved_frame_ids,
+        project_id=getattr(ctx, "active_project_id", None),
         kvstore_hash=kvstore_key,
         payload_ref=kvstore_key,
         payload_encoding=payload_encoding,

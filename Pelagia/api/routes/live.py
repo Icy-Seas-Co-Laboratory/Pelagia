@@ -23,6 +23,7 @@ def _file_entry(path: Path, root: Path) -> dict[str, Any]:
 
 
 if APIRouter is not None:
+    from ..auth import scoped_project_id
     from ...processing.detection_candidate import live_detection_candidate_wrapper, threshold_frame
     from ...processing.frame_codec import encode_array_payload
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
@@ -61,13 +62,38 @@ if APIRouter is not None:
         live_preview = metadata.get("live_preview") or {}
         return bool(live_preview.get("is_sandbox"))
 
-    def _ensure_live_sandbox_frame(repository, frame_record: Any, *, operation: str) -> tuple[dict[str, Any], bool]:
+    def _has_preprocessed_payload(record: Any) -> bool:
+        frame = _as_record_dict(record)
+        return bool(frame.get("preprocessed_payload_ref") or frame.get("preprocessed_kvstore_hash"))
+
+    def _require_live_payload(frame: Any, *, payload_kind: str, endpoint: str) -> None:
+        if payload_kind not in {"preprocessed", "processed", "corrected"}:
+            return
+        if _has_preprocessed_payload(frame):
+            return
+        frame_id = _as_record_dict(frame).get("id")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{endpoint} requested {payload_kind!r} frame payloads, but frame {frame_id!r} "
+                "does not have a live preprocessed payload. Run /live/preprocess first or use frame_payload_kind='original'."
+            ),
+        )
+
+    def _ensure_live_sandbox_frame(
+        repository,
+        frame_record: Any,
+        *,
+        operation: str,
+        project_id: str,
+    ) -> tuple[dict[str, Any], bool]:
         frame = _as_record_dict(frame_record)
         if _is_live_sandbox_frame(frame):
             return frame, False
         sandbox = repository.create_live_frame_copy(
             str(frame["id"]),
             operation=operation,
+            project_id=project_id,
         )
         return dict(sandbox), True
 
@@ -143,9 +169,10 @@ if APIRouter is not None:
         background_max_field_value: int | float | None = None,
         invert_intensity: bool | None = None,
     ) -> dict:
-        context = get_context(request)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
         repository = get_repository(request)
-        frame_record = repository.get_frame_record(frame_id)
+        frame_record = repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
 
@@ -153,6 +180,7 @@ if APIRouter is not None:
             repository,
             frame_record,
             operation="preprocess",
+            project_id=project_id,
         )
         sandbox_frame_id = str(sandbox_row["id"])
         old_key = (
@@ -287,15 +315,17 @@ if APIRouter is not None:
         include_mask_payload: bool = False,
         mask_encoding: str = "png",
     ) -> dict:
-        context = get_context(request)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
         repository = get_repository(request)
-        frame_record = repository.get_frame_record(frame_id)
+        frame_record = repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
         sandbox_row, sandbox_created = _ensure_live_sandbox_frame(
             repository,
             frame_record,
             operation="threshold",
+            project_id=project_id,
         )
         sandbox_frame_id = str(sandbox_row["id"])
 
@@ -344,6 +374,11 @@ if APIRouter is not None:
                 context.config.processing,
             )
             flat_options = flatten_segmentation_options(resolved_options)
+            _require_live_payload(
+                sandbox_row,
+                payload_kind=flat_options["frame_payload_kind"],
+                endpoint="/live/threshold",
+            )
             frame = retrieve_frame(
                 sandbox_frame_id,
                 context=context,
@@ -354,6 +389,8 @@ if APIRouter is not None:
                 **_threshold_kwargs(resolved_options),
                 context=context,
             )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -485,15 +522,17 @@ if APIRouter is not None:
         include_detection_payloads: bool = False,
         max_detections: int | None = 500,
     ) -> dict:
-        context = get_context(request)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
         repository = get_repository(request)
-        frame_record = repository.get_frame_record(frame_id)
+        frame_record = repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
         sandbox_row, sandbox_created = _ensure_live_sandbox_frame(
             repository,
             frame_record,
             operation="detection_candidate",
+            project_id=project_id,
         )
         sandbox_frame_id = str(sandbox_row["id"])
 
@@ -582,6 +621,11 @@ if APIRouter is not None:
                 context.config.processing,
             )
             flat_options = flatten_segmentation_options(resolved_options)
+            _require_live_payload(
+                sandbox_row,
+                payload_kind=flat_options["frame_payload_kind"],
+                endpoint="/live/detection-candidate",
+            )
             detections = live_detection_candidate_wrapper(
                 sandbox_frame_id,
                 frame_payload_kind=flat_options["frame_payload_kind"],
@@ -590,6 +634,8 @@ if APIRouter is not None:
                 **segment_frame_kwargs(resolved_options),
                 context=context,
             )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -642,6 +688,7 @@ if APIRouter is not None:
         rows = repository.list_live_frame_copies(
             source_frame_id=source_frame_id,
             operation=operation,
+            project_id=scoped_project_id(request),
             limit=limit,
             offset=offset,
         )
@@ -656,9 +703,10 @@ if APIRouter is not None:
 
     @router.delete("/sandbox/{sandbox_frame_id}")
     def delete_live_sandbox_frame(request: Request, sandbox_frame_id: str) -> dict:
-        context = get_context(request)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
         repository = get_repository(request)
-        result = repository.delete_live_frame_copy(sandbox_frame_id)
+        result = repository.delete_live_frame_copy(sandbox_frame_id, project_id=project_id)
         if result is None:
             raise HTTPException(
                 status_code=404,

@@ -19,6 +19,9 @@ from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.frame_store import retrieve_frame, store_frame
 from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.thumbhash import compute_thumbhash
+from Pelagia.services.context import AppContext
+from Pelagia.storage.kvstore import KVStore
+from Pelagia.storage.postgres import DEFAULT_PROJECT_ID
 from Pelagia.processing.ingest import convert_frame_to_grayscale, discover_ingest_sources
 from Pelagia.processing.ingest import ingest_image_folder, ingest_video_file
 
@@ -95,6 +98,121 @@ class FakeContext:
         self.kvstore = FakeKVStore()
         self.repository = FakeRepository()
         self.config = CoreConfig()
+
+
+class PartitionedCursor:
+    def __init__(self, repository):
+        self.repository = repository
+        self.params = None
+        self.row = None
+
+    def execute(self, query, params):
+        self.params = params
+        normalized_query = " ".join(str(query).split()).lower()
+        if normalized_query.startswith("insert into"):
+            frame_id = f"00000000-0000-7000-8000-{len(self.repository.frames) + 1:012d}"
+            asset = self.repository.assets[str(params[1])]
+            row = {
+                "id": frame_id,
+                "run_id": params[0],
+                "asset_id": params[1],
+                "frame_index": params[2],
+                "captured_at": params[3],
+                "width": params[4],
+                "height": params[5],
+                "bbox_x": params[6],
+                "bbox_y": params[7],
+                "parent_frame_id": params[8],
+                "source_ref": params[9],
+                "kvstore_hash": params[10],
+                "preview_thumbhash": params[11],
+                "payload_ref": params[12],
+                "payload_encoding": params[13],
+                "payload_format": params[14],
+                "payload_dtype": params[15],
+                "payload_shape": json.loads(params[16]),
+                "metadata": json.loads(params[17]),
+                "project_id": asset["project_id"],
+            }
+            self.repository.frames[frame_id] = row
+            self.row = row
+            return
+        if "from pelagia.frames frames" in normalized_query:
+            frame_id = str(params[0])
+            row = self.repository.frames.get(frame_id)
+            if row is not None and len(params) > 1 and str(row["project_id"]) != str(params[1]):
+                row = None
+            self.row = row
+            return
+        self.row = None
+
+    def fetchone(self):
+        return self.row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+class PartitionedConnection:
+    def __init__(self, repository):
+        self.repository = repository
+
+    def cursor(self):
+        return PartitionedCursor(self.repository)
+
+    def commit(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+class PartitionedRepository:
+    schema = "pelagia"
+
+    def __init__(self, project_id, project_root=None):
+        self.project_id = str(project_id)
+        self.project_root = project_root
+        self.assets = {
+            "asset-project": {"id": "asset-project", "project_id": self.project_id},
+            "asset-default": {"id": "asset-default", "project_id": DEFAULT_PROJECT_ID},
+        }
+        self.frames = {}
+
+    def get_project(self, project_id):
+        if str(project_id) == self.project_id:
+            return {
+                "id": self.project_id,
+                "kvstore_root_path": None if self.project_root is None else str(self.project_root),
+            }
+        if str(project_id) == DEFAULT_PROJECT_ID:
+            return {"id": DEFAULT_PROJECT_ID, "kvstore_root_path": None}
+        return None
+
+    def get_asset(self, asset_id, *, project_id=None):
+        asset = self.assets.get(str(asset_id))
+        if asset is None:
+            return None
+        if project_id is not None and str(asset["project_id"]) != str(project_id):
+            return None
+        return dict(asset)
+
+    def get_frame(self, frame_id, *, project_id=None):
+        row = self.frames.get(str(frame_id))
+        if row is None:
+            return None
+        if project_id is not None and str(row["project_id"]) != str(project_id):
+            return None
+        return dict(row)
+
+    def connect(self):
+        return PartitionedConnection(self)
 
 
 class FakeDatabaseLogger:
@@ -334,6 +452,96 @@ def test_store_frame_writes_numpy_payload_and_metadata():
     assert metadata["height"] == 3
     assert metadata["bbox_x"] == 0
     assert metadata["bbox_y"] == 0
+
+
+def test_project_kvstore_roots_partition_frame_writes_and_reads(tmp_path):
+    project_id = "11111111-1111-1111-1111-111111111111"
+    config = CoreConfig()
+    config.kvstore.root_path = tmp_path / "kvstore"
+    config.kvstore.prefix_length = 1
+    default_store = KVStore(config.kvstore.root_path)
+    default_store.initialize(prefix_length=1)
+    repository = PartitionedRepository(project_id)
+    context = AppContext(config=config, repository=repository, kvstore=default_store)
+    data = np.arange(12, dtype=np.uint8).reshape(3, 4)
+
+    row = store_frame(
+        FrameData(
+            sourcePath="/tmp/",
+            filename="frame.png",
+            frameNumber=1,
+            data=data,
+            metadata={
+                "run_id": "run-1",
+                "asset_id": "asset-project",
+                "kvstore_encoding": "raw",
+            },
+        ),
+        context=context.for_project(project_id),
+    )
+
+    project_store = context.kvstore_for_project(project_id)
+    assert project_store is not None
+    assert project_store.root_path == (tmp_path / "kvstore" / "projects" / project_id).resolve(strict=False)
+    assert project_store.key_exists(row["payload_ref"])
+    assert not default_store.key_exists(row["payload_ref"])
+
+    retrieved = retrieve_frame(str(row["id"]), context=context)
+    np.testing.assert_array_equal(retrieved.read(), data)
+
+    other_context = context.for_project("22222222-2222-2222-2222-222222222222")
+    with pytest.raises(KeyError):
+        retrieve_frame(str(row["id"]), context=other_context)
+
+
+def test_default_project_kvstore_uses_existing_root(tmp_path):
+    config = CoreConfig()
+    config.kvstore.root_path = tmp_path / "kvstore"
+    config.kvstore.prefix_length = 1
+    default_store = KVStore(config.kvstore.root_path)
+    default_store.initialize(prefix_length=1)
+    repository = PartitionedRepository("11111111-1111-1111-1111-111111111111")
+    context = AppContext(config=config, repository=repository, kvstore=default_store)
+    data = np.arange(4, dtype=np.uint8).reshape(2, 2)
+
+    row = store_frame(
+        FrameData(
+            sourcePath="/tmp/",
+            filename="frame.png",
+            frameNumber=1,
+            data=data,
+            metadata={
+                "run_id": "run-default",
+                "asset_id": "asset-default",
+                "kvstore_encoding": "raw",
+            },
+        ),
+        context=context.for_project(DEFAULT_PROJECT_ID),
+    )
+
+    assert context.kvstore_for_project(DEFAULT_PROJECT_ID) is default_store
+    assert default_store.key_exists(row["payload_ref"])
+
+
+def test_project_kvstore_root_can_come_from_project_row(tmp_path):
+    project_id = "11111111-1111-1111-1111-111111111111"
+    custom_root = tmp_path / "custom-project-kv"
+    config = CoreConfig()
+    config.kvstore.root_path = tmp_path / "kvstore"
+    config.kvstore.prefix_length = 1
+    default_store = KVStore(config.kvstore.root_path)
+    default_store.initialize(prefix_length=1)
+    context = AppContext(
+        config=config,
+        repository=PartitionedRepository(project_id, project_root=custom_root),
+        kvstore=default_store,
+    )
+
+    project_store = context.kvstore_for_project(project_id)
+
+    assert project_store is not None
+    assert project_store.root_path == custom_root.resolve(strict=False)
+    assert project_store.initialized is True
 
 
 def test_store_frame_writes_roi_geometry_metadata():

@@ -14,6 +14,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ..schemas import FrameContextResponse
+    from ..auth import require_project_write, scoped_project_id
     from ...domain import PipelineStage
     from ...processing.frame_correction import generate_background_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
@@ -97,11 +98,12 @@ if APIRouter is not None:
 
     def _resolve_frame_row(request: Request, frame_id: str | None, asset_id: str | None, frame_num: int | None) -> dict:
         repository = get_repository(request)
+        project_id = scoped_project_id(request)
         if frame_id is not None:
-            row = repository.get_frame(frame_id)
+            row = repository.get_frame(frame_id, project_id=project_id)
             label = f"Frame {frame_id!r}"
         elif asset_id is not None and frame_num is not None:
-            row = repository.get_frame_by_asset_index(asset_id, frame_num)
+            row = repository.get_frame_by_asset_index(asset_id, frame_num, project_id=project_id)
             label = f"Frame {frame_num!r} for asset {asset_id!r}"
         else:
             raise HTTPException(
@@ -123,7 +125,7 @@ if APIRouter is not None:
         width: int | None = None,
         height: int | None = None,
     ):
-        context = get_context(request)
+        context = get_context(request).for_project(scoped_project_id(request))
         try:
             frame = retrieve_frame(str(row["id"]), context=context, payload_kind=payload_kind)
         except (KeyError, ValueError) as exc:
@@ -242,6 +244,7 @@ if APIRouter is not None:
                 )
             frames = repository.list_frames(
                 asset_id,
+                project_id=scoped_project_id(request),
                 start_frame=body.start_frame,
                 end_frame=body.end_frame,
                 limit=body.limit,
@@ -252,7 +255,7 @@ if APIRouter is not None:
             return run_id, asset_id, []
 
         for frame_id in frame_ids:
-            frame_record = repository.get_frame_record(frame_id)
+            frame_record = repository.get_frame_record(frame_id, project_id=scoped_project_id(request))
             if frame_record is None:
                 raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
             if asset_id is None:
@@ -283,6 +286,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> dict:
         stats = get_repository(request).list_frame_processing_state(
+            project_id=scoped_project_id(request),
             run_id=run_id,
             asset_id=asset_id,
             collection=collection,
@@ -316,11 +320,12 @@ if APIRouter is not None:
         frame_payload_kind: Literal["original", "preprocessed"] = "preprocessed",
     ) -> dict:
         repository = get_repository(request)
-        row = repository.get_frame(frame_id)
+        project_id = scoped_project_id(request)
+        row = repository.get_frame(frame_id, project_id=project_id)
         if row is None:
             raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
 
-        asset = repository.get_asset(row["asset_id"])
+        asset = repository.get_asset(row["asset_id"], project_id=project_id)
         if asset is None:
             raise HTTPException(status_code=404, detail=f"Asset {row['asset_id']!r} was not found.")
 
@@ -328,6 +333,7 @@ if APIRouter is not None:
         if include_detections:
             detections = repository.list_detections(
                 row["asset_id"],
+                project_id=project_id,
                 frame_id=frame_id,
                 limit=detection_limit,
                 offset=detection_offset,
@@ -428,7 +434,7 @@ if APIRouter is not None:
         )
 
     def _preprocess_resolved_frame(request: Request, row: dict, body: FramePreprocessRequest) -> dict:
-        context = get_context(request)
+        context = get_context(request).for_project(scoped_project_id(request))
         source_frame = retrieve_frame(str(row["id"]), context=context, payload_kind="original")
         processed = preprocess_frame_for_segmentation(
             source_frame,
@@ -516,6 +522,7 @@ if APIRouter is not None:
         if body.asset_id is not None and body.frame_num is None:
             rows = repository.list_frames(
                 body.asset_id,
+                project_id=scoped_project_id(request),
                 start_frame=body.start_frame,
                 end_frame=body.end_frame,
                 limit=body.limit,
@@ -542,6 +549,7 @@ if APIRouter is not None:
     @router.post("/preprocess/jobs")
     def queue_frame_preprocess_job(request: Request, body: QueueFramePreprocessRequest) -> dict:
         repository = get_repository(request)
+        auth = require_project_write(request)
         processing_defaults = get_context(request).config.processing
         flatfield_defaults = processing_defaults.flatfield
         preprocessing_defaults = processing_defaults.preprocessing
@@ -552,7 +560,7 @@ if APIRouter is not None:
         run_id = body.run_id
         asset_id = body.asset_id
         if asset_id is None and frame_ids:
-            first_frame = repository.get_frame_record(frame_ids[0])
+            first_frame = repository.get_frame_record(frame_ids[0], project_id=auth.project_id)
             if first_frame is None:
                 raise HTTPException(
                     status_code=404,
@@ -568,7 +576,7 @@ if APIRouter is not None:
             )
 
         if run_id is None:
-            asset = repository.get_asset(asset_id)
+            asset = repository.get_asset(asset_id, project_id=auth.project_id)
             if asset is None:
                 raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
             run_id = asset.get("run_id")
@@ -627,15 +635,19 @@ if APIRouter is not None:
             ),
             "encoding": body.encoding,
         }
-        job = repository.create_job(
-            PipelineStage.PREPROCESS_FRAMES,
-            run_id=run_id,
-            asset_id=asset_id,
-            priority=body.priority,
-            payload=payload,
-            depends_on=body.depends_on or [],
-            summary=f"preprocess queued for asset {asset_id}",
-        )
+        try:
+            job = repository.create_job(
+                PipelineStage.PREPROCESS_FRAMES,
+                project_id=auth.project_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                priority=body.priority,
+                payload=payload,
+                depends_on=body.depends_on or [],
+                summary=f"preprocess queued for asset {asset_id}",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"job": as_response(job)}
 
     @router.post("/background")
@@ -654,7 +666,7 @@ if APIRouter is not None:
         try:
             result = generate_background_for_frames(
                 frame_ids,
-                context=get_context(request),
+                context=get_context(request).for_project(scoped_project_id(request)),
                 payload_kind=body.payload_kind,
                 encoding=body.encoding,
             )
@@ -672,6 +684,7 @@ if APIRouter is not None:
     @router.post("/background/jobs")
     def queue_frame_background_job(request: Request, body: QueueFrameBackgroundRequest) -> dict:
         repository = get_repository(request)
+        auth = require_project_write(request)
         run_id, asset_id, frame_ids = _resolve_background_target(request, body)
         payload = {
             "frame_ids": frame_ids,
@@ -695,15 +708,19 @@ if APIRouter is not None:
             )
         if asset_id is None:
             raise HTTPException(status_code=422, detail="Background jobs require an asset_id or resolvable frame_ids.")
-        job = repository.create_job(
-            PipelineStage.BACKGROUND_FRAMES,
-            run_id=run_id,
-            asset_id=asset_id,
-            priority=body.priority,
-            payload=payload,
-            depends_on=body.depends_on or [],
-            summary=f"background queued for asset {asset_id}",
-        )
+        try:
+            job = repository.create_job(
+                PipelineStage.BACKGROUND_FRAMES,
+                project_id=auth.project_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                priority=body.priority,
+                payload=payload,
+                depends_on=body.depends_on or [],
+                summary=f"background queued for asset {asset_id}",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"job": as_response(job)}
 else:
     router = None

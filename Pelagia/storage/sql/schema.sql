@@ -55,8 +55,94 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql VOLATILE;
 
+CREATE TABLE IF NOT EXISTS {schema}.users (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    username text NOT NULL UNIQUE,
+    display_name text,
+    password_hash text,
+    is_active boolean NOT NULL DEFAULT true,
+    is_admin boolean NOT NULL DEFAULT false,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.projects (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_key text NOT NULL UNIQUE,
+    project_name text NOT NULL,
+    description text,
+    kvstore_root_path text,
+    is_active boolean NOT NULL DEFAULT true,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO {schema}.projects (id, project_key, project_name, description, metadata)
+VALUES (
+    '00000000-0000-0000-0000-000000000001'::uuid,
+    'default',
+    'Default',
+    'Default project for existing Pelagia data.',
+    '{"system_default": true}'::jsonb
+)
+ON CONFLICT (project_key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS {schema}.project_memberships (
+    user_id uuid NOT NULL REFERENCES {schema}.users(id) ON DELETE CASCADE,
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    role text NOT NULL DEFAULT 'viewer',
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, project_id),
+    CONSTRAINT project_memberships_role_known CHECK (role IN ('viewer', 'editor', 'manager', 'admin'))
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.user_sessions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES {schema}.users(id) ON DELETE CASCADE,
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    token_hash text NOT NULL UNIQUE,
+    user_agent text,
+    remote_addr text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,
+    last_seen_at timestamptz NOT NULL DEFAULT NOW(),
+    created_at timestamptz NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE {schema}.users
+    ADD COLUMN IF NOT EXISTS display_name text,
+    ADD COLUMN IF NOT EXISTS password_hash text,
+    ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+
+ALTER TABLE {schema}.projects
+    ADD COLUMN IF NOT EXISTS description text,
+    ADD COLUMN IF NOT EXISTS kvstore_root_path text,
+    ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+
+ALTER TABLE {schema}.project_memberships
+    ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+
+ALTER TABLE {schema}.user_sessions
+    ADD COLUMN IF NOT EXISTS user_agent text,
+    ADD COLUMN IF NOT EXISTS remote_addr text,
+    ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS revoked_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_seen_at timestamptz NOT NULL DEFAULT NOW();
+
 CREATE TABLE IF NOT EXISTS {schema}.runs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     run_key text NOT NULL UNIQUE,
     instrument text NOT NULL,
     source_path text NOT NULL,
@@ -67,8 +153,33 @@ CREATE TABLE IF NOT EXISTS {schema}.runs (
     updated_at timestamptz NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE {schema}.runs
+    ADD COLUMN IF NOT EXISTS project_id uuid;
+
+UPDATE {schema}.runs
+SET project_id = '00000000-0000-0000-0000-000000000001'::uuid
+WHERE project_id IS NULL;
+
+ALTER TABLE {schema}.runs
+    ALTER COLUMN project_id DROP DEFAULT,
+    ALTER COLUMN project_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'runs_project_id_fkey'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.runs
+            ADD CONSTRAINT runs_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES {schema}.projects(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     run_id uuid NOT NULL REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     filename text NOT NULL,
     path text NOT NULL,
@@ -82,6 +193,36 @@ CREATE TABLE IF NOT EXISTS {schema}.raw_assets (
     CONSTRAINT raw_assets_collections_nonempty CHECK (cardinality(collections) > 0),
     UNIQUE (run_id, filename)
 );
+
+ALTER TABLE {schema}.raw_assets
+    ADD COLUMN IF NOT EXISTS project_id uuid;
+
+UPDATE {schema}.raw_assets assets
+SET project_id = runs.project_id
+FROM {schema}.runs runs
+WHERE assets.run_id = runs.id
+  AND assets.project_id IS NULL;
+
+UPDATE {schema}.raw_assets
+SET project_id = '00000000-0000-0000-0000-000000000001'::uuid
+WHERE project_id IS NULL;
+
+ALTER TABLE {schema}.raw_assets
+    ALTER COLUMN project_id DROP DEFAULT,
+    ALTER COLUMN project_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'raw_assets_project_id_fkey'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.raw_assets
+            ADD CONSTRAINT raw_assets_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES {schema}.projects(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -488,6 +629,7 @@ ALTER TABLE {schema}.detections_refined
 
 CREATE TABLE IF NOT EXISTS {schema}.models (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     model_key text NOT NULL UNIQUE,
     model_name text NOT NULL,
     version text NOT NULL,
@@ -497,6 +639,30 @@ CREATE TABLE IF NOT EXISTS {schema}.models (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE {schema}.models
+    ADD COLUMN IF NOT EXISTS project_id uuid;
+
+UPDATE {schema}.models
+SET project_id = '00000000-0000-0000-0000-000000000001'::uuid
+WHERE project_id IS NULL;
+
+ALTER TABLE {schema}.models
+    ALTER COLUMN project_id DROP DEFAULT,
+    ALTER COLUMN project_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'models_project_id_fkey'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.models
+            ADD CONSTRAINT models_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES {schema}.projects(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS {schema}.classification_results (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -513,6 +679,7 @@ CREATE TABLE IF NOT EXISTS {schema}.classification_results (
 
 CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     run_id uuid REFERENCES {schema}.runs(id) ON DELETE CASCADE,
     asset_id uuid REFERENCES {schema}.raw_assets(id) ON DELETE CASCADE,
     stage {schema}.stage_name NOT NULL,
@@ -534,6 +701,34 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     started_at timestamptz,
     finished_at timestamptz
 );
+
+ALTER TABLE {schema}.processing_jobs
+    ADD COLUMN IF NOT EXISTS project_id uuid;
+
+UPDATE {schema}.processing_jobs jobs
+SET project_id = COALESCE(
+    (SELECT runs.project_id FROM {schema}.runs runs WHERE runs.id = jobs.run_id),
+    (SELECT assets.project_id FROM {schema}.raw_assets assets WHERE assets.id = jobs.asset_id),
+    '00000000-0000-0000-0000-000000000001'::uuid
+)
+WHERE jobs.project_id IS NULL;
+
+ALTER TABLE {schema}.processing_jobs
+    ALTER COLUMN project_id DROP DEFAULT,
+    ALTER COLUMN project_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'processing_jobs_project_id_fkey'
+          AND connamespace = '{schema}'::regnamespace
+    ) THEN
+        ALTER TABLE {schema}.processing_jobs
+            ADD CONSTRAINT processing_jobs_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES {schema}.projects(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -580,6 +775,7 @@ CREATE TABLE IF NOT EXISTS {schema}.job_events (
 
 CREATE TABLE IF NOT EXISTS {schema}.logs (
     id bigserial PRIMARY KEY,
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     level text NOT NULL DEFAULT 'info',
     logger text NOT NULL DEFAULT 'pelagia',
@@ -594,7 +790,36 @@ CREATE TABLE IF NOT EXISTS {schema}.logs (
     payload jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
+ALTER TABLE {schema}.logs
+    ADD COLUMN IF NOT EXISTS project_id uuid;
+
+UPDATE {schema}.logs logs
+SET project_id = COALESCE(
+    (SELECT runs.project_id FROM {schema}.runs runs WHERE runs.id = logs.run_id),
+    (SELECT assets.project_id FROM {schema}.raw_assets assets WHERE assets.id = logs.asset_id),
+    (SELECT jobs.project_id FROM {schema}.processing_jobs jobs WHERE jobs.id = logs.job_id),
+    '00000000-0000-0000-0000-000000000001'::uuid
+)
+WHERE logs.project_id IS NULL;
+
+ALTER TABLE {schema}.logs
+    ALTER COLUMN project_id SET NOT NULL;
+
+ALTER TABLE {schema}.logs
+    DROP CONSTRAINT IF EXISTS logs_project_id_fkey;
+
+ALTER TABLE {schema}.logs
+    ADD CONSTRAINT logs_project_id_fkey
+    FOREIGN KEY (project_id) REFERENCES {schema}.projects(id) ON DELETE RESTRICT;
+
+CREATE INDEX IF NOT EXISTS idx_{schema}_users_username ON {schema}.users (username);
+CREATE INDEX IF NOT EXISTS idx_{schema}_projects_project_key ON {schema}.projects (project_key);
+CREATE INDEX IF NOT EXISTS idx_{schema}_project_memberships_project_id ON {schema}.project_memberships (project_id, role);
+CREATE INDEX IF NOT EXISTS idx_{schema}_user_sessions_user_id ON {schema}.user_sessions (user_id, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_user_sessions_project_id ON {schema}.user_sessions (project_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_run_id ON {schema}.raw_assets (run_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_runs_project_id ON {schema}.runs (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_project_id ON {schema}.raw_assets (project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_assets USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detection_candidate_frame_id ON {schema}.detection_candidate (frame_id);
@@ -602,6 +827,8 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_candidate_id ON {sche
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_job_id ON {schema}.detections_refined (job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_frame_id ON {schema}.detections_refined (frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_models_project_id ON {schema}.models (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_project_id ON {schema}.processing_jobs (project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_stage_status_updated ON {schema}.processing_jobs (stage, status, updated_at DESC);
@@ -610,6 +837,7 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_asset_stage ON {schema}.
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dependencies_depends_on ON {schema}.processing_job_dependencies (depends_on_job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_logs_project_id ON {schema}.logs (project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_event_type ON {schema}.logs (event_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_level ON {schema}.logs (level, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_run_id ON {schema}.logs (run_id, created_at DESC);
@@ -620,6 +848,24 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_logs_request_id ON {schema}.logs (reques
 DROP TRIGGER IF EXISTS trg_runs_updated_at ON {schema}.runs;
 CREATE TRIGGER trg_runs_updated_at
 BEFORE UPDATE ON {schema}.runs
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_users_updated_at ON {schema}.users;
+CREATE TRIGGER trg_users_updated_at
+BEFORE UPDATE ON {schema}.users
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_projects_updated_at ON {schema}.projects;
+CREATE TRIGGER trg_projects_updated_at
+BEFORE UPDATE ON {schema}.projects
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_project_memberships_updated_at ON {schema}.project_memberships;
+CREATE TRIGGER trg_project_memberships_updated_at
+BEFORE UPDATE ON {schema}.project_memberships
 FOR EACH ROW
 EXECUTE FUNCTION {schema}.set_updated_at();
 

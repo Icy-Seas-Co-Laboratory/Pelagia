@@ -68,16 +68,21 @@ def _payload_frame_ids(payload: dict[str, Any]) -> list[str]:
     return []
 
 
+def _job_project_id(job: dict[str, Any], context: AppContext) -> str | None:
+    return None if job.get("project_id") is None else str(job.get("project_id"))
+
+
 def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for extracting and storing frames from a registered asset."""
     if context.repository is None:
         raise RuntimeError("Extract frames handler requires a PostgresRepository.")
 
     payload = _job_payload(job)
+    project_id = _job_project_id(job, context)
     run_id = _job_identifier(job, "run_id", payload)
     asset_id = _job_identifier(job, "asset_id", payload)
 
-    asset = context.repository.get_asset(asset_id)
+    asset = context.repository.get_asset(asset_id, project_id=project_id)
     if asset is None:
         raise KeyError(f"Raw asset {asset_id!r} was not found.")
 
@@ -140,6 +145,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     result: dict[str, Any] = {
         "stage": PipelineStage.EXTRACT_FRAMES.value,
+        "project_id": project_id,
         "run_id": run_id,
         "asset_id": asset_id,
         "source_path": str(source_path),
@@ -156,6 +162,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         roi_recording_defaults = context.config.processing.roi_recording
         segment_job = context.repository.create_job(
             PipelineStage.SEGMENT,
+            project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             payload={
@@ -178,6 +185,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         raise RuntimeError("Preprocess frames handler requires a PostgresRepository.")
 
     payload = _job_payload(job)
+    project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
 
@@ -186,6 +194,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             raise ValueError("Preprocess job requires asset_id, frame_id, or frame_ids.")
         frames = context.repository.list_frames(
             str(asset_id),
+            project_id=project_id,
             start_frame=payload.get("start_frame"),
             end_frame=payload.get("end_frame"),
             limit=payload.get("limit"),
@@ -195,6 +204,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     if not frame_ids:
         return {
             "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "project_id": project_id,
             "run_id": job.get("run_id") or payload.get("run_id"),
             "asset_id": asset_id,
             "frame_count": 0,
@@ -247,7 +257,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     progress.start(f"Preprocessing {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
 
     for index, frame_id in enumerate(frame_ids, start=1):
-        frame_record = context.repository.get_frame_record(frame_id)
+        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
@@ -301,6 +311,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     return {
         "stage": PipelineStage.PREPROCESS_FRAMES.value,
+        "project_id": project_id,
         "run_id": resolved_run_id,
         "asset_id": resolved_asset_id,
         "frame_count": len(stored_rows),
@@ -315,6 +326,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         raise RuntimeError("Background frames handler requires a PostgresRepository.")
 
     payload = _job_payload(job)
+    project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
 
@@ -323,6 +335,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             raise ValueError("Background job requires asset_id, frame_id, or frame_ids.")
         frames = context.repository.list_frames(
             str(asset_id),
+            project_id=project_id,
             start_frame=payload.get("start_frame"),
             end_frame=payload.get("end_frame"),
             limit=payload.get("limit"),
@@ -332,6 +345,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     if not frame_ids:
         return {
             "stage": PipelineStage.BACKGROUND_FRAMES.value,
+            "project_id": project_id,
             "run_id": job.get("run_id") or payload.get("run_id"),
             "asset_id": asset_id,
             "frame_count": 0,
@@ -349,7 +363,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     progress.start(f"Generating background from {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
     for frame_id in frame_ids:
-        frame_record = context.repository.get_frame_record(frame_id)
+        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
@@ -368,6 +382,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     result.update(
         {
             "stage": PipelineStage.BACKGROUND_FRAMES.value,
+            "project_id": project_id,
             "run_id": resolved_run_id,
             "asset_id": resolved_asset_id,
         }
@@ -385,6 +400,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         raise RuntimeError("ROI detection handler requires a PostgresRepository.")
 
     payload = _job_payload(job)
+    project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
 
@@ -393,6 +409,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
             raise ValueError("Segment job requires asset_id, frame_id, or frame_ids.")
         frames = context.repository.list_frames(
             str(asset_id),
+            project_id=project_id,
             start_frame=payload.get("start_frame"),
             end_frame=payload.get("end_frame"),
             limit=payload.get("limit"),
@@ -402,6 +419,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     if not frame_ids:
         return {
             "stage": PipelineStage.SEGMENT.value,
+            "project_id": project_id,
             "run_id": job.get("run_id") or payload.get("run_id"),
             "asset_id": asset_id,
             "frame_count": 0,
@@ -426,7 +444,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     progress.start(f"Segmenting {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
 
     for index, frame_id in enumerate(frame_ids, start=1):
-        frame_record = context.repository.get_frame_record(frame_id)
+        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
@@ -464,6 +482,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         resolved_run_id,
         frame_ids,
         detections,
+        project_id=project_id,
     )
     progress.finish(
         completed=len(frame_ids),
@@ -472,6 +491,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     )
     return {
         "stage": PipelineStage.SEGMENT.value,
+        "project_id": project_id,
         "run_id": resolved_run_id,
         "asset_id": resolved_asset_id,
         "frame_count": len(frame_ids),
@@ -551,6 +571,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         raise RuntimeError("ROI refinement handler requires a PostgresRepository.")
 
     payload = _job_payload(job)
+    project_id = _job_project_id(job, context)
     detection_ids = [str(detection_id) for detection_id in payload.get("detection_ids", []) if detection_id]
     if not detection_ids:
         raise ValueError("ROI refinement job requires detection_ids.")
@@ -567,7 +588,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     missing_ids = []
     candidate_rows = []
     for detection_id in detection_ids:
-        row = context.repository.get_detection(detection_id)
+        row = context.repository.get_detection(detection_id, project_id=project_id)
         if row is None:
             missing_ids.append(detection_id)
         else:
@@ -625,6 +646,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             for result, refined in zip(results, refined_records)
         ],
         job_id=job.get("id"),
+        project_id=project_id,
     )
     run_ids = sorted({record.run_id for record in detection_records})
     frame_ids = sorted({record.frame_id for record in detection_records})
@@ -641,6 +663,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
     return {
         "stage": PipelineStage.ROI_REFINEMENT.value,
+        "project_id": project_id,
         "run_id": job.get("run_id") or payload.get("run_id") or (run_ids[0] if len(run_ids) == 1 else None),
         "asset_id": job.get("asset_id") or payload.get("asset_id"),
         "detection_count": len(detection_records),

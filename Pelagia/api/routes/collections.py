@@ -7,6 +7,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import scoped_project_id
     from ._common import as_response, get_repository
 
     router = APIRouter(prefix="/collections", tags=["collections"])
@@ -22,6 +23,7 @@ if APIRouter is not None:
             "collections": as_response(
                 get_repository(request).list_collections(
                     collection=collection,
+                    project_id=scoped_project_id(request),
                     limit=limit,
                     offset=max(0, offset),
                 )

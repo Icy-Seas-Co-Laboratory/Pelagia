@@ -24,6 +24,7 @@ def _sha256_file(path: Path) -> str:
 
 
 if APIRouter is not None:
+    from ..auth import require_project_write
     from ._common import as_response, get_repository
 
     class QueueVideoRequest(BaseModel):
@@ -79,6 +80,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail="adaptive_background_period must be >= 1.")
 
         repository = get_repository(request)
+        auth = require_project_write(request)
         source_path = Path(body.source_path).expanduser().resolve()
         if not source_path.exists() or not source_path.is_file():
             raise HTTPException(
@@ -91,6 +93,7 @@ if APIRouter is not None:
         run_key = body.run_key or f"video:{source_path.stem}:{uuid.uuid4().hex[:12]}"
         collections = normalize_collections(body.collections)
         metadata = dict(body.metadata)
+        metadata["project_id"] = auth.project_id
         metadata.setdefault("api_endpoint", "POST /ingestion/videos")
         metadata.setdefault("collections", collections)
         stat = source_path.stat()
@@ -129,9 +132,10 @@ if APIRouter is not None:
                 ],
             )
         )
-        registration = repository.register_planned_run(planned_run)
+        registration = repository.register_planned_run(planned_run, project_id=auth.project_id)
         job = repository.create_job(
             PipelineStage.EXTRACT_FRAMES,
+            project_id=auth.project_id,
             run_id=run_id,
             asset_id=asset_id,
             payload={

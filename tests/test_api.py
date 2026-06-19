@@ -31,16 +31,67 @@ class FakeRepository:
         self.preprocessed_payload_ref = None
         self.sandbox_frames = {}
         self.deleted_sandbox_frames = []
+        self.users = {
+            "ada": {
+                "id": "user-1",
+                "username": "ada",
+                "display_name": "Ada",
+                "is_admin": False,
+                "is_active": True,
+                "password": "secret",
+            },
+            "admin": {
+                "id": "user-admin",
+                "username": "admin",
+                "display_name": "Admin",
+                "is_admin": True,
+                "is_active": True,
+                "password": "secret",
+            },
+        }
+        self.projects = {
+            "project-1": {
+                "id": "project-1",
+                "project_key": "default",
+                "project_name": "Default",
+                "is_active": True,
+            },
+            "project-2": {
+                "id": "project-2",
+                "project_key": "other",
+                "project_name": "Other",
+                "is_active": True,
+            },
+        }
+        self.memberships = {("user-1", "project-1"): "editor"}
+        self.sessions = {}
+        self.resource_projects = {
+            "run-1": "project-1",
+            "asset-1": "project-1",
+            "frame-1": "project-1",
+            "frame-2": "project-1",
+            "det-1": "project-1",
+            "det-wide": "project-1",
+            "det-no-roi": "project-1",
+            "job-1": "project-1",
+        }
+
+    def _visible(self, resource_id, project_id):
+        return project_id is None or self.resource_projects.get(resource_id) == project_id
 
     def list_runs(self, **kwargs):
+        if not self._visible("run-1", kwargs.get("project_id")):
+            return []
         return [{"id": "run-1", **kwargs}]
 
-    def get_run(self, run_id):
-        if run_id != "run-1":
+    def get_run(self, run_id, **kwargs):
+        if run_id != "run-1" or not self._visible(run_id, kwargs.get("project_id")):
             return None
-        return {"id": run_id, "status": "queued", "job_summary": []}
+        return {"id": run_id, "status": "queued", "job_summary": [], **kwargs}
 
     def list_assets(self, **kwargs):
+        if not self._visible("asset-1", kwargs.get("project_id")):
+            return []
         return [
             {
                 "id": "asset-1",
@@ -51,23 +102,25 @@ class FakeRepository:
             }
         ]
 
-    def get_asset(self, asset_id):
-        if asset_id != "asset-1":
+    def get_asset(self, asset_id, **kwargs):
+        if asset_id != "asset-1" or not self._visible(asset_id, kwargs.get("project_id")):
             return None
-        return {"id": asset_id, "run_id": "run-1", "kind": "video", "collections": ["test"]}
+        return {"id": asset_id, "run_id": "run-1", "kind": "video", "collections": ["test"], **kwargs}
 
-    def count_frames(self, asset_id):
+    def count_frames(self, asset_id, **kwargs):
         if asset_id != "asset-1":
             return 0
         return 12
 
     def list_frames(self, asset_id, **kwargs):
+        if not self._visible(asset_id, kwargs.get("project_id")):
+            return []
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 2, "preview_thumbhash": b"abc", **kwargs}]
 
-    def get_frame(self, frame_id):
+    def get_frame(self, frame_id, **kwargs):
         if frame_id in self.sandbox_frames:
             return dict(self.sandbox_frames[frame_id])
-        if frame_id not in {"frame-1", "frame-2"}:
+        if frame_id not in {"frame-1", "frame-2"} or not self._visible(frame_id, kwargs.get("project_id")):
             return None
         return {
             "id": frame_id,
@@ -82,15 +135,15 @@ class FakeRepository:
             "metadata": {"frame_id": frame_id},
         }
 
-    def get_frame_by_asset_index(self, asset_id, frame_index):
-        if asset_id != "asset-1" or frame_index != 2:
+    def get_frame_by_asset_index(self, asset_id, frame_index, **kwargs):
+        if asset_id != "asset-1" or frame_index != 2 or not self._visible(asset_id, kwargs.get("project_id")):
             return None
         return {"id": "frame-1", "asset_id": asset_id, "frame_index": frame_index}
 
-    def get_frame_record(self, frame_id):
+    def get_frame_record(self, frame_id, **kwargs):
         if frame_id in self.sandbox_frames:
             return FrameRecord.from_row(self.sandbox_frames[frame_id])
-        if frame_id not in {"frame-1", "frame-2"}:
+        if frame_id not in {"frame-1", "frame-2"} or not self._visible(frame_id, kwargs.get("project_id")):
             return None
         return FrameRecord(
             id=frame_id,
@@ -106,8 +159,8 @@ class FakeRepository:
             metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": frame_id},
         )
 
-    def create_live_frame_copy(self, frame_id, *, operation, metadata=None):
-        source = self.get_frame_record(frame_id)
+    def create_live_frame_copy(self, frame_id, *, operation, project_id=None, metadata=None):
+        source = self.get_frame_record(frame_id, project_id=project_id)
         if source is None:
             raise KeyError(frame_id)
         sandbox_id = f"live-frame-{len(self.sandbox_frames) + 1}"
@@ -146,14 +199,17 @@ class FakeRepository:
             "preprocessed_preview_thumbhash": None,
         }
         self.sandbox_frames[sandbox_id] = row
+        self.resource_projects[sandbox_id] = self.resource_projects.get(frame_id, "project-1")
         return dict(row)
 
     def count_frame_payload_references(self, payload_ref, *, exclude_frame_id=None):
         return 0
 
-    def list_live_frame_copies(self, *, source_frame_id=None, operation=None, limit=100, offset=0):
+    def list_live_frame_copies(self, *, source_frame_id=None, operation=None, project_id=None, limit=100, offset=0):
         rows = []
         for row in self.sandbox_frames.values():
+            if not self._visible(row["id"], project_id):
+                continue
             live_preview = (row.get("metadata") or {}).get("live_preview") or {}
             if source_frame_id and live_preview.get("source_frame_id") != source_frame_id:
                 continue
@@ -162,11 +218,14 @@ class FakeRepository:
             rows.append(dict(row))
         return rows[max(0, int(offset)):max(0, int(offset)) + int(limit)]
 
-    def delete_live_frame_copy(self, frame_id):
+    def delete_live_frame_copy(self, frame_id, *, project_id=None):
+        if not self._visible(frame_id, project_id):
+            return None
         row = self.sandbox_frames.pop(frame_id, None)
         if row is None:
             return None
         self.deleted_sandbox_frames.append(frame_id)
+        self.resource_projects.pop(frame_id, None)
         keys = sorted(
             {
                 key
@@ -221,7 +280,9 @@ class FakeRepository:
             self._detection_row(asset_id=asset_id or "asset-1", **kwargs)
         ]
 
-    def get_detection(self, detection_id):
+    def get_detection(self, detection_id, **kwargs):
+        if not self._visible(detection_id, kwargs.get("project_id")):
+            return None
         if detection_id == "det-wide":
             return self._detection_row(
                 id=detection_id,
@@ -249,7 +310,7 @@ class FakeRepository:
             )
         return None
 
-    def get_refined_detection_for_candidate(self, detection_id):
+    def get_refined_detection_for_candidate(self, detection_id, **kwargs):
         if detection_id != "det-1":
             return None
         return self._detection_row(
@@ -260,7 +321,7 @@ class FakeRepository:
             metadata={"detection_stage": "refined"},
         )
 
-    def upsert_refined_detections(self, refined_detections, *, job_id=None):
+    def upsert_refined_detections(self, refined_detections, *, job_id=None, project_id=None):
         rows = []
         for candidate_detection_id, detection in refined_detections:
             row = asdict(detection)
@@ -373,7 +434,13 @@ class FakeRepository:
             ],
         }
 
-    def replace_frame_detections(self, run_id, frame_ids, detections):
+    def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
+        project_id = kwargs.get("project_id")
+        if project_id is not None and (
+            not self._visible(run_id, project_id)
+            or any(not self._visible(frame_id, project_id) for frame_id in frame_ids)
+        ):
+            raise KeyError("Frame was not found in project.")
         rows = []
         for index, detection in enumerate(detections, start=1):
             frame_id = getattr(detection, "frame_id", None)
@@ -396,8 +463,8 @@ class FakeRepository:
     def list_collections(self, **kwargs):
         return [{"collection": kwargs.get("collection") or "test", "asset_count": 1, "limit": kwargs.get("limit")}]
 
-    def get_model(self, model_id):
-        return {"id": model_id, "model_key": "demo"} if model_id == "model-1" else None
+    def get_model(self, model_id, **kwargs):
+        return {"id": model_id, "model_key": "demo", **kwargs} if model_id == "model-1" else None
 
     def list_jobs(self, **kwargs):
         row = {"id": "job-1", "stage": PipelineStage.EXTRACT_FRAMES.value, **kwargs}
@@ -409,10 +476,23 @@ class FakeRepository:
             row["result_bytes"] = 2048
         return [row]
 
-    def get_job(self, job_id):
-        return {"id": job_id, "status": "queued"} if job_id == "job-1" else None
+    def get_job(self, job_id, **kwargs):
+        return {"id": job_id, "status": "queued", **kwargs} if job_id == "job-1" and self._visible(job_id, kwargs.get("project_id")) else None
 
     def create_job(self, stage, **kwargs):
+        project_id = kwargs.get("project_id")
+        if project_id is not None:
+            if kwargs.get("run_id") and not self._visible(kwargs["run_id"], project_id):
+                raise KeyError("Run was not found in project.")
+            if kwargs.get("asset_id") and not self._visible(kwargs["asset_id"], project_id):
+                raise KeyError("Asset was not found in project.")
+            payload = kwargs.get("payload") or {}
+            for frame_id in payload.get("frame_ids") or []:
+                if not self._visible(frame_id, project_id):
+                    raise KeyError("Frame was not found in project.")
+            for detection_id in payload.get("detection_ids") or []:
+                if not self._visible(detection_id, project_id):
+                    raise KeyError("Detection was not found in project.")
         stage_value = stage.value if hasattr(stage, "value") else stage
         job = {"id": "job-new", "stage": stage_value, **kwargs}
         self.created_jobs.append(job)
@@ -429,16 +509,24 @@ class FakeRepository:
         self.logs.append(row)
         return row
 
-    def pause_job(self, job_id, reason=None):
+    def pause_job(self, job_id, reason=None, **kwargs):
+        if not self._visible(job_id, kwargs.get("project_id")):
+            return None
         return {"id": job_id, "status": "paused", "reason": reason}
 
-    def resume_job(self, job_id, reason=None):
+    def resume_job(self, job_id, reason=None, **kwargs):
+        if not self._visible(job_id, kwargs.get("project_id")):
+            return None
         return {"id": job_id, "status": "queued", "reason": reason}
 
-    def retry_job(self, job_id):
+    def retry_job(self, job_id, **kwargs):
+        if not self._visible(job_id, kwargs.get("project_id")):
+            return None
         return {"id": job_id, "status": "queued"}
 
-    def set_job_priority(self, job_id, priority, reason=None):
+    def set_job_priority(self, job_id, priority, reason=None, **kwargs):
+        if not self._visible(job_id, kwargs.get("project_id")):
+            return None
         self.priority_updates.append((job_id, priority, reason))
         return {"id": job_id, "priority": priority, "reason": reason}
 
@@ -455,9 +543,93 @@ class FakeRepository:
     def get_status_summary(self):
         return {"queue": {"queued": 2}, "workers": {"total": 1, "online": 1, "busy": 0}}
 
-    def register_planned_run(self, planned_run):
+    def register_planned_run(self, planned_run, **kwargs):
+        project_id = kwargs.get("project_id")
+        if project_id is not None:
+            self.resource_projects[str(planned_run.manifest.run_id)] = project_id
+            for asset in planned_run.manifest.assets:
+                self.resource_projects[str(asset.asset_id)] = project_id
         self.registered_runs.append(planned_run)
         return {"run": {"id": planned_run.manifest.run_id}, "asset_count": 1, "job_count": 0}
+
+    def verify_user_password(self, username, password):
+        user = self.users.get(str(username).lower())
+        if user and user["password"] == password and user["is_active"]:
+            return dict(user)
+        return None
+
+    def get_user(self, user_id):
+        for user in self.users.values():
+            if user["id"] == user_id:
+                return dict(user)
+        return None
+
+    def get_project(self, project_id):
+        project = self.projects.get(project_id)
+        return None if project is None else dict(project)
+
+    def get_project_by_key(self, project_key):
+        for project in self.projects.values():
+            if project["project_key"] == str(project_key).lower():
+                return dict(project)
+        return None
+
+    def list_user_projects(self, user_id, **kwargs):
+        return [
+            {**self.projects[project_id], "membership_role": role}
+            for (member_user_id, project_id), role in self.memberships.items()
+            if member_user_id == user_id
+        ]
+
+    def list_projects(self, **kwargs):
+        return list(self.projects.values())
+
+    def create_session(self, user_id, project_id, **kwargs):
+        user = self.get_user(user_id)
+        if user is None:
+            raise ValueError("missing user")
+        if not user.get("is_admin") and (user_id, project_id) not in self.memberships:
+            raise PermissionError("User is not a member of the requested project.")
+        token = f"token-{len(self.sessions) + 1}"
+        session = {
+            "id": f"session-{len(self.sessions) + 1}",
+            "user_id": user_id,
+            "project_id": project_id,
+            "token_hash": f"hash-{token}",
+            "user_agent": kwargs.get("user_agent"),
+            "remote_addr": kwargs.get("remote_addr"),
+            "ttl_seconds": kwargs.get("ttl_seconds"),
+            "expires_at": "2099-01-01T00:00:00Z",
+            "revoked_at": None,
+        }
+        self.sessions[token] = session
+        return {"token": token, "session": session}
+
+    def get_session(self, token, **kwargs):
+        session = self.sessions.get(token)
+        if session is None or session.get("revoked_at"):
+            return None
+        user = self.get_user(session["user_id"])
+        project = self.get_project(session["project_id"])
+        role = self.memberships.get((session["user_id"], session["project_id"]))
+        if user and user.get("is_admin") and role is None:
+            role = "admin"
+        return {
+            **session,
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "is_admin": user["is_admin"],
+            "project_key": project["project_key"],
+            "project_name": project["project_name"],
+            "project_role": role,
+        }
+
+    def revoke_session(self, token):
+        session = self.sessions.get(token)
+        if session is None:
+            return None
+        session["revoked_at"] = "now"
+        return dict(session)
 
     def connect(self):
         raise AssertionError("API unit tests should not open a database connection.")
@@ -483,12 +655,24 @@ class FakeKVStore:
         self.deleted_keys.append(key)
 
 
-def make_client():
-    app = create_app(CoreConfig())
+def make_client(*, auth_enabled=False):
+    config = CoreConfig()
+    config.auth.enabled = auth_enabled
+    app = create_app(config)
     repository = FakeRepository()
     kvstore = FakeKVStore()
-    app.state.context = AppContext(config=CoreConfig(), repository=repository, kvstore=kvstore)
+    app.state.config = config
+    app.state.context = AppContext(config=config, repository=repository, kvstore=kvstore)
     return TestClient(app), repository, kvstore
+
+
+def auth_headers(client, *, username="ada", project_key="default"):
+    response = client.post(
+        "/auth/login",
+        json={"username": username, "password": "secret", "project_key": project_key},
+    )
+    assert response.status_code == 200
+    return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
 def test_api_lists_system_status_without_live_database():
@@ -553,6 +737,67 @@ def test_api_exposes_system_capabilities():
     assert "roi_refinement" in body["processing"]["groups"]
     assert "builtin:model/roi_refinement/example_model" in body["processing"]["roi_refinement"]["supported"]["model_refs"]
     assert body["storage"]["kvstore"]["hash_algorithm_options"] == ["sha256", "blake3"]
+
+
+def test_api_auth_login_me_projects_and_logout():
+    client, repo, _ = make_client()
+
+    bad = client.post("/auth/login", json={"username": "ada", "password": "wrong"})
+    assert bad.status_code == 401
+
+    login = client.post(
+        "/auth/login",
+        json={"username": "ada", "password": "secret", "project_key": "default"},
+    )
+
+    assert login.status_code == 200
+    body = login.json()
+    token = body["token"]
+    assert token
+    assert body["user"]["username"] == "ada"
+    assert body["project"]["project_key"] == "default"
+    assert body["project"]["role"] == "editor"
+
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json()["auth"]["project_id"] == "project-1"
+
+    projects = client.get("/projects", headers=headers)
+    assert projects.status_code == 200
+    assert [project["project_key"] for project in projects.json()["projects"]] == ["default"]
+
+    project_names = client.get("/projects?include_all_names=true", headers=headers)
+    assert project_names.status_code == 200
+    assert [project["project_key"] for project in project_names.json()["projects"]] == ["default"]
+    assert project_names.json()["all_project_names"] == ["Default", "Other"]
+
+    runs = client.get("/runs", headers=headers)
+    assert runs.status_code == 200
+    assert runs.json()["runs"][0]["project_id"] == "project-1"
+
+    assert token in repo.sessions
+    logout = client.post("/auth/logout", headers=headers)
+    assert logout.status_code == 200
+    assert logout.json()["revoked"] is True
+    assert client.get("/auth/me", headers=headers).status_code == 401
+
+
+def test_api_auth_login_clamps_requested_session_ttl():
+    client, repo, _ = make_client(auth_enabled=True)
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "username": "ada",
+            "password": "secret",
+            "project_key": "default",
+            "ttl_seconds": 999999999,
+        },
+    )
+
+    assert response.status_code == 200
+    assert repo.sessions[response.json()["token"]]["ttl_seconds"] == client.app.state.config.auth.session_ttl_seconds
 
 
 def test_api_roi_refinement_options_are_ui_ready():
@@ -721,9 +966,11 @@ def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
 
 def test_api_queue_roi_refinement_job():
     client, repo, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/roi-refinement/jobs",
+        headers=headers,
         json={
             "detection_ids": ["det-1"],
             "model_kind": "identity",
@@ -740,6 +987,7 @@ def test_api_queue_roi_refinement_job():
     assert response.status_code == 200
     body = response.json()
     assert body["job"]["stage"] == PipelineStage.ROI_REFINEMENT.value
+    assert body["job"]["project_id"] == "project-1"
     assert body["job"]["run_id"] == "run-1"
     assert body["job"]["asset_id"] == "asset-1"
     assert body["job"]["priority"] == 7
@@ -756,9 +1004,11 @@ def test_api_queue_roi_refinement_job():
 
 def test_api_queue_roi_refinement_job_dry_run():
     client, _, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/roi-refinement/jobs",
+        headers=headers,
         json={
             "detection_ids": ["det-1"],
             "model_ref": "builtin:model/roi_refinement/example_model",
@@ -915,6 +1165,38 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert removed.status_code == 404
 
 
+def test_api_live_threshold_requires_preprocessed_payload_before_preprocessed_source():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/live/threshold",
+        params={
+            "frame_id": "frame-1",
+            "frame_payload_kind": "preprocessed",
+            "apply_preprocessing": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Run /live/preprocess first" in response.json()["detail"]
+
+
+def test_api_live_detection_candidate_requires_preprocessed_payload_before_preprocessed_source():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/live/detection-candidate",
+        params={
+            "frame_id": "frame-1",
+            "frame_payload_kind": "preprocessed",
+            "apply_preprocessing": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Run /live/preprocess first" in response.json()["detail"]
+
+
 def test_api_segmentation_options_are_ui_ready():
     client, _, _ = make_client()
 
@@ -952,9 +1234,11 @@ def test_api_segmentation_options_are_ui_ready():
 
 def test_api_can_create_queue_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/jobs",
+        headers=headers,
         json={
             "stage": "extract_frames",
             "run_id": "run-1",
@@ -965,7 +1249,28 @@ def test_api_can_create_queue_job():
 
     assert response.status_code == 200
     assert response.json()["job"]["stage"] == "extract_frames"
+    assert response.json()["job"]["project_id"] == "project-1"
     assert repository.created_jobs[0]["run_id"] == "run-1"
+    assert repository.created_jobs[0]["project_id"] == "project-1"
+
+
+def test_api_create_queue_job_rejects_cross_project_asset():
+    client, repository, _ = make_client()
+    headers = auth_headers(client, username="admin", project_key="other")
+
+    response = client.post(
+        "/jobs",
+        headers=headers,
+        json={
+            "stage": "extract_frames",
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"source_path": "/tmp/source.avi"},
+        },
+    )
+
+    assert response.status_code == 404
+    assert repository.created_jobs == []
 
 
 def test_api_lists_jobs_without_details_by_default():
@@ -1020,9 +1325,11 @@ def test_api_can_create_and_list_structured_logs():
 
 def test_api_can_queue_segmentation_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/segmentation/jobs",
+        headers=headers,
         json={
             "run_id": "run-1",
             "asset_id": "asset-1",
@@ -1043,6 +1350,7 @@ def test_api_can_queue_segmentation_job():
 
     assert response.status_code == 200
     assert response.json()["job"]["stage"] == "segment"
+    assert response.json()["job"]["project_id"] == "project-1"
     assert repository.created_jobs[-1]["run_id"] == "run-1"
     assert repository.created_jobs[-1]["asset_id"] == "asset-1"
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
@@ -1061,6 +1369,26 @@ def test_api_can_queue_segmentation_job():
     assert repository.created_jobs[-1]["payload"]["flatfield_axis"] == 0
     assert repository.created_jobs[-1]["payload"]["flatfield_min_field_value"] == 1.0
     assert repository.created_jobs[-1]["payload"]["background_min_field_value"] == 1.0
+
+
+def test_api_rejects_preprocessed_segmentation_job_for_unprocessed_frames():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/segmentation/jobs",
+        headers=headers,
+        json={
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "frame_ids": ["frame-1"],
+            "frame_payload_kind": "preprocessed",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "lack preprocessed payloads" in response.json()["detail"]
+    assert repository.created_jobs == []
 
 
 def test_api_validate_segmentation_resolves_without_queueing():
@@ -1089,9 +1417,11 @@ def test_api_validate_segmentation_resolves_without_queueing():
 
 def test_api_queue_segmentation_dry_run_does_not_create_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/segmentation/jobs",
+        headers=headers,
         json={"asset_id": "asset-1", "frame_ids": ["frame-1"], "dry_run": True},
     )
 
@@ -1103,9 +1433,11 @@ def test_api_queue_segmentation_dry_run_does_not_create_job():
 
 def test_api_segmentation_rejects_invalid_enum_values():
     client, _, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/segmentation/jobs",
+        headers=headers,
         json={"asset_id": "asset-1", "threshold_method": "definitely-not-real"},
     )
 
@@ -1114,9 +1446,11 @@ def test_api_segmentation_rejects_invalid_enum_values():
 
 def test_api_can_queue_frame_preprocess_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/frame/preprocess/jobs",
+        headers=headers,
         json={
             "frame_ids": ["frame-1"],
             "flatfield_correction": False,
@@ -1127,6 +1461,7 @@ def test_api_can_queue_frame_preprocess_job():
 
     assert response.status_code == 200
     assert response.json()["job"]["stage"] == "preprocess_frames"
+    assert response.json()["job"]["project_id"] == "project-1"
     assert repository.created_jobs[-1]["run_id"] == "run-1"
     assert repository.created_jobs[-1]["asset_id"] == "asset-1"
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
@@ -1174,9 +1509,11 @@ def test_api_can_generate_frame_background(monkeypatch):
 
 def test_api_can_queue_frame_background_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/frame/background/jobs",
+        headers=headers,
         json={
             "frame_ids": ["frame-1"],
             "payload_kind": "original",
@@ -1201,9 +1538,11 @@ def test_api_can_queue_frame_background_job():
 
 def test_api_queue_frame_background_job_dry_run_does_not_create_job():
     client, repository, _ = make_client()
+    headers = auth_headers(client)
 
     response = client.post(
         "/frame/background/jobs",
+        headers=headers,
         json={"asset_id": "asset-1", "start_frame": 2, "end_frame": 4, "dry_run": True},
     )
 
@@ -1251,6 +1590,22 @@ def test_api_frame_endpoints_accept_dimension_resize(monkeypatch):
     assert preprocessed.headers["x-pelagia-scale-x"] == "0.4"
     assert preprocessed.headers["x-pelagia-scale-y"] == "0.4"
     assert calls == [("frame-1", "original"), ("frame-1", "preprocessed")]
+
+
+def test_api_frame_original_uuid_asset_query_requires_auth_with_cors(monkeypatch):
+    import uuid
+
+    asset_id = str(uuid.uuid4())
+    client, _, _ = make_client(auth_enabled=True)
+
+    response = client.get(
+        f"/frame/original?format=matrix&asset_id={asset_id}&frame_num=1&width=1100"
+        f"&token_id={asset_id}&session_id={asset_id}",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
 def test_api_frame_image_endpoints_accept_head_for_scale_headers(monkeypatch):
@@ -2003,11 +2358,13 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ingestion_route, "_sha256_file", fail_if_called)
     client, repository, _ = make_client()
+    headers = auth_headers(client)
     video_path = tmp_path / "sample.avi"
     video_path.write_bytes(b"not-a-real-video")
 
     response = client.post(
         "/ingestion/videos",
+        headers=headers,
         json={
             "source_path": str(video_path),
             "n_tile": 2,
@@ -2035,6 +2392,7 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
     assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
     assert repository.created_jobs[0]["payload"]["apply_mask"] is False
     assert repository.created_jobs[0]["payload"]["mask_path"] is None
+    assert repository.created_jobs[0]["project_id"] == "project-1"
 
 
 def test_api_queues_video_ingestion_can_compute_checksum(tmp_path, monkeypatch):
@@ -2048,11 +2406,13 @@ def test_api_queues_video_ingestion_can_compute_checksum(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ingestion_route, "_sha256_file", fake_sha256)
     client, repository, _ = make_client()
+    headers = auth_headers(client)
     video_path = tmp_path / "sample.avi"
     video_path.write_bytes(b"not-a-real-video")
 
     response = client.post(
         "/ingestion/videos",
+        headers=headers,
         json={
             "source_path": str(video_path),
             "compute_checksum": True,
@@ -2070,11 +2430,13 @@ def test_api_queues_video_ingestion_can_compute_checksum(tmp_path, monkeypatch):
 
 def test_api_queues_video_ingestion_with_collections(tmp_path):
     client, repository, _ = make_client()
+    headers = auth_headers(client)
     video_path = tmp_path / "sample.avi"
     video_path.write_bytes(b"not-a-real-video")
 
     response = client.post(
         "/ingestion/videos",
+        headers=headers,
         json={
             "source_path": str(video_path),
             "collections": "skq202510S-T1, test, transect1",
@@ -2165,6 +2527,24 @@ def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):
     assert delete_response.json()["deleted_kvstore_keys"][0]["key"] == "new-preprocessed-key"
     assert kvstore.deleted_keys == ["new-preprocessed-key"]
     assert repository.deleted_sandbox_frames == ["live-frame-1"]
+
+
+def test_live_preprocess_uuid_frame_requires_auth_with_cors(monkeypatch):
+    import uuid
+
+    client, _, _ = make_client(auth_enabled=True)
+    frame_id = str(uuid.uuid4())
+
+    response = client.post(
+        f"/live/preprocess?frame_id={frame_id}&encoding=png&background_correction=false"
+        "&flatfield_correction=true&flatfield_q=0.95&flatfield_axis=0"
+        "&flatfield_min_field_value=1&flatfield_max_field_value=255"
+        "&apply_mask=false&crop_enabled=false&invert_intensity=true",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
 def test_api_lists_collections_and_filters_assets():

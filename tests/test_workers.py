@@ -34,8 +34,10 @@ class FakeRepository:
         self.touches = []
         self.requeued = 0
         self.shutdown_requested = False
+        self.project_calls = []
 
-    def get_asset(self, asset_id):
+    def get_asset(self, asset_id, **kwargs):
+        self.project_calls.append(("get_asset", kwargs.get("project_id")))
         return self.assets.get(asset_id)
 
     def claim_jobs(self, worker_id, stages=None):
@@ -55,9 +57,11 @@ class FakeRepository:
         return job
 
     def list_frames(self, asset_id, **kwargs):
+        self.project_calls.append(("list_frames", kwargs.get("project_id")))
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 1, **kwargs}]
 
-    def get_frame_record(self, frame_id):
+    def get_frame_record(self, frame_id, **kwargs):
+        self.project_calls.append(("get_frame_record", kwargs.get("project_id")))
         if frame_id != "frame-1":
             return None
         return FrameRecord(
@@ -71,7 +75,8 @@ class FakeRepository:
             preview_thumbhash=b"thumb",
         )
 
-    def replace_frame_detections(self, run_id, frame_ids, detections):
+    def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
+        self.project_calls.append(("replace_frame_detections", kwargs.get("project_id")))
         rows = [
             {"id": f"det-{index}", "frame_id": detection.frame_id}
             for index, detection in enumerate(detections, start=1)
@@ -79,7 +84,8 @@ class FakeRepository:
         self.replaced_detections.append((run_id, frame_ids, detections))
         return rows
 
-    def get_detection(self, detection_id):
+    def get_detection(self, detection_id, **kwargs):
+        self.project_calls.append(("get_detection", kwargs.get("project_id")))
         if detection_id not in {"det-1", "det-no-roi"}:
             return None
         roi = np.array([[0, 20], [40, 80]], dtype=np.uint8)
@@ -117,7 +123,8 @@ class FakeRepository:
             "metadata": {},
         }
 
-    def upsert_refined_detections(self, refined_detections, *, job_id=None):
+    def upsert_refined_detections(self, refined_detections, *, job_id=None, project_id=None):
+        self.project_calls.append(("upsert_refined_detections", project_id))
         rows = []
         for candidate_detection_id, detection in refined_detections:
             row = {
@@ -179,6 +186,7 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
 
     assert result == {
         "stage": PipelineStage.EXTRACT_FRAMES.value,
+        "project_id": None,
         "run_id": "run-1",
         "asset_id": "asset-1",
         "source_path": "/tmp/source.avi",
@@ -238,6 +246,33 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
         "collections": ["test"],
     }
     assert repo.created_jobs[0]["depends_on"] == ["job-1"]
+
+
+def test_extract_frames_handler_preserves_project_when_enqueuing_segment(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo).for_project("project-1")
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
+        lambda *args, **kwargs: [{"id": "frame-1"}],
+    )
+
+    result = extract_frames_handler(
+        {
+            "id": "job-1",
+            "project_id": "project-1",
+            "stage": PipelineStage.EXTRACT_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"enqueue_segment": True},
+        },
+        context,
+    )
+
+    assert result["project_id"] == "project-1"
+    assert repo.created_jobs[0]["project_id"] == "project-1"
+    assert repo.created_jobs[0]["stage"] == PipelineStage.SEGMENT.value
+    assert ("get_asset", "project-1") in repo.project_calls
 
 
 def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_path):
@@ -331,6 +366,42 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert preprocessed[0][1]["flatfield_correction"] is False
     assert preprocessed[0][1]["background_correction"] is True
     assert stored[0][2]["encoding"] == "jpg"
+
+
+def test_preprocess_frames_handler_uses_project_context(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo).for_project("project-1")
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, context=None, payload_kind="original": FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        ),
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frame",
+        lambda frame_id, frame, **kwargs: {"id": frame_id},
+    )
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "project_id": "project-1",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"frame_ids": ["frame-1"]},
+        },
+        context,
+    )
+
+    assert result["project_id"] == "project-1"
+    assert ("get_frame_record", "project-1") in repo.project_calls
 
 
 def test_background_frames_handler_generates_background_for_frame_batch(monkeypatch):
@@ -466,6 +537,39 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
     assert repo.replaced_detections[0][1] == ["frame-1"]
 
 
+def test_roi_detection_handler_preserves_project_id(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo).for_project("project-1")
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, context=None, payload_kind="original": FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=None,
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        ),
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.segment_frame", lambda frame, **kwargs: [])
+
+    result = roi_detection_handler(
+        {
+            "id": "job-segment",
+            "project_id": "project-1",
+            "stage": PipelineStage.SEGMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"frame_ids": ["frame-1"]},
+        },
+        context,
+    )
+
+    assert result["project_id"] == "project-1"
+    assert ("get_frame_record", "project-1") in repo.project_calls
+    assert ("replace_frame_detections", "project-1") in repo.project_calls
+
+
 def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     repo = FakeRepository()
     context = make_context(repo)
@@ -499,6 +603,32 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     assert result["resolved_options"]["allow_frame_expansion"] is False
     assert repo.refined_detections[0][0][0] == "det-1"
     assert repo.refined_detections[0][0][1].metadata["detection_stage"] == "refined"
+
+
+def test_roi_refinement_handler_preserves_project_id():
+    repo = FakeRepository()
+    context = make_context(repo).for_project("project-1")
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-refine",
+            "project_id": "project-1",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "model_kind": "identity",
+                "allow_frame_expansion": False,
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["project_id"] == "project-1"
+    assert ("get_detection", "project-1") in repo.project_calls
+    assert ("upsert_refined_detections", "project-1") in repo.project_calls
 
 
 def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():

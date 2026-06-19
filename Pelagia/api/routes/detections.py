@@ -12,6 +12,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ..schemas import DetectionDetailResponse, DetectionImageMatrixResponse, DetectionsListResponse
+    from ..auth import scoped_project_id
     from ...processing.frame_codec import decode_array_payload
     from ._common import as_response, detection_summary, get_repository, page_metadata
     from ._images import (
@@ -207,6 +208,7 @@ if APIRouter is not None:
     ) -> dict:
         detections = get_repository(request).list_detections(
             asset_id=asset_id,
+            project_id=scoped_project_id(request),
             run_id=run_id,
             collection=collection,
             frame_id=frame_id,
@@ -243,7 +245,7 @@ if APIRouter is not None:
 
     @router.get("/{detection_id}", response_model=DetectionDetailResponse)
     def get_detection(request: Request, detection_id: str) -> dict:
-        detection = get_repository(request).get_detection(detection_id)
+        detection = get_repository(request).get_detection(detection_id, project_id=scoped_project_id(request))
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return {"detection": as_response(detection)}
@@ -267,7 +269,7 @@ if APIRouter is not None:
         scale_bar_margin_px: int = 8,
         scale_bar_color: Literal["white", "black"] = "white",
     ):
-        detection = get_repository(request).get_detection(detection_id)
+        detection = get_repository(request).get_detection(detection_id, project_id=scoped_project_id(request))
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
 
@@ -309,7 +311,7 @@ if APIRouter is not None:
         scale_bar_margin_px: int = 8,
         scale_bar_color: Literal["white", "black"] = "white",
     ):
-        detection = get_repository(request).get_detection(detection_id)
+        detection = get_repository(request).get_detection(detection_id, project_id=scoped_project_id(request))
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return _detection_payload_response(
@@ -349,7 +351,7 @@ if APIRouter is not None:
         scale_bar_margin_px: int = 8,
         scale_bar_color: Literal["white", "black"] = "white",
     ):
-        detection = get_repository(request).get_detection(detection_id)
+        detection = get_repository(request).get_detection(detection_id, project_id=scoped_project_id(request))
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return _detection_payload_response(
@@ -388,7 +390,10 @@ if APIRouter is not None:
         scale_bar_margin_px: int = 8,
         scale_bar_color: Literal["white", "black"] = "white",
     ):
-        detection = get_repository(request).get_refined_detection_for_candidate(detection_id)
+        detection = get_repository(request).get_refined_detection_for_candidate(
+            detection_id,
+            project_id=scoped_project_id(request),
+        )
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
         return _detection_payload_response(
@@ -428,7 +433,10 @@ if APIRouter is not None:
         scale_bar_margin_px: int = 8,
         scale_bar_color: Literal["white", "black"] = "white",
     ):
-        detection = get_repository(request).get_refined_detection_for_candidate(detection_id)
+        detection = get_repository(request).get_refined_detection_for_candidate(
+            detection_id,
+            project_id=scoped_project_id(request),
+        )
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Refined detection for {detection_id!r} was not found.")
         return _detection_payload_response(

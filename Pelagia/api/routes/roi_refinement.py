@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
     from ...domain import DetectionRecord, PipelineStage
     from ...processing.detection_refinement import (
@@ -252,14 +253,15 @@ if APIRouter is not None:
         if not body.detection_ids:
             raise HTTPException(status_code=422, detail="Provide at least one detection_id.")
         repository = get_repository(request)
-        context = get_context(request)
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
         options = _resolve_options(request, body)
         model_metadata = _requested_model_metadata(request, body)
 
         candidate_rows = []
         missing_ids = []
         for detection_id in body.detection_ids:
-            row = repository.get_detection(detection_id)
+            row = repository.get_detection(detection_id, project_id=project_id)
             if row is None:
                 missing_ids.append(detection_id)
             else:
@@ -337,7 +339,8 @@ if APIRouter is not None:
                     [
                         (refined_storage_candidate_detection_id(result), refined_record)
                         for result, refined_record in zip(results, refined_records)
-                    ]
+                    ],
+                    project_id=project_id,
                 )
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to store refined detections: {exc}") from exc
@@ -369,10 +372,11 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail="Provide at least one detection_id.")
         repository = get_repository(request)
         context = get_context(request)
+        auth = require_project_write(request)
         options = _resolve_options(request, body)
         model_metadata = _requested_model_metadata(request, body)
 
-        first_detection = repository.get_detection(body.detection_ids[0])
+        first_detection = repository.get_detection(body.detection_ids[0], project_id=auth.project_id)
         if first_detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {body.detection_ids[0]!r} was not found.")
         payload = {
@@ -419,15 +423,19 @@ if APIRouter is not None:
                     **model_metadata,
                 }
             )
-        job = repository.create_job(
-            PipelineStage.ROI_REFINEMENT,
-            run_id=run_id,
-            asset_id=asset_id,
-            priority=body.priority,
-            payload=payload,
-            depends_on=body.depends_on or [],
-            summary=f"roi refinement queued for {len(body.detection_ids)} detections",
-        )
+        try:
+            job = repository.create_job(
+                PipelineStage.ROI_REFINEMENT,
+                project_id=auth.project_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                priority=body.priority,
+                payload=payload,
+                depends_on=body.depends_on or [],
+                summary=f"roi refinement queued for {len(body.detection_ids)} detections",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"job": as_response(job)}
 
     def _options_dict(options: RoiRefinementOptions) -> dict[str, Any]:

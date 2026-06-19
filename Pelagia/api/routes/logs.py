@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
+    from ..auth import scoped_project_id
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -51,6 +52,7 @@ if APIRouter is not None:
     ) -> dict[str, list]:
         repository = get_repository(request)
         logs = repository.list_logs(
+            project_id=scoped_project_id(request),
             after_id=after_id,
             before_id=before_id,
             level=level,
@@ -71,6 +73,7 @@ if APIRouter is not None:
         repository = get_repository(request)
         row = repository.append_log(
             event_type=body.event_type,
+            project_id=scoped_project_id(request),
             message=body.message,
             level=body.level,
             logger=body.logger,

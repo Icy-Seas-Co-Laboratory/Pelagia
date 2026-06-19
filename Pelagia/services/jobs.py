@@ -16,6 +16,7 @@ class JobService:
         self,
         stage: PipelineStage,
         *,
+        project_id: str,
         run_id: str | None = None,
         asset_id: str | None = None,
         payload: dict[str, Any] | None = None,
@@ -24,6 +25,7 @@ class JobService:
         """Create a queued processing job."""
         return self.repository.create_job(
             stage,
+            project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             status=JobStatus.QUEUED,
