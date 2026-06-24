@@ -27,6 +27,8 @@ class FakeRepository:
         self.registered_runs = []
         self.shutdown_requests = []
         self.priority_updates = []
+        self.cancel_job_calls = []
+        self.delete_job_calls = []
         self.logs = []
         self.preprocessed_payload_ref = None
         self.sandbox_frames = {}
@@ -595,6 +597,67 @@ class FakeRepository:
             return None
         self.priority_updates.append((job_id, priority, reason))
         return {"id": job_id, "priority": priority, "reason": reason}
+
+    def cancel_jobs(self, **kwargs):
+        self.cancel_job_calls.append(kwargs)
+        if kwargs.get("project_id") == "project-2":
+            return {
+                "matched_count": 0,
+                "cancellable_count": 0,
+                "cancelled_count": 0,
+                "dry_run": bool(kwargs.get("dry_run")),
+                "jobs": [],
+            }
+        if kwargs.get("dry_run"):
+            return {
+                "matched_count": 1,
+                "cancellable_count": 1,
+                "cancelled_count": 0,
+                "dry_run": True,
+                "jobs": [],
+            }
+        return {
+            "matched_count": 1,
+            "cancellable_count": 1,
+            "cancelled_count": 1,
+            "dry_run": False,
+            "jobs": [
+                {
+                    "id": "job-1",
+                    "status": "cancelled",
+                    "stage": PipelineStage.EXTRACT_FRAMES.value,
+                    "project_id": kwargs.get("project_id"),
+                    "control_reason": kwargs.get("reason"),
+                }
+            ],
+        }
+
+    def delete_jobs(self, **kwargs):
+        self.delete_job_calls.append(kwargs)
+        if kwargs.get("dry_run"):
+            return {
+                "matched_count": 1,
+                "cancellable_count": 0,
+                "cancelled_count": 0,
+                "deleted_count": 0,
+                "dry_run": True,
+                "jobs": [],
+            }
+        return {
+            "matched_count": 1,
+            "cancellable_count": 0,
+            "cancelled_count": 0,
+            "deleted_count": 1,
+            "dry_run": False,
+            "jobs": [
+                {
+                    "id": "job-1",
+                    "status": "queued",
+                    "stage": PipelineStage.EXTRACT_FRAMES.value,
+                    "project_id": kwargs.get("project_id"),
+                }
+            ],
+        }
 
     def list_worker_sessions(self, **kwargs):
         return [{"worker_id": "extract-1", "status": kwargs.get("status") or "idle", **kwargs}]
@@ -1640,12 +1703,22 @@ def test_api_live_files_indexes_server_directory(tmp_path):
     hidden_file = visible_dir / ".hidden"
     hidden_file.write_text("secret", encoding="utf-8")
     client, _, _ = make_client()
+    client.app.state.context.config.file_browser.root_path_import_dir = tmp_path
+    client.app.state.context.config.file_browser.root_path_kvstore = tmp_path / "kvstore"
+
+    roots_response = client.get("/live/files")
+
+    assert roots_response.status_code == 200
+    roots_body = roots_response.json()
+    assert roots_body["directory"] is None
+    assert {root["key"] for root in roots_body["roots"]} == {"import", "kvstore"}
 
     response = client.get("/live/files", params={"directory": str(tmp_path)})
 
     assert response.status_code == 200
     body = response.json()
     assert body["directory"] == str(tmp_path.resolve())
+    assert body["root"]["key"] == "import"
     assert body["count"] == 1
     assert body["entries"][0]["name"] == "frames"
     assert body["entries"][0]["is_dir"] is True
@@ -1656,6 +1729,41 @@ def test_api_live_files_indexes_server_directory(tmp_path):
     )
     names = {entry["name"] for entry in recursive.json()["entries"]}
     assert {"frames", "sample.mkv", ".hidden"}.issubset(names)
+
+
+def test_api_live_files_rejects_paths_outside_allowed_roots(tmp_path):
+    allowed_dir = tmp_path / "allowed"
+    blocked_dir = tmp_path / "blocked"
+    allowed_dir.mkdir()
+    blocked_dir.mkdir()
+    client, _, _ = make_client()
+    client.app.state.context.config.file_browser.root_path_import_dir = allowed_dir
+    client.app.state.context.config.file_browser.root_path_kvstore = tmp_path / "kvstore"
+
+    response = client.get("/live/files", params={"directory": str(blocked_dir)})
+
+    assert response.status_code == 403
+
+
+def test_api_live_files_skips_symlink_escape(tmp_path):
+    allowed_dir = tmp_path / "allowed"
+    blocked_dir = tmp_path / "blocked"
+    allowed_dir.mkdir()
+    blocked_dir.mkdir()
+    (blocked_dir / "secret.mkv").write_bytes(b"video")
+    escape = allowed_dir / "escape"
+    try:
+        escape.symlink_to(blocked_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not available on this filesystem")
+    client, _, _ = make_client()
+    client.app.state.context.config.file_browser.root_path_import_dir = allowed_dir
+    client.app.state.context.config.file_browser.root_path_kvstore = tmp_path / "kvstore"
+
+    response = client.get("/live/files", params={"directory": str(allowed_dir)})
+
+    assert response.status_code == 200
+    assert "escape" not in {entry["name"] for entry in response.json()["entries"]}
 
 
 def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
@@ -1862,6 +1970,105 @@ def test_api_lists_jobs_with_details_when_requested():
     assert job["include_details"] is True
     assert job["payload"]["frame_ids"] == ["frame-1"]
     assert job["result"]["detection_ids"] == ["det-1"]
+
+
+def test_api_can_clear_jobs():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/jobs/clear",
+        headers=headers,
+        json={
+            "stage": ["extract_frames"],
+            "status": ["queued", "leased"],
+            "reason": "reset queue",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["matched_count"] == 1
+    assert body["cancellable_count"] == 1
+    assert body["cancelled_count"] == 1
+    assert body["jobs"][0]["status"] == "cancelled"
+    assert repository.cancel_job_calls[-1]["project_id"] == "project-1"
+    assert repository.cancel_job_calls[-1]["stages"] == ["extract_frames"]
+    assert repository.cancel_job_calls[-1]["statuses"] == ["queued", "leased"]
+    assert repository.cancel_job_calls[-1]["reason"] == "reset queue"
+
+
+def test_api_clear_jobs_supports_dry_run():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/jobs/clear",
+        headers=headers,
+        json={"dry_run": True, "worker_id": "worker-1"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["dry_run"] is True
+    assert body["matched_count"] == 1
+    assert body["cancelled_count"] == 0
+    assert body["jobs"] == []
+    assert repository.cancel_job_calls[-1]["worker_id"] == "worker-1"
+    assert repository.cancel_job_calls[-1]["dry_run"] is True
+
+
+def test_api_clear_jobs_accepts_empty_body():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post("/jobs/clear", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["cancelled_count"] == 1
+    assert repository.cancel_job_calls[-1]["project_id"] == "project-1"
+
+
+def test_api_clear_jobs_delete_mode_dispatches_to_delete_jobs():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/jobs/clear",
+        headers=headers,
+        json={"mode": "delete", "status": ["cancelled"], "stage": ["extract_frames"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+    assert repository.delete_job_calls[-1]["project_id"] == "project-1"
+    assert repository.delete_job_calls[-1]["statuses"] == ["cancelled"]
+    assert repository.delete_job_calls[-1]["stages"] == ["extract_frames"]
+    assert repository.cancel_job_calls == []
+
+
+def test_api_clear_jobs_uses_active_project_scope():
+    client, repository, _ = make_client()
+    headers = auth_headers(client, username="admin", project_key="other")
+
+    response = client.post("/jobs/clear", headers=headers, json={})
+
+    assert response.status_code == 200
+    assert response.json()["matched_count"] == 0
+    assert repository.cancel_job_calls[-1]["project_id"] == "project-2"
+
+
+def test_api_clear_jobs_rejects_invalid_filters():
+    client, _, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/jobs/clear",
+        headers=headers,
+        json={"status": ["not-a-status"]},
+    )
+
+    assert response.status_code == 422
 
 
 def test_api_can_create_and_list_structured_logs():

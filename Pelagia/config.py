@@ -54,6 +54,15 @@ class KVStoreConfig:
 
 
 @dataclass(slots=True)
+class FileBrowserConfig:
+    """Server-side roots exposed to the file selection API."""
+
+    root_path_kvstore: Path = Path("./data/kvstore")
+    root_path_import_dir: Path = Path("./data/import")
+    allowed_root_paths: list[Path] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ImageDataStorageConfig:
     """Frame image payload storage settings."""
 
@@ -335,6 +344,7 @@ class CoreConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     kvstore: KVStoreConfig = field(default_factory=KVStoreConfig)
+    file_browser: FileBrowserConfig = field(default_factory=FileBrowserConfig)
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
@@ -433,6 +443,10 @@ def _set_from_env(
     target[key] = cast(value)
 
 
+def _env_path_list(value: str) -> list[Path]:
+    return [Path(item.strip()) for item in value.split(",") if item.strip()]
+
+
 def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "database", "dsn", "PELAGIA_DATABASE_DSN")
     _set_from_env(settings, "database", "schema_name", "PELAGIA_DATABASE_SCHEMA")
@@ -450,6 +464,10 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "kvstore", "prefix_length", "PELAGIA_KVSTORE_PREFIX_LENGTH", int)
     _set_from_env(settings, "kvstore", "max_db_bytes", "PELAGIA_KVSTORE_MAX_DB_BYTES", int)
     _set_from_env(settings, "kvstore", "max_rows", "PELAGIA_KVSTORE_MAX_ROWS", int)
+
+    _set_from_env(settings, "file_browser", "root_path_kvstore", "PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", Path)
+    _set_from_env(settings, "file_browser", "root_path_import_dir", "PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", Path)
+    _set_from_env(settings, "file_browser", "allowed_root_paths", "PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", _env_path_list)
 
     _set_from_env(settings, "image_data_storage", "encoding", "PELAGIA_IMAGE_DATA_STORAGE_ENCODING")
 
@@ -606,6 +624,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     database = _section(settings, "database")
     queue = _section(settings, "queue")
     kvstore = _section(settings, "kvstore")
+    file_browser = _section(settings, "file_browser")
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
     auth = _section(settings, "auth")
@@ -651,6 +670,24 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             prefix_length=int(kvstore.get("prefix_length", KVStoreConfig.prefix_length)),
             max_db_bytes=int(kvstore.get("max_db_bytes", KVStoreConfig.max_db_bytes)),
             max_rows=int(kvstore.get("max_rows", KVStoreConfig.max_rows)),
+        ),
+        file_browser=FileBrowserConfig(
+            root_path_kvstore=Path(
+                file_browser.get(
+                    "root_path_kvstore",
+                    kvstore.get("root_path", FileBrowserConfig.root_path_kvstore),
+                )
+            ),
+            root_path_import_dir=Path(
+                file_browser.get("root_path_import_dir", FileBrowserConfig.root_path_import_dir)
+            ),
+            allowed_root_paths=[
+                Path(path)
+                for path in file_browser.get(
+                    "allowed_root_paths",
+                    FileBrowserConfig.allowed_root_paths,
+                )
+            ],
         ),
         image_data_storage=ImageDataStorageConfig(
             encoding=image_data_storage.get("encoding", ImageDataStorageConfig.encoding),

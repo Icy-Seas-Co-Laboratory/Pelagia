@@ -81,7 +81,7 @@ if APIRouter is not None:
         return as_response(preprocessing_capabilities(get_context(request).config.processing))
 
     @router.get("/status")
-    def get_system_status(request: Request) -> dict:
+    def get_system_status(request: Request, deep_kvstore: bool = False) -> dict:
         repository = get_repository(request)
         kvstore = get_kvstore(request)
         postgres = {"healthy": False}
@@ -93,7 +93,7 @@ if APIRouter is not None:
         return as_response(
             {
                 "postgres": postgres,
-                "kvstore": kvstore_status(kvstore),
+                "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
             }
@@ -116,7 +116,7 @@ if APIRouter is not None:
         return repository.get_project_by_key(project_ref)
 
     @router.get("/status/{project_ref}")
-    def get_project_system_status(request: Request, project_ref: str) -> dict:
+    def get_project_system_status(request: Request, project_ref: str, deep_kvstore: bool = False) -> dict:
         auth = require_auth(request)
         context = get_context(request)
         repository = get_repository(request)
@@ -142,7 +142,7 @@ if APIRouter is not None:
             {
                 "project": project,
                 "postgres": postgres,
-                "kvstore": kvstore_status(kvstore),
+                "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
             }

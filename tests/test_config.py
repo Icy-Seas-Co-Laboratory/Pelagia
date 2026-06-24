@@ -50,6 +50,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
 
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
+    assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstore"
+    assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
+    assert config.file_browser.allowed_root_paths == []
     assert config.image_data_storage.encoding == "zstd"
     assert config.auth.enabled is True
     assert config.auth.session_ttl_seconds == 604800
@@ -138,6 +141,11 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [kvstore]
         root_path = "/tmp/pelagia-kv"
+
+        [file_browser]
+        root_path_kvstore = "/tmp/browser-kv"
+        root_path_import_dir = "/tmp/raw-assets"
+        allowed_root_paths = ["/tmp/shared", "/mnt/cruise"]
 
         [image_data_storage]
         encoding = "raw"
@@ -248,6 +256,12 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.database.dsn == "postgresql://postgres:postgres@localhost:5432/pelagia"
     assert config.queue.lease_seconds == 42
     assert config.kvstore.root_path.as_posix() == "/tmp/pelagia-kv"
+    assert config.file_browser.root_path_kvstore.as_posix() == "/tmp/browser-kv"
+    assert config.file_browser.root_path_import_dir.as_posix() == "/tmp/raw-assets"
+    assert [path.as_posix() for path in config.file_browser.allowed_root_paths] == [
+        "/tmp/shared",
+        "/mnt/cruise",
+    ]
     assert config.image_data_storage.encoding == "raw"
     assert config.artifacts.local_root.as_posix() == "/tmp/pelagia-artifacts"
     assert config.artifacts.models.builtin_enabled is False
@@ -334,6 +348,9 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("PELAGIA_DATABASE_SCHEMA", "pelagia_from_env")
     monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_ENCODING", "zstd")
+    monkeypatch.setenv("PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", "/tmp/env-browser-kv")
+    monkeypatch.setenv("PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", "/tmp/env-import")
+    monkeypatch.setenv("PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", "/tmp/env-raw,/mnt/env-cruise")
     monkeypatch.setenv("PELAGIA_ARTIFACTS_LOCAL_ROOT", "/tmp/env-pelagia-artifacts")
     monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_BUILTIN_ENABLED", "false")
     monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/models")
@@ -372,6 +389,12 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
 
     assert config.database.schema_name == "pelagia_from_env"
     assert config.image_data_storage.encoding == "zstd"
+    assert config.file_browser.root_path_kvstore.as_posix() == "/tmp/env-browser-kv"
+    assert config.file_browser.root_path_import_dir.as_posix() == "/tmp/env-import"
+    assert [path.as_posix() for path in config.file_browser.allowed_root_paths] == [
+        "/tmp/env-raw",
+        "/mnt/env-cruise",
+    ]
     assert config.artifacts.local_root.as_posix() == "/tmp/env-pelagia-artifacts"
     assert config.artifacts.models.builtin_enabled is False
     assert config.artifacts.models.local_path.as_posix() == "/tmp/env-pelagia-artifacts/models"

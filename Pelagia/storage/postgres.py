@@ -4006,6 +4006,193 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    def cancel_jobs(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        reason: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        clauses, params = self._job_filter_clauses(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        active_status_sql = "status IN ('queued', 'leased', 'paused')"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COUNT(*)::bigint AS matched_count,
+                        COUNT(*) FILTER (WHERE {active_status_sql})::bigint AS cancellable_count
+                    FROM {self.schema}.processing_jobs
+                    {where};
+                    """,
+                    tuple(params),
+                )
+                counts = cursor.fetchone() or {"matched_count": 0, "cancellable_count": 0}
+                matched_count = int(counts["matched_count"] or 0)
+                cancellable_count = int(counts["cancellable_count"] or 0)
+                if dry_run or cancellable_count == 0:
+                    connection.commit()
+                    return {
+                        "matched_count": matched_count,
+                        "cancellable_count": cancellable_count,
+                        "cancelled_count": 0,
+                        "jobs": [],
+                        "dry_run": bool(dry_run),
+                    }
+
+                update_clauses = [*clauses, active_status_sql]
+                update_where = f"WHERE {' AND '.join(update_clauses)}"
+                cursor.execute(
+                    f"""
+                    WITH matched AS (
+                        SELECT id, status AS previous_status
+                        FROM {self.schema}.processing_jobs
+                        {update_where}
+                    )
+                    UPDATE {self.schema}.processing_jobs jobs
+                    SET status = 'cancelled',
+                        lease_expires_at = NULL,
+                        worker_id = NULL,
+                        control_reason = %s,
+                        finished_at = NOW(),
+                        updated_at = NOW()
+                    FROM matched
+                    WHERE jobs.id = matched.id
+                    RETURNING jobs.*, matched.previous_status;
+                    """,
+                    tuple([*params, reason]),
+                )
+                rows = cursor.fetchall()
+                filters = {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "asset_id": asset_id,
+                    "statuses": list(statuses or []),
+                    "stages": list(stages or []),
+                    "job_ids": list(job_ids or []),
+                    "worker_id": worker_id,
+                }
+                for row in rows:
+                    self._append_job_event(
+                        cursor,
+                        row["id"],
+                        "job.cancelled",
+                        {
+                            "reason": reason,
+                            "bulk": True,
+                            "previous_status": row.get("previous_status"),
+                            "filters": json_ready(filters),
+                        },
+                    )
+            connection.commit()
+        return {
+            "matched_count": matched_count,
+            "cancellable_count": cancellable_count,
+            "cancelled_count": len(rows),
+            "jobs": rows,
+            "dry_run": False,
+        }
+
+    def delete_jobs(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        reason: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        clauses, params = self._job_filter_clauses(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*)::bigint AS matched_count
+                    FROM {self.schema}.processing_jobs
+                    {where};
+                    """,
+                    tuple(params),
+                )
+                counts = cursor.fetchone() or {"matched_count": 0}
+                matched_count = int(counts["matched_count"] or 0)
+                if dry_run or matched_count == 0:
+                    connection.commit()
+                    return {
+                        "matched_count": matched_count,
+                        "cancellable_count": 0,
+                        "cancelled_count": 0,
+                        "deleted_count": 0,
+                        "jobs": [],
+                        "dry_run": bool(dry_run),
+                    }
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.processing_jobs
+                    {where}
+                    RETURNING *;
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+                self._append_log(
+                    cursor,
+                    event_type="jobs.deleted",
+                    message=f"Deleted {len(rows)} job records.",
+                    logger="pelagia.jobs",
+                    project_id=project_id,
+                    payload={
+                        "reason": reason,
+                        "bulk": True,
+                        "deleted_count": len(rows),
+                        "filters": {
+                            "project_id": project_id,
+                            "run_id": run_id,
+                            "asset_id": asset_id,
+                            "statuses": list(statuses or []),
+                            "stages": list(stages or []),
+                            "job_ids": list(job_ids or []),
+                            "worker_id": worker_id,
+                        },
+                    },
+                )
+            connection.commit()
+        return {
+            "matched_count": matched_count,
+            "cancellable_count": 0,
+            "cancelled_count": 0,
+            "deleted_count": len(rows),
+            "jobs": rows,
+            "dry_run": False,
+        }
+
     def cancel_run(self, run_id: str, *, project_id: str | None = None) -> dict[str, Any]:
         with self.connect() as connection:
             with connection.cursor() as cursor:

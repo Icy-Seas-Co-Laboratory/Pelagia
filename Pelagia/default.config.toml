@@ -27,6 +27,14 @@ prefix_length = 2
 max_db_bytes = 42949672960
 max_rows = 1000000
 
+[file_browser]
+# Server-side roots exposed through /live/files for local file/folder selection.
+# The file API cannot browse outside root_path_kvstore, root_path_import_dir,
+# or explicitly listed allowed_root_paths.
+root_path_kvstore = "./data/kvstore"
+root_path_import_dir = "./data/import"
+allowed_root_paths = []
+
 [image_data_storage]
 # Default image payload encoding. Options: zstd, png, jpg, raw.
 encoding = "zstd"

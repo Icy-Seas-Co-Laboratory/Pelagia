@@ -186,6 +186,15 @@ class JobDetailResponse(FlexibleModel):
     job: JobSummary
 
 
+class JobsClearResponse(FlexibleModel):
+    matched_count: int = 0
+    cancellable_count: int = 0
+    cancelled_count: int = 0
+    deleted_count: int = 0
+    dry_run: bool = False
+    jobs: list[JobSummary] = Field(default_factory=list)
+
+
 class RunSummary(FlexibleModel):
     id: str | None = None
     run_id: str | None = None

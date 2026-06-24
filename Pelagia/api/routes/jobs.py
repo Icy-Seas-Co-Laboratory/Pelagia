@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    from ..schemas import JobDetailResponse, JobsListResponse, JobsSummaryResponse
+    from ..schemas import JobDetailResponse, JobsClearResponse, JobsListResponse, JobsSummaryResponse
     from ..auth import require_project_write, scoped_project_id
     from ._common import as_response, get_repository
 
@@ -74,6 +74,17 @@ if APIRouter is not None:
     class PriorityRequest(BaseModel):
         priority: int
         reason: str | None = None
+
+    class ClearJobsRequest(BaseModel):
+        run_id: str | None = None
+        asset_id: str | None = None
+        status: list[str] = Field(default_factory=list)
+        stage: list[str] = Field(default_factory=list)
+        ids: list[str] = Field(default_factory=list)
+        worker_id: str | None = None
+        reason: str | None = None
+        mode: str = "cancel"
+        dry_run: bool = False
 
     router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -191,6 +202,47 @@ if APIRouter is not None:
             offset=_bounded_offset(offset),
         )
         return {"events": as_response(events)}
+
+    @router.post("/clear", response_model=JobsClearResponse, response_model_exclude_none=True)
+    def clear_jobs(request: Request, body: ClearJobsRequest | None = None) -> dict:
+        repository = get_repository(request)
+        auth = require_project_write(request)
+        body = body or ClearJobsRequest()
+        statuses = _enum_values(body.status, JobStatus, "status")
+        stages = _enum_values(body.stage, PipelineStage, "stage")
+        job_ids = _uuid_values(body.ids)
+        if body.mode not in {"cancel", "delete"}:
+            raise HTTPException(status_code=422, detail="mode must be one of: cancel, delete.")
+        if body.mode == "delete":
+            active_statuses = {JobStatus.QUEUED.value, JobStatus.LEASED.value, JobStatus.PAUSED.value}
+            if not statuses:
+                raise HTTPException(status_code=422, detail="Delete mode requires explicit terminal status filters.")
+            if active_statuses.intersection(statuses):
+                raise HTTPException(status_code=422, detail="Delete mode can only clear terminal job statuses.")
+            result = repository.delete_jobs(
+                project_id=auth.project_id,
+                run_id=body.run_id,
+                asset_id=body.asset_id,
+                statuses=statuses,
+                stages=stages,
+                job_ids=job_ids,
+                worker_id=body.worker_id,
+                reason=body.reason,
+                dry_run=body.dry_run,
+            )
+            return as_response(result)
+        result = repository.cancel_jobs(
+            project_id=auth.project_id,
+            run_id=body.run_id,
+            asset_id=body.asset_id,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=body.worker_id,
+            reason=body.reason,
+            dry_run=body.dry_run,
+        )
+        return as_response(result)
 
     @router.get("/{job_id}", response_model=JobDetailResponse, response_model_exclude_none=True)
     def get_job(request: Request, job_id: str) -> dict:

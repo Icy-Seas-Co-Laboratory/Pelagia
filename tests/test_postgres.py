@@ -11,6 +11,7 @@ from Pelagia.domain import (
     AssetKind,
     DetectionRecord,
     FrameRecord,
+    JobStatus,
     ModelRecord,
     PlannedRun,
     PipelineStage,
@@ -828,6 +829,73 @@ def test_postgres_repository_enforces_project_scope_on_job_creation(postgres_rep
             asset_id=asset_id,
             payload={"frame_ids": [str(uuid.uuid4())]},
         )
+
+
+def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
+    other_project = postgres_repo.create_project(f"cancel-scope-{uuid.uuid4().hex}")
+    queued_job = postgres_repo.create_job(
+        PipelineStage.EXTRACT_FRAMES,
+        project_id=DEFAULT_PROJECT_ID,
+        status=JobStatus.QUEUED,
+        summary="queued default",
+    )
+    leased_job = postgres_repo.create_job(
+        PipelineStage.PREPROCESS_FRAMES,
+        project_id=DEFAULT_PROJECT_ID,
+        status=JobStatus.QUEUED,
+        summary="leased default",
+    )
+    succeeded_job = postgres_repo.create_job(
+        PipelineStage.SEGMENT,
+        project_id=DEFAULT_PROJECT_ID,
+        status=JobStatus.QUEUED,
+        summary="succeeded default",
+    )
+    other_job = postgres_repo.create_job(
+        PipelineStage.EXTRACT_FRAMES,
+        project_id=str(other_project["id"]),
+        status=JobStatus.QUEUED,
+        summary="queued other",
+    )
+    claimed = postgres_repo.claim_jobs(
+        "cancel-worker",
+        stages=[PipelineStage.PREPROCESS_FRAMES],
+        limit=1,
+    )
+    assert str(claimed[0]["id"]) == str(leased_job["id"])
+    postgres_repo.complete_job(str(succeeded_job["id"]), result={"done": True})
+
+    preview = postgres_repo.cancel_jobs(project_id=DEFAULT_PROJECT_ID, dry_run=True)
+
+    assert preview["dry_run"] is True
+    assert preview["matched_count"] == 3
+    assert preview["cancellable_count"] == 2
+    assert preview["cancelled_count"] == 0
+    assert postgres_repo.get_job(str(queued_job["id"]))["status"] == JobStatus.QUEUED.value
+
+    result = postgres_repo.cancel_jobs(
+        project_id=DEFAULT_PROJECT_ID,
+        stages=[PipelineStage.EXTRACT_FRAMES.value, PipelineStage.PREPROCESS_FRAMES.value],
+        reason="clear test queue",
+    )
+
+    assert result["matched_count"] == 2
+    assert result["cancellable_count"] == 2
+    assert result["cancelled_count"] == 2
+    assert {str(row["id"]) for row in result["jobs"]} == {
+        str(queued_job["id"]),
+        str(leased_job["id"]),
+    }
+    assert postgres_repo.get_job(str(queued_job["id"]))["status"] == JobStatus.CANCELLED.value
+    assert postgres_repo.get_job(str(leased_job["id"]))["status"] == JobStatus.CANCELLED.value
+    assert postgres_repo.get_job(str(succeeded_job["id"]))["status"] == JobStatus.SUCCEEDED.value
+    assert postgres_repo.get_job(str(other_job["id"]))["status"] == JobStatus.QUEUED.value
+    assert postgres_repo.get_job(str(queued_job["id"]))["control_reason"] == "clear test queue"
+
+    events = postgres_repo.list_job_events(job_id=str(queued_job["id"]))
+    assert events[0]["event_type"] == "job.cancelled"
+    assert events[0]["payload"]["bulk"] is True
+    assert events[0]["payload"]["previous_status"] == JobStatus.QUEUED.value
 
 
 def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
