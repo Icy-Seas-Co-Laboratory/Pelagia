@@ -33,6 +33,8 @@ class FakeRepository:
         self.background_calls = []
         self.touches = []
         self.requeued = 0
+        self.progress_updates = []
+        self.frames_with_background = set()
         self.shutdown_requested = False
         self.project_calls = []
 
@@ -56,6 +58,17 @@ class FakeRepository:
         self.created_jobs.append(job)
         return job
 
+    def update_job_progress(self, job_id, progress, summary=None, log_message=None):
+        self.progress_updates.append(
+            {
+                "job_id": job_id,
+                "progress": progress,
+                "summary": summary,
+                "log_message": log_message,
+            }
+        )
+        return {"id": job_id, "progress": progress}
+
     def list_frames(self, asset_id, **kwargs):
         self.project_calls.append(("list_frames", kwargs.get("project_id")))
         return [{"id": "frame-1", "asset_id": asset_id, "frame_index": 1, **kwargs}]
@@ -73,6 +86,24 @@ class FakeRepository:
             height=4,
             kvstore_hash="kvstore-key",
             preview_thumbhash=b"thumb",
+            background_kvstore_hash=(
+                "background-key" if frame_id in self.frames_with_background else None
+            ),
+            background_payload_ref=(
+                "background-key" if frame_id in self.frames_with_background else None
+            ),
+            background_payload_encoding=(
+                "raw" if frame_id in self.frames_with_background else None
+            ),
+            background_payload_format=(
+                "raw_ndarray_c_order" if frame_id in self.frames_with_background else None
+            ),
+            background_payload_dtype=(
+                "float32" if frame_id in self.frames_with_background else None
+            ),
+            background_payload_shape=(
+                [4, 4] if frame_id in self.frames_with_background else []
+            ),
         )
 
     def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
@@ -213,6 +244,77 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["metadata"]["worker_job_id"] == "job-1"
 
 
+def test_extract_frames_handler_reports_video_ingest_progress(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+
+    def fake_ingest_video_file(*args, **kwargs):
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(
+            {
+                "event": "video_opened",
+                "filename": "source.avi",
+                "source_frame_count": 50,
+                "source_frames_read": 0,
+                "stored_tile_count": 0,
+                "n_tile": 5,
+                "estimated_tile_count": 10,
+                "fps": 20.0,
+            }
+        )
+        progress_callback(
+            {
+                "event": "tile_stored",
+                "filename": "source.avi",
+                "source_frame_count": 50,
+                "source_frames_read": 25,
+                "source_frame_start": 21,
+                "source_frame_end": 25,
+                "stored_tile_count": 5,
+                "tile_number": 5,
+                "n_tile": 5,
+                "estimated_tile_count": 10,
+                "fps": 20.0,
+            }
+        )
+        return [
+            {"id": "tile-1"},
+            {"id": "tile-2"},
+            {"id": "tile-3"},
+            {"id": "tile-4"},
+            {"id": "tile-5"},
+        ]
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
+        fake_ingest_video_file,
+    )
+
+    result = extract_frames_handler(
+        {
+            "id": "job-1",
+            "stage": PipelineStage.EXTRACT_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"n_tile": 5},
+        },
+        context,
+    )
+
+    assert result["frame_count"] == 5
+    progress_payloads = [update["progress"] for update in repo.progress_updates]
+    assert progress_payloads[0]["completed"] == 0
+    assert any(payload["completed"] == 25 for payload in progress_payloads)
+    assert progress_payloads[-1]["completed"] == 50
+    assert progress_payloads[-1]["total"] == 50
+    assert progress_payloads[-1]["secondary"]["stored_frame_count"] == 5
+    mid_progress = next(payload for payload in progress_payloads if payload["completed"] == 25)
+    assert mid_progress["unit"] == "frames"
+    assert mid_progress["current"]["tile_number"] == 5
+    assert mid_progress["secondary"]["stored_tile_count"] == 5
+    assert mid_progress["secondary"]["estimated_tile_count"] == 10
+
+
 def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
@@ -316,6 +418,7 @@ def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_p
 
 def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     repo = FakeRepository()
+    repo.frames_with_background.add("frame-1")
     context = make_context(repo)
     retrieved = []
     preprocessed = []
@@ -366,6 +469,194 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert preprocessed[0][1]["flatfield_correction"] is False
     assert preprocessed[0][1]["background_correction"] is True
     assert stored[0][2]["encoding"] == "jpg"
+
+
+def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    background_generated = False
+    calls = []
+
+    def fake_generate_background_for_frames(frame_ids, **kwargs):
+        nonlocal background_generated
+        background_generated = True
+        calls.append((frame_ids, kwargs))
+        repo.frames_with_background.update(frame_ids)
+        return {
+            "background_payload_ref": "background-key",
+            "frame_ids": list(frame_ids),
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        }
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            bkg=(
+                np.ones((4, 4), dtype=np.float32)
+                if background_generated
+                else None
+            ),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_preprocess_frame(frame, **kwargs):
+        assert kwargs["background_correction"] is True
+        assert frame.bkg is not None
+        return frame
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.generate_background_for_frames",
+        fake_generate_background_for_frames,
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", fake_preprocess_frame)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frame",
+        lambda frame_id, frame, **kwargs: {"id": frame_id},
+    )
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "frame_ids": ["frame-1"],
+                "background_correction": True,
+                "background_payload_kind": "original",
+                "background_encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert calls == [
+        (
+            ["frame-1"],
+            {"context": context, "payload_kind": "original", "encoding": "raw"},
+        )
+    ]
+    assert result["background_generation"]["background_payload_ref"] == "background-key"
+    progress_payloads = [update["progress"] for update in repo.progress_updates]
+    assert any(
+        payload["secondary"].get("background_generation") == "completed"
+        for payload in progress_payloads
+    )
+
+
+def test_preprocess_frames_handler_skips_background_generation_when_present(monkeypatch):
+    repo = FakeRepository()
+    repo.frames_with_background.add("frame-1")
+    context = make_context(repo)
+    calls = []
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.generate_background_for_frames",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, context=None, payload_kind="original": FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            bkg=np.ones((4, 4), dtype=np.float32),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        ),
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frame",
+        lambda frame_id, frame, **kwargs: {"id": frame_id},
+    )
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "frame_ids": ["frame-1"],
+                "background_correction": True,
+            },
+        },
+        context,
+    )
+
+    assert calls == []
+    assert "background_generation" not in result
+
+
+def test_preprocess_frames_handler_regenerates_stale_background_reference(monkeypatch):
+    repo = FakeRepository()
+    repo.frames_with_background.add("frame-1")
+    context = make_context(repo)
+    calls = []
+    retrieve_calls = 0
+
+    def fake_generate_background_for_frames(frame_ids, **kwargs):
+        calls.append((frame_ids, kwargs))
+        return {
+            "background_payload_ref": "fresh-background-key",
+            "frame_ids": list(frame_ids),
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        }
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        nonlocal retrieve_calls
+        retrieve_calls += 1
+        if retrieve_calls == 1:
+            raise KeyError("stale-background-key")
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            bkg=np.ones((4, 4), dtype=np.float32),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.generate_background_for_frames",
+        fake_generate_background_for_frames,
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frame",
+        lambda frame_id, frame, **kwargs: {"id": frame_id},
+    )
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "frame_ids": ["frame-1"],
+                "background_correction": True,
+            },
+        },
+        context,
+    )
+
+    assert len(calls) == 1
+    assert retrieve_calls == 2
+    assert result["background_generation"]["background_payload_ref"] == "fresh-background-key"
+    progress_payloads = [update["progress"] for update in repo.progress_updates]
+    assert any(
+        payload["secondary"].get("reason") == "background_retrieve_failed"
+        for payload in progress_payloads
+    )
 
 
 def test_preprocess_frames_handler_uses_project_context(monkeypatch):

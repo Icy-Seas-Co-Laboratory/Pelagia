@@ -1,5 +1,6 @@
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ VIDEO_FRAME_EXTENSIONS = {
     ".mpg",
     ".wmv",
 }
+IngestProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,22 @@ def _log_database_event(
         logger="pelagia.processing.ingest",
         core_logger=_CORE_LOGGER,
     )
+
+
+def _emit_ingest_progress(
+    progress_callback: IngestProgressCallback | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback({"event": event, **payload})
+
+
+def _estimated_tile_count(source_frame_count: int, n_tile: int) -> int | None:
+    if source_frame_count < 1 or n_tile < 1:
+        return None
+    return (source_frame_count + n_tile - 1) // n_tile
 
 
 def convert_frame_to_grayscale(frame: np.ndarray) -> np.ndarray:
@@ -200,6 +218,7 @@ def ingest(
     adaptive_background_period: int | None = None,
     apply_mask: bool | None = None,
     mask_path: str | None = None,
+    progress_callback: IngestProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """Generic direct-ingest dispatcher for a single registered source."""
     sources = discover_ingest_sources(input_path, recursive=recursive)
@@ -220,6 +239,7 @@ def ingest(
             run_id=run_id,
             asset_id=asset_id,
             metadata=metadata,
+            progress_callback=progress_callback,
         )
     if source.kind == "video":
         return ingest_video_file(
@@ -233,6 +253,7 @@ def ingest(
             adaptive_background_period=adaptive_background_period,
             apply_mask=apply_mask,
             mask_path=mask_path,
+            progress_callback=progress_callback,
         )
     raise ValueError(f"Unsupported ingest source kind: {source.kind!r}")
 
@@ -245,6 +266,7 @@ def ingest_image_folder(
     run_id: str | None = None,
     asset_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    progress_callback: IngestProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """Ingest a folder of image files as one stored frame per image."""
     started = time.perf_counter()
@@ -273,6 +295,11 @@ def ingest_image_folder(
         asset_id=asset_id,
         payload=ingest_payload,
     )
+    _emit_ingest_progress(
+        progress_callback,
+        "started",
+        {**ingest_payload, "source_frames_read": 0, "stored_frame_count": 0},
+    )
 
     if not image_files:
         duration_ms = (time.perf_counter() - started) * 1000
@@ -285,6 +312,11 @@ def ingest_image_folder(
             asset_id=asset_id,
             duration_ms=duration_ms,
             payload=ingest_payload,
+        )
+        _emit_ingest_progress(
+            progress_callback,
+            "completed",
+            {**ingest_payload, "source_frames_read": 0, "stored_frame_count": 0},
         )
         return []
 
@@ -345,6 +377,18 @@ def ingest_image_folder(
                         "stored_frame_count": len(stored_frames),
                     },
                 )
+            _emit_ingest_progress(
+                progress_callback,
+                "frame_stored",
+                {
+                    **ingest_payload,
+                    "frame_index": frame_index,
+                    "source_frames_read": frame_index,
+                    "stored_frame_count": len(stored_frames),
+                    "filename": image_path.name,
+                    "source_image_relative_path": str(image_path.relative_to(root)),
+                },
+            )
     except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000
         _CORE_LOGGER.exception(
@@ -363,6 +407,17 @@ def ingest_image_folder(
             duration_ms=duration_ms,
             payload={
                 **ingest_payload,
+                "stored_frame_count": len(stored_frames),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+        )
+        _emit_ingest_progress(
+            progress_callback,
+            "failed",
+            {
+                **ingest_payload,
+                "source_frames_read": len(stored_frames),
                 "stored_frame_count": len(stored_frames),
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
@@ -392,6 +447,15 @@ def ingest_image_folder(
             "stored_frame_count": len(stored_frames),
         },
     )
+    _emit_ingest_progress(
+        progress_callback,
+        "completed",
+        {
+            **ingest_payload,
+            "source_frames_read": len(image_files),
+            "stored_frame_count": len(stored_frames),
+        },
+    )
     return stored_frames
 
 
@@ -407,6 +471,7 @@ def ingest_video_file(
     adaptive_background_period: int | None = None,
     apply_mask: bool | None = None,
     mask_path: str | None = None,
+    progress_callback: IngestProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     started = time.perf_counter()
     ingest_defaults = (
@@ -467,6 +532,11 @@ def ingest_video_file(
         asset_id=asset_id,
         payload=ingest_payload,
     )
+    _emit_ingest_progress(
+        progress_callback,
+        "started",
+        {**ingest_payload, "source_frames_read": 0, "stored_tile_count": 0},
+    )
     frame_metadata = dict(metadata or {})
     if run_id is not None:
         frame_metadata["run_id"] = run_id
@@ -491,9 +561,22 @@ def ingest_video_file(
             duration_ms=duration_ms,
             payload=ingest_payload,
         )
+        _emit_ingest_progress(
+            progress_callback,
+            "failed",
+            {
+                **ingest_payload,
+                "source_frames_read": 0,
+                "stored_tile_count": 0,
+                "error_type": "ValueError",
+                "error_message": f"Could not open video file: {input_path}",
+            },
+        )
         raise ValueError(f"Could not open video file: {input_path}")
 
     fps = float(video.get(cv2.CAP_PROP_FPS) or 0.0)
+    source_frame_count = max(0, int(video.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    estimated_tile_count = _estimated_tile_count(source_frame_count, int(n_tile))
     start_timestamp = parse_filename_timestamp_utc(filename)
     if start_timestamp is not None:
         frame_metadata["source_timestamp_utc"] = start_timestamp.isoformat()
@@ -510,6 +593,21 @@ def ingest_video_file(
         payload={
             **ingest_payload,
             "fps": fps,
+            "source_frame_count": source_frame_count,
+            "estimated_tile_count": estimated_tile_count,
+            "source_timestamp_utc": None if start_timestamp is None else start_timestamp.isoformat(),
+        },
+    )
+    _emit_ingest_progress(
+        progress_callback,
+        "video_opened",
+        {
+            **ingest_payload,
+            "fps": fps,
+            "source_frame_count": source_frame_count,
+            "estimated_tile_count": estimated_tile_count,
+            "source_frames_read": 0,
+            "stored_tile_count": 0,
             "source_timestamp_utc": None if start_timestamp is None else start_timestamp.isoformat(),
         },
     )
@@ -562,6 +660,22 @@ def ingest_video_file(
                                 "stored_tile_count": len(stored_frames),
                             },
                         )
+                    _emit_ingest_progress(
+                        progress_callback,
+                        "tile_stored",
+                        {
+                            **ingest_payload,
+                            "fps": fps,
+                            "source_frame_count": source_frame_count,
+                            "estimated_tile_count": estimated_tile_count,
+                            "source_frames_read": n,
+                            "filename": filename,
+                            "tile_number": tile_number,
+                            "source_frame_start": n - len(frame_buffer) + 1,
+                            "source_frame_end": n,
+                            "stored_tile_count": len(stored_frames),
+                        },
+                    )
                     tile_number += 1
                     frame_buffer = []
                 n += 1
@@ -601,6 +715,23 @@ def ingest_video_file(
                     "partial_tile": True,
                 },
             )
+            _emit_ingest_progress(
+                progress_callback,
+                "tile_stored",
+                {
+                    **ingest_payload,
+                    "fps": fps,
+                    "source_frame_count": source_frame_count,
+                    "estimated_tile_count": estimated_tile_count,
+                    "source_frames_read": n - 1,
+                    "filename": filename,
+                    "tile_number": tile_number,
+                    "source_frame_start": n - len(frame_buffer),
+                    "source_frame_end": n - 1,
+                    "stored_tile_count": len(stored_frames),
+                    "partial_tile": True,
+                },
+            )
     except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000
         _CORE_LOGGER.exception(
@@ -620,6 +751,19 @@ def ingest_video_file(
             payload={
                 **ingest_payload,
                 "source_frame_count": max(0, n - 1),
+                "stored_tile_count": len(stored_frames),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+        )
+        _emit_ingest_progress(
+            progress_callback,
+            "failed",
+            {
+                **ingest_payload,
+                "source_frame_count": source_frame_count,
+                "estimated_tile_count": estimated_tile_count,
+                "source_frames_read": max(0, n - 1),
                 "stored_tile_count": len(stored_frames),
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
@@ -650,7 +794,20 @@ def ingest_video_file(
         payload={
             **ingest_payload,
             "fps": fps,
-            "source_frame_count": max(0, n - 1),
+            "source_frame_count": max(source_frame_count, max(0, n - 1)),
+            "estimated_tile_count": estimated_tile_count,
+            "stored_tile_count": len(stored_frames),
+        },
+    )
+    _emit_ingest_progress(
+        progress_callback,
+        "completed",
+        {
+            **ingest_payload,
+            "fps": fps,
+            "source_frame_count": max(source_frame_count, max(0, n - 1)),
+            "estimated_tile_count": estimated_tile_count,
+            "source_frames_read": max(0, n - 1),
             "stored_tile_count": len(stored_frames),
         },
     )

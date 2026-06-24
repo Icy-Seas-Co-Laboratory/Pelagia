@@ -105,6 +105,81 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         total=0,
     )
     progress.start(f"Extracting frames from {Path(str(source_path)).name}")
+    ingest_progress_state = {
+        "source_frame_count": 0,
+        "source_frames_read": 0,
+        "stored_frame_count": 0,
+        "stored_tile_count": 0,
+    }
+
+    def _progress_dict(values: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in values.items() if value is not None}
+
+    def report_ingest_progress(update: dict[str, Any]) -> None:
+        source_frame_count = int(update.get("source_frame_count") or 0)
+        if source_frame_count > 0:
+            ingest_progress_state["source_frame_count"] = max(
+                int(ingest_progress_state["source_frame_count"]),
+                source_frame_count,
+            )
+            progress.total = int(ingest_progress_state["source_frame_count"])
+
+        source_frames_read = int(
+            update.get("source_frames_read")
+            or update.get("stored_frame_count")
+            or update.get("stored_tile_count")
+            or 0
+        )
+        ingest_progress_state["source_frames_read"] = max(
+            int(ingest_progress_state["source_frames_read"]),
+            source_frames_read,
+        )
+        ingest_progress_state["stored_frame_count"] = max(
+            int(ingest_progress_state["stored_frame_count"]),
+            int(update.get("stored_frame_count") or 0),
+        )
+        ingest_progress_state["stored_tile_count"] = max(
+            int(ingest_progress_state["stored_tile_count"]),
+            int(update.get("stored_tile_count") or 0),
+        )
+
+        event = str(update.get("event") or "ingesting")
+        if event == "started":
+            message = f"Starting extraction from {Path(str(source_path)).name}"
+        elif event == "video_opened":
+            message = f"Opened video {Path(str(source_path)).name}"
+        elif event == "completed":
+            message = f"Completed extraction from {Path(str(source_path)).name}"
+        elif event == "failed":
+            message = f"Extraction failed for {Path(str(source_path)).name}"
+        else:
+            message = f"Extracting frames from {Path(str(source_path)).name}"
+
+        progress.update(
+            source_frames_read,
+            current=_progress_dict(
+                {
+                    "event": event,
+                    "filename": update.get("filename"),
+                    "frame_index": update.get("frame_index"),
+                    "tile_number": update.get("tile_number"),
+                    "source_frame_start": update.get("source_frame_start"),
+                    "source_frame_end": update.get("source_frame_end"),
+                    "partial_tile": update.get("partial_tile"),
+                }
+            ),
+            secondary=_progress_dict(
+                {
+                    "stored_frame_count": update.get("stored_frame_count"),
+                    "stored_tile_count": update.get("stored_tile_count"),
+                    "n_tile": update.get("n_tile"),
+                    "estimated_tile_count": update.get("estimated_tile_count"),
+                    "fps": update.get("fps"),
+                }
+            ),
+            message=message,
+            force=event in {"started", "video_opened", "completed", "failed"},
+        )
 
     source_is_folder = Path(str(source_path)).expanduser().is_dir()
     asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
@@ -116,6 +191,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             run_id=run_id,
             asset_id=asset_id,
             metadata=metadata,
+            progress_callback=report_ingest_progress,
         )
     else:
         frame_rows = ingest_module.ingest_video_file(
@@ -141,6 +217,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 payload.get("apply_mask", preprocessing_defaults.apply_mask)
             ),
             mask_path=payload.get("mask_path", preprocessing_defaults.mask_path),
+            progress_callback=report_ingest_progress,
         )
 
     result: dict[str, Any] = {
@@ -152,9 +229,25 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_count": len(frame_rows),
         "frame_ids": [row.get("id") for row in frame_rows],
     }
-    progress.total = len(frame_rows)
+    final_completed = max(
+        len(frame_rows),
+        int(ingest_progress_state["source_frames_read"]),
+        int(ingest_progress_state["source_frame_count"]),
+    )
+    progress.total = final_completed
     progress.finish(
-        completed=len(frame_rows),
+        completed=final_completed,
+        secondary=_progress_dict(
+            {
+                "stored_frame_count": len(frame_rows),
+                "stored_tile_count": (
+                    int(ingest_progress_state["stored_tile_count"])
+                    if ingest_progress_state["stored_tile_count"]
+                    else None
+                ),
+                "source_frame_count": int(ingest_progress_state["source_frame_count"]) or final_completed,
+            }
+        ),
         message=f"Extracted {len(frame_rows)} frame{'s' if len(frame_rows) != 1 else ''}",
     )
 
@@ -256,7 +349,8 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     progress.start(f"Preprocessing {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
 
-    for index, frame_id in enumerate(frame_ids, start=1):
+    missing_background_frame_ids = []
+    for frame_id in frame_ids:
         frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
@@ -266,8 +360,59 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             raise ValueError("Preprocess jobs may only process frames from one asset.")
         if resolved_run_id is None:
             resolved_run_id = frame_record.run_id
+        if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
+            missing_background_frame_ids.append(frame_id)
 
-        frame = retrieve_frame(frame_id, context=context, payload_kind="original")
+    background_generation_result = None
+
+    def generate_preprocess_background(reason: str) -> dict[str, Any]:
+        progress.update(
+            0,
+            secondary={
+                "background_generation": "started",
+                "missing_background_frames": len(missing_background_frame_ids),
+                "reason": reason,
+            },
+            message=(
+                "Generating background for "
+                f"{len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}"
+            ),
+            force=True,
+        )
+        result = generate_background_for_frames(
+            frame_ids,
+            context=context,
+            payload_kind=str(payload.get("background_payload_kind", "original")),
+            encoding=str(payload.get("background_encoding", "zstd")),
+        )
+        progress.update(
+            0,
+            secondary={
+                "background_generation": "completed",
+                "background_payload_ref": result.get("background_payload_ref"),
+                "background_source_frame_count": result.get("frame_count"),
+                "updated_background_frame_count": result.get("updated_frame_count"),
+                "reason": reason,
+            },
+            message=(
+                "Generated background for "
+                f"{len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}"
+            ),
+            force=True,
+        )
+        return result
+
+    if background_correction and missing_background_frame_ids:
+        background_generation_result = generate_preprocess_background("missing_background_payload")
+
+    for index, frame_id in enumerate(frame_ids, start=1):
+        try:
+            frame = retrieve_frame(frame_id, context=context, payload_kind="original")
+        except KeyError:
+            if not background_correction or background_generation_result is not None:
+                raise
+            background_generation_result = generate_preprocess_background("background_retrieve_failed")
+            frame = retrieve_frame(frame_id, context=context, payload_kind="original")
         processed = preprocess_frame_for_segmentation(
             frame,
             flatfield_correction=flatfield_correction,
@@ -309,7 +454,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         secondary={"preprocessed_frames": len(stored_rows)},
         message=f"Preprocessed {len(stored_rows)} frame{'s' if len(stored_rows) != 1 else ''}",
     )
-    return {
+    result = {
         "stage": PipelineStage.PREPROCESS_FRAMES.value,
         "project_id": project_id,
         "run_id": resolved_run_id,
@@ -318,6 +463,9 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         "frame_ids": frame_ids,
         "preprocessed_frame_ids": [str(row.get("id")) for row in stored_rows],
     }
+    if background_generation_result is not None:
+        result["background_generation"] = background_generation_result
+    return result
 
 
 def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:

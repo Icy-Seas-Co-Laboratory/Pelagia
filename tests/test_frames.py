@@ -979,6 +979,66 @@ def test_ingest_video_file_writes_structured_log_events(monkeypatch):
     assert completed["payload"]["stored_tile_count"] == 1
 
 
+def test_ingest_video_file_emits_progress_callback(monkeypatch):
+    class FakeVideoCapture:
+        def __init__(self, path):
+            self.frames = [
+                np.zeros((2, 2), dtype=np.uint8),
+                np.ones((2, 2), dtype=np.uint8),
+                np.full((2, 2), 2, dtype=np.uint8),
+            ]
+            self.index = 0
+
+        def isOpened(self):
+            return self.index <= len(self.frames)
+
+        def get(self, prop):
+            if prop == ingest_module.cv2.CAP_PROP_FPS:
+                return 10.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_COUNT:
+                return 3.0
+            return 0.0
+
+        def read(self):
+            if self.index >= len(self.frames):
+                return False, None
+            frame = self.frames[self.index]
+            self.index += 1
+            return True, frame
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    ctx = FakeContext()
+    updates = []
+
+    ingest_video_file(
+        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        n_tile=2,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata={"kvstore_encoding": "raw"},
+        progress_callback=updates.append,
+    )
+
+    assert [update["event"] for update in updates] == [
+        "started",
+        "video_opened",
+        "tile_stored",
+        "tile_stored",
+        "completed",
+    ]
+    assert updates[1]["source_frame_count"] == 3
+    assert updates[1]["estimated_tile_count"] == 2
+    assert updates[2]["source_frames_read"] == 2
+    assert updates[2]["stored_tile_count"] == 1
+    assert updates[3]["partial_tile"] is True
+    assert updates[3]["source_frames_read"] == 3
+    assert updates[-1]["stored_tile_count"] == 2
+
+
 def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
     class FakeVideoCapture:
         def __init__(self, path):

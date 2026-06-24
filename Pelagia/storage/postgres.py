@@ -1739,7 +1739,10 @@ class PostgresRepository:
                     INSERT INTO {self.schema}.frames
                     (run_id, asset_id, frame_index, captured_at, width, height,
                      bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
-                     payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
+                     payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape,
+                     background_kvstore_hash, background_payload_ref, background_payload_encoding,
+                     background_payload_format, background_payload_dtype, background_payload_shape,
+                     background_metadata, metadata)
                     SELECT
                         source.run_id,
                         source.asset_id,
@@ -1758,6 +1761,13 @@ class PostgresRepository:
                         source.payload_format,
                         source.payload_dtype,
                         source.payload_shape,
+                        source.background_kvstore_hash,
+                        source.background_payload_ref,
+                        source.background_payload_encoding,
+                        source.background_payload_format,
+                        source.background_payload_dtype,
+                        source.background_payload_shape,
+                        source.background_metadata,
                         COALESCE(source.metadata, '{{}}'::jsonb) || %s::jsonb
                     FROM source, next_index
                     RETURNING *;

@@ -217,22 +217,17 @@ def apply_flatfield_correction(
     )
 
 
-def generate_background_for_frames(
+def build_background_payload_for_frames(
     frame_ids: list[str] | tuple[str, ...],
     *,
     context: AppContext | None = None,
     payload_kind: str = "original",
     encoding: str = "zstd",
 ) -> dict:
-    """
-    Build a mean background field from stored frames and assign it to those frames.
-
-    The generated field is stored once in the KVStore and the resulting payload ref
-    is written back to every frame row listed in ``frame_ids``.
-    """
+    """Build a mean background field from stored frames and store it in the KVStore."""
     resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
     if not resolved_frame_ids:
-        raise ValueError("generate_background_for_frames requires at least one frame_id.")
+        raise ValueError("Background generation requires at least one frame_id.")
 
     ctx = context
     if ctx is None:
@@ -283,25 +278,57 @@ def generate_background_for_frames(
         "dtype": str(background.dtype),
         "shape": list(background.shape),
     }
-    rows = ctx.repository.update_frame_background_payloads(
-        resolved_frame_ids,
-        project_id=getattr(ctx, "active_project_id", None),
-        kvstore_hash=kvstore_key,
-        payload_ref=kvstore_key,
-        payload_encoding=payload_encoding,
-        payload_format=payload_format,
-        payload_dtype=str(background.dtype),
-        payload_shape=list(background.shape),
-        metadata=json_ready(metadata),
-    )
     return {
         "background_payload_ref": kvstore_key,
         "background_payload_encoding": payload_encoding,
         "background_payload_format": payload_format,
         "background_payload_dtype": str(background.dtype),
         "background_payload_shape": list(background.shape),
+        "background_method": "mean",
+        "background_metadata": json_ready(metadata),
         "frame_ids": resolved_frame_ids,
         "frame_count": len(resolved_frame_ids),
-        "updated_frame_count": len(rows),
         "metadata": json_ready(metadata),
+    }
+
+
+def generate_background_for_frames(
+    frame_ids: list[str] | tuple[str, ...],
+    *,
+    context: AppContext | None = None,
+    payload_kind: str = "original",
+    encoding: str = "zstd",
+) -> dict:
+    """
+    Build a mean background field from stored frames and assign it to those frames.
+
+    The generated field is stored once in the KVStore and the resulting payload ref
+    is written back to every frame row listed in ``frame_ids``.
+    """
+    result = build_background_payload_for_frames(
+        frame_ids,
+        context=context,
+        payload_kind=payload_kind,
+        encoding=encoding,
+    )
+    resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
+    ctx = context
+    if ctx is None:
+        from .frame_store import default_context
+
+        ctx = default_context()
+    rows = ctx.repository.update_frame_background_payloads(
+        resolved_frame_ids,
+        project_id=getattr(ctx, "active_project_id", None),
+        kvstore_hash=str(result["background_payload_ref"]),
+        payload_ref=str(result["background_payload_ref"]),
+        payload_encoding=str(result["background_payload_encoding"]),
+        payload_format=str(result["background_payload_format"]),
+        payload_dtype=str(result["background_payload_dtype"]),
+        payload_shape=list(result["background_payload_shape"] or []),
+        metadata=dict(result["background_metadata"] or {}),
+    )
+    return {
+        **result,
+        "updated_frame_count": len(rows),
     }

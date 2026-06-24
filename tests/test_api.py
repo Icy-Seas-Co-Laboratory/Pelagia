@@ -131,6 +131,13 @@ class FakeRepository:
             "preprocessed_payload_ref": self.preprocessed_payload_ref,
             "preprocessed_kvstore_hash": self.preprocessed_payload_ref,
             "preprocessed_preview_thumbhash": b"def" if self.preprocessed_payload_ref else None,
+            "background_payload_ref": None,
+            "background_kvstore_hash": None,
+            "background_payload_encoding": None,
+            "background_payload_format": None,
+            "background_payload_dtype": None,
+            "background_payload_shape": [],
+            "background_metadata": {},
             "width": 10,
             "height": 10,
             "metadata": {"frame_id": frame_id},
@@ -157,6 +164,8 @@ class FakeRepository:
             preview_thumbhash=b"abc",
             preprocessed_payload_ref=self.preprocessed_payload_ref,
             preprocessed_kvstore_hash=self.preprocessed_payload_ref,
+            background_payload_ref=None,
+            background_kvstore_hash=None,
             metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": frame_id},
         )
 
@@ -198,10 +207,55 @@ class FakeRepository:
             "preprocessed_payload_ref": None,
             "preprocessed_kvstore_hash": None,
             "preprocessed_preview_thumbhash": None,
+            "background_payload_ref": source.background_payload_ref,
+            "background_kvstore_hash": source.background_kvstore_hash,
+            "background_payload_encoding": source.background_payload_encoding,
+            "background_payload_format": source.background_payload_format,
+            "background_payload_dtype": source.background_payload_dtype,
+            "background_payload_shape": list(source.background_payload_shape or []),
+            "background_metadata": dict(source.background_metadata or {}),
         }
         self.sandbox_frames[sandbox_id] = row
         self.resource_projects[sandbox_id] = self.resource_projects.get(frame_id, "project-1")
         return dict(row)
+
+    def update_frame_background_payloads(
+        self,
+        frame_ids,
+        *,
+        project_id=None,
+        kvstore_hash,
+        payload_ref,
+        payload_encoding,
+        payload_format,
+        payload_dtype,
+        payload_shape,
+        metadata=None,
+    ):
+        rows = []
+        for frame_id in frame_ids:
+            if not self._visible(frame_id, project_id):
+                raise KeyError(frame_id)
+            row = self.sandbox_frames.get(frame_id)
+            if row is None:
+                row = self.get_frame(frame_id, project_id=project_id)
+                if row is None:
+                    raise KeyError(frame_id)
+            row.update(
+                {
+                    "background_kvstore_hash": kvstore_hash,
+                    "background_payload_ref": payload_ref,
+                    "background_payload_encoding": payload_encoding,
+                    "background_payload_format": payload_format,
+                    "background_payload_dtype": payload_dtype,
+                    "background_payload_shape": list(payload_shape or []),
+                    "background_metadata": dict(metadata or {}),
+                }
+            )
+            if frame_id in self.sandbox_frames:
+                self.sandbox_frames[frame_id] = row
+            rows.append(dict(row))
+        return rows
 
     def count_frame_payload_references(self, payload_ref, *, exclude_frame_id=None):
         return 0
@@ -1547,6 +1601,19 @@ def test_api_preprocessing_options_are_ui_ready():
     assert flatfield_fields["flatfield_min_field_value"]["min"] == 0
     assert flatfield_fields["flatfield_max_field_value"]["type"] == "nullable-number"
     background_fields = {field["key"]: field for field in body["fields"]["background_correction"]}
+    assert background_fields["background_asset_id"]["type"] == "nullable-string"
+    assert background_fields["background_frame_ids"]["type"] == "string-list"
+    assert background_fields["background_start_frame"]["min"] == 0
+    assert background_fields["background_end_frame"]["min"] == 0
+    assert background_fields["background_limit"]["min"] == 1
+    assert sorted(background_fields["background_payload_kind"]["options"]) == [
+        "corrected",
+        "original",
+        "preprocessed",
+        "processed",
+        "raw",
+    ]
+    assert background_fields["background_encoding"]["default"] == "zstd"
     assert background_fields["background_min_field_value"]["min"] == 0
     assert background_fields["background_max_field_value"]["type"] == "nullable-number"
     recording_fields = {field["key"]: field for field in body["fields"]["recording"]}
@@ -3052,6 +3119,73 @@ def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):
     assert delete_response.json()["deleted_kvstore_keys"][0]["key"] == "new-preprocessed-key"
     assert kvstore.deleted_keys == ["new-preprocessed-key"]
     assert repository.deleted_sandbox_frames == ["live-frame-1"]
+
+
+def test_live_preprocess_can_generate_background_for_sandbox(monkeypatch):
+    client, repository, _ = make_client()
+    calls = []
+
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+        calls.append(("retrieve", frame_id, payload_kind))
+        return FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=2,
+            data=np.full((2, 2), 10, dtype=np.uint8),
+            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
+        )
+
+    def fake_build_background_payload_for_frames(frame_ids, **kwargs):
+        calls.append(("background", frame_ids, kwargs.get("payload_kind"), kwargs.get("encoding")))
+        return {
+            "background_payload_ref": "background-key",
+            "background_payload_encoding": "raw",
+            "background_payload_format": "raw_ndarray_c_order",
+            "background_payload_dtype": "float32",
+            "background_payload_shape": [2, 2],
+            "frame_ids": frame_ids,
+            "frame_count": len(frame_ids),
+            "updated_frame_count": len(frame_ids),
+        }
+
+    def fake_preprocess_frame(frame, **kwargs):
+        calls.append(("preprocess", kwargs.get("background_correction"), kwargs.get("background_min_field_value")))
+        return frame
+
+    def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
+        calls.append(("store", frame_id, kwargs.get("encoding")))
+        repository.sandbox_frames[frame_id]["preprocessed_payload_ref"] = "new-preprocessed-key"
+        repository.sandbox_frames[frame_id]["preprocessed_kvstore_hash"] = "new-preprocessed-key"
+        return {
+            "id": frame_id,
+            "asset_id": "asset-1",
+            "frame_index": -1,
+            "preprocessed_payload_ref": "new-preprocessed-key",
+            "preprocessed_kvstore_hash": "new-preprocessed-key",
+        }
+
+    monkeypatch.setattr("Pelagia.api.routes.live.retrieve_frame", fake_retrieve_frame)
+    monkeypatch.setattr("Pelagia.api.routes.live.build_background_payload_for_frames", fake_build_background_payload_for_frames)
+    monkeypatch.setattr("Pelagia.api.routes.live.preprocess_frame_for_segmentation", fake_preprocess_frame)
+    monkeypatch.setattr("Pelagia.api.routes.live.store_preprocessed_frame", fake_store_preprocessed_frame)
+
+    response = client.post(
+        "/live/preprocess"
+        "?frame_id=frame-1&asset_id=asset-1&start_frame=2&end_frame=5&limit=1"
+        "&background_encoding=raw&background_min_field_value=2"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["background_generation"]["background_payload_ref"] == "background-key"
+    assert body["background_generation"]["asset_id"] == "asset-1"
+    assert body["background_generation"]["start_frame"] == 2
+    assert body["background_generation"]["end_frame"] == 5
+    assert body["background_generation"]["limit"] == 1
+    assert repository.sandbox_frames["live-frame-1"]["background_payload_ref"] == "background-key"
+    assert repository.sandbox_frames["live-frame-1"]["background_payload_shape"] == [2, 2]
+    assert calls[0] == ("background", ["frame-1"], "original", "raw")
+    assert calls[2] == ("preprocess", True, 2.0)
 
 
 def test_live_preprocess_uuid_frame_requires_auth_with_cors(monkeypatch):

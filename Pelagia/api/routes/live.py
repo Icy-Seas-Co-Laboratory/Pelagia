@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, HTTPException, Query, Request
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -26,6 +26,7 @@ if APIRouter is not None:
     from ..auth import scoped_project_id
     from ...processing.detection_candidate import live_detection_candidate_wrapper, threshold_frame
     from ...processing.frame_codec import encode_array_payload
+    from ...processing.frame_correction import build_background_payload_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
     from ...processing.segmentation_options import (
@@ -108,6 +109,108 @@ if APIRouter is not None:
         except KeyError:
             return {"key": key, "deleted": False, "referenced": False, "missing": True}
 
+    def _merge_frame_id_lists(*values: list[str] | None) -> list[str]:
+        frame_ids: list[str] = []
+        for value in values:
+            if not value:
+                continue
+            frame_ids.extend(str(frame_id) for frame_id in value)
+        return list(dict.fromkeys(frame_ids))
+
+    def _has_background_source_selection(
+        *,
+        asset_id: str | None,
+        frame_ids: list[str],
+        start_frame: int | None,
+        end_frame: int | None,
+        limit: int | None,
+    ) -> bool:
+        return bool(asset_id or frame_ids or start_frame is not None or end_frame is not None or limit is not None)
+
+    def _resolve_live_background_frame_ids(
+        request: Request,
+        *,
+        target_frame_record: Any,
+        asset_id: str | None,
+        frame_ids: list[str],
+        start_frame: int | None,
+        end_frame: int | None,
+        limit: int | None,
+    ) -> tuple[str | None, list[str]]:
+        repository = get_repository(request)
+        project_id = scoped_project_id(request)
+        target = _as_record_dict(target_frame_record)
+        resolved_asset_id = asset_id
+        resolved_frame_ids = list(frame_ids)
+        if not resolved_frame_ids:
+            resolved_asset_id = resolved_asset_id or target.get("asset_id")
+            if resolved_asset_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Background generation requires background_asset_id/asset_id or background_frame_ids/frame_ids.",
+                )
+            frames = repository.list_frames(
+                resolved_asset_id,
+                project_id=project_id,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                limit=limit,
+            )
+            resolved_frame_ids = [str(frame["id"]) for frame in frames]
+
+        if not resolved_frame_ids:
+            raise HTTPException(status_code=422, detail="No background source frames were selected.")
+
+        for background_frame_id in resolved_frame_ids:
+            frame_record = repository.get_frame_record(background_frame_id, project_id=project_id)
+            if frame_record is None:
+                raise HTTPException(status_code=404, detail=f"Frame {background_frame_id!r} was not found.")
+            frame = _as_record_dict(frame_record)
+            if resolved_asset_id is None:
+                resolved_asset_id = frame.get("asset_id")
+            elif frame.get("asset_id") != resolved_asset_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Background generation may only use frames from one asset.",
+                )
+        return resolved_asset_id, resolved_frame_ids
+
+    def _assign_generated_background_to_frame(
+        repository,
+        frame_id: str,
+        *,
+        project_id: str,
+        result: dict[str, Any],
+        source_frame_ids: list[str],
+        payload_kind: str,
+    ) -> list[dict[str, Any]]:
+        payload_ref = str(result["background_payload_ref"])
+        metadata = {
+            "frame_variant": "background",
+            "background_method": result.get("background_method", "mean"),
+            "background_source_payload_kind": payload_kind,
+            "background_source_frame_ids": source_frame_ids,
+            "background_source_frame_count": len(source_frame_ids),
+            "kvstore_key": payload_ref,
+            "kvstore_hash": payload_ref,
+            "kvstore_encoding": result.get("background_payload_encoding"),
+            "kvstore_format": result.get("background_payload_format"),
+            "dtype": result.get("background_payload_dtype"),
+            "shape": result.get("background_payload_shape") or [],
+            "live_preprocess": True,
+        }
+        return repository.update_frame_background_payloads(
+            [frame_id],
+            project_id=project_id,
+            kvstore_hash=payload_ref,
+            payload_ref=payload_ref,
+            payload_encoding=str(result["background_payload_encoding"]),
+            payload_format=str(result["background_payload_format"]),
+            payload_dtype=str(result["background_payload_dtype"]),
+            payload_shape=list(result["background_payload_shape"] or []),
+            metadata=metadata,
+        )
+
     @router.get("/files")
     def list_server_files(
         directory: str,
@@ -153,6 +256,11 @@ if APIRouter is not None:
         request: Request,
         frame_id: str,
         encoding: str | None = None,
+        asset_id: str | None = None,
+        frame_ids: list[str] | None = Query(default=None),
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int | None = None,
         flatfield_correction: bool | None = None,
         flatfield_q: float | None = None,
         flatfield_axis: int | None = None,
@@ -167,6 +275,13 @@ if APIRouter is not None:
         background_correction: bool | None = None,
         background_min_field_value: int | float | None = None,
         background_max_field_value: int | float | None = None,
+        background_asset_id: str | None = None,
+        background_frame_ids: list[str] | None = Query(default=None),
+        background_start_frame: int | None = None,
+        background_end_frame: int | None = None,
+        background_limit: int | None = None,
+        background_payload_kind: str = "original",
+        background_encoding: str = "zstd",
         invert_intensity: bool | None = None,
     ) -> dict:
         project_id = scoped_project_id(request)
@@ -187,7 +302,55 @@ if APIRouter is not None:
             sandbox_row.get("preprocessed_payload_ref")
             or sandbox_row.get("preprocessed_kvstore_hash")
         )
+        merged_background_frame_ids = _merge_frame_id_lists(frame_ids, background_frame_ids)
+        resolved_background_asset_id = background_asset_id or asset_id
+        resolved_background_start_frame = background_start_frame if background_start_frame is not None else start_frame
+        resolved_background_end_frame = background_end_frame if background_end_frame is not None else end_frame
+        resolved_background_limit = background_limit if background_limit is not None else limit
+        background_generation = None
+        background_source_selected = _has_background_source_selection(
+            asset_id=resolved_background_asset_id,
+            frame_ids=merged_background_frame_ids,
+            start_frame=resolved_background_start_frame,
+            end_frame=resolved_background_end_frame,
+            limit=resolved_background_limit,
+        )
         try:
+            if background_source_selected:
+                source_asset_id, background_source_frame_ids = _resolve_live_background_frame_ids(
+                    request,
+                    target_frame_record=frame_record,
+                    asset_id=resolved_background_asset_id,
+                    frame_ids=merged_background_frame_ids,
+                    start_frame=resolved_background_start_frame,
+                    end_frame=resolved_background_end_frame,
+                    limit=resolved_background_limit,
+                )
+                background_generation = build_background_payload_for_frames(
+                    background_source_frame_ids,
+                    context=context,
+                    payload_kind=background_payload_kind,
+                    encoding=background_encoding,
+                )
+                _assign_generated_background_to_frame(
+                    repository,
+                    sandbox_frame_id,
+                    project_id=project_id,
+                    result=background_generation,
+                    source_frame_ids=background_source_frame_ids,
+                    payload_kind=background_payload_kind,
+                )
+                background_generation = {
+                    **background_generation,
+                    "asset_id": source_asset_id,
+                    "start_frame": resolved_background_start_frame,
+                    "end_frame": resolved_background_end_frame,
+                    "limit": resolved_background_limit,
+                    "payload_kind": background_payload_kind,
+                    "encoding": background_encoding,
+                }
+                if background_correction is None:
+                    background_correction = True
             source_frame = retrieve_frame(sandbox_frame_id, context=context, payload_kind="original")
             processed = preprocess_frame_for_segmentation(
                 source_frame,
@@ -250,6 +413,7 @@ if APIRouter is not None:
                 "old_preprocessed_deleted": deleted_old,
                 "old_preprocessed_missing": old_missing,
                 "old_preprocessed_referenced": old_referenced,
+                "background_generation": background_generation,
                 "preprocessing": processed.metadata,
                 "frame": frame_summary(stored_row),
             }
