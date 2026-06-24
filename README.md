@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/pelagia_logo.jpeg" alt="Pelagia" width="520">
+  <img src="docs/assets/pelagia_logo.png" alt="Pelagia" width="520">
 </p>
 
 # Pelagia
@@ -17,6 +17,11 @@ Pelagia is designed for workflows where full source frames are large and mostly 
 Pelagia is split into a Python backend (`Pelagia`) and an optional SvelteKit
 frontend (`PelagiaView`). The backend owns storage, processing, the job queue,
 workers, and the HTTP API. PelagiaView connects to that API from a browser.
+
+For operational procedures after installation, see the
+[End-User Operations Guide](docs/end-user-support.md). It links the reset,
+migration, KVStore migration, backup, and restore procedures that keep the
+database and blob storage in sync.
 
 ### Prerequisites
 
@@ -388,6 +393,13 @@ Model and plugin artifacts are split between packaged assets under
 `Pelagia/assets/` and a local runtime library under `./.pelagia/`. See
 [docs/artifacts.md](docs/artifacts.md) for the manifest layout and discovery
 rules.
+
+For storage maintenance, migration, and recovery procedures, use:
+
+- [End-User Operations Guide](docs/end-user-support.md)
+- [Resetting Pelagia](docs/reset-system.md)
+- [Migrating Pelagia](docs/migration.md)
+- [Backup And Restore](docs/backup.md)
 
 ## Python Environment
 
