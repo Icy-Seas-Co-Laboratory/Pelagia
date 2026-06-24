@@ -26,6 +26,9 @@ PELAGIA_API_ENABLED=true
 PELAGIA_API_HOST="0.0.0.0"
 PELAGIA_API_PORT="8000"
 PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX=""
+PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE=""
+PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR=""
+PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS=""
 PELAGIA_INIT_ON_START=""
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS=""
 WORKER_ROWS=()
@@ -42,6 +45,9 @@ load_stack_config() {
                     database_dsn) PELAGIA_DATABASE_DSN="$value" ;;
                     database_schema) PELAGIA_DATABASE_SCHEMA="$value" ;;
                     kvstore_root) PELAGIA_KVSTORE_ROOT="$value" ;;
+                    file_browser_root_path_kvstore) PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE="$value" ;;
+                    file_browser_root_path_import_dir) PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR="$value" ;;
+                    file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
                     api_enabled) PELAGIA_API_ENABLED="$value" ;;
                     api_host) PELAGIA_API_HOST="$value" ;;
                     api_port) PELAGIA_API_PORT="$value" ;;
@@ -135,6 +141,7 @@ stage_aliases = {
 stack = section("stack")
 database = section("database")
 kvstore = section("kvstore")
+file_browser = section("file_browser")
 api = section("api")
 worker_defaults = section("worker_defaults")
 
@@ -143,6 +150,22 @@ run_dir = path_value(
     stack.get("run_dir", os.environ.get("PELAGIA_RUN_DIR")),
     root_dir / ".pelagia" / "run" / stack_name,
 )
+kvstore_root = path_value(
+    kvstore.get("root"),
+    Path(os.environ.get("PELAGIA_KVSTORE_ROOT", root_dir / "data" / "kvstore")),
+)
+
+
+def path_list_value(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise SystemExit("[file_browser].allowed_root_paths must be a list or comma-separated string")
+    return ",".join(path_value(item, root_dir) for item in items)
 
 config_rows = {
     "stack_name": stack_name,
@@ -152,7 +175,19 @@ config_rows = {
         os.environ.get("PELAGIA_DATABASE_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"),
     ),
     "database_schema": scalar(database.get("schema"), os.environ.get("PELAGIA_DATABASE_SCHEMA", "pelagia")),
-    "kvstore_root": path_value(kvstore.get("root"), Path(os.environ.get("PELAGIA_KVSTORE_ROOT", root_dir / "data" / "kvstore"))),
+    "kvstore_root": kvstore_root,
+    "file_browser_root_path_kvstore": path_value(
+        file_browser.get("root_path_kvstore"),
+        Path(os.environ.get("PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", kvstore_root)),
+    ),
+    "file_browser_root_path_import_dir": path_value(
+        file_browser.get("root_path_import_dir"),
+        Path(os.environ.get("PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", root_dir / "data" / "import")),
+    ),
+    "file_browser_allowed_root_paths": path_list_value(
+        file_browser.get("allowed_root_paths"),
+        os.environ.get("PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", ""),
+    ),
     "api_enabled": bool_text(api.get("enabled", True)),
     "api_host": scalar(api.get("host"), os.environ.get("PELAGIA_API_HOST", "127.0.0.1")),
     "api_port": scalar(api.get("port"), os.environ.get("PELAGIA_API_PORT", "8000")),
@@ -373,6 +408,9 @@ start_stack() {
     export PELAGIA_DATABASE_DSN
     export PELAGIA_DATABASE_SCHEMA
     export PELAGIA_KVSTORE_ROOT
+    export PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE
+    export PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR
+    export PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS
     if [[ -n "$PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX" ]]; then
         export PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX
     fi

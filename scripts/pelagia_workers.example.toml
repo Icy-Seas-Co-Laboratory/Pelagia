@@ -14,6 +14,13 @@ schema = "pelagia"
 [kvstore]
 root = "./data/kvstore"
 
+[file_browser]
+# Server-side roots exposed by GET /live/files.
+# Relative paths are resolved from the Pelagia repository root.
+root_path_kvstore = "./data/kvstore"
+root_path_import_dir = "./data/import"
+allowed_root_paths = []
+
 [api]
 enabled = true
 host = "127.0.0.1"

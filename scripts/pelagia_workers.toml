@@ -14,6 +14,11 @@ schema = "pelagia"
 [kvstore]
 root = "./data/kvstore"
 
+[file_browser]
+root_path_kvstore = "./data/kvstore"
+root_path_import_dir = "./data/import"
+allowed_root_paths = []
+
 [api]
 enabled = true
 host = "0.0.0.0"

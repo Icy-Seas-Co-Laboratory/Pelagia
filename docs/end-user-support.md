@@ -95,6 +95,17 @@ PELAGIA_AUTH_SESSION_TTL_SECONDS
 PELAGIA_AUTH_DEV_PROJECT_KEY
 ```
 
+If you start Pelagia with `scripts/pelagia_stack_from_toml.sh`, the stack TOML
+can also include a `[file_browser]` section. The launcher translates those
+values into the `PELAGIA_FILE_BROWSER_*` environment variables used by the API:
+
+```toml
+[file_browser]
+root_path_kvstore = "/storage/kvstore"
+root_path_import_dir = "/storage"
+allowed_root_paths = ["/scratch", "/storage"]
+```
+
 ## Storage Layout
 
 The default local development layout is:
