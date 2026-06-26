@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import io
+import sqlite3
+import zipfile
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -17,6 +21,7 @@ from Pelagia.domain import FrameRecord, PipelineStage
 from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.services.context import AppContext
+from Pelagia.services.io_exports import ExportPayload, _sqlite_bytes, _xlsx_bytes
 
 
 class FakeRepository:
@@ -933,6 +938,99 @@ def auth_headers(client, *, username="ada", project_key="default"):
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+def test_io_export_options_are_discoverable():
+    client, _, _ = make_client()
+
+    response = client.get("/io/export/options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "sqlite" in body["formats"]
+    assert "xlsx" in body["formats"]
+    assert "runs" in body["tables"]
+    assert "users" in body["tables"]
+    assert "frame_metadata" in body["datasets"]
+    assert body["endpoints"]["table"] == "/io/export/table/{table_name}"
+
+
+def test_io_table_export_requires_admin_for_auth_tables():
+    client, _, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    response = client.get("/io/export/table/users", headers=headers)
+
+    assert response.status_code == 403
+    assert "Admin permission" in response.json()["detail"]
+
+
+def test_io_table_export_routes_to_export_service(monkeypatch):
+    calls = []
+
+    class FakeExportService:
+        def __init__(self, repository):
+            self.repository = repository
+
+        def table_export(self, tables, *, file_format, project_id, include_all_projects, filters):
+            calls.append(
+                {
+                    "tables": tables,
+                    "file_format": file_format,
+                    "project_id": project_id,
+                    "include_all_projects": include_all_projects,
+                    "filters": filters,
+                }
+            )
+            return ExportPayload(
+                filename="runs.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                content=b"export-bytes",
+                row_counts={"runs": 2},
+            )
+
+    monkeypatch.setattr("Pelagia.api.routes.io.ExportService", FakeExportService)
+    client, _, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    response = client.get(
+        "/io/export/table/runs",
+        headers=headers,
+        params={"format": "xlsx", "collection": "test", "limit": 50},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"export-bytes"
+    assert response.headers["content-disposition"] == 'attachment; filename="runs.xlsx"'
+    assert response.headers["x-pelagia-export-rows"] == '{"runs": 2}'
+    assert calls == [
+        {
+            "tables": ["runs"],
+            "file_format": "xlsx",
+            "project_id": "project-1",
+            "include_all_projects": False,
+            "filters": {"collection": "test", "active_only": False, "limit": 50, "offset": 0},
+        }
+    ]
+
+
+def test_io_export_writers_create_sqlite_and_xlsx_files(tmp_path):
+    rows = [{"id": "run-1", "count": 2, "metadata": {"ok": True}}]
+
+    sqlite_payload = _sqlite_bytes({"runs": rows})
+    sqlite_path = tmp_path / "export.sqlite"
+    sqlite_path.write_bytes(sqlite_payload)
+    connection = sqlite3.connect(sqlite_path)
+    try:
+        assert connection.execute("SELECT id, count FROM runs").fetchone() == ("run-1", 2)
+    finally:
+        connection.close()
+
+    xlsx_payload = _xlsx_bytes({"runs": rows})
+    assert xlsx_payload.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(xlsx_payload)) as archive:
+        assert "xl/workbook.xml" in archive.namelist()
+        assert "xl/worksheets/sheet1.xml" in archive.namelist()
+
+
 def test_api_lists_system_status_without_live_database():
     client, _, _ = make_client()
 
@@ -1800,6 +1898,29 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert threshold_body["mask"]["foreground_pixels"] == 12
     assert threshold_body["mask"]["mask_encoding"] == "png"
     assert threshold_body["resolved_options"]["thresholding"]["threshold_method"] == "manual"
+    assert threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == []
+
+    augmented_threshold_response = client.get(
+        "/live/threshold",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "apply_preprocessing": False,
+            "mask_augmentation_steps": "dilate",
+            "dilate_iterations": 1,
+        },
+    )
+
+    assert augmented_threshold_response.status_code == 200
+    augmented_threshold_body = augmented_threshold_response.json()
+    assert augmented_threshold_body["sandbox_frame_id"] == "live-frame-2"
+    assert augmented_threshold_body["mask"]["kind"] == "augmented"
+    assert augmented_threshold_body["mask"]["threshold_foreground_pixels"] == 12
+    assert augmented_threshold_body["mask"]["foreground_pixels"] == 30
+    assert augmented_threshold_body["stage_counts"]["threshold_foreground_pixels"] == 12
+    assert augmented_threshold_body["stage_counts"]["augmented_foreground_pixels"] == 30
+    assert augmented_threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_enabled"] is True
+    assert augmented_threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == ["dilate"]
 
     response = client.get(
         "/live/detection-candidate",
@@ -1817,7 +1938,7 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert body["saved"] is False
     assert body["sandboxed"] is True
     assert body["source_frame_id"] == "frame-1"
-    assert body["sandbox_frame_id"] == "live-frame-2"
+    assert body["sandbox_frame_id"] == "live-frame-3"
     assert body["candidate_detection_count"] == 1
     assert body["detection_count"] == 1
     detection = body["candidate_detections"][0]
@@ -1833,6 +1954,30 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == []
     assert body["stage_counts"]["recorded_detection_count"] == 1
     assert "roi_assembly" in body["stage_durations_ms"]
+
+    augmented_response = client.get(
+        "/live/detection-candidate",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "apply_preprocessing": False,
+            "mask_augmentation_steps": "dilate",
+            "dilate_iterations": 1,
+            "min_perimeter": 0,
+            "padding": 0,
+        },
+    )
+
+    assert augmented_response.status_code == 200
+    augmented_body = augmented_response.json()
+    assert augmented_body["sandbox_frame_id"] == "live-frame-4"
+    assert augmented_body["stage_counts"]["threshold_foreground_pixels"] == 12
+    assert augmented_body["stage_counts"]["augmented_foreground_pixels"] == 30
+    augmented_detection = augmented_body["candidate_detections"][0]
+    assert augmented_detection["bbox_x"] == 2
+    assert augmented_detection["bbox_y"] == 1
+    assert augmented_detection["bbox_w"] == 6
+    assert augmented_detection["bbox_h"] == 5
 
     removed = client.get("/live/segmentation", params={"frame_id": "frame-1"})
     assert removed.status_code == 404
@@ -2183,6 +2328,7 @@ def test_api_validate_segmentation_resolves_without_queueing():
     assert body["valid"] is True
     assert body["payload"]["threshold_method"] == "adaptive_mean"
     assert body["payload"]["mask_augmentation_steps"] == ["open", "fill_holes"]
+    assert body["resolved_options"]["mask_augmentation"]["mask_augmentation_enabled"] is True
     assert body["resolved_options"]["mask_augmentation"]["open_iterations"] == 2
     assert repository.created_jobs == []
 

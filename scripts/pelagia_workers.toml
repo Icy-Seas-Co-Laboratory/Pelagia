@@ -31,49 +31,57 @@ idle_sleep_seconds = 2.0
 requeue_interval_seconds = 30.0
 
 [[worker]]
-name = "general-1"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
-
-[[worker]]
-name = "general-2"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
-
-[[worker]]
-name = "general-3"
+name = "fio-1"
 capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-4"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "fio-2"
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-5"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "fio-3"
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-6"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "fio-4"
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-7"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "fio-5"
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-8"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "fio-6"
+capabilities = ["ingest", "background", "preprocess", "segment"]
 
 [[worker]]
-name = "general-9"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "cpu-1"
+capabilities = ["segment"]
 
 [[worker]]
-name = "general-10"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "cpu-2"
+capabilities = ["segment"]
 
 [[worker]]
-name = "general-11"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "cpu-3"
+capabilities = ["segment"]
 
 [[worker]]
-name = "general-12"
-capabilities = ["ingest", "preprocess", "segment"]
+name = "cpu-4"
+capabilities = ["segment"]
+
+[[worker]]
+name = "cpu-5"
+capabilities = ["segment"]
+
+[[worker]]
+name = "cpu-6"
+capabilities = ["segment"]
+
+[[worker]]
+name = "gpu-1"
+capabilities = ["roi_refinement"]
+
+[[worker]]
+name = "gpu-2"
+capabilities = ["roi_refinement"]

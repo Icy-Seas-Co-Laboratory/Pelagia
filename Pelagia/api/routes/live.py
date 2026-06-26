@@ -45,6 +45,7 @@ if APIRouter is not None:
     from ...processing.frame_correction import build_background_payload_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
+    from ...processing.mask_augmentation import augment_mask
     from ...processing.segmentation_options import (
         flatten_segmentation_options,
         resolve_segmentation_options,
@@ -104,6 +105,38 @@ if APIRouter is not None:
             kwargs.update(resolved_options.get(group, {}))
         kwargs.pop("frame_payload_kind", None)
         return kwargs
+
+    def _augment_mask_from_options(mask, resolved_options: dict[str, dict[str, Any]]):
+        options = resolved_options.get("mask_augmentation", {})
+        return augment_mask(
+            mask,
+            enabled=bool(options.get("mask_augmentation_enabled", False)),
+            steps=options.get("mask_augmentation_steps", []),
+            dilate_kernel_size=(
+                int(options.get("dilate_kernel_w", 3)),
+                int(options.get("dilate_kernel_h", 3)),
+            ),
+            dilate_iterations=int(options.get("dilate_iterations", 1)),
+            erode_kernel_size=(
+                int(options.get("erode_kernel_w", 3)),
+                int(options.get("erode_kernel_h", 3)),
+            ),
+            erode_iterations=int(options.get("erode_iterations", 1)),
+            open_kernel_size=(
+                int(options.get("open_kernel_w", 3)),
+                int(options.get("open_kernel_h", 3)),
+            ),
+            open_iterations=int(options.get("open_iterations", 1)),
+            close_kernel_size=(
+                int(options.get("close_kernel_w", 3)),
+                int(options.get("close_kernel_h", 3)),
+            ),
+            close_iterations=int(options.get("close_iterations", 1)),
+            fill_holes=bool(options.get("fill_holes", False)),
+            remove_small_components=bool(options.get("remove_small_components", False)),
+            min_component_area=float(options.get("min_component_area", 1)),
+            clear_border=bool(options.get("clear_border", False)),
+        )
 
     def _as_record_dict(record: Any) -> dict[str, Any]:
         if record is None:
@@ -569,6 +602,8 @@ if APIRouter is not None:
         background_min_field_value: int | float | None = None,
         background_max_field_value: int | float | None = None,
         invert_intensity: bool | None = None,
+        mask_augmentation_enabled: bool | None = None,
+        mask_augmentation_steps: list[str] | None = Query(default=None),
         include_mask_payload: bool = False,
         mask_encoding: str = "png",
     ) -> dict:
@@ -597,6 +632,22 @@ if APIRouter is not None:
             "canny_low_threshold",
             "canny_high_threshold",
             "canny_blur_kernel",
+            "dilate_kernel_w",
+            "dilate_kernel_h",
+            "dilate_iterations",
+            "erode_kernel_w",
+            "erode_kernel_h",
+            "erode_iterations",
+            "open_kernel_w",
+            "open_kernel_h",
+            "open_iterations",
+            "close_kernel_w",
+            "close_kernel_h",
+            "close_iterations",
+            "fill_holes",
+            "remove_small_components",
+            "min_component_area",
+            "clear_border",
             "adaptive_block_size",
             "adaptive_c",
             "percentile_background_percentile",
@@ -624,6 +675,8 @@ if APIRouter is not None:
             "background_min_field_value",
             "background_max_field_value",
             "invert_intensity",
+            "mask_augmentation_enabled",
+            "mask_augmentation_steps",
         ]
         try:
             resolved_options = resolve_segmentation_options(
@@ -646,6 +699,10 @@ if APIRouter is not None:
                 **_threshold_kwargs(resolved_options),
                 context=context,
             )
+            augmented_mask = _augment_mask_from_options(
+                result.threshold_mask,
+                resolved_options,
+            )
         except HTTPException:
             raise
         except ValueError as exc:
@@ -653,7 +710,9 @@ if APIRouter is not None:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        mask = result.threshold_mask
+        threshold_mask = result.threshold_mask
+        mask = augmented_mask
+        threshold_foreground_pixels = int((threshold_mask > 0).sum())
         foreground_pixels = int((mask > 0).sum())
         mask_payload: dict[str, Any] = {}
         if include_mask_payload:
@@ -682,12 +741,19 @@ if APIRouter is not None:
                 "apply_preprocessing": flat_options["apply_preprocessing"],
                 "resolved_options": resolved_options,
                 "processed_frame_shape": result.metadata.get("processed_frame_shape"),
-                "stage_counts": result.metadata.get("stage_counts"),
+                "stage_counts": {
+                    **dict(result.metadata.get("stage_counts") or {}),
+                    "threshold_foreground_pixels": threshold_foreground_pixels,
+                    "augmented_foreground_pixels": foreground_pixels,
+                },
                 "stage_durations_ms": result.metadata.get("stage_durations_ms"),
                 "mask": {
                     "shape": list(mask.shape),
                     "dtype": str(mask.dtype),
+                    "kind": "augmented",
+                    "threshold_foreground_pixels": threshold_foreground_pixels,
                     "foreground_pixels": foreground_pixels,
+                    "augmented_foreground_pixels": foreground_pixels,
                     "foreground_fraction": (
                         foreground_pixels / float(mask.size) if mask.size else 0.0
                     ),
@@ -755,7 +821,7 @@ if APIRouter is not None:
         background_max_field_value: int | float | None = None,
         invert_intensity: bool | None = None,
         mask_augmentation_enabled: bool | None = None,
-        mask_augmentation_steps: list[str] | None = None,
+        mask_augmentation_steps: list[str] | None = Query(default=None),
         roi_assembly_method: str | None = None,
         roi_assembly_connectivity: int | None = None,
         min_area: int | float | None = None,

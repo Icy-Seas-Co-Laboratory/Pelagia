@@ -72,7 +72,13 @@ def resolve_segmentation_options(
         field_name="threshold_method",
     )
     mask_steps_default = [] if explicit_manual_threshold else mask.steps
+    explicit_mask_steps = "mask_augmentation_steps" in values
     mask_steps = _normalize_steps(_get(values, "mask_augmentation_steps", mask_steps_default))
+    mask_augmentation_enabled_default = (
+        bool(mask_steps)
+        if explicit_mask_steps
+        else mask.enabled
+    )
 
     resolved = {
         "source": {
@@ -192,7 +198,7 @@ def resolve_segmentation_options(
         },
         "mask_augmentation": {
             "mask_augmentation_enabled": bool(
-                _get(values, "mask_augmentation_enabled", mask.enabled)
+                _get(values, "mask_augmentation_enabled", mask_augmentation_enabled_default)
             ),
             "mask_augmentation_steps": mask_steps,
             "dilate_kernel_w": int(_get(values, "dilate_kernel_w", mask.dilate_kernel_w)),

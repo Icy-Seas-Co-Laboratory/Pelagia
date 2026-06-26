@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_MAX_DB_BYTES = 4 * 1024 * 1024 * 1024
+DEFAULT_MAX_DB_BYTES = 32 * 1024 * 1024 * 1024
 DEFAULT_MAX_ROWS = 1_000_000
 CONFIG_FILENAME = "config.json"
 LOCK_FILENAME = ".kvstore.lock"
@@ -606,8 +606,10 @@ class KVStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(db_path)
         connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA auto_vacuum = NONE")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA page_size = 16384")
         return connection
 
     def _create_schema(self, db_path: Path) -> None:

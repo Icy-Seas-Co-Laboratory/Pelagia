@@ -368,6 +368,9 @@ Useful endpoint groups:
 - `GET /frames/{frame_id}/context`
 - `GET /detections`, `/detections/{detection_id}/framedata`, `/mask`, `/refined-roi`, `/refined-mask`
 - `GET /logs`
+- `GET /io/export/options`
+- `GET /io/export/table/{table_name}`, `GET /io/export/tables`
+- `GET /io/export/datasets/frame-metadata`, `/roi-metadata`
 
 General list endpoints are intentionally shaped as limited searches. For example,
 `GET /assets` does not require a run id and can be narrowed with filters such as
