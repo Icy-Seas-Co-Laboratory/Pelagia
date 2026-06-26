@@ -1196,10 +1196,11 @@ def test_api_auth_login_me_projects_and_logout():
     assert client.get("/auth/me", headers=headers).status_code == 401
 
 
-def test_api_admin_can_create_project_and_non_admin_cannot():
+def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
     client, repo, _ = make_client()
     user_headers = auth_headers(client, username="ada", project_key="default")
     admin_headers = auth_headers(client, username="admin", project_key="default")
+    project_kvstore_root = tmp_path / "survey-kvstore"
 
     denied = client.post(
         "/projects",
@@ -1213,7 +1214,7 @@ def test_api_admin_can_create_project_and_non_admin_cannot():
             "project_key": "survey",
             "project_name": "Survey",
             "description": "Field survey data.",
-            "kvstore_root_path": "/tmp/pelagia/survey",
+            "kvstore_root_path": str(project_kvstore_root),
         },
     )
     duplicate = client.post(
@@ -1227,8 +1228,11 @@ def test_api_admin_can_create_project_and_non_admin_cannot():
     body = created.json()
     assert body["project"]["project_key"] == "survey"
     assert body["project"]["project_name"] == "Survey"
-    assert body["project"]["kvstore_root_path"] == "/tmp/pelagia/survey"
+    assert body["project"]["kvstore_root_path"] == str(project_kvstore_root)
     assert body["membership"]["role"] == "admin"
+    assert body["kvstore"]["initialized"] is True
+    assert body["kvstore"]["root_path"] == str(project_kvstore_root.resolve(strict=False))
+    assert (project_kvstore_root / "config.json").exists()
     assert repo.memberships[("user-admin", body["project"]["id"])] == "admin"
     assert duplicate.status_code == 409
 

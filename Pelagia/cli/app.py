@@ -13,6 +13,7 @@ from ..config import CoreConfig
 from ..domain import AssetKind, JobStatus, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
 from ..observability import configure_core_logging
 from ..services.context import AppContext
+from ..services.projects import initialize_project_kvstore
 from ..services.stores import StoreService
 from ..utils.serialization import json_ready
 
@@ -504,7 +505,8 @@ if typer is not None:
             kvstore_root_path=None if kvstore_root_path is None else str(kvstore_root_path),
             is_active=not inactive,
         )
-        _echo_json({"project": project})
+        kvstore = initialize_project_kvstore(context, project)
+        _echo_json({"project": project, "kvstore": kvstore})
 
     @app.command("add-project-user")
     def add_project_user(
@@ -579,11 +581,13 @@ if typer is not None:
                 is_admin=True,
             )
         project = context.repository.get_project_by_key(resolved_project_key)
+        project_kvstore = None
         if project is None:
             project = context.repository.create_project(
                 resolved_project_key,
                 project_name=project_name or resolved_project_key.title(),
             )
+            project_kvstore = initialize_project_kvstore(context, project)
         membership = context.repository.add_project_member(str(user["id"]), str(project["id"]), role=role)
         session = context.repository.create_session(
             str(user["id"]),
@@ -597,6 +601,7 @@ if typer is not None:
                 "password": resolved_password if user_created else None,
                 "password_applied": user_created,
                 "project": project,
+                "kvstore": project_kvstore,
                 "membership": membership,
                 "token": session["token"],
                 "session": session,

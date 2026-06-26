@@ -12,8 +12,9 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ..auth import MANAGE_ROLES, bearer_token, require_auth
+    from ...services.projects import initialize_project_kvstore
     from ...storage.postgres import DEFAULT_PROJECT_ID, PROJECT_ROLES
-    from ._common import as_response, get_repository
+    from ._common import as_response, get_context, get_repository
 
     class LoginRequest(BaseModel):
         username: str
@@ -283,7 +284,8 @@ if APIRouter is not None:
         membership = None
         if user is not None:
             membership = repository.add_project_member(auth.user_id, str(project["id"]), role="admin")
-        return as_response({"project": project, "membership": membership})
+        kvstore = initialize_project_kvstore(get_context(request), project)
+        return as_response({"project": project, "membership": membership, "kvstore": kvstore})
 
     @projects_router.delete("/{project_id}")
     def delete_project(request: Request, project_id: str) -> dict:

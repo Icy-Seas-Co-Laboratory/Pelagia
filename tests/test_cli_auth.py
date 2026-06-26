@@ -58,6 +58,10 @@ class _FakeRepository:
         project = self.projects_by_key.get(project_key)
         return None if project is None else dict(project)
 
+    def get_project(self, project_id):
+        project = self.projects_by_id.get(project_id)
+        return None if project is None else dict(project)
+
     def add_project_member(self, user_id, project_id, *, role):
         membership = {"user_id": user_id, "project_id": project_id, "role": role}
         self.memberships[(user_id, project_id)] = membership
@@ -102,6 +106,14 @@ def _install_fake_context(monkeypatch):
     repo = _FakeRepository()
     context = AppContext(config=config, repository=repo, kvstore=_FakeKVStore())
     monkeypatch.setattr(cli_module, "_context_from_options", lambda *args, **kwargs: context)
+    monkeypatch.setattr(
+        cli_module,
+        "initialize_project_kvstore",
+        lambda context, project: {
+            "initialized": True,
+            "root_path": f"/tmp/pelagia-kv/projects/{project['id']}",
+        },
+    )
     return repo
 
 
@@ -130,6 +142,8 @@ def test_cli_create_dev_login_bootstraps_user_project_and_session(monkeypatch):
     assert body["password"] == "secret"
     assert body["password_applied"] is True
     assert body["project"]["project_key"] == "reef"
+    assert body["kvstore"]["initialized"] is True
+    assert body["kvstore"]["root_path"] == "/tmp/pelagia-kv/projects/project-1"
     assert body["token"] == "token-1"
     assert repo.memberships[("user-1", "project-1")]["role"] == "admin"
     assert repo.sessions["token-1"]["ttl_seconds"] == 120
@@ -166,7 +180,10 @@ def test_cli_create_project_user_membership_and_list(monkeypatch):
     runner = CliRunner()
 
     assert runner.invoke(cli_module.app, ["create-user", "ben", "--password", "secret"]).exit_code == 0
-    assert runner.invoke(cli_module.app, ["create-project", "survey", "--project-name", "Survey"]).exit_code == 0
+    create_project = runner.invoke(cli_module.app, ["create-project", "survey", "--project-name", "Survey"])
+    assert create_project.exit_code == 0
+    created_project = json.loads(create_project.output)
+    assert created_project["kvstore"]["initialized"] is True
     assert runner.invoke(cli_module.app, ["add-project-user", "ben", "survey", "--role", "viewer"]).exit_code == 0
     result = runner.invoke(cli_module.app, ["list-projects", "--username", "ben"])
 
