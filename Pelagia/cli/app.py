@@ -15,6 +15,7 @@ from ..observability import configure_core_logging
 from ..services.context import AppContext
 from ..services.projects import initialize_project_kvstore
 from ..services.stores import StoreService
+from ..storage.blob_store import initialize_kvstore, reset_kvstore
 from ..utils.serialization import json_ready
 
 
@@ -69,12 +70,7 @@ if typer is not None:
         configure_core_logging(config)
         context = AppContext.from_config(config)
         if context.kvstore is not None and not context.kvstore.initialized:
-            context.kvstore.initialize(
-                hash_algorithm=config.kvstore.hash_algorithm,
-                prefix_length=config.kvstore.prefix_length,
-                max_db_bytes=config.kvstore.max_db_bytes,
-                max_rows=config.kvstore.max_rows,
-            )
+            initialize_kvstore(context.kvstore, config.kvstore)
         if initialize_schema and context.repository is not None:
             context.repository.initialize_schema()
         return context
@@ -1313,12 +1309,7 @@ if typer is not None:
 
         context.repository.initialize_schema()
         database_result = context.repository.purge_all()
-        kvstore_result = context.kvstore.reset(
-            hash_algorithm=config.kvstore.hash_algorithm,
-            prefix_length=config.kvstore.prefix_length,
-            max_db_bytes=config.kvstore.max_db_bytes,
-            max_rows=config.kvstore.max_rows,
-        )
+        kvstore_result = reset_kvstore(context.kvstore, config.kvstore)
         typer.echo(
             json.dumps(
                 json_ready(

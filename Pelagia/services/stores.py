@@ -1,30 +1,25 @@
 from __future__ import annotations
 
 from ..config import KVStoreConfig
-from ..storage.kvstore import KVStore
+from ..storage.blob_store import BlobStore, create_kvstore, initialize_kvstore
 
 
 class StoreService:
     """Service facade for storing and loading large payload bytes."""
 
-    def __init__(self, store: KVStore):
+    def __init__(self, store: BlobStore):
         self.store = store
 
     @classmethod
     def from_config(cls, config: KVStoreConfig) -> "StoreService":
         """Create the service for a configured KVStore root."""
-        return cls(KVStore(config.root_path))
+        return cls(create_kvstore(config.root_path, config))
 
     def ensure_initialized(self, config: KVStoreConfig) -> None:
         """Initialize the store if it has not been initialized yet."""
         if self.store.initialized:
             return
-        self.store.initialize(
-            hash_algorithm=config.hash_algorithm,
-            prefix_length=config.prefix_length,
-            max_db_bytes=config.max_db_bytes,
-            max_rows=config.max_rows,
-        )
+        initialize_kvstore(self.store, config)
 
     def put_payload(self, payload: bytes | bytearray | str) -> str:
         """Store payload data and return its canonical content key."""

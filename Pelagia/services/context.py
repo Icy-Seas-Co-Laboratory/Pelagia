@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ..config import CoreConfig
 from ..observability import DatabaseLogger
-from ..storage.kvstore import KVStore
+from ..storage.blob_store import BlobStore, create_kvstore, initialize_kvstore
 from ..storage.postgres import DEFAULT_PROJECT_ID, DEFAULT_PROJECT_KEY, PostgresRepository
 
 
@@ -15,21 +15,21 @@ class AppContext:
 
     config: CoreConfig
     repository: PostgresRepository | None = None
-    kvstore: KVStore | None = None
+    kvstore: BlobStore | None = None
     logger: DatabaseLogger | None = None
     active_project_id: str | None = None
-    _project_kvstores: dict[str, KVStore] = field(default_factory=dict)
+    _project_kvstores: dict[str, BlobStore] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, config: CoreConfig | None = None) -> "AppContext":
         """Create a context with configured storage adapters."""
         resolved = config or CoreConfig.load()
-        kvstore = KVStore(resolved.kvstore.root_path)
+        kvstore = create_kvstore(resolved.kvstore.root_path, resolved.kvstore)
         repository = PostgresRepository(resolved)
         logger = DatabaseLogger(repository)
         return cls(config=resolved, repository=repository, kvstore=kvstore, logger=logger)
 
-    def kvstore_for_project(self, project_id: str | None, *, initialize: bool = True) -> KVStore | None:
+    def kvstore_for_project(self, project_id: str | None, *, initialize: bool = True) -> BlobStore | None:
         """Return the physical KVStore for a project."""
         if self.kvstore is None:
             return None
@@ -43,15 +43,9 @@ class AppContext:
         if cached is not None:
             return cached
 
-        store = KVStore(self._kvstore_root_for_project(resolved_project_id))
+        store = create_kvstore(self._kvstore_root_for_project(resolved_project_id), self.config.kvstore)
         if initialize and not store.initialized:
-            config = self.config.kvstore
-            store.initialize(
-                hash_algorithm=config.hash_algorithm,
-                prefix_length=config.prefix_length,
-                max_db_bytes=config.max_db_bytes,
-                max_rows=config.max_rows,
-            )
+            initialize_kvstore(store, self.config.kvstore)
         self._project_kvstores[resolved_project_id] = store
         return store
 

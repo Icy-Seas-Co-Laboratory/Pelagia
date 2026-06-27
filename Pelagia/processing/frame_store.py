@@ -7,6 +7,7 @@ import numpy as np
 
 from ..domain import FrameRecord
 from ..services.context import AppContext
+from ..storage.blob_store import initialize_kvstore
 from ..utils.serialization import json_ready
 from ._logging import log_processing_event, processing_core_logger
 from .frame_codec import decode_array_payload, encode_array_payload
@@ -23,13 +24,7 @@ def default_context() -> AppContext:
     if _DEFAULT_CONTEXT is None:
         _DEFAULT_CONTEXT = AppContext.from_config()
         if _DEFAULT_CONTEXT.kvstore is not None and not _DEFAULT_CONTEXT.kvstore.initialized:
-            config = _DEFAULT_CONTEXT.config.kvstore
-            _DEFAULT_CONTEXT.kvstore.initialize(
-                hash_algorithm=config.hash_algorithm,
-                prefix_length=config.prefix_length,
-                max_db_bytes=config.max_db_bytes,
-                max_rows=config.max_rows,
-            )
+            initialize_kvstore(_DEFAULT_CONTEXT.kvstore, _DEFAULT_CONTEXT.config.kvstore)
     return _DEFAULT_CONTEXT
 
 

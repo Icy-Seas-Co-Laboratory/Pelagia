@@ -84,7 +84,13 @@ dsn = "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"
 schema_name = "pelagia"
 
 [kvstore]
+backend = "kvstore" # Options: kvstore, kvstore2
 root_path = "./data/kvstore"
+hash_algorithm = "blake3"
+prefix_length = 2
+max_db_bytes = 42949672960   # Used by kvstore.
+max_rows = 1000000           # Used by kvstore.
+max_blob_bytes = 67108864    # Used by kvstore2.
 
 [api]
 host = "0.0.0.0"
@@ -98,7 +104,8 @@ dev_project_key = "default"
 ```
 
 `config.toml` is ignored by git. You can also use environment variables such as
-`PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`,
+`PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_BACKEND`,
+`PELAGIA_KVSTORE_ROOT`,
 `PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_AUTH_ENABLED`,
 `PELAGIA_AUTH_SESSION_TTL_SECONDS`, and `PELAGIA_AUTH_DEV_PROJECT_KEY`.
 

@@ -12,7 +12,11 @@ dsn = "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"
 schema = "pelagia"
 
 [kvstore]
+# Options: kvstore, kvstore2.
+backend = "kvstore"
 root = "./data/kvstore"
+# Used by kvstore2.
+max_blob_bytes = 68_719_476_736
 
 [file_browser]
 # Server-side roots exposed by GET /live/files.

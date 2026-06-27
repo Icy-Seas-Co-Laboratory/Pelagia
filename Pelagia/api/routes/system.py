@@ -14,6 +14,7 @@ if APIRouter is not None:
     from ..schemas import OptionsResponse, SystemCapabilitiesResponse
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
+    from ...storage.blob_store import initialize_kvstore
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
 
     router = APIRouter(prefix="/system", tags=["system"])
@@ -41,11 +42,13 @@ if APIRouter is not None:
                     "heartbeat_interval_seconds": config.queue.heartbeat_interval_seconds,
                 },
                 "kvstore": {
+                    "backend": config.kvstore.backend,
                     "root_path": config.kvstore.root_path,
                     "hash_algorithm": config.kvstore.hash_algorithm,
                     "prefix_length": config.kvstore.prefix_length,
                     "max_db_bytes": config.kvstore.max_db_bytes,
                     "max_rows": config.kvstore.max_rows,
+                    "max_blob_bytes": config.kvstore.max_blob_bytes,
                 },
                 "image_data_storage": {
                     "encoding": config.image_data_storage.encoding,
@@ -186,13 +189,7 @@ if APIRouter is not None:
             context.repository.initialize_schema()
             initialized["postgres"] = True
         if context.kvstore is not None and not context.kvstore.initialized:
-            config = context.config.kvstore
-            context.kvstore.initialize(
-                hash_algorithm=config.hash_algorithm,
-                prefix_length=config.prefix_length,
-                max_db_bytes=config.max_db_bytes,
-                max_rows=config.max_rows,
-            )
+            initialize_kvstore(context.kvstore, context.config.kvstore)
             initialized["kvstore"] = True
         if context.repository is None and context.kvstore is None:
             raise HTTPException(status_code=503, detail="No system stores are configured.")

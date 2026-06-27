@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import sqlite3
+import tempfile
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -899,16 +901,18 @@ class FakeRepository:
 class FakeKVStore:
     initialized = True
 
-    def __init__(self, root_path="/tmp/pelagia-kv", total_stored_blobs=3):
+    def __init__(self, root_path="/tmp/pelagia-kv", total_stored_blobs=3, total_sqlite_file_bytes=4096):
         self.deleted_keys = []
         self.root_path = root_path
         self.total_stored_blobs = total_stored_blobs
+        self.total_sqlite_file_bytes = total_sqlite_file_bytes
 
     def status(self):
         return {
             "root_path": self.root_path,
             "initialized": True,
             "total_stored_blobs": self.total_stored_blobs,
+            "total_sqlite_file_bytes": self.total_sqlite_file_bytes,
         }
 
     def check_health(self):
@@ -918,9 +922,30 @@ class FakeKVStore:
         self.deleted_keys.append(key)
 
 
+class FakeKVStore2Status:
+    initialized = True
+
+    def __init__(self, root_path="/tmp/pelagia-kv2"):
+        self.root_path = root_path
+
+    def status(self, *, deep=False):
+        return {
+            "root_path": self.root_path,
+            "initialized": True,
+            "layout": "sqlite-index-blob-shard",
+            "total_index_file_bytes": 128,
+            "total_blob_file_bytes": 2048,
+            "deep": deep,
+        }
+
+    def check_health(self):
+        return {"healthy": True, "errors": [], "warnings": []}
+
+
 def make_client(*, auth_enabled=False):
     config = CoreConfig()
     config.auth.enabled = auth_enabled
+    config.kvstore.root_path = Path(tempfile.mkdtemp(prefix="pelagia-api-test-kvstore-"))
     app = create_app(config)
     repository = FakeRepository()
     kvstore = FakeKVStore()
@@ -1041,6 +1066,27 @@ def test_api_lists_system_status_without_live_database():
     assert body["queue"] == {"queued": 2}
     assert body["workers"]["online"] == 1
     assert body["kvstore"]["initialized"] is True
+    assert body["kvstore"]["total_sqlite_file_bytes"] == 4096
+    assert body["kvstore"]["total_file_bytes"] == 4096
+    assert body["kvstore"]["total_physical_file_bytes"] == 4096
+    assert body["kvstore"]["total_storage_file_bytes"] == 4096
+
+
+def test_api_normalizes_kvstore2_system_status_size_fields():
+    client, _, _ = make_client()
+    client.app.state.context.kvstore = FakeKVStore2Status()
+
+    response = client.get("/system/status")
+
+    assert response.status_code == 200
+    kvstore = response.json()["kvstore"]
+    assert kvstore["layout"] == "sqlite-index-blob-shard"
+    assert kvstore["total_index_file_bytes"] == 128
+    assert kvstore["total_blob_file_bytes"] == 2048
+    assert kvstore["total_file_bytes"] == 2176
+    assert kvstore["total_physical_file_bytes"] == 2176
+    assert kvstore["total_storage_file_bytes"] == 2176
+    assert kvstore["total_sqlite_file_bytes"] == 2176
 
 
 def test_api_lists_project_system_status_with_project_kvstore():
@@ -1061,6 +1107,7 @@ def test_api_lists_project_system_status_with_project_kvstore():
     assert body["project"]["project_key"] == "other"
     assert body["kvstore"]["root_path"] == "/tmp/pelagia-kv/projects/project-2"
     assert body["kvstore"]["total_stored_blobs"] == 8
+    assert body["kvstore"]["total_file_bytes"] == 4096
     assert body["queue"] == {"queued": 5}
     assert body["workers"]["online"] == 1
 

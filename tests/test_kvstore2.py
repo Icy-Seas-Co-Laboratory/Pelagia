@@ -81,6 +81,16 @@ def test_loading_existing_store_from_config(tmp_path):
     assert loaded.config["prefix_length"] == 1
 
 
+def test_loading_legacy_kvstore_root_reports_backend_mismatch(tmp_path):
+    from Pelagia.storage.kvstore import KVStore
+
+    root = tmp_path / "store"
+    KVStore(root).initialize(prefix_length=1)
+
+    with pytest.raises(KVStore2ConfigError, match="legacy KVStore config"):
+        KVStore2(root)
+
+
 def test_initialize_existing_store_without_overwrite_raises(tmp_path):
     root = tmp_path / "store"
     KVStore2(root).initialize(prefix_length=1)
@@ -404,7 +414,9 @@ def test_status_reports_counts_and_padding(tmp_path):
     assert status["layout"] == "sqlite-index-blob-shard"
     assert status["prefix_directory_count"] == 16
     assert status["total_index_files"] == 16
+    assert status["total_index_file_bytes"] > 0
     assert status["total_blob_files"] == 16
+    assert status["total_file_bytes"] == status["total_index_file_bytes"] + status["total_blob_file_bytes"]
     assert status["total_stored_blobs"] == 2
     assert status["total_stored_payload_bytes"] == len(first_payload) + len(second_payload)
     assert status["total_record_header_bytes"] > 0

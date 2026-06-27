@@ -46,11 +46,25 @@ class QueueConfig:
 class KVStoreConfig:
     """Large blob store settings."""
 
+    backend: str = "kvstore"
     root_path: Path = Path("./data/kvstore")
     hash_algorithm: str = "sha256"
     prefix_length: int = 3
     max_db_bytes: int = 4 * 1024 * 1024 * 1024
     max_rows: int = 1_000_000
+    max_blob_bytes: int = 64 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        self.backend = str(self.backend).lower()
+        aliases = {
+            "legacy": "kvstore",
+            "kvstore1": "kvstore",
+            "v1": "kvstore",
+            "v2": "kvstore2",
+        }
+        self.backend = aliases.get(self.backend, self.backend)
+        if self.backend not in {"kvstore", "kvstore2"}:
+            raise ValueError("kvstore backend must be one of: kvstore, kvstore2.")
 
 
 @dataclass(slots=True)
@@ -459,11 +473,13 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "queue", "lease_seconds", "PELAGIA_QUEUE_LEASE_SECONDS", int)
     _set_from_env(settings, "queue", "heartbeat_interval_seconds", "PELAGIA_QUEUE_HEARTBEAT_SECONDS", int)
 
+    _set_from_env(settings, "kvstore", "backend", "PELAGIA_KVSTORE_BACKEND")
     _set_from_env(settings, "kvstore", "root_path", "PELAGIA_KVSTORE_ROOT", Path)
     _set_from_env(settings, "kvstore", "hash_algorithm", "PELAGIA_KVSTORE_HASH")
     _set_from_env(settings, "kvstore", "prefix_length", "PELAGIA_KVSTORE_PREFIX_LENGTH", int)
     _set_from_env(settings, "kvstore", "max_db_bytes", "PELAGIA_KVSTORE_MAX_DB_BYTES", int)
     _set_from_env(settings, "kvstore", "max_rows", "PELAGIA_KVSTORE_MAX_ROWS", int)
+    _set_from_env(settings, "kvstore", "max_blob_bytes", "PELAGIA_KVSTORE_MAX_BLOB_BYTES", int)
 
     _set_from_env(settings, "file_browser", "root_path_kvstore", "PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", Path)
     _set_from_env(settings, "file_browser", "root_path_import_dir", "PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", Path)
@@ -665,11 +681,13 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
         ),
         kvstore=KVStoreConfig(
+            backend=str(kvstore.get("backend", KVStoreConfig.backend)),
             root_path=Path(kvstore.get("root_path", KVStoreConfig.root_path)),
             hash_algorithm=str(kvstore.get("hash_algorithm", KVStoreConfig.hash_algorithm)),
             prefix_length=int(kvstore.get("prefix_length", KVStoreConfig.prefix_length)),
             max_db_bytes=int(kvstore.get("max_db_bytes", KVStoreConfig.max_db_bytes)),
             max_rows=int(kvstore.get("max_rows", KVStoreConfig.max_rows)),
+            max_blob_bytes=int(kvstore.get("max_blob_bytes", KVStoreConfig.max_blob_bytes)),
         ),
         file_browser=FileBrowserConfig(
             root_path_kvstore=Path(

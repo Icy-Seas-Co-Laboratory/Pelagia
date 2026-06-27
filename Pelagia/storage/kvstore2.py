@@ -498,6 +498,7 @@ class KVStore2:
             }
 
         total_index_files = 0
+        total_index_file_bytes = 0
         total_blob_files = 0
         total_blob_file_bytes = 0
         total_data_end_bytes = 0
@@ -510,6 +511,7 @@ class KVStore2:
             index_path = self._index_path_for_prefix(prefix)
             if index_path.exists():
                 total_index_files += 1
+                total_index_file_bytes += self._db_file_size(index_path)
                 if deep:
                     with self._connect(index_path) as connection:
                         row = connection.execute(
@@ -543,8 +545,10 @@ class KVStore2:
             "prefix_length": prefix_length,
             "prefix_directory_count": 16**prefix_length,
             "total_index_files": total_index_files,
+            "total_index_file_bytes": total_index_file_bytes,
             "total_blob_files": total_blob_files,
             "total_blob_file_bytes": total_blob_file_bytes,
+            "total_file_bytes": total_index_file_bytes + total_blob_file_bytes,
             "total_data_end_bytes": total_data_end_bytes,
             "largest_blob_file_size": largest_blob_file_size,
             "config_path": str(self.config_path),
@@ -1356,6 +1360,13 @@ class KVStore2:
         return str(row[0]) if row else "missing integrity_check result"
 
     def _validate_config(self, config: dict[str, Any]) -> None:
+        if "layout" not in config and config.get("version") == 1 and "rotation" in config:
+            raise KVStore2ConfigError(
+                "KVStore2 cannot open this root because it appears to contain a legacy "
+                "KVStore config. Set [kvstore].backend = 'kvstore' for this root, choose "
+                "an empty kvstore root_path for KVStore2, or migrate/reset the store before "
+                "using [kvstore].backend = 'kvstore2'."
+            )
         try:
             version = int(config["version"])
             layout = str(config["layout"])

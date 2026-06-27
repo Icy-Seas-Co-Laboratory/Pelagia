@@ -21,7 +21,9 @@ PID_DIR=""
 LOG_DIR=""
 PELAGIA_DATABASE_DSN=""
 PELAGIA_DATABASE_SCHEMA=""
+PELAGIA_KVSTORE_BACKEND=""
 PELAGIA_KVSTORE_ROOT=""
+PELAGIA_KVSTORE_MAX_BLOB_BYTES=""
 PELAGIA_API_ENABLED=true
 PELAGIA_API_HOST="0.0.0.0"
 PELAGIA_API_PORT="8000"
@@ -44,7 +46,9 @@ load_stack_config() {
                     run_dir) RUN_DIR="$value" ;;
                     database_dsn) PELAGIA_DATABASE_DSN="$value" ;;
                     database_schema) PELAGIA_DATABASE_SCHEMA="$value" ;;
+                    kvstore_backend) PELAGIA_KVSTORE_BACKEND="$value" ;;
                     kvstore_root) PELAGIA_KVSTORE_ROOT="$value" ;;
+                    kvstore_max_blob_bytes) PELAGIA_KVSTORE_MAX_BLOB_BYTES="$value" ;;
                     file_browser_root_path_kvstore) PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE="$value" ;;
                     file_browser_root_path_import_dir) PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR="$value" ;;
                     file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
@@ -151,7 +155,7 @@ run_dir = path_value(
     root_dir / ".pelagia" / "run" / stack_name,
 )
 kvstore_root = path_value(
-    kvstore.get("root"),
+    kvstore.get("root_path", kvstore.get("root")),
     Path(os.environ.get("PELAGIA_KVSTORE_ROOT", root_dir / "data" / "kvstore")),
 )
 
@@ -175,7 +179,12 @@ config_rows = {
         os.environ.get("PELAGIA_DATABASE_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"),
     ),
     "database_schema": scalar(database.get("schema"), os.environ.get("PELAGIA_DATABASE_SCHEMA", "pelagia")),
+    "kvstore_backend": scalar(kvstore.get("backend"), os.environ.get("PELAGIA_KVSTORE_BACKEND", "kvstore")),
     "kvstore_root": kvstore_root,
+    "kvstore_max_blob_bytes": scalar(
+        kvstore.get("max_blob_bytes"),
+        os.environ.get("PELAGIA_KVSTORE_MAX_BLOB_BYTES", "67108864"),
+    ),
     "file_browser_root_path_kvstore": path_value(
         file_browser.get("root_path_kvstore"),
         Path(os.environ.get("PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", kvstore_root)),
@@ -361,6 +370,8 @@ cleanup_stale_pid_files() {
 }
 
 storage_is_ready() {
+    PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
+    PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
     python -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
@@ -390,7 +401,10 @@ initialize_system() {
     esac
 
     echo "initializing storage..."
-    if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" python -m Pelagia.cli.app init-system \
+    if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" \
+        PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
+        PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
+        python -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then
@@ -407,7 +421,9 @@ start_stack() {
 
     export PELAGIA_DATABASE_DSN
     export PELAGIA_DATABASE_SCHEMA
+    export PELAGIA_KVSTORE_BACKEND
     export PELAGIA_KVSTORE_ROOT
+    export PELAGIA_KVSTORE_MAX_BLOB_BYTES
     export PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE
     export PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR
     export PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS

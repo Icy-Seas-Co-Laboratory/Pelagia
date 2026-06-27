@@ -32,7 +32,7 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
             raise RuntimeError("zstandard is required to encode frame arrays as zstd.") from exc
 
         return (
-            zstd.ZstdCompressor(level=3).compress(array.tobytes(order="C")),
+            zstd.ZstdCompressor(level=1).compress(array.tobytes(order="C")),
             "zstd",
             "zstd_ndarray_c_order",
         )

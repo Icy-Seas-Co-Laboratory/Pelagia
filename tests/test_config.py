@@ -36,6 +36,16 @@ def test_core_config_load_applies_auth_env(monkeypatch):
     assert config.auth.dev_project_key == "sandbox"
 
 
+def test_core_config_load_applies_kvstore_backend_env(monkeypatch):
+    monkeypatch.setenv("PELAGIA_KVSTORE_BACKEND", "kvstore2")
+    monkeypatch.setenv("PELAGIA_KVSTORE_MAX_BLOB_BYTES", "123456")
+
+    config = CoreConfig.load(local_config_path=None)
+
+    assert config.kvstore.backend == "kvstore2"
+    assert config.kvstore.max_blob_bytes == 123456
+
+
 def test_logging_config_defaults_to_core_file_logger():
     config = LoggingConfig()
 
@@ -49,7 +59,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     config = CoreConfig.load(local_config_path=None, use_env=False)
 
     assert config.database.schema_name == "pelagia"
+    assert config.kvstore.backend == "kvstore"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
+    assert config.kvstore.max_blob_bytes == 67108864
     assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstore"
     assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
     assert config.file_browser.allowed_root_paths == []
@@ -140,7 +152,9 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         lease_seconds = 42
 
         [kvstore]
+        backend = "kvstore2"
         root_path = "/tmp/pelagia-kv"
+        max_blob_bytes = 12345
 
         [file_browser]
         root_path_kvstore = "/tmp/browser-kv"
@@ -255,7 +269,9 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.database.schema_name == "pelagia_custom"
     assert config.database.dsn == "postgresql://postgres:postgres@localhost:5432/pelagia"
     assert config.queue.lease_seconds == 42
+    assert config.kvstore.backend == "kvstore2"
     assert config.kvstore.root_path.as_posix() == "/tmp/pelagia-kv"
+    assert config.kvstore.max_blob_bytes == 12345
     assert config.file_browser.root_path_kvstore.as_posix() == "/tmp/browser-kv"
     assert config.file_browser.root_path_import_dir.as_posix() == "/tmp/raw-assets"
     assert [path.as_posix() for path in config.file_browser.allowed_root_paths] == [

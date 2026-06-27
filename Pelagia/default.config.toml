@@ -19,13 +19,18 @@ heartbeat_interval_seconds = 30
 
 [kvstore]
 # Cold storage for large frame payloads.
+# Options: kvstore, kvstore2. Existing stores should keep kvstore unless migrated.
+backend = "kvstore2"
 root_path = "./data/kvstore"
 # Options: sha256, blake3.
 hash_algorithm = "blake3"
 # Number of hash-prefix characters used to shard object storage paths.
 prefix_length = 2
-max_db_bytes = 42949672960
+# kvstore backend rotation controls.
+max_db_bytes = 68_719_476_736
 max_rows = 1000000
+# kvstore2 blob-shard size limit.
+max_blob_bytes = 68_719_476_736
 
 [file_browser]
 # Server-side roots exposed through /live/files for local file/folder selection.

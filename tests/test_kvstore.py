@@ -85,6 +85,16 @@ def test_loading_existing_store_from_config(tmp_path):
     assert loaded.config["prefix_length"] == 1
 
 
+def test_loading_kvstore2_root_reports_backend_mismatch(tmp_path):
+    from Pelagia.storage.kvstore2 import KVStore2
+
+    root = tmp_path / "store"
+    KVStore2(root).initialize(prefix_length=1)
+
+    with pytest.raises(KVStoreConfigError, match="KVStore2 config"):
+        KVStore(root)
+
+
 def test_initialize_existing_store_without_overwrite_raises(tmp_path):
     root = tmp_path / "store"
     KVStore(root).initialize(prefix_length=1)

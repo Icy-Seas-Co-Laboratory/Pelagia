@@ -21,6 +21,7 @@ from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.thumbhash import compute_thumbhash
 from Pelagia.services.context import AppContext
 from Pelagia.storage.kvstore import KVStore
+from Pelagia.storage.kvstore2 import KVStore2
 from Pelagia.storage.postgres import DEFAULT_PROJECT_ID
 from Pelagia.processing.ingest import convert_frame_to_grayscale, discover_ingest_sources
 from Pelagia.processing.ingest import ingest_image_folder, ingest_video_file
@@ -542,6 +543,30 @@ def test_project_kvstore_root_can_come_from_project_row(tmp_path):
     assert project_store is not None
     assert project_store.root_path == custom_root.resolve(strict=False)
     assert project_store.initialized is True
+
+
+def test_project_kvstore_can_use_kvstore2_backend(tmp_path):
+    project_id = "11111111-1111-1111-1111-111111111111"
+    config = CoreConfig()
+    config.kvstore.backend = "kvstore2"
+    config.kvstore.root_path = tmp_path / "kvstore"
+    config.kvstore.prefix_length = 1
+    config.kvstore.max_blob_bytes = 1024
+    default_store = KVStore2(config.kvstore.root_path)
+    default_store.initialize(prefix_length=1, max_blob_bytes=1024)
+    context = AppContext(
+        config=config,
+        repository=PartitionedRepository(project_id),
+        kvstore=default_store,
+    )
+
+    project_store = context.kvstore_for_project(project_id)
+    key = project_store.put_store(b"kvstore2 payload")
+
+    assert isinstance(project_store, KVStore2)
+    assert project_store.root_path == (tmp_path / "kvstore" / "projects" / project_id).resolve(strict=False)
+    assert project_store.get_store(key) == b"kvstore2 payload"
+    assert project_store.config["layout"] == "sqlite-index-blob-shard"
 
 
 def test_store_frame_writes_roi_geometry_metadata():

@@ -195,4 +195,47 @@ def kvstore_status(kvstore, *, deep: bool = False) -> dict[str, Any]:
         status = kvstore.status(deep=deep)
     except TypeError:
         status = kvstore.status()
+    status = _normalize_kvstore_status(status)
     return as_response(status)
+
+
+def _normalize_kvstore_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Add stable byte-count aliases across legacy KVStore and KVStore2."""
+    normalized = dict(status)
+    total_file_bytes = _first_int(
+        normalized,
+        "total_file_bytes",
+        "total_physical_file_bytes",
+        "total_storage_file_bytes",
+    )
+    if total_file_bytes is None:
+        index_bytes = _first_int(normalized, "total_index_file_bytes")
+        blob_bytes = _first_int(normalized, "total_blob_file_bytes")
+        sqlite_bytes = _first_int(normalized, "total_sqlite_file_bytes")
+        if blob_bytes is not None:
+            total_file_bytes = blob_bytes + (index_bytes or 0)
+        elif sqlite_bytes is not None:
+            total_file_bytes = sqlite_bytes
+
+    if total_file_bytes is not None:
+        normalized.setdefault("total_file_bytes", total_file_bytes)
+        normalized.setdefault("total_physical_file_bytes", total_file_bytes)
+        # Compatibility for clients that historically read the legacy KVStore field
+        # as the single on-disk size indicator.
+        normalized.setdefault("total_sqlite_file_bytes", total_file_bytes)
+
+    if "total_storage_file_bytes" not in normalized and total_file_bytes is not None:
+        normalized["total_storage_file_bytes"] = total_file_bytes
+    return normalized
+
+
+def _first_int(mapping: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None

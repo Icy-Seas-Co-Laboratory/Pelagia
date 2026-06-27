@@ -677,6 +677,12 @@ class KVStore:
         return str(row[0]) if row else "missing integrity_check result"
 
     def _validate_config(self, config: dict[str, Any]) -> None:
+        if config.get("layout") == "sqlite-index-blob-shard":
+            raise KVStoreConfigError(
+                "Legacy KVStore cannot open this root because it appears to contain a "
+                "KVStore2 config. Set [kvstore].backend = 'kvstore2' for this root, or "
+                "choose a legacy KVStore root_path."
+            )
         try:
             version = config["version"]
             hash_algorithm = str(config["hash_algorithm"]).lower()
