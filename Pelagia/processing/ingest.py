@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -146,6 +148,110 @@ def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
 
     decode_mode = "default_after_software_attempts" if prefer_software_decode else "default"
     return cv2.VideoCapture(input_path), decode_mode
+
+
+def _video_dimensions(video, input_path: str) -> tuple[int, int]:
+    width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if width > 0 and height > 0:
+        return width, height
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return 0, 0
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        input_path,
+    ]
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return 0, 0
+    if result.returncode != 0:
+        return 0, 0
+    line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    parts = line.split("x", 1)
+    if len(parts) != 2:
+        return 0, 0
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
+
+
+def _decode_with_ffmpeg_cli(
+    input_path: str,
+    *,
+    width: int,
+    height: int,
+    frame_callback: Callable[[np.ndarray], None],
+) -> tuple[int, str]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg executable is not available for software video decode fallback.")
+    if width < 1 or height < 1:
+        raise RuntimeError("Cannot use ffmpeg fallback because video width/height could not be determined.")
+
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-hwaccel",
+        "none",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]
+    frame_nbytes = width * height
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise RuntimeError(f"Could not start ffmpeg software decode fallback: {exc}") from exc
+
+    frames_read = 0
+    stderr_text = ""
+    try:
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(frame_nbytes)
+            if not chunk:
+                break
+            if len(chunk) != frame_nbytes:
+                raise RuntimeError(
+                    f"ffmpeg software decode fallback produced an incomplete frame "
+                    f"({len(chunk)} of {frame_nbytes} bytes)."
+                )
+            frame = np.frombuffer(chunk, dtype=np.uint8).reshape((height, width)).copy()
+            frame_callback(frame)
+            frames_read += 1
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            stderr_text = process.stderr.read().decode("utf-8", errors="replace").strip()
+            process.stderr.close()
+        return_code = process.wait()
+
+    if return_code != 0 and frames_read == 0:
+        message = stderr_text or f"ffmpeg exited with status {return_code}"
+        raise RuntimeError(f"ffmpeg software decode fallback failed: {message}")
+    return frames_read, stderr_text
 
 
 def convert_frame_to_grayscale(frame: np.ndarray) -> np.ndarray:
@@ -674,120 +780,148 @@ def ingest_video_file(
     n = 1
     tile_number = 1
 
+    def store_tile(tile: np.ndarray, source_start: int, source_end: int, *, partial_tile: bool = False) -> None:
+        nonlocal tile_number
+        stored_frames.append(
+            store_frame(
+                FrameData(
+                    sourcePath=source_path,
+                    filename=filename,
+                    frameNumber=source_end,
+                    data=tile,
+                    tileNumber=tile_number,
+                    sourceFrameStart=source_start,
+                    sourceFrameEnd=source_end,
+                    frameType="line",
+                    timestamp=timestamp_for_frame(start_timestamp, fps, source_end),
+                    metadata=frame_metadata.copy(),
+                ),
+                context=context,
+            )
+        )
+        event_payload = {
+            "filename": filename,
+            "tile_number": tile_number,
+            "source_frame_start": source_start,
+            "source_frame_end": source_end,
+            "stored_tile_count": len(stored_frames),
+        }
+        if partial_tile:
+            event_payload["partial_tile"] = True
+        if partial_tile or tile_number == 1 or tile_number % _PROGRESS_LOG_TILE_INTERVAL == 0:
+            _log_database_event(
+                context,
+                "debug",
+                "video_ingest.tile_stored",
+                "Video ingest final tile stored" if partial_tile else "Video ingest tile stored",
+                run_id=run_id,
+                asset_id=asset_id,
+                payload=event_payload,
+            )
+        _emit_ingest_progress(
+            progress_callback,
+            "tile_stored",
+            {
+                **ingest_payload,
+                "fps": fps,
+                "source_frame_count": source_frame_count,
+                "estimated_tile_count": estimated_tile_count,
+                "source_frames_read": source_end,
+                **event_payload,
+            },
+        )
+        tile_number += 1
+
+    def store_source_frame(frame: np.ndarray) -> None:
+        nonlocal frame_buffer, n
+        frame = convert_frame_to_grayscale(frame)
+        frame_buffer.append(frame)
+        if len(frame_buffer) == n_tile:
+            source_start = n - len(frame_buffer) + 1
+            source_end = n
+            store_tile(np.vstack(frame_buffer), source_start, source_end)
+            frame_buffer = []
+        n += 1
+
+    def flush_partial_tile() -> None:
+        nonlocal frame_buffer
+        if not frame_buffer:
+            return
+        source_start = n - len(frame_buffer)
+        source_end = n - 1
+        store_tile(np.vstack(frame_buffer), source_start, source_end, partial_tile=True)
+        frame_buffer = []
+
     try:
         while video.isOpened():
             good_return, frame = video.read()
             if not good_return:
                 break
             if frame is not None:
-                frame = convert_frame_to_grayscale(frame)
-                frame_buffer.append(frame)
-                if len(frame_buffer) == n_tile:
-                    tiled = np.vstack(frame_buffer)
-                    stored_frames.append(
-                        store_frame(
-                            FrameData(
-                                sourcePath=source_path,
-                                filename=filename,
-                                frameNumber=n,
-                                data=tiled,
-                                tileNumber=tile_number,
-                                sourceFrameStart=n - len(frame_buffer) + 1,
-                                sourceFrameEnd=n,
-                                frameType="line",
-                                timestamp=timestamp_for_frame(start_timestamp, fps, n),
-                                metadata=frame_metadata.copy(),
-                            ),
-                            context=context,
-                        )
-                    )
-                    if tile_number == 1 or tile_number % _PROGRESS_LOG_TILE_INTERVAL == 0:
-                        _log_database_event(
-                            context,
-                            "debug",
-                            "video_ingest.tile_stored",
-                            "Video ingest tile stored",
-                            run_id=run_id,
-                            asset_id=asset_id,
-                            payload={
-                                "filename": filename,
-                                "tile_number": tile_number,
-                                "source_frame_start": n - len(frame_buffer) + 1,
-                                "source_frame_end": n,
-                                "stored_tile_count": len(stored_frames),
-                            },
-                        )
-                    _emit_ingest_progress(
-                        progress_callback,
-                        "tile_stored",
-                        {
-                            **ingest_payload,
-                            "fps": fps,
-                            "source_frame_count": source_frame_count,
-                            "estimated_tile_count": estimated_tile_count,
-                            "source_frames_read": n,
-                            "filename": filename,
-                            "tile_number": tile_number,
-                            "source_frame_start": n - len(frame_buffer) + 1,
-                            "source_frame_end": n,
-                            "stored_tile_count": len(stored_frames),
-                        },
-                    )
-                    tile_number += 1
-                    frame_buffer = []
-                n += 1
+                store_source_frame(frame)
 
-        if frame_buffer:
-            tiled = np.vstack(frame_buffer)
-            stored_frames.append(
-                store_frame(
-                    FrameData(
-                        sourcePath=source_path,
-                        filename=filename,
-                        frameNumber=n - 1,
-                        data=tiled,
-                        tileNumber=tile_number,
-                        sourceFrameStart=n - len(frame_buffer),
-                        sourceFrameEnd=n - 1,
-                        frameType="line",
-                        timestamp=timestamp_for_frame(start_timestamp, fps, n - 1),
-                        metadata=frame_metadata.copy(),
-                    ),
-                    context=context,
-                )
-            )
+        if n == 1 and prefer_software_decode:
+            width, height = _video_dimensions(video, input_path)
+            fallback_payload = {
+                **ingest_payload,
+                "opencv_video_decode_mode": video_decode_mode,
+                "ffmpeg_width": width,
+                "ffmpeg_height": height,
+            }
             _log_database_event(
                 context,
-                "debug",
-                "video_ingest.tile_stored",
-                "Video ingest final tile stored",
+                "warning",
+                "video_ingest.decoder_fallback",
+                "OpenCV decoded zero frames; trying ffmpeg software fallback",
                 run_id=run_id,
                 asset_id=asset_id,
-                payload={
-                    "filename": filename,
-                    "tile_number": tile_number,
-                    "source_frame_start": n - len(frame_buffer),
-                    "source_frame_end": n - 1,
-                    "stored_tile_count": len(stored_frames),
-                    "partial_tile": True,
-                },
+                payload=fallback_payload,
             )
             _emit_ingest_progress(
                 progress_callback,
-                "tile_stored",
+                "decoder_fallback",
                 {
-                    **ingest_payload,
-                    "fps": fps,
-                    "source_frame_count": source_frame_count,
-                    "estimated_tile_count": estimated_tile_count,
-                    "source_frames_read": n - 1,
-                    "filename": filename,
-                    "tile_number": tile_number,
-                    "source_frame_start": n - len(frame_buffer),
-                    "source_frame_end": n - 1,
-                    "stored_tile_count": len(stored_frames),
-                    "partial_tile": True,
+                    **fallback_payload,
+                    "source_frames_read": 0,
+                    "stored_tile_count": 0,
                 },
+            )
+            video_decode_mode = "ffmpeg_cli_software_fallback"
+            ingest_payload["video_decode_mode"] = video_decode_mode
+            ffmpeg_frames_read, ffmpeg_stderr = _decode_with_ffmpeg_cli(
+                input_path,
+                width=width,
+                height=height,
+                frame_callback=store_source_frame,
+            )
+            flush_partial_tile()
+            fallback_completed_payload = {
+                **ingest_payload,
+                "ffmpeg_frames_read": ffmpeg_frames_read,
+                "ffmpeg_stderr": ffmpeg_stderr,
+                "source_frames_read": max(0, n - 1),
+                "stored_tile_count": len(stored_frames),
+            }
+            _log_database_event(
+                context,
+                "info",
+                "video_ingest.decoder_fallback_completed",
+                "ffmpeg software fallback decoded video frames",
+                run_id=run_id,
+                asset_id=asset_id,
+                payload=fallback_completed_payload,
+            )
+            _emit_ingest_progress(
+                progress_callback,
+                "decoder_fallback_completed",
+                fallback_completed_payload,
+            )
+
+        flush_partial_tile()
+        if n == 1:
+            raise ValueError(
+                f"Decoded zero frames from video: {input_path}. "
+                f"OpenCV decode mode was {video_decode_mode!r}."
             )
     except Exception as exc:
         duration_ms = (time.perf_counter() - started) * 1000

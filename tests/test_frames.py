@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -1119,6 +1120,115 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
     assert "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ
     opened = [event for event in ctx.logger.events if event["event_type"] == "video_ingest.video_opened"][0]
     assert opened["payload"]["video_decode_mode"] == "software_ffmpeg_options"
+
+
+def test_ingest_video_file_uses_ffmpeg_fallback_when_opencv_decodes_zero_frames(monkeypatch):
+    frame = np.array([[1, 2], [3, 4]], dtype=np.uint8)
+    popen_calls = []
+
+    class FakeVideoCapture:
+        def __init__(self, *args):
+            self.index = 0
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            if prop == ingest_module.cv2.CAP_PROP_FPS:
+                return 4.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_COUNT:
+                return 1.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_WIDTH:
+                return 2.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_HEIGHT:
+                return 2.0
+            return 0.0
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self, command, stdout=None, stderr=None):
+            popen_calls.append(command)
+            self.stdout = io.BytesIO(frame.tobytes())
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(ingest_module.cv2, "CAP_FFMPEG", 1900, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "CAP_PROP_HW_ACCELERATION", 999, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "VIDEO_ACCELERATION_NONE", 0, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.setattr(ingest_module.shutil, "which", lambda name: f"/usr/bin/{name}" if name == "ffmpeg" else None)
+    monkeypatch.setattr(ingest_module.subprocess, "Popen", FakeProcess)
+    ctx = FakeContext()
+    ctx.logger = FakeDatabaseLogger()
+    ctx.config.processing.video_ingest.prefer_software_decode = True
+
+    rows = ingest_video_file(
+        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        n_tile=1,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata={"kvstore_encoding": "raw"},
+    )
+
+    assert len(rows) == 1
+    assert popen_calls[0][:6] == ["/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-hwaccel"]
+    assert "none" in popen_calls[0]
+    metadata = json.loads(ctx.repository.cursor_obj.params_history[0][17])
+    decoded = decode_array_payload(ctx.kvstore.payload, metadata)
+    assert decoded.tolist() == frame.tolist()
+    event_types = [event["event_type"] for event in ctx.logger.events]
+    assert "video_ingest.decoder_fallback" in event_types
+    assert "video_ingest.decoder_fallback_completed" in event_types
+    assert ctx.logger.events[-1]["payload"]["video_decode_mode"] == "ffmpeg_cli_software_fallback"
+    assert ctx.logger.events[-1]["payload"]["stored_tile_count"] == 1
+
+
+def test_ingest_video_file_fails_when_video_decodes_zero_frames(monkeypatch):
+    class FakeVideoCapture:
+        def __init__(self, path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            if prop == ingest_module.cv2.CAP_PROP_FPS:
+                return 4.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_COUNT:
+                return 1.0
+            return 0.0
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    ctx = FakeContext()
+    ctx.logger = FakeDatabaseLogger()
+    ctx.config.processing.video_ingest.prefer_software_decode = False
+
+    with pytest.raises(ValueError, match="Decoded zero frames from video"):
+        ingest_video_file(
+            "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+            n_tile=1,
+            context=ctx,
+            run_id="00000000-0000-0000-0000-000000000001",
+            asset_id="00000000-0000-0000-0000-000000000002",
+            metadata={"kvstore_encoding": "raw"},
+        )
+
+    assert ctx.logger.events[-1]["event_type"] == "video_ingest.failed"
+    assert ctx.logger.events[-1]["payload"]["error_type"] == "ValueError"
 
 
 def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
