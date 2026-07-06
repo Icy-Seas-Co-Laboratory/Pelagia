@@ -5,7 +5,7 @@ import numpy as np
 
 
 def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, str, str]:
-    requested = str(encoding or "png").lower()
+    requested = str(encoding or "zstd").lower()
     if requested in {"raw", "raw_ndarray_c_order"}:
         return array.tobytes(order="C"), "raw", "raw_ndarray_c_order"
 
@@ -32,7 +32,7 @@ def encode_array_payload(array: np.ndarray, encoding: object) -> tuple[bytes, st
             raise RuntimeError("zstandard is required to encode frame arrays as zstd.") from exc
 
         return (
-            zstd.ZstdCompressor(level=1).compress(array.tobytes(order="C")),
+            zstd.ZstdCompressor(level=2, threads=1).compress(array.tobytes(order="C")),
             "zstd",
             "zstd_ndarray_c_order",
         )

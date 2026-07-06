@@ -203,7 +203,7 @@ if APIRouter is not None:
         mask_encoding: str | None = None,
         mask_format: str | None = None,
         refinement_state: Literal["any", "refined", "unrefined", "has-refinement", "needs-refinement"] = "any",
-        sort_by: Literal["area", "byte_size", "id", "asset_frame"] = "asset_frame",
+        sort_by: Literal["area", "byte_size", "id", "asset_frame", "random"] = "asset_frame",
         sort_dir: Literal["asc", "desc"] = "desc",
         limit: int | None = 100,
         offset: int = 0,

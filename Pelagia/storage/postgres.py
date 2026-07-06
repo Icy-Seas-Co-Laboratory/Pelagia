@@ -2328,6 +2328,7 @@ class PostgresRepository:
             "byte_size": f"octet_length(detections.roi_payload) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
             "id": f"detections.id {direction}",
             "asset_frame": f"assets.filename {direction} NULLS LAST, frames.frame_index {direction}, detections.roi_index {direction}",
+            "random": "random()",
         }
         order_by = order_by_options.get(sort_key, order_by_options["asset_frame"])
 

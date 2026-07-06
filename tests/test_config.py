@@ -1,10 +1,14 @@
 import pytest
 
-from Pelagia.config import CoreConfig, ImageDataStorageConfig, LoggingConfig
+from Pelagia.config import CoreConfig, FrameStorageProcessingConfig, ImageDataStorageConfig, LoggingConfig
 
 
 def test_image_data_storage_config_defaults_to_zstd():
     assert ImageDataStorageConfig().encoding == "zstd"
+
+
+def test_frame_storage_processing_config_defaults_to_zstd():
+    assert FrameStorageProcessingConfig().image_encoding == "zstd"
 
 
 def test_image_data_storage_config_accepts_jpg():

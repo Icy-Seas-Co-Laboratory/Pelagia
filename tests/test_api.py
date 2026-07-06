@@ -2843,12 +2843,13 @@ def test_api_filters_asset_detections():
 def test_api_lists_global_detections_without_image_payloads():
     client, _, _ = make_client()
 
-    response = client.get("/detections?asset_id=asset-1&collection=test&limit=100&offset=400")
+    response = client.get("/detections?asset_id=asset-1&collection=test&sort_by=random&limit=100&offset=400")
 
     assert response.status_code == 200
     detection = response.json()["detections"][0]
     assert detection["asset_id"] == "asset-1"
     assert detection["collection"] == "test"
+    assert detection["sort_by"] == "random"
     assert detection["limit"] == 100
     assert detection["offset"] == 400
     assert "roi_payload" not in detection

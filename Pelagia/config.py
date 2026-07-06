@@ -286,7 +286,7 @@ class PreprocessingConfig:
 class FrameStorageProcessingConfig:
     """Default frame storage parameters."""
 
-    image_encoding: ImageDataStorageEncoding = "jpg"
+    image_encoding: ImageDataStorageEncoding = "zstd"
 
     def __post_init__(self) -> None:
         self.image_encoding = str(self.image_encoding).lower()
