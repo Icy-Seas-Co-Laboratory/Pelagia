@@ -225,6 +225,7 @@ class VideoIngestProcessingConfig:
     """Default video-to-frame extraction parameters."""
 
     n_tile: int = 4
+    prefer_software_decode: bool = True
 
 
 @dataclass(slots=True)
@@ -514,6 +515,13 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "artifacts.plugins", "metadata_filename", "PELAGIA_ARTIFACT_PLUGINS_METADATA_FILENAME")
 
     _set_from_env(settings, "processing.video_ingest", "n_tile", "PELAGIA_VIDEO_INGEST_N_TILE", int)
+    _set_from_env(
+        settings,
+        "processing.video_ingest",
+        "prefer_software_decode",
+        "PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE",
+        _env_bool,
+    )
 
     _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
     _set_from_env(settings, "processing.flatfield", "flatfield_q", "PELAGIA_FLATFIELD_Q", float)
@@ -953,6 +961,12 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             ),
             video_ingest=VideoIngestProcessingConfig(
                 n_tile=int(video_ingest.get("n_tile", VideoIngestProcessingConfig.n_tile)),
+                prefer_software_decode=bool(
+                    video_ingest.get(
+                        "prefer_software_decode",
+                        VideoIngestProcessingConfig.prefer_software_decode,
+                    )
+                ),
             ),
             flatfield=FlatfieldProcessingConfig(
                 flatfield_correction=bool(

@@ -63,9 +63,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     config = CoreConfig.load(local_config_path=None, use_env=False)
 
     assert config.database.schema_name == "pelagia"
-    assert config.kvstore.backend == "kvstore"
+    assert config.kvstore.backend == "kvstore2"
     assert config.kvstore.root_path.as_posix() == "data/kvstore"
-    assert config.kvstore.max_blob_bytes == 67108864
+    assert config.kvstore.max_blob_bytes == 68_719_476_736
     assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstore"
     assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
     assert config.file_browser.allowed_root_paths == []
@@ -83,6 +83,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.artifacts.plugins.local_path.as_posix() == ".pelagia/plugins"
     assert config.artifacts.plugins.metadata_filename == "metadata.toml"
     assert config.processing.video_ingest.n_tile == 4
+    assert config.processing.video_ingest.prefer_software_decode is True
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
@@ -183,6 +184,7 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [processing.video_ingest]
         n_tile = 4
+        prefer_software_decode = false
 
         [processing.flatfield]
         flatfield_correction = false
@@ -291,6 +293,7 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.artifacts.plugins.local_path.as_posix() == "/tmp/pelagia-artifacts/plugins"
     assert config.artifacts.plugins.metadata_filename == "plugin.toml"
     assert config.processing.video_ingest.n_tile == 4
+    assert config.processing.video_ingest.prefer_software_decode is False
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.8
     assert config.processing.flatfield.flatfield_axis == 1
@@ -378,6 +381,7 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_ARTIFACT_PLUGINS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/plugins")
     monkeypatch.setenv("PELAGIA_ROI_FILTER_MIN_PERIMETER", "9")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_N_TILE", "5")
+    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
     monkeypatch.setenv("PELAGIA_FLATFIELD_AXIS", "1")
@@ -422,6 +426,7 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.artifacts.plugins.local_path.as_posix() == "/tmp/env-pelagia-artifacts/plugins"
     assert config.processing.roi_filter.min_perimeter == 9.0
     assert config.processing.video_ingest.n_tile == 5
+    assert config.processing.video_ingest.prefer_software_decode is False
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.7
     assert config.processing.flatfield.flatfield_axis == 1

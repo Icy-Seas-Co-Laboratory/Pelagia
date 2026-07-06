@@ -99,6 +99,28 @@ def _estimated_tile_count(source_frame_count: int, n_tile: int) -> int | None:
     return (source_frame_count + n_tile - 1) // n_tile
 
 
+def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
+    if prefer_software_decode:
+        hw_prop = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+        software_value = getattr(cv2, "VIDEO_ACCELERATION_NONE", None)
+        api_preference = getattr(cv2, "CAP_FFMPEG", 0)
+        if hw_prop is not None and software_value is not None:
+            try:
+                capture = cv2.VideoCapture(
+                    input_path,
+                    api_preference,
+                    [int(hw_prop), int(software_value)],
+                )
+            except (TypeError, cv2.error):
+                capture = None
+            if capture is not None:
+                if capture.isOpened():
+                    return capture, "software"
+                capture.release()
+
+    return cv2.VideoCapture(input_path), "default"
+
+
 def convert_frame_to_grayscale(frame: np.ndarray) -> np.ndarray:
     array = np.asarray(frame)
     if array.ndim == 2:
@@ -485,6 +507,7 @@ def ingest_video_file(
         else default_processing_config().preprocessing
     )
     n_tile = ingest_defaults.n_tile if n_tile is None else n_tile
+    prefer_software_decode = bool(ingest_defaults.prefer_software_decode)
     adaptive_background_subtraction = (
         preprocessing_defaults.adaptive_background_subtraction
         if adaptive_background_subtraction is None
@@ -511,6 +534,7 @@ def ingest_video_file(
         "source_path": source_path,
         "filename": filename,
         "n_tile": int(n_tile),
+        "prefer_software_decode": prefer_software_decode,
         "adaptive_background_subtraction": bool(adaptive_background_subtraction),
         "adaptive_background_period": int(adaptive_background_period),
         "apply_mask": bool(apply_mask),
@@ -547,7 +571,11 @@ def ingest_video_file(
     frame_metadata["apply_mask"] = bool(apply_mask)
     frame_metadata["mask_path"] = mask_path
 
-    video = cv2.VideoCapture(input_path)
+    video, video_decode_mode = _open_video_capture(
+        input_path,
+        prefer_software_decode=prefer_software_decode,
+    )
+    ingest_payload["video_decode_mode"] = video_decode_mode
     if not video.isOpened():
         duration_ms = (time.perf_counter() - started) * 1000
         _CORE_LOGGER.error("Could not open video file %s", input_path)
@@ -595,6 +623,7 @@ def ingest_video_file(
             "fps": fps,
             "source_frame_count": source_frame_count,
             "estimated_tile_count": estimated_tile_count,
+            "video_decode_mode": video_decode_mode,
             "source_timestamp_utc": None if start_timestamp is None else start_timestamp.isoformat(),
         },
     )
@@ -606,6 +635,7 @@ def ingest_video_file(
             "fps": fps,
             "source_frame_count": source_frame_count,
             "estimated_tile_count": estimated_tile_count,
+            "video_decode_mode": video_decode_mode,
             "source_frames_read": 0,
             "stored_tile_count": 0,
             "source_timestamp_utc": None if start_timestamp is None else start_timestamp.isoformat(),

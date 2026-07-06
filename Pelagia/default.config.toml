@@ -122,6 +122,9 @@ store_roi_payload_min_width_plus_height = 50
 # downstream processing steps own correction and segmentation transforms.
 # Number of source video frames stacked into one stored frame/tile.
 n_tile = 4
+# Prefer CPU/software decode for reliability with codecs such as AV1 on systems
+# where hardware acceleration is unavailable or misreported.
+prefer_software_decode = true
 
 [processing.flatfield]
 # Flatfield correction defaults used during segmentation. Must be > 0 and < 1.

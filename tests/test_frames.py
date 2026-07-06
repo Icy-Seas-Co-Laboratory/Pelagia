@@ -1064,6 +1064,61 @@ def test_ingest_video_file_emits_progress_callback(monkeypatch):
     assert updates[-1]["stored_tile_count"] == 2
 
 
+def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
+    calls = []
+
+    class FakeVideoCapture:
+        def __init__(self, *args):
+            calls.append(args)
+            self.frames = [np.zeros((2, 2), dtype=np.uint8)]
+            self.index = 0
+
+        def isOpened(self):
+            return self.index <= len(self.frames)
+
+        def get(self, prop):
+            if prop == ingest_module.cv2.CAP_PROP_FPS:
+                return 20.0
+            if prop == ingest_module.cv2.CAP_PROP_FRAME_COUNT:
+                return 1.0
+            return 0.0
+
+        def read(self):
+            if self.index >= len(self.frames):
+                return False, None
+            frame = self.frames[self.index]
+            self.index += 1
+            return True, frame
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(ingest_module.cv2, "CAP_FFMPEG", 1900, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "CAP_PROP_HW_ACCELERATION", 999, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "VIDEO_ACCELERATION_NONE", 0, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    ctx = FakeContext()
+    ctx.logger = FakeDatabaseLogger()
+    ctx.config.processing.video_ingest.prefer_software_decode = True
+
+    ingest_video_file(
+        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        n_tile=1,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata={"kvstore_encoding": "raw"},
+    )
+
+    assert calls[0] == (
+        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
+        1900,
+        [999, 0],
+    )
+    opened = [event for event in ctx.logger.events if event["event_type"] == "video_ingest.video_opened"][0]
+    assert opened["payload"]["video_decode_mode"] == "software"
+
+
 def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):
     class FakeVideoCapture:
         def __init__(self, path):
