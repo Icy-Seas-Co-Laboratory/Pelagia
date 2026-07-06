@@ -99,8 +99,34 @@ def _estimated_tile_count(source_frame_count: int, n_tile: int) -> int | None:
     return (source_frame_count + n_tile - 1) // n_tile
 
 
+def _open_ffmpeg_capture_with_options(input_path: str, options: str):
+    existing_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+    try:
+        return cv2.VideoCapture(input_path, getattr(cv2, "CAP_FFMPEG", 0))
+    finally:
+        if existing_options is None:
+            os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+        else:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = existing_options
+
+
 def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
     if prefer_software_decode:
+        existing_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+        if "hwaccel" not in existing_options.lower():
+            software_options = "hwaccel;none"
+            if existing_options:
+                software_options = f"{existing_options}|{software_options}"
+            try:
+                capture = _open_ffmpeg_capture_with_options(input_path, software_options)
+            except (TypeError, cv2.error):
+                capture = None
+            if capture is not None:
+                if capture.isOpened():
+                    return capture, "software_ffmpeg_options"
+                capture.release()
+
         hw_prop = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
         software_value = getattr(cv2, "VIDEO_ACCELERATION_NONE", None)
         api_preference = getattr(cv2, "CAP_FFMPEG", 0)
@@ -118,7 +144,8 @@ def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
                     return capture, "software"
                 capture.release()
 
-    return cv2.VideoCapture(input_path), "default"
+    decode_mode = "default_after_software_attempts" if prefer_software_decode else "default"
+    return cv2.VideoCapture(input_path), decode_mode
 
 
 def convert_frame_to_grayscale(frame: np.ndarray) -> np.ndarray:

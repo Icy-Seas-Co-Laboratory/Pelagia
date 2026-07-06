@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -1069,7 +1070,7 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
 
     class FakeVideoCapture:
         def __init__(self, *args):
-            calls.append(args)
+            calls.append((args, os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")))
             self.frames = [np.zeros((2, 2), dtype=np.uint8)]
             self.index = 0
 
@@ -1097,6 +1098,7 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
     monkeypatch.setattr(ingest_module.cv2, "CAP_PROP_HW_ACCELERATION", 999, raising=False)
     monkeypatch.setattr(ingest_module.cv2, "VIDEO_ACCELERATION_NONE", 0, raising=False)
     monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.delenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", raising=False)
     ctx = FakeContext()
     ctx.logger = FakeDatabaseLogger()
     ctx.config.processing.video_ingest.prefer_software_decode = True
@@ -1111,12 +1113,12 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
     )
 
     assert calls[0] == (
-        "/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv",
-        1900,
-        [999, 0],
+        ("/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv", 1900),
+        "hwaccel;none",
     )
+    assert "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ
     opened = [event for event in ctx.logger.events if event["event_type"] == "video_ingest.video_opened"][0]
-    assert opened["payload"]["video_decode_mode"] == "software"
+    assert opened["payload"]["video_decode_mode"] == "software_ffmpeg_options"
 
 
 def test_ingest_video_file_converts_color_frames_to_grayscale(monkeypatch):

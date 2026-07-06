@@ -31,40 +31,16 @@ PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX=""
 PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE=""
 PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR=""
 PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS=""
+PELAGIA_VIDEO_INGEST_N_TILE=""
+PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE=""
 PELAGIA_INIT_ON_START=""
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS=""
 WORKER_ROWS=()
 
 load_stack_config() {
-    local row kind key value
+    local parser_output row kind key value
     WORKER_ROWS=()
-    while IFS=$'\t' read -r kind key value; do
-        case "$kind" in
-            config)
-                case "$key" in
-                    stack_name) STACK_NAME="$value" ;;
-                    run_dir) RUN_DIR="$value" ;;
-                    database_dsn) PELAGIA_DATABASE_DSN="$value" ;;
-                    database_schema) PELAGIA_DATABASE_SCHEMA="$value" ;;
-                    kvstore_backend) PELAGIA_KVSTORE_BACKEND="$value" ;;
-                    kvstore_root) PELAGIA_KVSTORE_ROOT="$value" ;;
-                    kvstore_max_blob_bytes) PELAGIA_KVSTORE_MAX_BLOB_BYTES="$value" ;;
-                    file_browser_root_path_kvstore) PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE="$value" ;;
-                    file_browser_root_path_import_dir) PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR="$value" ;;
-                    file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
-                    api_enabled) PELAGIA_API_ENABLED="$value" ;;
-                    api_host) PELAGIA_API_HOST="$value" ;;
-                    api_port) PELAGIA_API_PORT="$value" ;;
-                    api_cors_allow_origin_regex) PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX="$value" ;;
-                    init_on_start) PELAGIA_INIT_ON_START="$value" ;;
-                    init_statement_timeout_ms) PELAGIA_INIT_STATEMENT_TIMEOUT_MS="$value" ;;
-                esac
-                ;;
-            worker)
-                WORKER_ROWS+=("$key"$'\t'"$value")
-                ;;
-        esac
-    done < <(python - "$CONFIG_FILE" "$ROOT_DIR" <<'PY'
+    parser_output="$(python - "$CONFIG_FILE" "$ROOT_DIR" <<'PY'
 from __future__ import annotations
 
 import os
@@ -104,6 +80,13 @@ def clean(value: object) -> str:
 
 
 def bool_text(value: object) -> str:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return "true"
+        if lowered in {"0", "false", "no", "off"}:
+            return "false"
+        raise SystemExit(f"Invalid boolean value: {value!r}")
     return "true" if bool(value) else "false"
 
 
@@ -148,6 +131,10 @@ kvstore = section("kvstore")
 file_browser = section("file_browser")
 api = section("api")
 worker_defaults = section("worker_defaults")
+processing = section("processing")
+video_ingest = processing.get("video_ingest", {})
+if not isinstance(video_ingest, dict):
+    raise SystemExit("[processing.video_ingest] must be a TOML table")
 
 stack_name = stack_slug(str(stack.get("name") or config_path.stem))
 run_dir = path_value(
@@ -196,6 +183,16 @@ config_rows = {
     "file_browser_allowed_root_paths": path_list_value(
         file_browser.get("allowed_root_paths"),
         os.environ.get("PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", ""),
+    ),
+    "video_ingest_n_tile": scalar(
+        video_ingest.get("n_tile"),
+        os.environ.get("PELAGIA_VIDEO_INGEST_N_TILE", "4"),
+    ),
+    "video_ingest_prefer_software_decode": bool_text(
+        video_ingest.get(
+            "prefer_software_decode",
+            os.environ.get("PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE", "true"),
+        )
     ),
     "api_enabled": bool_text(api.get("enabled", True)),
     "api_host": scalar(api.get("host"), os.environ.get("PELAGIA_API_HOST", "127.0.0.1")),
@@ -276,7 +273,36 @@ for index, worker in enumerate(workers, start=1):
             f"{clean(worker_id + suffix)}|{clean(','.join(stages))}|{clean(idle)}|{clean(requeue)}"
         )
 PY
-    )
+)"
+    while IFS=$'\t' read -r kind key value; do
+        case "$kind" in
+            config)
+                case "$key" in
+                    stack_name) STACK_NAME="$value" ;;
+                    run_dir) RUN_DIR="$value" ;;
+                    database_dsn) PELAGIA_DATABASE_DSN="$value" ;;
+                    database_schema) PELAGIA_DATABASE_SCHEMA="$value" ;;
+                    kvstore_backend) PELAGIA_KVSTORE_BACKEND="$value" ;;
+                    kvstore_root) PELAGIA_KVSTORE_ROOT="$value" ;;
+                    kvstore_max_blob_bytes) PELAGIA_KVSTORE_MAX_BLOB_BYTES="$value" ;;
+                    file_browser_root_path_kvstore) PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE="$value" ;;
+                    file_browser_root_path_import_dir) PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR="$value" ;;
+                    file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
+                    video_ingest_n_tile) PELAGIA_VIDEO_INGEST_N_TILE="$value" ;;
+                    video_ingest_prefer_software_decode) PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE="$value" ;;
+                    api_enabled) PELAGIA_API_ENABLED="$value" ;;
+                    api_host) PELAGIA_API_HOST="$value" ;;
+                    api_port) PELAGIA_API_PORT="$value" ;;
+                    api_cors_allow_origin_regex) PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX="$value" ;;
+                    init_on_start) PELAGIA_INIT_ON_START="$value" ;;
+                    init_statement_timeout_ms) PELAGIA_INIT_STATEMENT_TIMEOUT_MS="$value" ;;
+                esac
+                ;;
+            worker)
+                WORKER_ROWS+=("$key"$'\t'"$value")
+                ;;
+        esac
+    done <<<"$parser_output"
 
     if [[ -z "$RUN_DIR" || "$RUN_DIR" == "/" ]]; then
         echo "resolved run_dir is unsafe: '$RUN_DIR'" >&2
@@ -427,6 +453,8 @@ start_stack() {
     export PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE
     export PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR
     export PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS
+    export PELAGIA_VIDEO_INGEST_N_TILE
+    export PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE
     if [[ -n "$PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX" ]]; then
         export PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX
     fi

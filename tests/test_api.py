@@ -2291,6 +2291,31 @@ def test_api_can_create_and_list_structured_logs():
     assert list_response.json()["logs"][0]["offset"] == 10
 
 
+def test_api_can_list_and_read_physical_log_files(tmp_path):
+    client, _, _ = make_client()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "worker-special.log"
+    log_path.write_text("first\nsecond\nthird\n", encoding="utf-8")
+    client.app.state.context.config.logging.log_path = log_dir
+
+    list_response = client.get("/logs/files?root=configured")
+    read_response = client.get("/logs/files/worker-special.log?root=configured&tail_lines=2")
+    traversal_response = client.get("/logs/files/%2E%2E/secret.log?root=configured")
+
+    assert list_response.status_code == 200
+    listed = list_response.json()["files"]
+    assert listed[0]["root"] == "configured"
+    assert listed[0]["relative_path"] == "worker-special.log"
+    assert listed[0]["size_bytes"] == log_path.stat().st_size
+    assert read_response.status_code == 200
+    body = read_response.json()
+    assert body["file"]["relative_path"] == "worker-special.log"
+    assert body["lines"] == ["second", "third"]
+    assert body["text"] == "second\nthird"
+    assert traversal_response.status_code == 422
+
+
 def test_api_can_queue_segmentation_job():
     client, repository, _ = make_client()
     headers = auth_headers(client)
