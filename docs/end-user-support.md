@@ -25,6 +25,8 @@ when resetting, migrating, or backing up.
   checkout, or move the PostgreSQL database and KVStore.
 - [Backup And Restore](backup.md): recommended backup schedule, commands, and
   restore checks.
+- [Processing Status Projection](processing-status.md): server-side filtering
+  and status tracking for large frame sets.
 - [Python Environment Setup](python-environment.md): Python, dependency, and
   local configuration setup.
 - [Artifact Organization](artifacts.md): model and plugin artifact layout.

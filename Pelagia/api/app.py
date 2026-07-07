@@ -3,7 +3,8 @@ from __future__ import annotations
 from ..config import CoreConfig
 from ..observability import configure_core_logging
 from ..services.context import AppContext
-from .routes import assets, auth, collections, detections, frame, health, ingestion, io, jobs, kvstore, live, logs, models, roi_refinement, runs, segmentation, system, workers
+from ..version import __version__
+from .routes import assets, auth, collections, detections, frame, health, ingestion, io, jobs, kvstore, live, logs, models, processing_status, roi_refinement, runs, segmentation, system, workers
 
 
 def create_app(config: CoreConfig | None = None):
@@ -21,7 +22,7 @@ def create_app(config: CoreConfig | None = None):
     resolved_config = config or CoreConfig.load()
     core_logger = configure_core_logging(resolved_config)
     core_logger.info("Starting Pelagia API")
-    app = FastAPI(title="Pelagia", version="0.0.1")
+    app = FastAPI(title="Pelagia", version=__version__)
     exposed_headers = [
         "X-Pelagia-Frame-Id",
         "X-Pelagia-Payload-Kind",
@@ -48,6 +49,7 @@ def create_app(config: CoreConfig | None = None):
         segmentation,
         runs,
         jobs,
+        processing_status,
         workers,
         frame,
         assets,

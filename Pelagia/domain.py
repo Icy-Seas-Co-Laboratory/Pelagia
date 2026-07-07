@@ -60,6 +60,7 @@ class PipelineStage(str, Enum):
 class JobStatus(str, Enum):
     QUEUED = "queued"
     LEASED = "leased"
+    WORKING = "working"
     PAUSED = "paused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

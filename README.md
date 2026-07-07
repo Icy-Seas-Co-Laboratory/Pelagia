@@ -23,6 +23,9 @@ For operational procedures after installation, see the
 migration, KVStore migration, backup, and restore procedures that keep the
 database and blob storage in sync.
 
+For large-frame filtering and project processing summaries, see the
+[Processing Status Projection](docs/processing-status.md) guide.
+
 ### Prerequisites
 
 - Python 3.10 or newer. Python 3.11+ is preferred.
@@ -116,6 +119,13 @@ Initialize database tables and storage:
 ```bash
 python -m Pelagia.cli.app init-system
 python -m Pelagia.cli.app create-dev-login --username dev-admin --password pelagia-dev
+```
+
+For code upgrades where storage already exists, apply database migrations with:
+
+```bash
+python -m Pelagia.cli.app migrate-db
+python -m Pelagia.cli.app check-system
 ```
 
 `create-dev-login` creates the default project if needed, creates or reuses the
@@ -359,7 +369,7 @@ Useful endpoint groups:
   `POST /users/{user_id_or_username}/deactivate`, `DELETE /users/{user_id_or_username}`
 - `GET /system`, `/system/status`, `/system/status/{project_id_or_key}`, `/system/use`, `/system/config`
 - `POST /system/initialize`
-- `POST /ingestion/videos`
+- `POST /ingestion/analyze`, `POST /ingestion/assets`, `POST /ingestion/videos`
 - `POST /frame/preprocess`, `POST /frame/preprocess/jobs`
 - `GET /frame/original`, `GET /frame/preprocessed`
 - `POST /segmentation/frames/{frame_id}`

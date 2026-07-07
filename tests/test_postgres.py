@@ -36,6 +36,7 @@ def test_render_schema_loads_sql_resource():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.projects" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.project_memberships" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.user_sessions" in rendered
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.schema_migrations" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frames" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
     assert "project_id uuid" in rendered
@@ -43,6 +44,15 @@ def test_render_schema_loads_sql_resource():
     assert "job_id uuid REFERENCES pelagia_unit.processing_jobs(id) ON DELETE SET NULL" in rendered
     assert "UNIQUE (candidate_detection_id)" not in rendered
     assert "DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key" in rendered
+    assert "{schema}" not in rendered
+
+
+def test_packaged_migrations_are_discoverable_and_rendered():
+    migrations = postgres.available_migrations()
+
+    assert [migration["migration_id"] for migration in migrations] == ["0001_processing_status"]
+    rendered = postgres.render_migration(migrations[0], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
     assert "{schema}" not in rendered
 
 
@@ -68,6 +78,17 @@ def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
     for row in rows.values():
         assert row["is_nullable"] == "NO"
         assert row["column_default"] is None
+
+
+def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
+    status = postgres_repo.schema_status()
+
+    assert status["ready"] is True
+    assert "schema_migrations" in status["existing_tables"]
+    assert status["migrations"]["available_count"] == 1
+    assert status["migrations"]["applied_count"] == 1
+    assert status["migrations"]["pending_count"] == 0
+    assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
 
 @pytest.fixture()
@@ -521,6 +542,200 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     )
     assert logs[0]["payload"] == {"frame_count": 2}
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
+
+
+def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(postgres_repo):
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    planned_run = PlannedRun(
+        manifest=RunManifest(
+            run_id=run_id,
+            run_key=f"status-run-{uuid.uuid4().hex}",
+            instrument="pytest",
+            source_path="/tmp/status.avi",
+            source_type=AssetKind.VIDEO.value,
+            created_at=datetime.now(timezone.utc),
+            assets=[
+                RawAssetManifest(
+                    asset_id=asset_id,
+                    filename="status.avi",
+                    path="/tmp/status.avi",
+                    kind=AssetKind.VIDEO,
+                    size_bytes=456,
+                    checksum="sha256:status",
+                    collections=["status-test"],
+                )
+            ],
+        ),
+        jobs=[],
+    )
+    postgres_repo.register_planned_run(planned_run, project_id=DEFAULT_PROJECT_ID)
+    frames = postgres_repo.replace_frames(
+        run_id,
+        [
+            FrameRecord(
+                asset_id=asset_id,
+                frame_index=1,
+                width=4,
+                height=4,
+                preview_thumbhash=b"thumb-1",
+                kvstore_hash="frame-1",
+                payload_ref="frame-1",
+                payload_encoding="zstd",
+                payload_format="zstd_ndarray_c_order",
+                payload_dtype="uint8",
+                payload_shape=[4, 4],
+            ),
+            FrameRecord(
+                asset_id=asset_id,
+                frame_index=2,
+                width=4,
+                height=4,
+                preview_thumbhash=b"thumb-2",
+                kvstore_hash="frame-2",
+                payload_ref="frame-2",
+                payload_encoding="zstd",
+                payload_format="zstd_ndarray_c_order",
+                payload_dtype="uint8",
+                payload_shape=[4, 4],
+            ),
+        ],
+    )
+    frame_ids = [str(row["id"]) for row in frames]
+
+    assert postgres_repo.ensure_frame_status_rows(project_id=DEFAULT_PROJECT_ID, asset_id=asset_id) == 2
+    preprocess_job = postgres_repo.create_job(
+        PipelineStage.PREPROCESS_FRAMES,
+        project_id=DEFAULT_PROJECT_ID,
+        run_id=run_id,
+        asset_id=asset_id,
+        payload={"frame_ids": [frame_ids[0]]},
+    )
+    queued_preprocess_rows = postgres_repo.list_frame_status(
+        project_id=DEFAULT_PROJECT_ID,
+        preprocessing_status=[JobStatus.QUEUED.value],
+    )
+    assert [str(row["frame_id"]) for row in queued_preprocess_rows["frames"]] == [frame_ids[0]]
+    assert (
+        postgres_repo.upsert_frame_stage_status(
+            project_id=DEFAULT_PROJECT_ID,
+            frame_ids=[frame_ids[0]],
+            stage=PipelineStage.PREPROCESS_FRAMES,
+            status=JobStatus.WORKING,
+            job_id=str(preprocess_job["id"]),
+        )
+        == 1
+    )
+    working_rows = postgres_repo.list_frame_status(
+        project_id=DEFAULT_PROJECT_ID,
+        preprocessing_status=[JobStatus.WORKING.value],
+    )
+    assert [str(row["frame_id"]) for row in working_rows["frames"]] == [frame_ids[0]]
+
+    detections = postgres_repo.replace_detections(
+        run_id,
+        asset_id,
+        [
+            DetectionRecord(
+                run_id=run_id,
+                frame_id=frame_ids[0],
+                roi_index=1,
+                bbox_x=0,
+                bbox_y=0,
+                bbox_w=2,
+                bbox_h=2,
+                area=4,
+                perimeter=8,
+                major_axis_length=2,
+                minor_axis_length=2,
+                min_gray_value=1,
+                mean_gray_value=2.0,
+                roi_payload=None,
+            ),
+            DetectionRecord(
+                run_id=run_id,
+                frame_id=frame_ids[1],
+                roi_index=1,
+                bbox_x=0,
+                bbox_y=0,
+                bbox_w=2,
+                bbox_h=2,
+                area=4,
+                perimeter=8,
+                major_axis_length=2,
+                minor_axis_length=2,
+                min_gray_value=1,
+                mean_gray_value=2.0,
+                roi_payload=None,
+            ),
+        ],
+    )
+    refined_job = postgres_repo.create_job(
+        PipelineStage.ROI_REFINEMENT,
+        project_id=DEFAULT_PROJECT_ID,
+        run_id=run_id,
+        asset_id=asset_id,
+        payload={"detection_ids": [str(detections[0]["id"])]},
+    )
+    queued_refinement_rows = postgres_repo.list_frame_status(
+        project_id=DEFAULT_PROJECT_ID,
+        roi_refinement_status=[JobStatus.QUEUED.value],
+    )
+    assert [str(row["frame_id"]) for row in queued_refinement_rows["frames"]] == [frame_ids[0]]
+    postgres_repo.upsert_refined_detections(
+        [
+            (
+                str(detections[0]["id"]),
+                DetectionRecord(
+                    run_id=run_id,
+                    frame_id=frame_ids[0],
+                    roi_index=1,
+                    bbox_x=0,
+                    bbox_y=0,
+                    bbox_w=2,
+                    bbox_h=2,
+                    area=4,
+                    perimeter=8,
+                    major_axis_length=2,
+                    minor_axis_length=2,
+                    min_gray_value=1,
+                    mean_gray_value=2.0,
+                    roi_payload=None,
+                ),
+            )
+        ],
+        job_id=str(refined_job["id"]),
+        project_id=DEFAULT_PROJECT_ID,
+    )
+    assert postgres_repo.refresh_frame_status_counts(project_id=DEFAULT_PROJECT_ID, asset_id=asset_id) == 2
+
+    refined_ids = postgres_repo.list_frame_status_ids(project_id=DEFAULT_PROJECT_ID, has_refined_rois=True)
+    assert refined_ids["frame_ids"] == [frame_ids[0]]
+    summary = postgres_repo.get_frame_status_summary(project_id=DEFAULT_PROJECT_ID, asset_id=asset_id)
+    assert summary["total_frame_count"] == 2
+    assert summary["candidate_detection_count"] == 2
+    assert summary["refined_detection_count"] == 1
+    assert summary["unrefined_candidate_count"] == 1
+    assert summary["by_status"]["preprocessing"] == {"unknown": 1, "working": 1}
+
+    snapshot = postgres_repo.get_or_create_processing_status_snapshot(
+        project_id=DEFAULT_PROJECT_ID,
+        summary=summary,
+    )
+    unchanged_snapshot = postgres_repo.get_or_create_processing_status_snapshot(
+        project_id=DEFAULT_PROJECT_ID,
+        summary=summary,
+    )
+    changed_snapshot = postgres_repo.get_or_create_processing_status_snapshot(
+        project_id=DEFAULT_PROJECT_ID,
+        summary={**summary, "candidate_detection_count": 3},
+    )
+    assert unchanged_snapshot["status_version"] == snapshot["status_version"]
+    assert changed_snapshot["status_version"] == snapshot["status_version"] + 1
+
+    first_touch = postgres_repo.touch_processing_status_snapshot(project_id=DEFAULT_PROJECT_ID)
+    second_touch = postgres_repo.touch_processing_status_snapshot(project_id=DEFAULT_PROJECT_ID)
+    assert second_touch["status_version"] == first_touch["status_version"] + 1
 
 
 def test_postgres_repository_manages_users_projects_memberships_and_sessions(postgres_repo):

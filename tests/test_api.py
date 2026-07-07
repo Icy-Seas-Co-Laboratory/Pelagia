@@ -74,6 +74,12 @@ class FakeRepository:
         }
         self.memberships = {("user-1", "project-1"): "editor"}
         self.sessions = {}
+        self.processing_status_snapshots = []
+        self.frame_status_filter_calls = []
+        self.rebuild_frame_status_calls = []
+        self.frame_stage_status_updates = []
+        self.frame_status_count_refreshes = []
+        self.processing_status_snapshot_touches = []
         self.resource_projects = {
             "run-1": "project-1",
             "asset-1": "project-1",
@@ -88,6 +94,24 @@ class FakeRepository:
 
     def _visible(self, resource_id, project_id):
         return project_id is None or self.resource_projects.get(resource_id) == project_id
+
+    def schema_status(self):
+        return {
+            "schema": "pelagia",
+            "ready": True,
+            "required_tables": [],
+            "existing_tables": [],
+            "missing_tables": [],
+            "migrations": {
+                "available_count": 1,
+                "applied_count": 1,
+                "pending_count": 0,
+                "applied": [{"migration_id": "0001_processing_status"}],
+                "pending": [],
+                "checksum_mismatches": [],
+                "ready": True,
+            },
+        }
 
     def list_runs(self, **kwargs):
         if not self._visible("run-1", kwargs.get("project_id")):
@@ -508,6 +532,100 @@ class FakeRepository:
                 },
             ],
         }
+
+    def _frame_status_rows(self, **kwargs):
+        self.frame_status_filter_calls.append(kwargs)
+        return [
+            {
+                "project_id": kwargs.get("project_id"),
+                "frame_id": "frame-1",
+                "asset_id": "asset-1",
+                "run_id": "run-1",
+                "frame_index": 2,
+                "collections": ["test"],
+                "preprocessing_status": "succeeded",
+                "candidate_detection_status": "succeeded",
+                "candidate_detection_count": 7,
+                "roi_refinement_status": "succeeded",
+                "refined_detection_count": 3,
+                "unrefined_candidate_count": 4,
+                "asset_filename": "sample.mkv",
+                "asset_kind": "video",
+            },
+            {
+                "project_id": kwargs.get("project_id"),
+                "frame_id": "frame-2",
+                "asset_id": "asset-1",
+                "run_id": "run-1",
+                "frame_index": 3,
+                "collections": ["test"],
+                "preprocessing_status": "unknown",
+                "candidate_detection_status": "unknown",
+                "candidate_detection_count": 0,
+                "roi_refinement_status": "unknown",
+                "refined_detection_count": 0,
+                "unrefined_candidate_count": 0,
+                "asset_filename": "sample.mkv",
+                "asset_kind": "video",
+            },
+        ][: kwargs.get("limit", 1000)]
+
+    def list_frame_status(self, **kwargs):
+        return {"frames": self._frame_status_rows(**kwargs), "next_cursor": None}
+
+    def list_frame_status_ids(self, **kwargs):
+        rows = self._frame_status_rows(**kwargs)
+        return {"frame_ids": [row["frame_id"] for row in rows], "next_cursor": None}
+
+    def get_frame_status_summary(self, **kwargs):
+        self.frame_status_filter_calls.append(kwargs)
+        return {
+            "total_frame_count": 2,
+            "preprocessing_succeeded_count": 1,
+            "candidate_detection_succeeded_count": 1,
+            "roi_refinement_succeeded_count": 1,
+            "frames_with_candidates_count": 1,
+            "frames_with_refined_rois_count": 1,
+            "candidate_detection_count": 7,
+            "refined_detection_count": 3,
+            "unrefined_candidate_count": 4,
+            "updated_at": None,
+            "by_status": {
+                "preprocessing": {"succeeded": 1, "unknown": 1},
+                "candidate_detection": {"succeeded": 1, "unknown": 1},
+                "roi_refinement": {"succeeded": 1, "unknown": 1},
+            },
+        }
+
+    def get_or_create_processing_status_snapshot(self, **kwargs):
+        snapshot = {
+            "id": f"snapshot-{len(self.processing_status_snapshots) + 1}",
+            "project_id": kwargs.get("project_id"),
+            "session_id": kwargs.get("session_id"),
+            "status_version": 1,
+            "summary": kwargs.get("summary") or {},
+        }
+        self.processing_status_snapshots.append(snapshot)
+        return snapshot
+
+    def rebuild_frame_status(self, **kwargs):
+        self.rebuild_frame_status_calls.append(kwargs)
+        return {
+            "rebuilt_frame_count": 2,
+            "summary": self.get_frame_status_summary(**kwargs),
+        }
+
+    def upsert_frame_stage_status(self, **kwargs):
+        self.frame_stage_status_updates.append(kwargs)
+        return len(kwargs.get("frame_ids") or [])
+
+    def refresh_frame_status_counts(self, **kwargs):
+        self.frame_status_count_refreshes.append(kwargs)
+        return len(kwargs.get("frame_ids") or [])
+
+    def touch_processing_status_snapshot(self, **kwargs):
+        self.processing_status_snapshot_touches.append(kwargs)
+        return {"project_id": kwargs.get("project_id"), "status_version": len(self.processing_status_snapshot_touches)}
 
     def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
         project_id = kwargs.get("project_id")
@@ -964,7 +1082,7 @@ def auth_headers(client, *, username="ada", project_key="default"):
 
 
 def test_io_export_options_are_discoverable():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.get("/io/export/options")
 
@@ -1057,12 +1175,16 @@ def test_io_export_writers_create_sqlite_and_xlsx_files(tmp_path):
 
 
 def test_api_lists_system_status_without_live_database():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.get("/system/status")
 
     assert response.status_code == 200
     body = response.json()
+    assert body["build"]["version"] == "0.0.1"
+    assert "git_commit" in body["build"]
+    assert body["database"]["ready"] is True
+    assert body["database"]["migrations"]["pending_count"] == 0
     assert body["queue"] == {"queued": 2}
     assert body["workers"]["online"] == 1
     assert body["kvstore"]["initialized"] is True
@@ -1073,7 +1195,7 @@ def test_api_lists_system_status_without_live_database():
 
 
 def test_api_normalizes_kvstore2_system_status_size_fields():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
     client.app.state.context.kvstore = FakeKVStore2Status()
 
     response = client.get("/system/status")
@@ -1148,7 +1270,7 @@ def test_api_project_system_status_does_not_initialize_missing_project_kvstore()
 
 
 def test_api_exposes_system_config():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.get("/system/config")
 
@@ -1167,13 +1289,15 @@ def test_api_exposes_system_config():
 
 
 def test_api_exposes_system_capabilities():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.get("/system/capabilities")
 
     assert response.status_code == 200
     body = response.json()
     assert body["name"] == "Pelagia"
+    assert body["version"] == "0.0.1"
+    assert "git_commit" in body["build"]
     assert body["api"]["endpoints"]["segmentation_options"] == "/segmentation/options"
     assert body["api"]["endpoints"]["preprocessing_options"] == "/preprocessing/options"
     assert body["api"]["endpoints"]["live_threshold"] == "/live/threshold"
@@ -1626,7 +1750,7 @@ def test_api_roi_refinement_dry_run_resolves_builtin_model_ref():
 
 
 def test_api_roi_refinement_identity_stores_refined_detection():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.post(
         "/roi-refinement",
@@ -1654,10 +1778,23 @@ def test_api_roi_refinement_identity_stores_refined_detection():
     assert refined["refined_mask_url"] == "/refined-detections/refined-det-1/mask"
     assert refined["metadata"]["detection_stage"] == "refined"
     assert refined["metadata"]["refinement_method"] == "identity"
+    assert repository.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "status": "succeeded",
+            "job_id": None,
+        }
+    ]
+    assert repository.frame_status_count_refreshes == [
+        {"project_id": "project-1", "frame_ids": ["frame-1"], "asset_id": None}
+    ]
+    assert repository.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_api_roi_refinement_rejects_missing_roi_payload():
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.post(
         "/roi-refinement",
@@ -2739,7 +2876,7 @@ def test_api_direct_preprocess_accepts_frame_ids(monkeypatch):
     monkeypatch.setattr(frame, "retrieve_frame", fake_retrieve_frame)
     monkeypatch.setattr(frame, "preprocess_frame_for_segmentation", fake_preprocess_frame)
     monkeypatch.setattr(frame, "store_preprocessed_frame", fake_store_preprocessed_frame)
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.post(
         "/frame/preprocess",
@@ -2752,6 +2889,26 @@ def test_api_direct_preprocess_accepts_frame_ids(monkeypatch):
     assert body["frame_ids"] == ["frame-1", "frame-2"]
     assert [frame["stored"] for frame in body["frames"]] == [True, True]
     assert stored == [("frame-1", "png"), ("frame-2", "png")]
+    assert repository.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "status": "succeeded",
+            "job_id": None,
+        },
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-2"],
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "status": "succeeded",
+            "job_id": None,
+        },
+    ]
+    assert repository.processing_status_snapshot_touches == [
+        {"project_id": "project-1"},
+        {"project_id": "project-1"},
+    ]
 
     asset_response = client.post(
         "/frame/preprocess",
@@ -2761,6 +2918,7 @@ def test_api_direct_preprocess_accepts_frame_ids(monkeypatch):
     assert asset_response.json()["asset_id"] == "asset-1"
     assert asset_response.json()["frame_count"] == 1
     assert asset_response.json()["frames"][0]["stored"] is False
+    assert len(repository.frame_stage_status_updates) == 2
 
 
 def test_api_direct_segmentation_accepts_frame_ids(monkeypatch):
@@ -2783,7 +2941,7 @@ def test_api_direct_segmentation_accepts_frame_ids(monkeypatch):
 
     monkeypatch.setattr(segmentation, "retrieve_frame", fake_retrieve_frame)
     monkeypatch.setattr(segmentation, "segment_frame", fake_segment_frame)
-    client, _, _ = make_client()
+    client, repository, _ = make_client()
 
     response = client.post(
         "/segmentation/frames",
@@ -2798,6 +2956,30 @@ def test_api_direct_segmentation_accepts_frame_ids(monkeypatch):
     assert body["frames"][0]["resolved_options"]["roi_recording"]["padding"] == 4
     assert body["frames"][0]["stage_counts"]["recorded_detection_count"] == 1
     assert segmented == [("frame-1", 4), ("frame-2", 4)]
+    assert repository.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.SEGMENT.value,
+            "status": "succeeded",
+            "job_id": None,
+        },
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-2"],
+            "stage": PipelineStage.SEGMENT.value,
+            "status": "succeeded",
+            "job_id": None,
+        },
+    ]
+    assert repository.frame_status_count_refreshes == [
+        {"project_id": "project-1", "frame_ids": ["frame-1"], "asset_id": "asset-1"},
+        {"project_id": "project-1", "frame_ids": ["frame-2"], "asset_id": "asset-1"},
+    ]
+    assert repository.processing_status_snapshot_touches == [
+        {"project_id": "project-1"},
+        {"project_id": "project-1"},
+    ]
 
 
 def test_api_can_request_worker_shutdown():
@@ -3197,6 +3379,87 @@ def test_api_reports_frame_processing_state():
     assert body["page"] == {"limit": 5, "offset": 0, "count": 2, "next_offset": None}
 
 
+def test_api_processing_status_summary_creates_project_session_snapshot():
+    client, repo, _ = make_client()
+
+    response = client.get(
+        "/processing/status/summary"
+        "?collection=test&preprocessing_status=succeeded"
+        "&candidate_detection_status=succeeded&roi_refinement_status=succeeded"
+        "&has_candidates=true&has_refined_rois=true"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_frame_count"] == 2
+    assert body["summary"]["candidate_detection_count"] == 7
+    assert body["snapshot"]["project_id"] == "project-1"
+    assert body["snapshot"]["summary"]["total_frame_count"] == 2
+    call = repo.frame_status_filter_calls[0]
+    assert call["project_id"] == "project-1"
+    assert call["collection"] == "test"
+    assert call["preprocessing_status"] == ["succeeded"]
+    assert call["candidate_detection_status"] == ["succeeded"]
+    assert call["roi_refinement_status"] == ["succeeded"]
+    assert call["has_candidates"] is True
+    assert call["has_refined_rois"] is True
+
+
+def test_api_processing_status_snapshot_uses_authenticated_session():
+    client, _, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+
+    response = client.get("/processing/status/summary", headers=headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["snapshot"]["project_id"] == "project-1"
+    assert body["snapshot"]["session_id"] == "session-1"
+
+
+def test_api_processing_status_frames_and_ids_are_filterable():
+    client, repo, _ = make_client()
+
+    frames_response = client.get(
+        "/processing/status/frames"
+        "?asset_id=asset-1&collection=test&candidate_detection_status=succeeded"
+        "&start_frame=2&end_frame=5&limit=1"
+    )
+    ids_response = client.get(
+        "/processing/status/frames/ids"
+        "?asset_id=asset-1&collection=test&candidate_detection_status=succeeded"
+        "&start_frame=2&end_frame=5&limit=2"
+    )
+
+    assert frames_response.status_code == 200
+    frames_body = frames_response.json()
+    assert frames_body["frames"][0]["frame_id"] == "frame-1"
+    assert frames_body["frames"][0]["candidate_detection_status"] == "succeeded"
+    assert frames_body["page"] == {"limit": 1, "offset": 0, "count": 1, "next_offset": 1}
+    assert ids_response.status_code == 200
+    ids_body = ids_response.json()
+    assert ids_body["frame_ids"] == ["frame-1", "frame-2"]
+    call = repo.frame_status_filter_calls[-1]
+    assert call["asset_id"] == "asset-1"
+    assert call["collection"] == "test"
+    assert call["candidate_detection_status"] == ["succeeded"]
+    assert call["start_frame"] == 2
+    assert call["end_frame"] == 5
+
+
+def test_api_processing_status_rebuild_is_project_scoped():
+    client, repo, _ = make_client()
+
+    response = client.post("/processing/status/rebuild?asset_id=asset-1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "rebuilt"
+    assert body["rebuilt_frame_count"] == 2
+    assert body["snapshot"]["project_id"] == "project-1"
+    assert repo.rebuild_frame_status_calls == [{"project_id": "project-1", "asset_id": "asset-1"}]
+
+
 def test_api_asset_frames_accepts_range_filters():
     client, _, _ = make_client()
 
@@ -3477,6 +3740,113 @@ def test_api_queues_video_ingestion_with_collections(tmp_path):
         "test",
         "transect1",
     ]
+
+
+def test_api_analyzes_image_sequence_before_ingestion(tmp_path):
+    client, _, _ = make_client()
+    headers = auth_headers(client)
+    import_root = tmp_path / "import"
+    sequence = import_root / "sequence-a"
+    sequence.mkdir(parents=True)
+    cv2.imwrite(str(sequence / "frame_001.png"), np.zeros((3, 4), dtype=np.uint8))
+    cv2.imwrite(str(sequence / "frame_002.jpg"), np.ones((3, 4), dtype=np.uint8))
+    client.app.state.context.config.file_browser.root_path_import_dir = import_root
+
+    response = client.post(
+        "/ingestion/analyze",
+        headers=headers,
+        json={
+            "source_path": str(sequence),
+            "kind": "image_sequence",
+            "collections": ["survey-a"],
+            "metadata": {"operator": "ada"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["asset_count"] == 1
+    asset = body["assets"][0]
+    assert asset["kind"] == "image_sequence"
+    assert asset["path"] == str(sequence.resolve())
+    assert asset["media_count"] == 2
+    assert asset["collections"] == ["survey-a"]
+    assert asset["metadata"]["operator"] == "ada"
+    assert asset["metadata"]["source_frame_count"] == 2
+    assert asset["metadata"]["width"] == 4
+    assert asset["metadata"]["height"] == 3
+    assert body["suggested_ingestion_request"]["assets"][0]["asset_id"] == asset["asset_id"]
+
+
+def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):
+    client, _, _ = make_client()
+    headers = auth_headers(client)
+    allowed = tmp_path / "allowed"
+    blocked = tmp_path / "blocked"
+    allowed.mkdir()
+    blocked.mkdir()
+    video_path = blocked / "sample.mkv"
+    video_path.write_bytes(b"not-a-real-video")
+    client.app.state.context.config.file_browser.root_path_import_dir = allowed
+
+    response = client.post(
+        "/ingestion/analyze",
+        headers=headers,
+        json={"source_path": str(video_path), "kind": "video"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_api_queues_analyzed_assets_with_edited_metadata(tmp_path):
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+    sequence = tmp_path / "sequence-b"
+    sequence.mkdir()
+    cv2.imwrite(str(sequence / "frame_001.png"), np.zeros((2, 5), dtype=np.uint8))
+    client.app.state.context.config.file_browser.root_path_import_dir = tmp_path
+
+    response = client.post(
+        "/ingestion/assets",
+        headers=headers,
+        json={
+            "run_key": "edited-run",
+            "assets": [
+                {
+                    "asset_id": "asset-edited",
+                    "path": str(sequence),
+                    "kind": "image_sequence",
+                    "collections": ["edited"],
+                    "media_count": 1,
+                    "metadata": {
+                        "operator": "ben",
+                        "source_frame_count": 1,
+                        "camera": "cam-1",
+                    },
+                    "recursive": False,
+                    "enqueue_segment": True,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_key"] == "edited-run"
+    assert body["asset_count"] == 1
+    manifest = repository.registered_runs[0].manifest
+    asset = manifest.assets[0]
+    assert asset.asset_id == "asset-edited"
+    assert asset.kind.value == "image_sequence"
+    assert asset.collections == ["edited"]
+    assert asset.metadata["operator"] == "ben"
+    assert asset.metadata["camera"] == "cam-1"
+    assert asset.metadata["api_endpoint"] == "POST /ingestion/assets"
+    assert repository.created_jobs[0]["stage"] == "extract_frames"
+    assert repository.created_jobs[0]["asset_id"] == "asset-edited"
+    assert repository.created_jobs[0]["payload"]["kind"] == "image_sequence"
+    assert repository.created_jobs[0]["payload"]["recursive"] is False
+    assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
 
 
 def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):

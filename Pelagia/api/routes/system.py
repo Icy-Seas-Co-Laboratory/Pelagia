@@ -15,6 +15,7 @@ if APIRouter is not None:
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
     from ...storage.blob_store import initialize_kvstore
+    from ...version import __version__, build_info
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
 
     router = APIRouter(prefix="/system", tags=["system"])
@@ -28,7 +29,8 @@ if APIRouter is not None:
         return as_response(
             {
                 "name": "Pelagia",
-                "version": "0.0.1",
+                "version": __version__,
+                "build": build_info(),
                 "database": {
                     "schema": config.database.schema_name,
                     "connect_timeout_s": config.database.connect_timeout_s,
@@ -93,9 +95,12 @@ if APIRouter is not None:
         except Exception as exc:
             postgres = {"healthy": False, "error": str(exc), "schema": repository.schema}
         queue = repository.get_status_summary()
+        database_status = repository.schema_status()
         return as_response(
             {
+                "build": build_info(),
                 "postgres": postgres,
+                "database": database_status,
                 "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
@@ -141,10 +146,13 @@ if APIRouter is not None:
         except Exception as exc:
             postgres = {"healthy": False, "error": str(exc), "schema": repository.schema}
         queue = repository.get_status_summary(project_id=project_id)
+        database_status = repository.schema_status()
         return as_response(
             {
+                "build": build_info(),
                 "project": project,
                 "postgres": postgres,
+                "database": database_status,
                 "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
@@ -163,6 +171,8 @@ if APIRouter is not None:
                 "browse runs, assets, frames, detections, and registered models",
             ],
             "common_flows": {
+                "analyze_ingestion_source": "POST /ingestion/analyze",
+                "queue_analyzed_assets": "POST /ingestion/assets",
                 "queue_video_ingestion": "POST /ingestion/videos",
                 "system_capabilities": "GET /system/capabilities",
                 "preprocessing_options": "GET /preprocessing/options",

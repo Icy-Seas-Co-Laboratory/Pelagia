@@ -9,7 +9,7 @@ from threading import Event
 from ..domain import PipelineStage
 from ..observability import get_core_logger
 from ..services.context import AppContext
-from .handlers import HandlerRegistry
+from .handlers import HandlerRegistry, mark_job_frame_stage_failed
 
 
 @dataclass(slots=True)
@@ -99,6 +99,7 @@ class Worker:
                     )
             except Exception as exc:
                 duration_ms = (time.perf_counter() - started) * 1000
+                mark_job_frame_stage_failed(job, job_context)
                 get_core_logger("worker").exception(
                     "Worker %s failed job %s stage=%s",
                     self.worker_id,

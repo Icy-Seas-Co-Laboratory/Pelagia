@@ -214,7 +214,7 @@ if APIRouter is not None:
         if body.mode not in {"cancel", "delete"}:
             raise HTTPException(status_code=422, detail="mode must be one of: cancel, delete.")
         if body.mode == "delete":
-            active_statuses = {JobStatus.QUEUED.value, JobStatus.LEASED.value, JobStatus.PAUSED.value}
+            active_statuses = {JobStatus.QUEUED.value, JobStatus.LEASED.value, JobStatus.WORKING.value, JobStatus.PAUSED.value}
             if not statuses:
                 raise HTTPException(status_code=422, detail="Delete mode requires explicit terminal status filters.")
             if active_statuses.intersection(statuses):

@@ -4,7 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..domain import PipelineStage
+from ..domain import JobStatus, PipelineStage
 from ..domain import DetectionRecord
 from ..domain import normalize_collections
 from ..processing import ingest as ingest_module
@@ -72,6 +72,97 @@ def _job_project_id(job: dict[str, Any], context: AppContext) -> str | None:
     return None if job.get("project_id") is None else str(job.get("project_id"))
 
 
+def _status_stage(stage: PipelineStage | str) -> str | None:
+    value = stage.value if isinstance(stage, PipelineStage) else str(stage)
+    if value in {
+        PipelineStage.PREPROCESS_FRAMES.value,
+        PipelineStage.SEGMENT.value,
+        PipelineStage.ROI_REFINEMENT.value,
+    }:
+        return value
+    return None
+
+
+def _mark_frame_stage_status(
+    context: AppContext,
+    *,
+    project_id: str | None,
+    frame_ids: list[str],
+    stage: PipelineStage | str,
+    status: JobStatus | str,
+    job_id: str | None = None,
+) -> None:
+    if not project_id or not frame_ids or context.repository is None:
+        return
+    stage_value = _status_stage(stage)
+    if stage_value is None:
+        return
+    updater = getattr(context.repository, "upsert_frame_stage_status", None)
+    if not callable(updater):
+        return
+    status_value = status.value if isinstance(status, JobStatus) else str(status)
+    updater(
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=stage_value,
+        status=status_value,
+        job_id=job_id,
+    )
+
+
+def _ensure_frame_status_rows(
+    context: AppContext,
+    *,
+    project_id: str | None,
+    frame_ids: list[str],
+    asset_id: str | None = None,
+) -> None:
+    if not project_id or context.repository is None:
+        return
+    ensure_rows = getattr(context.repository, "ensure_frame_status_rows", None)
+    if callable(ensure_rows):
+        ensure_rows(project_id=project_id, frame_ids=frame_ids, asset_id=asset_id)
+
+
+def _refresh_frame_status_counts(
+    context: AppContext,
+    *,
+    project_id: str | None,
+    frame_ids: list[str],
+    asset_id: str | None = None,
+) -> None:
+    if not project_id or context.repository is None:
+        return
+    refresh_counts = getattr(context.repository, "refresh_frame_status_counts", None)
+    if callable(refresh_counts):
+        refresh_counts(project_id=project_id, frame_ids=frame_ids, asset_id=asset_id)
+
+
+def _touch_processing_status_snapshot(context: AppContext, *, project_id: str | None) -> None:
+    if not project_id or context.repository is None:
+        return
+    touch_snapshot = getattr(context.repository, "touch_processing_status_snapshot", None)
+    if callable(touch_snapshot):
+        touch_snapshot(project_id=project_id)
+
+
+def mark_job_frame_stage_failed(job: dict[str, Any], context: AppContext) -> None:
+    try:
+        payload = _job_payload(job)
+        project_id = _job_project_id(job, context)
+        _mark_frame_stage_status(
+            context,
+            project_id=project_id,
+            frame_ids=_payload_frame_ids(payload),
+            stage=str(job.get("stage")),
+            status=JobStatus.FAILED,
+            job_id=None if job.get("id") is None else str(job.get("id")),
+        )
+        _touch_processing_status_snapshot(context, project_id=project_id)
+    except Exception:
+        return
+
+
 def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for extracting and storing frames from a registered asset."""
     if context.repository is None:
@@ -90,7 +181,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     if not source_path:
         raise ValueError(f"Raw asset {asset_id!r} does not include a source path.")
 
-    metadata = dict(payload.get("metadata") or {})
+    metadata = {**dict(asset.get("metadata") or {}), **dict(payload.get("metadata") or {})}
     collections = normalize_collections(payload.get("collections") or asset.get("collections"))
     metadata.setdefault("collections", collections)
     metadata.setdefault("worker_job_id", str(job.get("id")))
@@ -229,6 +320,14 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_count": len(frame_rows),
         "frame_ids": [row.get("id") for row in frame_rows],
     }
+    status_frame_ids = [str(row.get("id")) for row in frame_rows if row.get("id")]
+    _ensure_frame_status_rows(
+        context,
+        project_id=project_id,
+        frame_ids=status_frame_ids,
+        asset_id=asset_id,
+    )
+    _touch_processing_status_snapshot(context, project_id=project_id)
     final_completed = max(
         len(frame_rows),
         int(ingest_progress_state["source_frames_read"]),
@@ -348,6 +447,14 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         total=len(frame_ids),
     )
     progress.start(f"Preprocessing {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=PipelineStage.PREPROCESS_FRAMES,
+        status=JobStatus.WORKING,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
 
     missing_background_frame_ids = []
     for frame_id in frame_ids:
@@ -465,6 +572,15 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     }
     if background_generation_result is not None:
         result["background_generation"] = background_generation_result
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=PipelineStage.PREPROCESS_FRAMES,
+        status=JobStatus.SUCCEEDED,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
+    _touch_processing_status_snapshot(context, project_id=project_id)
     return result
 
 
@@ -590,6 +706,14 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         total=len(frame_ids),
     )
     progress.start(f"Segmenting {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=PipelineStage.SEGMENT,
+        status=JobStatus.WORKING,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
 
     for index, frame_id in enumerate(frame_ids, start=1):
         frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
@@ -632,6 +756,21 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         detections,
         project_id=project_id,
     )
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=PipelineStage.SEGMENT,
+        status=JobStatus.SUCCEEDED,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
+    _refresh_frame_status_counts(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        asset_id=resolved_asset_id,
+    )
+    _touch_processing_status_snapshot(context, project_id=project_id)
     progress.finish(
         completed=len(frame_ids),
         secondary={"detections_created": len(inserted)},
@@ -743,6 +882,15 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             candidate_rows.append(row)
     if missing_ids:
         raise KeyError(f"Detection(s) not found: {', '.join(missing_ids)}")
+    candidate_frame_ids = sorted({str(row["frame_id"]) for row in candidate_rows if row.get("frame_id")})
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=candidate_frame_ids,
+        stage=PipelineStage.ROI_REFINEMENT,
+        status=JobStatus.WORKING,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
     progress.update(
         0,
         current={"loaded_candidates": len(candidate_rows)},
@@ -798,6 +946,20 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
     run_ids = sorted({record.run_id for record in detection_records})
     frame_ids = sorted({record.frame_id for record in detection_records})
+    _mark_frame_stage_status(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+        stage=PipelineStage.ROI_REFINEMENT,
+        status=JobStatus.SUCCEEDED,
+        job_id=None if job.get("id") is None else str(job.get("id")),
+    )
+    _refresh_frame_status_counts(
+        context,
+        project_id=project_id,
+        frame_ids=frame_ids,
+    )
+    _touch_processing_status_snapshot(context, project_id=project_id)
     progress.finish(
         completed=len(detection_records),
         secondary={

@@ -19,7 +19,16 @@ if APIRouter is not None:
     from ...processing.frame_correction import generate_background_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
-    from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
+    from ._common import (
+        as_response,
+        detection_summary,
+        frame_summary,
+        get_context,
+        get_repository,
+        mark_frame_stage_status,
+        page_metadata,
+        touch_processing_status_snapshot,
+    )
     from ._images import encode_image, preview_image, resize_image_to_dimension, scale_image
 
     router = APIRouter(prefix="/frame", tags=["frame"])
@@ -434,7 +443,9 @@ if APIRouter is not None:
         )
 
     def _preprocess_resolved_frame(request: Request, row: dict, body: FramePreprocessRequest) -> dict:
-        context = get_context(request).for_project(scoped_project_id(request))
+        project_id = scoped_project_id(request)
+        context = get_context(request).for_project(project_id)
+        repository = get_repository(request)
         source_frame = retrieve_frame(str(row["id"]), context=context, payload_kind="original")
         processed = preprocess_frame_for_segmentation(
             source_frame,
@@ -478,6 +489,14 @@ if APIRouter is not None:
             "preprocessing": processed.metadata,
         }
         if stored_row is not None:
+            mark_frame_stage_status(
+                repository,
+                project_id=project_id,
+                frame_ids=[str(row["id"])],
+                stage=PipelineStage.PREPROCESS_FRAMES.value,
+                status="succeeded",
+            )
+            touch_processing_status_snapshot(repository, project_id=project_id)
             response["frame"] = frame_summary(stored_row)
         if body.response_format == "matrix":
             response["data"] = np.asarray(array).tolist()

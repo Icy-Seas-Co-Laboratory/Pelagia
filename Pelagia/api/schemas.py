@@ -166,6 +166,7 @@ class JobAggregateSummary(FlexibleModel):
     job_count: int = 0
     queued: int | None = None
     leased: int | None = None
+    working: int | None = None
     paused: int | None = None
     succeeded: int | None = None
     failed: int | None = None
@@ -193,6 +194,78 @@ class JobsClearResponse(FlexibleModel):
     deleted_count: int = 0
     dry_run: bool = False
     jobs: list[JobSummary] = Field(default_factory=list)
+
+
+class FrameProcessingStatus(FlexibleModel):
+    project_id: str | None = None
+    frame_id: str
+    asset_id: str | None = None
+    run_id: str | None = None
+    frame_index: int | None = None
+    collections: list[str] = Field(default_factory=list)
+    preprocessing_status: str = "unknown"
+    preprocessing_job_id: str | None = None
+    preprocessing_completed_at: datetime | None = None
+    candidate_detection_status: str = "unknown"
+    candidate_detection_job_id: str | None = None
+    candidate_detection_completed_at: datetime | None = None
+    candidate_detection_count: int = 0
+    roi_refinement_status: str = "unknown"
+    roi_refinement_job_id: str | None = None
+    roi_refinement_completed_at: datetime | None = None
+    refined_detection_count: int = 0
+    unrefined_candidate_count: int = 0
+    updated_at: datetime | None = None
+    asset_filename: str | None = None
+    asset_kind: str | None = None
+
+
+class ProcessingStatusSummary(FlexibleModel):
+    total_frame_count: int = 0
+    preprocessing_succeeded_count: int = 0
+    candidate_detection_succeeded_count: int = 0
+    roi_refinement_succeeded_count: int = 0
+    frames_with_candidates_count: int = 0
+    frames_with_refined_rois_count: int = 0
+    candidate_detection_count: int = 0
+    refined_detection_count: int = 0
+    unrefined_candidate_count: int = 0
+    updated_at: datetime | None = None
+    by_status: dict[str, dict[str, int]] = Field(default_factory=dict)
+
+
+class ProcessingStatusSnapshot(FlexibleModel):
+    id: str | None = None
+    project_id: str
+    session_id: str | None = None
+    status_version: int = 1
+    generated_at: datetime | None = None
+    updated_at: datetime | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessingStatusSummaryResponse(FlexibleModel):
+    summary: ProcessingStatusSummary
+    snapshot: ProcessingStatusSnapshot
+
+
+class ProcessingStatusFramesResponse(FlexibleModel):
+    frames: list[FrameProcessingStatus] = Field(default_factory=list)
+    next_cursor: str | None = None
+    page: PageMetadata
+
+
+class ProcessingStatusFrameIdsResponse(FlexibleModel):
+    frame_ids: list[str] = Field(default_factory=list)
+    next_cursor: str | None = None
+    page: PageMetadata
+
+
+class ProcessingStatusRebuildResponse(FlexibleModel):
+    status: str
+    rebuilt_frame_count: int = 0
+    summary: ProcessingStatusSummary
+    snapshot: ProcessingStatusSnapshot
 
 
 class RunSummary(FlexibleModel):

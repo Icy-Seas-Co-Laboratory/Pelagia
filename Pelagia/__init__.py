@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .config import CoreConfig
+from .version import __version__, build_info
 
-__version__ = "0.0.1"
-
-__all__ = ["CoreConfig", "__version__"]
+__all__ = ["CoreConfig", "__version__", "build_info"]

@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - exercised only when postgres extras ar
 
 
 REQUIRED_SCHEMA_TABLES = (
+    "schema_migrations",
     "users",
     "projects",
     "project_memberships",
@@ -39,6 +40,8 @@ REQUIRED_SCHEMA_TABLES = (
     "classification_results",
     "processing_jobs",
     "processing_job_dependencies",
+    "project_processing_status_snapshots",
+    "frame_processing_status",
     "worker_sessions",
     "job_events",
     "logs",
@@ -47,6 +50,7 @@ REQUIRED_SCHEMA_TABLES = (
 DEFAULT_PROJECT_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_PROJECT_KEY = "default"
 PROJECT_ROLES = {"viewer", "editor", "manager", "admin"}
+FRAME_PROCESSING_STATUSES = {"unknown", "queued", "leased", "working", "succeeded", "failed", "cancelled", "dead_lettered"}
 PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
@@ -55,6 +59,31 @@ def render_schema(schema: str = "seasight") -> str:
     schema = validate_schema_name(schema)
     template = files(__package__).joinpath("sql", "schema.sql").read_text(encoding="utf-8")
     return template.replace("{schema}", schema).strip()
+
+
+def available_migrations() -> list[dict[str, str]]:
+    migrations_dir = files(__package__).joinpath("sql", "migrations")
+    if not migrations_dir.is_dir():
+        return []
+    migrations = []
+    for item in sorted(migrations_dir.iterdir(), key=lambda path: path.name):
+        if not item.name.endswith(".sql"):
+            continue
+        template = item.read_text(encoding="utf-8")
+        migrations.append(
+            {
+                "migration_id": item.name.removesuffix(".sql"),
+                "filename": item.name,
+                "description": template.splitlines()[0].removeprefix("--").strip() if template.splitlines() else "",
+                "checksum": hashlib.sha256(template.encode("utf-8")).hexdigest(),
+                "template": template,
+            }
+        )
+    return migrations
+
+
+def render_migration(migration: dict[str, str], schema: str) -> str:
+    return migration["template"].replace("{schema}", validate_schema_name(schema)).strip()
 
 
 def _require_psycopg() -> None:
@@ -167,7 +196,101 @@ class PostgresRepository:
                         (str(self.config.database.statement_timeout_ms),),
                     )
                 cursor.execute(render_schema(self.schema))
+                self._apply_migrations(cursor)
             connection.commit()
+
+    def _apply_migrations(self, cursor) -> list[dict[str, Any]]:
+        applied_now = []
+        for migration in available_migrations():
+            cursor.execute(
+                f"""
+                SELECT migration_id, checksum
+                FROM {self.schema}.schema_migrations
+                WHERE migration_id = %s
+                """,
+                (migration["migration_id"],),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                if existing["checksum"] != migration["checksum"]:
+                    raise RuntimeError(
+                        f"Migration {migration['migration_id']} checksum mismatch. "
+                        "The database has a different migration body recorded."
+                    )
+                continue
+            cursor.execute(render_migration(migration, self.schema))
+            cursor.execute(
+                f"""
+                INSERT INTO {self.schema}.schema_migrations
+                    (migration_id, checksum, description, metadata)
+                VALUES (%s, %s, %s, %s::jsonb)
+                RETURNING migration_id, checksum, description, applied_at
+                """,
+                (
+                    migration["migration_id"],
+                    migration["checksum"],
+                    migration["description"],
+                    json.dumps({"filename": migration["filename"]}),
+                ),
+            )
+            applied_now.append(cursor.fetchone())
+        return applied_now
+
+    def list_schema_migrations(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name = 'schema_migrations'
+                    """,
+                    (self.schema,),
+                )
+                if cursor.fetchone() is None:
+                    return []
+                cursor.execute(
+                    f"""
+                    SELECT migration_id, checksum, description, metadata, applied_at
+                    FROM {self.schema}.schema_migrations
+                    ORDER BY migration_id
+                    """
+                )
+                return cursor.fetchall()
+
+    def migration_status(self) -> dict[str, Any]:
+        available = available_migrations()
+        applied = self.list_schema_migrations()
+        applied_by_id = {row["migration_id"]: row for row in applied}
+        pending = [
+            {
+                "migration_id": migration["migration_id"],
+                "checksum": migration["checksum"],
+                "description": migration["description"],
+            }
+            for migration in available
+            if migration["migration_id"] not in applied_by_id
+        ]
+        checksum_mismatches = [
+            {
+                "migration_id": migration["migration_id"],
+                "expected_checksum": migration["checksum"],
+                "applied_checksum": applied_by_id[migration["migration_id"]]["checksum"],
+            }
+            for migration in available
+            if migration["migration_id"] in applied_by_id
+            and applied_by_id[migration["migration_id"]]["checksum"] != migration["checksum"]
+        ]
+        return {
+            "available_count": len(available),
+            "applied_count": len(applied),
+            "pending_count": len(pending),
+            "applied": applied,
+            "pending": pending,
+            "checksum_mismatches": checksum_mismatches,
+            "ready": not pending and not checksum_mismatches,
+        }
 
     def ensure_default_project(self) -> dict[str, Any]:
         with self.connect() as connection:
@@ -215,17 +338,34 @@ class PostgresRepository:
                 )
                 existing = sorted(row["table_name"] for row in cursor.fetchall())
         missing = sorted(set(required) - set(existing))
+        migrations = self.migration_status() if "schema_migrations" in existing else {
+            "available_count": len(available_migrations()),
+            "applied_count": 0,
+            "pending_count": len(available_migrations()),
+            "applied": [],
+            "pending": [
+                {
+                    "migration_id": migration["migration_id"],
+                    "checksum": migration["checksum"],
+                    "description": migration["description"],
+                }
+                for migration in available_migrations()
+            ],
+            "checksum_mismatches": [],
+            "ready": False,
+        }
         return {
             "schema": self.schema,
-            "ready": not missing,
+            "ready": not missing and bool(migrations.get("ready")),
             "required_tables": required,
             "existing_tables": existing,
             "missing_tables": missing,
+            "migrations": migrations,
         }
 
     def purge_all(self) -> dict[str, Any]:
         """Delete all Pelagia rows while preserving the schema, indexes, and functions."""
-        tables = list(REQUIRED_SCHEMA_TABLES)
+        tables = [table for table in REQUIRED_SCHEMA_TABLES if table != "schema_migrations"]
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 before: dict[str, int] = {}
@@ -240,6 +380,7 @@ class PostgresRepository:
             "schema": self.schema,
             "tables": before,
             "total_rows_deleted": sum(before.values()),
+            "preserved_tables": ["schema_migrations"],
         }
 
     def create_user(
@@ -1127,6 +1268,7 @@ class PostgresRepository:
                         COUNT(*)::bigint AS job_count,
                         COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
                         COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                        COUNT(*) FILTER (WHERE status = 'working')::bigint AS working,
                         COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
                         COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
                         COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed,
@@ -1146,6 +1288,7 @@ class PostgresRepository:
                         COUNT(*)::bigint AS job_count,
                         COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
                         COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+                        COUNT(*) FILTER (WHERE status = 'working')::bigint AS working,
                         COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
                         COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
                         COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed,
@@ -2858,6 +3001,690 @@ class PostgresRepository:
             "frames": frames,
         }
 
+    @staticmethod
+    def _normalize_frame_processing_status(status: str | JobStatus) -> str:
+        value = status.value if isinstance(status, JobStatus) else status
+        normalized = str(value).strip().lower()
+        if normalized not in FRAME_PROCESSING_STATUSES:
+            raise ValueError(
+                f"frame processing status must be one of: {', '.join(sorted(FRAME_PROCESSING_STATUSES))}."
+            )
+        return normalized
+
+    @staticmethod
+    def _frame_status_next_cursor(rows: Sequence[dict[str, Any]], limit: int) -> str | None:
+        if len(rows) < limit or not rows:
+            return None
+        last = rows[-1]
+        return f"{last['asset_id']}|{last['frame_index']}|{last['frame_id']}"
+
+    @staticmethod
+    def _parse_frame_status_cursor(cursor: str | None) -> tuple[str, int, str] | None:
+        if not cursor:
+            return None
+        parts = str(cursor).split("|")
+        if len(parts) != 3:
+            raise ValueError("cursor must have the form asset_id|frame_index|frame_id.")
+        try:
+            frame_index = int(parts[1])
+        except ValueError as exc:
+            raise ValueError("cursor frame_index must be an integer.") from exc
+        return parts[0], frame_index, parts[2]
+
+    def _frame_status_filters(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        preprocessing_status: Sequence[str] | None = None,
+        candidate_detection_status: Sequence[str] | None = None,
+        roi_refinement_status: Sequence[str] | None = None,
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        cursor: str | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        clauses = ["status.project_id = %s"]
+        params: list[Any] = [project_id]
+        if run_id:
+            clauses.append("status.run_id = %s")
+            params.append(run_id)
+        if asset_id:
+            clauses.append("status.asset_id = %s")
+            params.append(asset_id)
+        if collection:
+            clauses.append("%s = ANY(status.collections)")
+            params.append(collection)
+        for column, values in (
+            ("preprocessing_status", preprocessing_status),
+            ("candidate_detection_status", candidate_detection_status),
+            ("roi_refinement_status", roi_refinement_status),
+        ):
+            normalized = [self._normalize_frame_processing_status(value) for value in (values or []) if value]
+            if normalized:
+                placeholders = ", ".join(["%s" for _ in normalized])
+                clauses.append(f"status.{column} IN ({placeholders})")
+                params.extend(normalized)
+        if has_candidates is not None:
+            clauses.append("status.candidate_detection_count > 0" if has_candidates else "status.candidate_detection_count = 0")
+        if has_refined_rois is not None:
+            clauses.append("status.refined_detection_count > 0" if has_refined_rois else "status.refined_detection_count = 0")
+        if start_frame is not None:
+            clauses.append("status.frame_index >= %s")
+            params.append(start_frame)
+        if end_frame is not None:
+            clauses.append("status.frame_index <= %s")
+            params.append(end_frame)
+        parsed_cursor = self._parse_frame_status_cursor(cursor)
+        if parsed_cursor is not None:
+            cursor_asset_id, cursor_frame_index, cursor_frame_id = parsed_cursor
+            clauses.append("(status.asset_id, status.frame_index, status.frame_id) > (%s::uuid, %s, %s::uuid)")
+            params.extend([cursor_asset_id, cursor_frame_index, cursor_frame_id])
+        return clauses, params
+
+    def ensure_frame_status_rows(
+        self,
+        *,
+        project_id: str,
+        frame_ids: Sequence[str] | None = None,
+        asset_id: str | None = None,
+    ) -> int:
+        resolved_project_id = self._required_project_id(project_id, "ensure_frame_status_rows")
+        clauses = ["assets.project_id = %s"]
+        params: list[Any] = [resolved_project_id]
+        if frame_ids:
+            clauses.append("frames.id = ANY(%s::uuid[])")
+            params.append([str(frame_id) for frame_id in frame_ids])
+        if asset_id:
+            clauses.append("frames.asset_id = %s")
+            params.append(asset_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.frame_processing_status
+                        (project_id, frame_id, asset_id, run_id, frame_index, collections, updated_at)
+                    SELECT
+                        assets.project_id,
+                        frames.id,
+                        frames.asset_id,
+                        frames.run_id,
+                        frames.frame_index,
+                        assets.collections,
+                        NOW()
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ON CONFLICT (project_id, frame_id) DO UPDATE SET
+                        asset_id = EXCLUDED.asset_id,
+                        run_id = EXCLUDED.run_id,
+                        frame_index = EXCLUDED.frame_index,
+                        collections = EXCLUDED.collections,
+                        updated_at = NOW()
+                    """,
+                    tuple(params),
+                )
+                count = cursor.rowcount
+            connection.commit()
+        return int(count or 0)
+
+    def upsert_frame_stage_status(
+        self,
+        *,
+        project_id: str,
+        frame_ids: Sequence[str],
+        stage: str,
+        status: str,
+        job_id: str | None = None,
+        candidate_detection_count: int | None = None,
+        refined_detection_count: int | None = None,
+        unrefined_candidate_count: int | None = None,
+        completed_at: datetime | None = None,
+    ) -> int:
+        if not frame_ids:
+            return 0
+        resolved_project_id = self._required_project_id(project_id, "upsert_frame_stage_status")
+        normalized_status = self._normalize_frame_processing_status(status)
+        stage_value = stage.value if isinstance(stage, PipelineStage) else str(stage)
+        stage_map = {
+            "preprocess_frames": ("preprocessing_status", "preprocessing_job_id", "preprocessing_completed_at"),
+            "segment": ("candidate_detection_status", "candidate_detection_job_id", "candidate_detection_completed_at"),
+            "roi_refinement": ("roi_refinement_status", "roi_refinement_job_id", "roi_refinement_completed_at"),
+        }
+        if stage_value not in stage_map:
+            raise ValueError("stage must be one of: preprocess_frames, segment, roi_refinement.")
+        status_column, job_column, completed_column = stage_map[stage_value]
+        self.ensure_frame_status_rows(project_id=resolved_project_id, frame_ids=frame_ids)
+        completed_value = completed_at
+        if completed_value is None and normalized_status == JobStatus.SUCCEEDED.value:
+            completed_value = datetime.now(timezone.utc)
+        extra_assignments: list[str] = []
+        params: list[Any] = [normalized_status, job_id, completed_value]
+        if stage_value == "segment" and candidate_detection_count is not None:
+            extra_assignments.append("candidate_detection_count = %s")
+            params.append(max(0, int(candidate_detection_count)))
+        if stage_value == "roi_refinement":
+            if refined_detection_count is not None:
+                extra_assignments.append("refined_detection_count = %s")
+                params.append(max(0, int(refined_detection_count)))
+            if unrefined_candidate_count is not None:
+                extra_assignments.append("unrefined_candidate_count = %s")
+                params.append(max(0, int(unrefined_candidate_count)))
+        params.extend([resolved_project_id, [str(frame_id) for frame_id in frame_ids]])
+        extra_sql = ", " + ", ".join(extra_assignments) if extra_assignments else ""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.frame_processing_status
+                    SET
+                        {status_column} = %s,
+                        {job_column} = %s,
+                        {completed_column} = %s,
+                        updated_at = NOW()
+                        {extra_sql}
+                    WHERE project_id = %s
+                      AND frame_id = ANY(%s::uuid[])
+                    """,
+                    tuple(params),
+                )
+                count = cursor.rowcount
+            connection.commit()
+        return int(count or 0)
+
+    def refresh_frame_status_counts(
+        self,
+        *,
+        project_id: str,
+        frame_ids: Sequence[str] | None = None,
+        asset_id: str | None = None,
+    ) -> int:
+        resolved_project_id = self._required_project_id(project_id, "refresh_frame_status_counts")
+        clauses = ["assets.project_id = %s"]
+        params: list[Any] = [resolved_project_id]
+        if frame_ids:
+            clauses.append("frames.id = ANY(%s::uuid[])")
+            params.append([str(frame_id) for frame_id in frame_ids])
+        if asset_id:
+            clauses.append("frames.asset_id = %s")
+            params.append(asset_id)
+        self.ensure_frame_status_rows(project_id=resolved_project_id, frame_ids=frame_ids, asset_id=asset_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH candidate_counts AS (
+                        SELECT detections.frame_id, COUNT(*)::integer AS candidate_detection_count
+                        FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE {' AND '.join(clauses)}
+                        GROUP BY detections.frame_id
+                    ),
+                    refined_counts AS (
+                        SELECT
+                            refined.frame_id,
+                            COUNT(*)::integer AS refined_detection_count,
+                            COUNT(DISTINCT refined.candidate_detection_id)::integer AS refined_candidate_detection_count
+                        FROM {self.schema}.detections_refined refined
+                        JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE {' AND '.join(clauses)}
+                        GROUP BY refined.frame_id
+                    ),
+                    selected_frames AS (
+                        SELECT frames.id AS frame_id
+                        FROM {self.schema}.frames frames
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE {' AND '.join(clauses)}
+                    )
+                    UPDATE {self.schema}.frame_processing_status status
+                    SET
+                        candidate_detection_count = COALESCE(candidate_counts.candidate_detection_count, 0),
+                        refined_detection_count = COALESCE(refined_counts.refined_detection_count, 0),
+                        unrefined_candidate_count = GREATEST(
+                            COALESCE(candidate_counts.candidate_detection_count, 0)
+                            - COALESCE(refined_counts.refined_candidate_detection_count, 0),
+                            0
+                        ),
+                        updated_at = NOW()
+                    FROM selected_frames
+                    LEFT JOIN candidate_counts ON candidate_counts.frame_id = selected_frames.frame_id
+                    LEFT JOIN refined_counts ON refined_counts.frame_id = selected_frames.frame_id
+                    WHERE status.project_id = %s
+                      AND status.frame_id = selected_frames.frame_id
+                    """,
+                    tuple(params + params + params + [resolved_project_id]),
+                )
+                count = cursor.rowcount
+            connection.commit()
+        return int(count or 0)
+
+    def rebuild_frame_status(
+        self,
+        *,
+        project_id: str,
+        asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "rebuild_frame_status")
+        clauses = ["assets.project_id = %s"]
+        params: list[Any] = [resolved_project_id]
+        if asset_id:
+            clauses.append("frames.asset_id = %s")
+            params.append(asset_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH candidate_counts AS (
+                        SELECT detections.frame_id, COUNT(*)::integer AS candidate_detection_count
+                        FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE {' AND '.join(clauses)}
+                        GROUP BY detections.frame_id
+                    ),
+                    refined_counts AS (
+                        SELECT
+                            refined.frame_id,
+                            COUNT(*)::integer AS refined_detection_count,
+                            COUNT(DISTINCT refined.candidate_detection_id)::integer AS refined_candidate_detection_count
+                        FROM {self.schema}.detections_refined refined
+                        JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE {' AND '.join(clauses)}
+                        GROUP BY refined.frame_id
+                    ),
+                    source_rows AS (
+                        SELECT
+                            assets.project_id,
+                            frames.id AS frame_id,
+                            frames.asset_id,
+                            frames.run_id,
+                            frames.frame_index,
+                            assets.collections,
+                            CASE
+                                WHEN frames.preprocessed_payload_ref IS NOT NULL
+                                  OR frames.preprocessed_kvstore_hash IS NOT NULL
+                                THEN 'succeeded'
+                                ELSE COALESCE(existing.preprocessing_status, 'unknown')
+                            END AS preprocessing_status,
+                            CASE
+                                WHEN COALESCE(candidate_counts.candidate_detection_count, 0) > 0
+                                THEN 'succeeded'
+                                ELSE COALESCE(existing.candidate_detection_status, 'unknown')
+                            END AS candidate_detection_status,
+                            COALESCE(candidate_counts.candidate_detection_count, 0) AS candidate_detection_count,
+                            CASE
+                                WHEN COALESCE(refined_counts.refined_detection_count, 0) > 0
+                                THEN 'succeeded'
+                                ELSE COALESCE(existing.roi_refinement_status, 'unknown')
+                            END AS roi_refinement_status,
+                            COALESCE(refined_counts.refined_detection_count, 0) AS refined_detection_count,
+                            GREATEST(
+                                COALESCE(candidate_counts.candidate_detection_count, 0)
+                                - COALESCE(refined_counts.refined_candidate_detection_count, 0),
+                                0
+                            ) AS unrefined_candidate_count
+                        FROM {self.schema}.frames frames
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        LEFT JOIN candidate_counts ON candidate_counts.frame_id = frames.id
+                        LEFT JOIN refined_counts ON refined_counts.frame_id = frames.id
+                        LEFT JOIN {self.schema}.frame_processing_status existing
+                          ON existing.project_id = assets.project_id
+                         AND existing.frame_id = frames.id
+                        WHERE {' AND '.join(clauses)}
+                    ),
+                    upserted AS (
+                        INSERT INTO {self.schema}.frame_processing_status
+                            (
+                                project_id, frame_id, asset_id, run_id, frame_index, collections,
+                                preprocessing_status, candidate_detection_status, candidate_detection_count,
+                                roi_refinement_status, refined_detection_count, unrefined_candidate_count,
+                                updated_at
+                            )
+                        SELECT
+                            project_id, frame_id, asset_id, run_id, frame_index, collections,
+                            preprocessing_status, candidate_detection_status, candidate_detection_count,
+                            roi_refinement_status, refined_detection_count, unrefined_candidate_count,
+                            NOW()
+                        FROM source_rows
+                        ON CONFLICT (project_id, frame_id) DO UPDATE SET
+                            asset_id = EXCLUDED.asset_id,
+                            run_id = EXCLUDED.run_id,
+                            frame_index = EXCLUDED.frame_index,
+                            collections = EXCLUDED.collections,
+                            preprocessing_status = EXCLUDED.preprocessing_status,
+                            candidate_detection_status = EXCLUDED.candidate_detection_status,
+                            candidate_detection_count = EXCLUDED.candidate_detection_count,
+                            roi_refinement_status = EXCLUDED.roi_refinement_status,
+                            refined_detection_count = EXCLUDED.refined_detection_count,
+                            unrefined_candidate_count = EXCLUDED.unrefined_candidate_count,
+                            updated_at = NOW()
+                        RETURNING frame_id
+                    )
+                    SELECT COUNT(*)::bigint AS rebuilt_frame_count FROM upserted
+                    """,
+                    tuple(params + params + params),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        summary = self.get_frame_status_summary(project_id=resolved_project_id, asset_id=asset_id)
+        return {
+            "rebuilt_frame_count": 0 if row is None else row["rebuilt_frame_count"],
+            "summary": summary,
+        }
+
+    def touch_processing_status_snapshot(
+        self,
+        *,
+        project_id: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "touch_processing_status_snapshot")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if session_id is None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.project_processing_status_snapshots
+                        SET status_version = status_version + 1,
+                            updated_at = NOW()
+                        WHERE project_id = %s
+                          AND session_id IS NULL
+                        RETURNING *
+                        """,
+                        (resolved_project_id,),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.project_processing_status_snapshots
+                        SET status_version = status_version + 1,
+                            updated_at = NOW()
+                        WHERE project_id = %s
+                          AND session_id = %s
+                        RETURNING *
+                        """,
+                        (resolved_project_id, session_id),
+                    )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.project_processing_status_snapshots
+                            (project_id, session_id, status_version, updated_at, summary)
+                        VALUES (%s, %s, 1, NOW(), '{{}}'::jsonb)
+                        RETURNING *
+                        """,
+                        (resolved_project_id, session_id),
+                    )
+                    row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def list_frame_status(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        preprocessing_status: Sequence[str] | None = None,
+        candidate_detection_status: Sequence[str] | None = None,
+        roi_refinement_status: Sequence[str] | None = None,
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int = 1000,
+        cursor: str | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "list_frame_status")
+        bounded_limit = min(max(1, int(limit)), 10000)
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            collection=collection,
+            preprocessing_status=preprocessing_status,
+            candidate_detection_status=candidate_detection_status,
+            roi_refinement_status=roi_refinement_status,
+            has_candidates=has_candidates,
+            has_refined_rois=has_refined_rois,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            cursor=cursor,
+        )
+        offset_sql = "" if cursor else "OFFSET %s"
+        query_params = tuple(params + [bounded_limit] + ([] if cursor else [max(0, int(offset))]))
+        with self.connect() as connection:
+            with connection.cursor() as cursor_obj:
+                cursor_obj.execute(
+                    f"""
+                    SELECT
+                        status.*,
+                        assets.filename AS asset_filename,
+                        assets.kind AS asset_kind
+                    FROM {self.schema}.frame_processing_status status
+                    JOIN {self.schema}.raw_assets assets ON assets.id = status.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY status.asset_id ASC, status.frame_index ASC, status.frame_id ASC
+                    LIMIT %s
+                    {offset_sql}
+                    """,
+                    query_params,
+                )
+                rows = cursor_obj.fetchall()
+        return {
+            "frames": rows,
+            "next_cursor": self._frame_status_next_cursor(rows, bounded_limit),
+        }
+
+    def list_frame_status_ids(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        preprocessing_status: Sequence[str] | None = None,
+        candidate_detection_status: Sequence[str] | None = None,
+        roi_refinement_status: Sequence[str] | None = None,
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        limit: int = 5000,
+        cursor: str | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        result = self.list_frame_status(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            collection=collection,
+            preprocessing_status=preprocessing_status,
+            candidate_detection_status=candidate_detection_status,
+            roi_refinement_status=roi_refinement_status,
+            has_candidates=has_candidates,
+            has_refined_rois=has_refined_rois,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
+        )
+        return {
+            "frame_ids": [str(row["frame_id"]) for row in result["frames"]],
+            "next_cursor": result["next_cursor"],
+        }
+
+    def get_frame_status_summary(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        collection: str | None = None,
+        preprocessing_status: Sequence[str] | None = None,
+        candidate_detection_status: Sequence[str] | None = None,
+        roi_refinement_status: Sequence[str] | None = None,
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "get_frame_status_summary")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            collection=collection,
+            preprocessing_status=preprocessing_status,
+            candidate_detection_status=candidate_detection_status,
+            roi_refinement_status=roi_refinement_status,
+            has_candidates=has_candidates,
+            has_refined_rois=has_refined_rois,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH filtered AS (
+                        SELECT *
+                        FROM {self.schema}.frame_processing_status status
+                        WHERE {' AND '.join(clauses)}
+                    ),
+                    totals AS (
+                        SELECT
+                            COUNT(*)::bigint AS total_frame_count,
+                            COUNT(*) FILTER (WHERE preprocessing_status = 'succeeded')::bigint AS preprocessing_succeeded_count,
+                            COUNT(*) FILTER (WHERE candidate_detection_status = 'succeeded')::bigint AS candidate_detection_succeeded_count,
+                            COUNT(*) FILTER (WHERE roi_refinement_status = 'succeeded')::bigint AS roi_refinement_succeeded_count,
+                            COUNT(*) FILTER (WHERE candidate_detection_count > 0)::bigint AS frames_with_candidates_count,
+                            COUNT(*) FILTER (WHERE refined_detection_count > 0)::bigint AS frames_with_refined_rois_count,
+                            COALESCE(SUM(candidate_detection_count), 0)::bigint AS candidate_detection_count,
+                            COALESCE(SUM(refined_detection_count), 0)::bigint AS refined_detection_count,
+                            COALESCE(SUM(unrefined_candidate_count), 0)::bigint AS unrefined_candidate_count,
+                            MAX(updated_at) AS updated_at
+                        FROM filtered
+                    ),
+                    preprocessing_counts AS (
+                        SELECT preprocessing_status AS status, COUNT(*)::bigint AS frame_count
+                        FROM filtered
+                        GROUP BY preprocessing_status
+                    ),
+                    candidate_detection_counts AS (
+                        SELECT candidate_detection_status AS status, COUNT(*)::bigint AS frame_count
+                        FROM filtered
+                        GROUP BY candidate_detection_status
+                    ),
+                    roi_refinement_counts AS (
+                        SELECT roi_refinement_status AS status, COUNT(*)::bigint AS frame_count
+                        FROM filtered
+                        GROUP BY roi_refinement_status
+                    )
+                    SELECT
+                        totals.*,
+                        jsonb_build_object(
+                            'preprocessing',
+                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM preprocessing_counts), '{{}}'::jsonb),
+                            'candidate_detection',
+                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM candidate_detection_counts), '{{}}'::jsonb),
+                            'roi_refinement',
+                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM roi_refinement_counts), '{{}}'::jsonb)
+                        ) AS by_status
+                    FROM totals
+                    """,
+                    tuple(params),
+                )
+                row = cursor.fetchone() or {}
+        by_status = row.get("by_status") or {}
+        return {
+            "total_frame_count": row.get("total_frame_count", 0),
+            "preprocessing_succeeded_count": row.get("preprocessing_succeeded_count", 0),
+            "candidate_detection_succeeded_count": row.get("candidate_detection_succeeded_count", 0),
+            "roi_refinement_succeeded_count": row.get("roi_refinement_succeeded_count", 0),
+            "frames_with_candidates_count": row.get("frames_with_candidates_count", 0),
+            "frames_with_refined_rois_count": row.get("frames_with_refined_rois_count", 0),
+            "candidate_detection_count": row.get("candidate_detection_count", 0),
+            "refined_detection_count": row.get("refined_detection_count", 0),
+            "unrefined_candidate_count": row.get("unrefined_candidate_count", 0),
+            "updated_at": row.get("updated_at"),
+            "by_status": by_status,
+        }
+
+    def get_or_create_processing_status_snapshot(
+        self,
+        *,
+        project_id: str,
+        session_id: str | None = None,
+        summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "get_or_create_processing_status_snapshot")
+        summary_payload = json.dumps(json_ready(summary or {}))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if session_id is None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.project_processing_status_snapshots
+                        SET
+                            status_version = CASE
+                                WHEN summary IS DISTINCT FROM %s::jsonb
+                                THEN status_version + 1
+                                ELSE status_version
+                            END,
+                            generated_at = NOW(),
+                            updated_at = NOW(),
+                            summary = %s::jsonb
+                        WHERE project_id = %s
+                          AND session_id IS NULL
+                        RETURNING *
+                        """,
+                        (summary_payload, summary_payload, resolved_project_id),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.project_processing_status_snapshots
+                        SET
+                            status_version = CASE
+                                WHEN summary IS DISTINCT FROM %s::jsonb
+                                THEN status_version + 1
+                                ELSE status_version
+                            END,
+                            generated_at = NOW(),
+                            updated_at = NOW(),
+                            summary = %s::jsonb
+                        WHERE project_id = %s
+                          AND session_id = %s
+                        RETURNING *
+                        """,
+                        (summary_payload, summary_payload, resolved_project_id, session_id),
+                    )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.project_processing_status_snapshots
+                            (project_id, session_id, status_version, generated_at, updated_at, summary)
+                        VALUES (%s, %s, 1, NOW(), NOW(), %s::jsonb)
+                        RETURNING *
+                        """,
+                        (resolved_project_id, session_id, summary_payload),
+                    )
+                    row = cursor.fetchone()
+            connection.commit()
+        return row
+
     def register_model(
         self,
         model: ModelRecord,
@@ -3008,6 +3835,148 @@ class PostgresRepository:
             connection.commit()
         return inserted
 
+    def _job_frame_status_ids(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        stage: str,
+        payload_frame_ids: Sequence[str],
+        payload_detection_ids: Sequence[str],
+    ) -> list[str]:
+        if stage in {
+            PipelineStage.PREPROCESS_FRAMES.value,
+            PipelineStage.SEGMENT.value,
+        }:
+            return list(dict.fromkeys(str(frame_id) for frame_id in payload_frame_ids if frame_id))
+        if stage != PipelineStage.ROI_REFINEMENT.value or not payload_detection_ids:
+            return []
+        cursor.execute(
+            f"""
+            SELECT DISTINCT detections.frame_id
+            FROM {self.schema}.detection_candidate detections
+            JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+            JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+            WHERE assets.project_id = %s
+              AND detections.id = ANY(%s::uuid[])
+            ORDER BY detections.frame_id
+            """,
+            (project_id, [str(detection_id) for detection_id in payload_detection_ids]),
+        )
+        return [str(row["frame_id"]) for row in cursor.fetchall()]
+
+    def _ensure_frame_status_rows_in_cursor(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        frame_ids: Sequence[str],
+    ) -> None:
+        if not frame_ids:
+            return
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.frame_processing_status
+                (project_id, frame_id, asset_id, run_id, frame_index, collections, updated_at)
+            SELECT
+                assets.project_id,
+                frames.id,
+                frames.asset_id,
+                frames.run_id,
+                frames.frame_index,
+                assets.collections,
+                NOW()
+            FROM {self.schema}.frames frames
+            JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+            WHERE assets.project_id = %s
+              AND frames.id = ANY(%s::uuid[])
+            ON CONFLICT (project_id, frame_id) DO UPDATE SET
+                asset_id = EXCLUDED.asset_id,
+                run_id = EXCLUDED.run_id,
+                frame_index = EXCLUDED.frame_index,
+                collections = EXCLUDED.collections,
+                updated_at = NOW()
+            """,
+            (project_id, [str(frame_id) for frame_id in frame_ids]),
+        )
+
+    def _upsert_frame_stage_status_in_cursor(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        frame_ids: Sequence[str],
+        stage: str,
+        status: str,
+        job_id: str | None = None,
+    ) -> None:
+        if not frame_ids:
+            return
+        normalized_status = self._normalize_frame_processing_status(status)
+        stage_map = {
+            PipelineStage.PREPROCESS_FRAMES.value: (
+                "preprocessing_status",
+                "preprocessing_job_id",
+                "preprocessing_completed_at",
+            ),
+            PipelineStage.SEGMENT.value: (
+                "candidate_detection_status",
+                "candidate_detection_job_id",
+                "candidate_detection_completed_at",
+            ),
+            PipelineStage.ROI_REFINEMENT.value: (
+                "roi_refinement_status",
+                "roi_refinement_job_id",
+                "roi_refinement_completed_at",
+            ),
+        }
+        if stage not in stage_map:
+            return
+        status_column, job_column, completed_column = stage_map[stage]
+        completed_value = datetime.now(timezone.utc) if normalized_status == JobStatus.SUCCEEDED.value else None
+        self._ensure_frame_status_rows_in_cursor(cursor, project_id=project_id, frame_ids=frame_ids)
+        cursor.execute(
+            f"""
+            UPDATE {self.schema}.frame_processing_status
+            SET
+                {status_column} = %s,
+                {job_column} = %s,
+                {completed_column} = %s,
+                updated_at = NOW()
+            WHERE project_id = %s
+              AND frame_id = ANY(%s::uuid[])
+            """,
+            (
+                normalized_status,
+                job_id,
+                completed_value,
+                project_id,
+                [str(frame_id) for frame_id in frame_ids],
+            ),
+        )
+
+    def _touch_processing_status_snapshot_in_cursor(self, cursor, *, project_id: str) -> None:
+        cursor.execute(
+            f"""
+            UPDATE {self.schema}.project_processing_status_snapshots
+            SET status_version = status_version + 1,
+                updated_at = NOW()
+            WHERE project_id = %s
+              AND session_id IS NULL
+            RETURNING id
+            """,
+            (project_id,),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                f"""
+                INSERT INTO {self.schema}.project_processing_status_snapshots
+                    (project_id, session_id, status_version, updated_at, summary)
+                VALUES (%s, NULL, 1, NOW(), '{{}}'::jsonb)
+                """,
+                (project_id,),
+            )
+
     def create_job(
         self,
         stage: PipelineStage | str,
@@ -3091,6 +4060,26 @@ class PostgresRepository:
                         "depends_on": [str(dependency) for dependency in depends_on or []],
                     },
                 )
+                status_frame_ids = self._job_frame_status_ids(
+                    cursor,
+                    project_id=resolved_project_id,
+                    stage=stage_value,
+                    payload_frame_ids=payload_frame_ids,
+                    payload_detection_ids=payload_detection_ids,
+                )
+                if status_frame_ids:
+                    self._upsert_frame_stage_status_in_cursor(
+                        cursor,
+                        project_id=resolved_project_id,
+                        frame_ids=status_frame_ids,
+                        stage=stage_value,
+                        status=status_value,
+                        job_id=str(row["id"]),
+                    )
+                    self._touch_processing_status_snapshot_in_cursor(
+                        cursor,
+                        project_id=resolved_project_id,
+                    )
             connection.commit()
         return row
 
@@ -4030,7 +5019,7 @@ class PostgresRepository:
             worker_id=worker_id,
         )
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        active_status_sql = "status IN ('queued', 'leased', 'paused')"
+        active_status_sql = "status IN ('queued', 'leased', 'working', 'paused')"
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -4206,7 +5195,7 @@ class PostgresRepository:
                         control_reason = NULL,
                         finished_at = NOW(),
                         updated_at = NOW()
-                    WHERE run_id = %s AND status IN ('queued', 'leased', 'paused')
+                    WHERE run_id = %s AND status IN ('queued', 'leased', 'working', 'paused')
                       AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING id, status
                     """,

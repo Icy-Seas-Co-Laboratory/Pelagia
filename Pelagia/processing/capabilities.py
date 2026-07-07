@@ -5,6 +5,7 @@ from typing import Any
 
 from ..config import CoreConfig, IMAGE_DATA_STORAGE_ENCODINGS, ProcessingConfig
 from ..domain import AssetKind, JobStatus, PipelineStage
+from ..version import __version__, build_info
 from .segmentation_options import (
     FRAME_PAYLOAD_KINDS,
     ROI_ENCODINGS,
@@ -18,7 +19,8 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
     processing = config.processing
     return {
         "name": "Pelagia",
-        "version": "0.0.1",
+        "version": __version__,
+        "build": build_info(),
         "api": {
             "endpoints": {
                 "system": "/system",
@@ -42,6 +44,13 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "queue_segmentation": "/segmentation/jobs",
                 "jobs": "/jobs",
                 "jobs_summary": "/jobs/summary",
+                "processing_status_summary": "/processing/status/summary",
+                "processing_status_frames": "/processing/status/frames",
+                "processing_status_frame_ids": "/processing/status/frames/ids",
+                "processing_status_rebuild": "/processing/status/rebuild",
+                "analyze_ingestion": "/ingestion/analyze",
+                "queue_analyzed_assets": "/ingestion/assets",
+                "queue_video_ingestion": "/ingestion/videos",
             },
         },
         "supported": {
@@ -77,7 +86,9 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                     "id": PipelineStage.EXTRACT_FRAMES.value,
                     "label": "Ingestion",
                     "unit": "frames",
-                    "queue_endpoint": "/ingestion/videos",
+                    "analysis_endpoint": "/ingestion/analyze",
+                    "queue_endpoint": "/ingestion/assets",
+                    "legacy_queue_endpoint": "/ingestion/videos",
                 },
                 {
                     "id": PipelineStage.PREPROCESS_FRAMES.value,

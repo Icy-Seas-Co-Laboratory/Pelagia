@@ -5,6 +5,7 @@ from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.services.context import AppContext
 from Pelagia.workers.handlers import (
+    HandlerRegistry,
     background_frames_handler,
     default_handler_registry,
     extract_frames_handler,
@@ -34,6 +35,10 @@ class FakeRepository:
         self.touches = []
         self.requeued = 0
         self.progress_updates = []
+        self.frame_status_rows = []
+        self.frame_stage_status_updates = []
+        self.frame_status_count_refreshes = []
+        self.processing_status_snapshot_touches = []
         self.frames_with_background = set()
         self.shutdown_requested = False
         self.project_calls = []
@@ -68,6 +73,22 @@ class FakeRepository:
             }
         )
         return {"id": job_id, "progress": progress}
+
+    def ensure_frame_status_rows(self, **kwargs):
+        self.frame_status_rows.append(kwargs)
+        return len(kwargs.get("frame_ids") or [])
+
+    def upsert_frame_stage_status(self, **kwargs):
+        self.frame_stage_status_updates.append(kwargs)
+        return len(kwargs.get("frame_ids") or [])
+
+    def refresh_frame_status_counts(self, **kwargs):
+        self.frame_status_count_refreshes.append(kwargs)
+        return len(kwargs.get("frame_ids") or [])
+
+    def touch_processing_status_snapshot(self, **kwargs):
+        self.processing_status_snapshot_touches.append(kwargs)
+        return {"status_version": len(self.processing_status_snapshot_touches)}
 
     def list_frames(self, asset_id, **kwargs):
         self.project_calls.append(("list_frames", kwargs.get("project_id")))
@@ -190,6 +211,7 @@ def make_context(repository):
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     repo = FakeRepository()
+    repo.assets["asset-1"]["metadata"] = {"analysis": "generated", "source": "asset"}
     context = make_context(repo)
     calls = []
 
@@ -240,6 +262,7 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["apply_mask"] is False
     assert kwargs["mask_path"] is None
     assert kwargs["metadata"]["source"] == "test"
+    assert kwargs["metadata"]["analysis"] == "generated"
     assert kwargs["metadata"]["collections"] == ["test"]
     assert kwargs["metadata"]["worker_job_id"] == "job-1"
 
@@ -375,6 +398,14 @@ def test_extract_frames_handler_preserves_project_when_enqueuing_segment(monkeyp
     assert repo.created_jobs[0]["project_id"] == "project-1"
     assert repo.created_jobs[0]["stage"] == PipelineStage.SEGMENT.value
     assert ("get_asset", "project-1") in repo.project_calls
+    assert repo.frame_status_rows == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "asset_id": "asset-1",
+        }
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_path):
@@ -693,6 +724,23 @@ def test_preprocess_frames_handler_uses_project_context(monkeypatch):
 
     assert result["project_id"] == "project-1"
     assert ("get_frame_record", "project-1") in repo.project_calls
+    assert repo.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "status": "working",
+            "job_id": "job-preprocess",
+        },
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "status": "succeeded",
+            "job_id": "job-preprocess",
+        },
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_background_frames_handler_generates_background_for_frame_batch(monkeypatch):
@@ -859,6 +907,26 @@ def test_roi_detection_handler_preserves_project_id(monkeypatch):
     assert result["project_id"] == "project-1"
     assert ("get_frame_record", "project-1") in repo.project_calls
     assert ("replace_frame_detections", "project-1") in repo.project_calls
+    assert repo.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.SEGMENT.value,
+            "status": "working",
+            "job_id": "job-segment",
+        },
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.SEGMENT.value,
+            "status": "succeeded",
+            "job_id": "job-segment",
+        },
+    ]
+    assert repo.frame_status_count_refreshes == [
+        {"project_id": "project-1", "frame_ids": ["frame-1"], "asset_id": "asset-1"}
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_roi_refinement_handler_refines_and_stores_candidate_rois():
@@ -920,6 +988,26 @@ def test_roi_refinement_handler_preserves_project_id():
     assert result["project_id"] == "project-1"
     assert ("get_detection", "project-1") in repo.project_calls
     assert ("upsert_refined_detections", "project-1") in repo.project_calls
+    assert repo.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "status": "working",
+            "job_id": "job-refine",
+        },
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "status": "succeeded",
+            "job_id": "job-refine",
+        },
+    ]
+    assert repo.frame_status_count_refreshes == [
+        {"project_id": "project-1", "frame_ids": ["frame-1"], "asset_id": None}
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
@@ -1109,6 +1197,46 @@ def test_worker_run_once_uses_default_extract_frames_handler(monkeypatch):
     assert repo.completed[0][0] == "job-1"
     assert repo.completed[0][1]["frame_count"] == 2
     assert repo.failures == []
+
+
+def test_worker_run_once_marks_frame_stage_failed_for_project_job():
+    repo = FakeRepository()
+    repo.claimed_jobs = [
+        {
+            "id": "job-fail",
+            "project_id": "project-1",
+            "stage": PipelineStage.SEGMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"frame_ids": ["frame-1"]},
+        }
+    ]
+    registry = HandlerRegistry()
+
+    def failing_handler(job, context):
+        raise RuntimeError("decode failed")
+
+    registry.register(PipelineStage.SEGMENT, failing_handler)
+    worker = Worker(
+        context=make_context(repo),
+        handlers=registry,
+        worker_id="pytest-worker",
+    )
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
+    assert repo.completed == []
+    assert repo.failures[0][0] == "job-fail"
+    assert "decode failed" in repo.failures[0][1]
+    assert repo.frame_stage_status_updates == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "stage": PipelineStage.SEGMENT.value,
+            "status": "failed",
+            "job_id": "job-fail",
+        }
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
 def test_worker_run_once_stops_when_shutdown_requested():

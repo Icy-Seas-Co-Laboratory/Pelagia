@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
+    from ...domain import PipelineStage
     from ...processing.frame_store import retrieve_frame
     from ...processing.detection_candidate import segment_frame
     from ...processing.segmentation_options import (
@@ -24,7 +25,15 @@ if APIRouter is not None:
         segmentation_capabilities,
         segment_frame_kwargs,
     )
-    from ._common import as_response, detection_summary, get_context, get_repository
+    from ._common import (
+        as_response,
+        detection_summary,
+        get_context,
+        get_repository,
+        mark_frame_stage_status,
+        refresh_frame_status_counts,
+        touch_processing_status_snapshot,
+    )
 
     ThresholdMethod = Literal[
         "manual",
@@ -311,6 +320,20 @@ if APIRouter is not None:
                 detections,
                 project_id=project_id,
             )
+            mark_frame_stage_status(
+                repository,
+                project_id=project_id,
+                frame_ids=[frame_id],
+                stage=PipelineStage.SEGMENT.value,
+                status="succeeded",
+            )
+            refresh_frame_status_counts(
+                repository,
+                project_id=project_id,
+                frame_ids=[frame_id],
+                asset_id=frame_record.asset_id,
+            )
+            touch_processing_status_snapshot(repository, project_id=project_id)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -6,10 +6,13 @@ This page covers three common migration tasks:
 - moving Pelagia to a new machine;
 - moving the KVStore root or project-specific KVStore roots.
 
-Pelagia does not currently use a dedicated migration framework such as Alembic.
-Instead, `python -m Pelagia.cli.app init-system` reapplies the packaged SQL
-schema, which uses idempotent `CREATE`, `ALTER`, and backfill statements for the
-current schema. Always back up before upgrading.
+Pelagia uses a lightweight SQL migration ledger in PostgreSQL. The packaged base
+schema remains idempotent, and migration files under
+`Pelagia/storage/sql/migrations/` are applied once and recorded in
+`schema_migrations` with checksums. Always back up before upgrading.
+
+`init-system` initializes storage and applies database migrations. If you only
+need to migrate PostgreSQL, use `migrate-db`.
 
 ## Upgrade An Existing Checkout
 
@@ -46,10 +49,10 @@ For learned ROI refinement:
 python -m pip install -r requirements-ml.txt
 ```
 
-4. Apply the current schema and verify storage.
+4. Apply database migrations and verify storage.
 
 ```bash
-python -m Pelagia.cli.app init-system
+python -m Pelagia.cli.app migrate-db
 python -m Pelagia.cli.app check-system
 ```
 
@@ -122,10 +125,10 @@ SET kvstore_root_path = '/new/path/to/project-kvstore'
 WHERE project_key = 'field-survey';
 ```
 
-8. Apply the current schema and verify.
+8. Apply database migrations and verify.
 
 ```bash
-python -m Pelagia.cli.app init-system
+python -m Pelagia.cli.app migrate-db
 python -m Pelagia.cli.app check-system
 ```
 
@@ -248,7 +251,56 @@ the database and KVStore backup taken before the upgrade.
 - Preserve `config.toml` and environment overrides.
 - Preserve `.pelagia/` when local models or plugins are used.
 - Copy raw source data if source paths need to stay valid.
-- Run `init-system` after code upgrades.
+- Run `migrate-db` or `init-system` after code upgrades.
 - Run `check-system` before starting workers.
 - Verify at least one project with `/system/status/{project}`.
 - Verify image/frame retrieval in PelagiaView.
+
+## Database Migration Ledger
+
+Migration state is stored in:
+
+```text
+<schema>.schema_migrations
+```
+
+Each row records:
+
+- `migration_id`
+- `checksum`
+- `description`
+- `metadata`
+- `applied_at`
+
+Check migration readiness with:
+
+```bash
+python -m Pelagia.cli.app check-system
+```
+
+The JSON output includes:
+
+```json
+{
+  "database": {
+    "migrations": {
+      "available_count": 1,
+      "applied_count": 1,
+      "pending_count": 0,
+      "checksum_mismatches": [],
+      "ready": true
+    }
+  }
+}
+```
+
+The API reports the same database migration status from:
+
+```text
+GET /system/status
+GET /system/status/{project}
+```
+
+The first packaged migration is `0001_processing_status`, which creates and
+indexes the frame processing status projection used by
+`/processing/status/*`.

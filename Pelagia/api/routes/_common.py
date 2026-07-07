@@ -73,6 +73,60 @@ def page_metadata(*, limit: int | None, offset: int = 0, count: int = 0) -> dict
     }
 
 
+def mark_frame_stage_status(
+    repository,
+    *,
+    project_id: str | None,
+    frame_ids: list[str],
+    stage: str,
+    status: str,
+    job_id: str | None = None,
+) -> None:
+    if not project_id or not frame_ids:
+        return
+    resolved_frame_ids = list(dict.fromkeys(str(frame_id) for frame_id in frame_ids if frame_id))
+    if not resolved_frame_ids:
+        return
+    updater = getattr(repository, "upsert_frame_stage_status", None)
+    if callable(updater):
+        updater(
+            project_id=project_id,
+            frame_ids=resolved_frame_ids,
+            stage=stage,
+            status=status,
+            job_id=job_id,
+        )
+
+
+def refresh_frame_status_counts(
+    repository,
+    *,
+    project_id: str | None,
+    frame_ids: list[str],
+    asset_id: str | None = None,
+) -> None:
+    if not project_id or not frame_ids:
+        return
+    resolved_frame_ids = list(dict.fromkeys(str(frame_id) for frame_id in frame_ids if frame_id))
+    if not resolved_frame_ids:
+        return
+    refresh_counts = getattr(repository, "refresh_frame_status_counts", None)
+    if callable(refresh_counts):
+        refresh_counts(
+            project_id=project_id,
+            frame_ids=resolved_frame_ids,
+            asset_id=asset_id,
+        )
+
+
+def touch_processing_status_snapshot(repository, *, project_id: str | None) -> None:
+    if not project_id:
+        return
+    touch_snapshot = getattr(repository, "touch_processing_status_snapshot", None)
+    if callable(touch_snapshot):
+        touch_snapshot(project_id=project_id)
+
+
 def frame_summary(row: Any) -> dict[str, Any]:
     item = _as_dict(row)
     preview_thumbhash = item.pop("preview_thumbhash", item.pop("frame_png", None))

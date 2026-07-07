@@ -17,6 +17,7 @@ from ..services.projects import initialize_project_kvstore
 from ..services.stores import StoreService
 from ..storage.blob_store import initialize_kvstore, reset_kvstore
 from ..utils.serialization import json_ready
+from ..version import build_info
 
 
 try:
@@ -449,13 +450,37 @@ if typer is not None:
             initialize_schema=True,
         )
         result = {
+            "build": build_info(),
             "database": {
                 "schema": context.repository.schema if context.repository is not None else None,
                 "initialized": context.repository is not None,
+                "schema_status": (
+                    context.repository.schema_status()
+                    if context.repository is not None
+                    else None
+                ),
             },
             "kvstore": context.kvstore.status() if context.kvstore is not None else None,
         }
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
+
+    @app.command("migrate-db")
+    def migrate_db(
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        config = _config_from_options(None, database_dsn, schema)
+        configure_core_logging(config)
+        context = AppContext.from_config(config)
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required for database migrations.")
+        context.repository.initialize_schema()
+        _echo_json(
+            {
+                "build": build_info(),
+                "database": context.repository.schema_status(),
+            }
+        )
 
     @app.command("create-user")
     def create_user(
@@ -624,6 +649,7 @@ if typer is not None:
         )
         ready = bool(database_status.get("ready")) and bool(kvstore_status.get("initialized"))
         result = {
+            "build": build_info(),
             "ready": ready,
             "database": database_status,
             "kvstore": kvstore_status,
@@ -706,7 +732,7 @@ if typer is not None:
             if normalized_state == "all":
                 statuses = [None]
             elif normalized_state == "active":
-                statuses = [JobStatus.QUEUED.value, JobStatus.LEASED.value, JobStatus.PAUSED.value]
+                statuses = [JobStatus.QUEUED.value, JobStatus.LEASED.value, JobStatus.WORKING.value, JobStatus.PAUSED.value]
             elif normalized_state == "inactive":
                 statuses = [
                     JobStatus.SUCCEEDED.value,

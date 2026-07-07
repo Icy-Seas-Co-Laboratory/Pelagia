@@ -26,7 +26,15 @@ if APIRouter is not None:
     )
     from ...processing.capabilities import roi_refinement_capabilities
     from ...services.models import ModelService
-    from ._common import as_response, detection_summary, get_context, get_repository
+    from ._common import (
+        as_response,
+        detection_summary,
+        get_context,
+        get_repository,
+        mark_frame_stage_status,
+        refresh_frame_status_counts,
+        touch_processing_status_snapshot,
+    )
 
     ModelKind = Literal["identity", "keras_artifact", "oracle_builder_unet"]
     RoiEncoding = Literal["png", "raw", "zstd", "auto"]
@@ -342,6 +350,22 @@ if APIRouter is not None:
                     ],
                     project_id=project_id,
                 )
+                frame_ids = list(
+                    dict.fromkeys(str(row["frame_id"]) for row in stored_rows if row.get("frame_id"))
+                )
+                mark_frame_stage_status(
+                    repository,
+                    project_id=project_id,
+                    frame_ids=frame_ids,
+                    stage=PipelineStage.ROI_REFINEMENT.value,
+                    status="succeeded",
+                )
+                refresh_frame_status_counts(
+                    repository,
+                    project_id=project_id,
+                    frame_ids=frame_ids,
+                )
+                touch_processing_status_snapshot(repository, project_id=project_id)
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to store refined detections: {exc}") from exc
 

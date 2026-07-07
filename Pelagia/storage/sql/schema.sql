@@ -10,7 +10,7 @@ BEGIN
         CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
+        CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'working', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
     END IF;
 END $$;
 
@@ -24,6 +24,7 @@ ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_download';
 
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'paused';
+ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'working';
 
 CREATE OR REPLACE FUNCTION {schema}.set_updated_at()
 RETURNS trigger AS $$
@@ -54,6 +55,14 @@ BEGIN
     )::uuid;
 END;
 $$ LANGUAGE plpgsql VOLATILE;
+
+CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
+    migration_id text PRIMARY KEY,
+    checksum text NOT NULL,
+    description text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    applied_at timestamptz NOT NULL DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS {schema}.users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -749,6 +758,73 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_job_dependencies (
     PRIMARY KEY (job_id, depends_on_job_id)
 );
 
+CREATE TABLE IF NOT EXISTS {schema}.project_processing_status_snapshots (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    session_id uuid REFERENCES {schema}.user_sessions(id) ON DELETE CASCADE,
+    status_version bigint NOT NULL DEFAULT 0,
+    generated_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    summary jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+ALTER TABLE {schema}.project_processing_status_snapshots
+    ADD COLUMN IF NOT EXISTS session_id uuid REFERENCES {schema}.user_sessions(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS status_version bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS generated_at timestamptz,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS summary jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS {schema}.frame_processing_status (
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    frame_id uuid NOT NULL REFERENCES {schema}.frames(id) ON DELETE CASCADE,
+    asset_id uuid NOT NULL REFERENCES {schema}.raw_assets(id) ON DELETE CASCADE,
+    run_id uuid REFERENCES {schema}.runs(id) ON DELETE CASCADE,
+    frame_index integer NOT NULL,
+    collections text[] NOT NULL DEFAULT ARRAY[]::text[],
+    preprocessing_status text NOT NULL DEFAULT 'unknown',
+    preprocessing_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    preprocessing_completed_at timestamptz,
+    candidate_detection_status text NOT NULL DEFAULT 'unknown',
+    candidate_detection_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    candidate_detection_completed_at timestamptz,
+    candidate_detection_count integer NOT NULL DEFAULT 0,
+    roi_refinement_status text NOT NULL DEFAULT 'unknown',
+    roi_refinement_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    roi_refinement_completed_at timestamptz,
+    refined_detection_count integer NOT NULL DEFAULT 0,
+    unrefined_candidate_count integer NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (project_id, frame_id),
+    CONSTRAINT frame_processing_status_preprocessing_known CHECK (
+        preprocessing_status IN ('unknown', 'queued', 'leased', 'working', 'succeeded', 'failed', 'cancelled', 'dead_lettered')
+    ),
+    CONSTRAINT frame_processing_status_candidate_detection_known CHECK (
+        candidate_detection_status IN ('unknown', 'queued', 'leased', 'working', 'succeeded', 'failed', 'cancelled', 'dead_lettered')
+    ),
+    CONSTRAINT frame_processing_status_roi_refinement_known CHECK (
+        roi_refinement_status IN ('unknown', 'queued', 'leased', 'working', 'succeeded', 'failed', 'cancelled', 'dead_lettered')
+    )
+);
+
+ALTER TABLE {schema}.frame_processing_status
+    ADD COLUMN IF NOT EXISTS run_id uuid REFERENCES {schema}.runs(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS frame_index integer,
+    ADD COLUMN IF NOT EXISTS collections text[] NOT NULL DEFAULT ARRAY[]::text[],
+    ADD COLUMN IF NOT EXISTS preprocessing_status text NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS preprocessing_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS preprocessing_completed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS candidate_detection_status text NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS candidate_detection_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS candidate_detection_completed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS candidate_detection_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS roi_refinement_status text NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS roi_refinement_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS roi_refinement_completed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS refined_detection_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unrefined_candidate_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+
 CREATE TABLE IF NOT EXISTS {schema}.worker_sessions (
     worker_id text PRIMARY KEY,
     pid integer,
@@ -835,6 +911,24 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_stage_status_updated ON 
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_updated ON {schema}.processing_jobs (updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_asset_stage ON {schema}.processing_jobs (asset_id, stage, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dependencies_depends_on ON {schema}.processing_job_dependencies (depends_on_job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{schema}_project_processing_status_snapshots_session
+    ON {schema}.project_processing_status_snapshots (project_id, session_id)
+    WHERE session_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{schema}_project_processing_status_snapshots_project
+    ON {schema}.project_processing_status_snapshots (project_id)
+    WHERE session_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_asset_frame
+    ON {schema}.frame_processing_status (project_id, asset_id, frame_index, frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_preprocessing
+    ON {schema}.frame_processing_status (project_id, preprocessing_status, asset_id, frame_index, frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_candidate_detection
+    ON {schema}.frame_processing_status (project_id, candidate_detection_status, asset_id, frame_index, frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_roi_refinement
+    ON {schema}.frame_processing_status (project_id, roi_refinement_status, asset_id, frame_index, frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_updated
+    ON {schema}.frame_processing_status (project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_collections
+    ON {schema}.frame_processing_status USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_project_id ON {schema}.logs (project_id, created_at DESC);
