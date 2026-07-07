@@ -464,7 +464,8 @@ start_stack() {
             python -m uvicorn Pelagia.api.app:create_app \
             --factory \
             --host "$PELAGIA_API_HOST" \
-            --port "$PELAGIA_API_PORT"
+            --port "$PELAGIA_API_PORT" \
+            --workers 4
     else
         echo "api disabled by config"
     fi
