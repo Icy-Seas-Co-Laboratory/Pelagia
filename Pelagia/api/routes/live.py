@@ -96,8 +96,50 @@ if APIRouter is not None:
             detail="Directory is outside the configured file browser roots.",
         )
 
-    def _option_overrides(local_values: dict[str, Any], option_names: list[str]) -> dict[str, Any]:
-        return {name: local_values[name] for name in option_names}
+    def _split_mask_step_values(values: list[Any]) -> list[str]:
+        steps: list[str] = []
+        for value in values:
+            if value is None:
+                continue
+            for step in str(value).split(","):
+                normalized = step.strip()
+                if normalized:
+                    steps.append(normalized)
+        return steps
+
+    def _parse_square_kernel_alias(value: Any) -> tuple[int, int]:
+        text = str(value).strip().lower().replace("×", "x")
+        if not text:
+            raise ValueError("Kernel size aliases cannot be empty.")
+        for separator in ("x", ","):
+            if separator in text:
+                width_text, height_text = [part.strip() for part in text.split(separator, 1)]
+                return int(float(width_text)), int(float(height_text))
+        size = int(float(text))
+        return size, size
+
+    def _option_overrides(request: Request, local_values: dict[str, Any], option_names: list[str]) -> dict[str, Any]:
+        overrides = {name: local_values[name] for name in option_names}
+        query = request.query_params
+        mask_steps = _split_mask_step_values(query.getlist("mask_augmentation_steps"))
+        mask_steps.extend(_split_mask_step_values(query.getlist("mask_augmentation_steps[]")))
+        if mask_steps:
+            overrides["mask_augmentation_steps"] = mask_steps
+
+        for prefix in ("dilate", "erode", "open", "close"):
+            width_name = f"{prefix}_kernel_w"
+            height_name = f"{prefix}_kernel_h"
+            for alias in (f"{prefix}_kernel", f"{prefix}_kernel_size"):
+                values = query.getlist(alias)
+                if not values:
+                    continue
+                width, height = _parse_square_kernel_alias(values[-1])
+                if overrides.get(width_name) is None:
+                    overrides[width_name] = width
+                if overrides.get(height_name) is None:
+                    overrides[height_name] = height
+                break
+        return overrides
 
     def _threshold_kwargs(resolved_options: dict[str, dict[str, Any]]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
@@ -680,7 +722,7 @@ if APIRouter is not None:
         ]
         try:
             resolved_options = resolve_segmentation_options(
-                _option_overrides(locals(), option_names),
+                _option_overrides(request, locals(), option_names),
                 context.config.processing,
             )
             flat_options = flatten_segmentation_options(resolved_options)
@@ -936,9 +978,9 @@ if APIRouter is not None:
             "store_roi_payload_min_width_plus_height",
             "always_store_mask",
         ]
-        local_values = locals()
-        overrides = {name: local_values[name] for name in option_names}
         try:
+            local_values = locals()
+            overrides = _option_overrides(request, local_values, option_names)
             resolved_options = resolve_segmentation_options(
                 overrides,
                 context.config.processing,

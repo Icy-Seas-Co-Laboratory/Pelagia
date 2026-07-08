@@ -2110,6 +2110,27 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert augmented_threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_enabled"] is True
     assert augmented_threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == ["dilate"]
 
+    bracketed_threshold_response = client.get(
+        "/live/threshold",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "apply_preprocessing": False,
+            "mask_augmentation_steps[]": "dilate",
+            "dilate_kernel_size": 20,
+            "dilate_iterations": 1,
+        },
+    )
+
+    assert bracketed_threshold_response.status_code == 200
+    bracketed_threshold_body = bracketed_threshold_response.json()
+    assert bracketed_threshold_body["sandbox_frame_id"] == "live-frame-3"
+    assert bracketed_threshold_body["mask"]["threshold_foreground_pixels"] == 12
+    assert bracketed_threshold_body["mask"]["foreground_pixels"] == 100
+    assert bracketed_threshold_body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == ["dilate"]
+    assert bracketed_threshold_body["resolved_options"]["mask_augmentation"]["dilate_kernel_w"] == 20
+    assert bracketed_threshold_body["resolved_options"]["mask_augmentation"]["dilate_kernel_h"] == 20
+
     response = client.get(
         "/live/detection-candidate",
         params={
@@ -2126,7 +2147,7 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
     assert body["saved"] is False
     assert body["sandboxed"] is True
     assert body["source_frame_id"] == "frame-1"
-    assert body["sandbox_frame_id"] == "live-frame-3"
+    assert body["sandbox_frame_id"] == "live-frame-4"
     assert body["candidate_detection_count"] == 1
     assert body["detection_count"] == 1
     detection = body["candidate_detections"][0]
@@ -2149,7 +2170,7 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
             "frame_id": "frame-1",
             "threshold": 1,
             "apply_preprocessing": False,
-            "mask_augmentation_steps": "dilate",
+            "mask_augmentation_steps": "dilate,fill_holes",
             "dilate_iterations": 1,
             "min_perimeter": 0,
             "padding": 0,
@@ -2158,9 +2179,10 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
 
     assert augmented_response.status_code == 200
     augmented_body = augmented_response.json()
-    assert augmented_body["sandbox_frame_id"] == "live-frame-4"
+    assert augmented_body["sandbox_frame_id"] == "live-frame-5"
     assert augmented_body["stage_counts"]["threshold_foreground_pixels"] == 12
     assert augmented_body["stage_counts"]["augmented_foreground_pixels"] == 30
+    assert augmented_body["resolved_options"]["mask_augmentation"]["mask_augmentation_steps"] == ["dilate", "fill_holes"]
     augmented_detection = augmented_body["candidate_detections"][0]
     assert augmented_detection["bbox_x"] == 2
     assert augmented_detection["bbox_y"] == 1

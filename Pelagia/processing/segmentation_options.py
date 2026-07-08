@@ -343,10 +343,14 @@ def _normalize_steps(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        raw_steps = [value]
+        raw_steps = value.split(",")
     else:
-        raw_steps = list(value)
-    steps = [str(step).replace("-", "_").lower() for step in raw_steps]
+        raw_steps = [
+            item
+            for step in list(value)
+            for item in str(step).split(",")
+        ]
+    steps = [str(step).strip().replace("-", "_").lower() for step in raw_steps if str(step).strip()]
     unknown = [step for step in steps if step not in MASK_AUGMENTATION_STEPS]
     if unknown:
         raise ValueError(

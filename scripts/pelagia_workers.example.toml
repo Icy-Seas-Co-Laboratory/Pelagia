@@ -13,7 +13,7 @@ schema = "pelagia"
 
 [kvstore]
 # Options: kvstore, kvstore2.
-backend = "kvstore"
+backend = "kvstore2"
 root = "./data/kvstore"
 # Used by kvstore2.
 max_blob_bytes = 68_719_476_736

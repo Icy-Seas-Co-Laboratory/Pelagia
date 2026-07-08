@@ -32,6 +32,7 @@ if APIRouter is not None:
     class QueueVideoRequest(BaseModel):
         source_path: str
         n_tile: int | None = None
+        image_encoding: str | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -54,6 +55,7 @@ if APIRouter is not None:
         compute_checksum: bool = False
         collections: str | list[str] | None = None
         n_tile: int | None = None
+        image_encoding: str | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     class IngestionAssetRequest(BaseModel):
@@ -68,6 +70,7 @@ if APIRouter is not None:
         media_count: int | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
         n_tile: int | None = None
+        image_encoding: str | None = None
         recursive: bool | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
@@ -94,6 +97,7 @@ if APIRouter is not None:
         source_type: str | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
         n_tile: int | None = None
+        image_encoding: str | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -147,13 +151,28 @@ if APIRouter is not None:
             return f"sha256:{_sha256_file(path)}", "computed"
         return f"uncomputed:size={stat.st_size}:mtime_ns={stat.st_mtime_ns}", "deferred"
 
-    def _resolved_ingest_defaults(request: Request, *, n_tile: int | None = None) -> dict[str, Any]:
+    def _normalize_image_encoding(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized not in {"zstd", "jpg", "png"}:
+            raise HTTPException(status_code=422, detail="image_encoding must be one of: zstd, jpg, png.")
+        return normalized
+
+    def _resolved_ingest_defaults(
+        request: Request,
+        *,
+        n_tile: int | None = None,
+        image_encoding: str | None = None,
+    ) -> dict[str, Any]:
         defaults = request.app.state.context.config.processing
         ingest_defaults = defaults.video_ingest
         preprocessing_defaults = defaults.preprocessing
         roi_recording_defaults = defaults.roi_recording
+        frame_storage_defaults = defaults.frame_storage
         return {
             "n_tile": ingest_defaults.n_tile if n_tile is None else n_tile,
+            "image_encoding": _normalize_image_encoding(image_encoding) or frame_storage_defaults.image_encoding,
             "adaptive_background_subtraction": preprocessing_defaults.adaptive_background_subtraction,
             "adaptive_background_period": preprocessing_defaults.adaptive_background_period,
             "apply_mask": preprocessing_defaults.apply_mask,
@@ -173,8 +192,10 @@ if APIRouter is not None:
         defaults = _resolved_ingest_defaults(
             request,
             n_tile=getattr(global_body, "n_tile", None),
+            image_encoding=getattr(global_body, "image_encoding", None),
         )
         n_tile = defaults["n_tile"] if asset.n_tile is None else asset.n_tile
+        image_encoding = _normalize_image_encoding(asset.image_encoding) or defaults["image_encoding"]
         adaptive_background_period = (
             asset.adaptive_background_period
             if asset.adaptive_background_period is not None
@@ -219,6 +240,10 @@ if APIRouter is not None:
             "roi_encoding": resolve_option(asset.roi_encoding, "roi_encoding", "roi_encoding"),
             "collections": collections,
             "checksum_status": checksum_status,
+            "metadata": {
+                "kvstore_encoding": image_encoding,
+                "array_encoding": image_encoding,
+            },
         }
 
     @router.post("/analyze")
@@ -240,7 +265,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"Source path {str(exc)!r} was not found.") from exc
-        defaults = _resolved_ingest_defaults(request, n_tile=body.n_tile)
+        defaults = _resolved_ingest_defaults(request, n_tile=body.n_tile, image_encoding=body.image_encoding)
         asset_payloads = [asset.as_dict() for asset in assets]
         return as_response(
             {
@@ -254,6 +279,7 @@ if APIRouter is not None:
                     "source_path": str(source_path),
                     "assets": asset_payloads,
                     "n_tile": defaults["n_tile"],
+                    "image_encoding": defaults["image_encoding"],
                     "adaptive_background_subtraction": defaults["adaptive_background_subtraction"],
                     "adaptive_background_period": defaults["adaptive_background_period"],
                     "apply_mask": defaults["apply_mask"],
@@ -370,7 +396,9 @@ if APIRouter is not None:
         ingest_defaults = defaults.video_ingest
         preprocessing_defaults = defaults.preprocessing
         roi_recording_defaults = defaults.roi_recording
+        frame_storage_defaults = defaults.frame_storage
         n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
+        image_encoding = _normalize_image_encoding(body.image_encoding) or frame_storage_defaults.image_encoding
         adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
             if body.adaptive_background_subtraction is None
@@ -468,6 +496,10 @@ if APIRouter is not None:
                 "apply_mask": apply_mask,
                 "mask_path": mask_path,
                 "enqueue_segment": body.enqueue_segment,
+                "metadata": {
+                    "kvstore_encoding": image_encoding,
+                    "array_encoding": image_encoding,
+                },
                 "padding": roi_padding,
                 "roi_encoding": roi_encoding,
                 "collections": collections,
