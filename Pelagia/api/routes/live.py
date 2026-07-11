@@ -424,6 +424,7 @@ if APIRouter is not None:
         request: Request,
         frame_id: str,
         encoding: str | None = None,
+        quality: int | None = None,
         asset_id: str | None = None,
         frame_ids: list[str] | None = Query(default=None),
         start_frame: int | None = None,
@@ -450,6 +451,7 @@ if APIRouter is not None:
         background_limit: int | None = None,
         background_payload_kind: str = "original",
         background_encoding: str = "zstd",
+        background_quality: int | None = None,
         invert_intensity: bool | None = None,
     ) -> dict:
         project_id = scoped_project_id(request)
@@ -499,6 +501,7 @@ if APIRouter is not None:
                     context=context,
                     payload_kind=background_payload_kind,
                     encoding=background_encoding,
+                    quality=background_quality,
                 )
                 _assign_generated_background_to_frame(
                     repository,
@@ -516,6 +519,7 @@ if APIRouter is not None:
                     "limit": resolved_background_limit,
                     "payload_kind": background_payload_kind,
                     "encoding": background_encoding,
+                    "quality": background_quality,
                 }
                 if background_correction is None:
                     background_correction = True
@@ -544,6 +548,7 @@ if APIRouter is not None:
                 processed,
                 context=context,
                 encoding=encoding,
+                quality=quality,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc

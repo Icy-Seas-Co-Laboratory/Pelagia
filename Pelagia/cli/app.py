@@ -28,6 +28,8 @@ except ImportError:  # pragma: no cover - argparse fallback covers no-typer envs
 
 if typer is not None:
     app = typer.Typer(help="Pelagia command line tools.")
+    environment_app = typer.Typer(help="Create, synchronize, and inspect worker environments.")
+    app.add_typer(environment_app, name="env")
 
     def _sha256_file(path: Path) -> str:
         digest = hashlib.sha256()
@@ -88,6 +90,52 @@ if typer is not None:
 
     def _echo_json(payload: object) -> None:
         typer.echo(json.dumps(json_ready(payload), indent=2, sort_keys=True))
+
+    @environment_app.command("sync")
+    def environment_sync(
+        profile: str,
+        root: Path = Path("."),
+        python: Optional[Path] = None,
+        imagecodecs_wheel: Optional[Path] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Create and install a named worker environment."""
+        from .environments import sync_profile
+
+        try:
+            result = sync_profile(
+                profile,
+                root=root,
+                python=python,
+                imagecodecs_wheel=imagecodecs_wheel,
+                dry_run=dry_run,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        _echo_json(result)
+
+    @environment_app.command("doctor")
+    def environment_doctor(
+        profile: str = "all",
+        root: Path = Path("."),
+        require_gpu: bool = False,
+        require_jpegxs: bool = False,
+    ) -> None:
+        """Report whether named worker environments are ready to run."""
+        from .environments import doctor_profiles
+
+        try:
+            result = doctor_profiles(
+                profile,
+                root=root,
+                require_gpu=require_gpu,
+                require_jpegxs=require_jpegxs,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        _echo_json(result)
+        if not result["healthy"]:
+            raise typer.Exit(code=1)
 
     def _split_csv(value: Optional[str]) -> list[str]:
         if not value:
@@ -1358,7 +1406,7 @@ if typer is not None:
         worker_id: Optional[str] = None,
         stages: Optional[str] = None,
     ) -> None:
-        from ..workers import Worker, default_handler_registry
+        from ..workers import Worker, default_handler_registry, worker_runtime_profile
 
         context = _context_from_options(kvstore_root, database_dsn, schema)
         selected_stages = None
@@ -1368,6 +1416,7 @@ if typer is not None:
                 for stage in stages.split(",")
                 if stage.strip()
             ]
+        worker_runtime_profile(selected_stages)
         handlers = default_handler_registry()
         if worker_id:
             worker = Worker(context=context, handlers=handlers, worker_id=worker_id)
@@ -1386,7 +1435,7 @@ if typer is not None:
         idle_sleep_seconds: float = 2.0,
         requeue_interval_seconds: float = 30.0,
     ) -> None:
-        from ..workers import Worker, default_handler_registry
+        from ..workers import Worker, default_handler_registry, worker_runtime_profile
 
         context = _context_from_options(kvstore_root, database_dsn, schema)
         selected_stages = None
@@ -1396,6 +1445,7 @@ if typer is not None:
                 for stage in stages.split(",")
                 if stage.strip()
             ]
+        worker_runtime_profile(selected_stages)
         handlers = default_handler_registry()
         if worker_id:
             worker = Worker(context=context, handlers=handlers, worker_id=worker_id)

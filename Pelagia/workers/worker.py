@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import socket
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from ..domain import PipelineStage
 from ..observability import get_core_logger
 from ..services.context import AppContext
 from .handlers import HandlerRegistry, mark_job_frame_stage_failed
+from .runtime import worker_runtime_profile
 
 
 @dataclass(slots=True)
@@ -22,6 +24,14 @@ class Worker:
 
     def _capabilities(self, stages: list[PipelineStage] | None = None) -> list[str]:
         return [stage.value for stage in stages or []]
+
+    def _runtime_metadata(self, stages: list[PipelineStage] | None) -> dict[str, str]:
+        return {
+            "hostname": socket.gethostname(),
+            "runtime_profile": worker_runtime_profile(stages),
+            "python_executable": sys.executable,
+            "virtual_env": os.environ.get("VIRTUAL_ENV", ""),
+        }
 
     def _touch(
         self,
@@ -38,7 +48,7 @@ class Worker:
             status=status,
             leased_job_id=leased_job_id,
             capabilities=self._capabilities(stages),
-            metadata={"hostname": socket.gethostname()},
+            metadata=self._runtime_metadata(stages),
             pid=os.getpid(),
             shutdown_requested=shutdown_requested,
         )
@@ -53,6 +63,7 @@ class Worker:
         """Claim and process currently available jobs once."""
         if self.context.repository is None:
             raise RuntimeError("Worker requires a PostgresRepository.")
+        worker_runtime_profile(stages)
 
         if self.shutdown_requested():
             self._touch("stopped", stages=stages)
@@ -137,6 +148,7 @@ class Worker:
         """Run this worker until signaled or externally requested to shut down."""
         if self.context.repository is None:
             raise RuntimeError("Worker requires a PostgresRepository.")
+        worker_runtime_profile(stages)
 
         stop = stop_event or Event()
         last_requeue_at = 0.0

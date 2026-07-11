@@ -34,6 +34,10 @@ cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\
 idle_sleep_seconds = 2.0
 requeue_interval_seconds = 30.0
 
+[worker_profiles]
+default = "cpu"
+roi_refinement = "gpu-ml"
+
 [[worker]]
 name = "fio-1"
 capabilities = ["ingest", "background", "preprocess", "segment"]

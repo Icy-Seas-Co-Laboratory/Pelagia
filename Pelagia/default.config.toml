@@ -41,8 +41,10 @@ root_path_import_dir = "./data/import"
 allowed_root_paths = []
 
 [image_data_storage]
-# Default image payload encoding. Options: zstd, png, jpg, raw.
-encoding = "zstd"
+# Default image payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
+encoding = "jpg"
+# Default lossy image quality for jpg and jxl payloads.
+quality = 90
 
 [auth]
 # Enable bearer-token authentication for API clients. Set false for single-user
@@ -105,7 +107,7 @@ max_width_plus_height = null
 [processing.roi_recording]
 # Stored candidate ROI payload and mask behavior.
 padding = 50
-# ROI and mask payload encoding. Options: zstd, png, raw, auto.
+# ROI and mask payload encoding. Options: zstd, png, jpg, jxl, raw, auto.
 roi_encoding = "zstd"
 # Minimum ROI byte size before auto encoding prefers zstd over png.
 zstd_min_bytes = 8192
@@ -215,8 +217,10 @@ crop_w = null
 crop_h = null
 
 [processing.frame_storage]
-# Stored frame payload encoding. Options: zstd, png, jpg, raw.
-image_encoding = "zstd"
+# Stored frame payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
+image_encoding = "jpg"
+# Stored frame lossy image quality for jpg and jxl payloads.
+image_quality = 90
 
 [processing.thumbhash]
 # Maximum image dimension used before computing preview thumbhashes.

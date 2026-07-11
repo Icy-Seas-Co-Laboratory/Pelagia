@@ -3,29 +3,51 @@ import pytest
 from Pelagia.config import CoreConfig, FrameStorageProcessingConfig, ImageDataStorageConfig, LoggingConfig
 
 
-def test_image_data_storage_config_defaults_to_zstd():
-    assert ImageDataStorageConfig().encoding == "zstd"
+def test_image_data_storage_config_defaults_to_jpg_quality_90():
+    config = ImageDataStorageConfig()
+    assert config.encoding == "jpg"
+    assert config.quality == 90
 
 
-def test_frame_storage_processing_config_defaults_to_zstd():
-    assert FrameStorageProcessingConfig().image_encoding == "zstd"
+def test_frame_storage_processing_config_defaults_to_jpg_quality_90():
+    config = FrameStorageProcessingConfig()
+    assert config.image_encoding == "jpg"
+    assert config.image_quality == 90
 
 
 def test_image_data_storage_config_accepts_jpg():
     assert ImageDataStorageConfig(encoding="JPG").encoding == "jpg"
+    assert ImageDataStorageConfig(encoding="jpeg").encoding == "jpg"
+
+
+def test_image_data_storage_config_accepts_jxl():
+    assert ImageDataStorageConfig(encoding="JXL").encoding == "jxl"
+    assert ImageDataStorageConfig(encoding="jpeg-xl").encoding == "jxl"
+
+
+def test_image_data_storage_config_accepts_jxs():
+    assert ImageDataStorageConfig(encoding="JXS").encoding == "jxs"
+    assert ImageDataStorageConfig(encoding="jpeg-xs").encoding == "jxs"
+
+
+def test_image_data_storage_config_rejects_invalid_quality():
+    with pytest.raises(ValueError):
+        ImageDataStorageConfig(quality=101)
 
 
 def test_image_data_storage_config_rejects_unknown_encoding():
     with pytest.raises(ValueError):
-        ImageDataStorageConfig(encoding="jpeg")
+        ImageDataStorageConfig(encoding="tiff")
 
 
 def test_core_config_load_applies_image_data_storage_encoding_env(monkeypatch):
     monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_ENCODING", "ZSTD")
+    monkeypatch.setenv("PELAGIA_IMAGE_DATA_STORAGE_QUALITY", "87")
 
     config = CoreConfig.load(local_config_path=None)
 
     assert config.image_data_storage.encoding == "zstd"
+    assert config.image_data_storage.quality == 87
 
 
 def test_core_config_load_applies_auth_env(monkeypatch):
@@ -69,7 +91,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstore"
     assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
     assert config.file_browser.allowed_root_paths == []
-    assert config.image_data_storage.encoding == "zstd"
+    assert config.image_data_storage.encoding == "jpg"
+    assert config.image_data_storage.quality == 90
     assert config.auth.enabled is True
     assert config.auth.session_ttl_seconds == 604800
     assert config.auth.dev_project_key == "default"
@@ -117,7 +140,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.preprocessing.crop_y is None
     assert config.processing.preprocessing.crop_w is None
     assert config.processing.preprocessing.crop_h is None
-    assert config.processing.frame_storage.image_encoding == "zstd"
+    assert config.processing.frame_storage.image_encoding == "jpg"
+    assert config.processing.frame_storage.image_quality == 90
     assert config.processing.thumbhash.max_dim == 100
     assert config.processing.roi_refinement.enabled is True
     assert config.processing.roi_refinement.model_kind == "keras_artifact"

@@ -16,9 +16,25 @@ except ImportError:  # pragma: no cover - Python 3.10 fallback
         tomllib = None
 
 
-ImageDataStorageEncoding = Literal["png", "jpg", "raw", "zstd"]
-IMAGE_DATA_STORAGE_ENCODINGS = {"png", "jpg", "raw", "zstd"}
+ImageDataStorageEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"]
+IMAGE_DATA_STORAGE_ENCODINGS = {"png", "jpg", "jxl", "jxs", "raw", "zstd"}
 _TOML_NULL_SENTINEL = "__PELAGIA_TOML_NULL__"
+
+
+def _normalize_image_data_storage_encoding(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "jpeg": "jpg",
+        "image_jpeg": "jpg",
+        "jpegxl": "jxl",
+        "jpeg_xl": "jxl",
+        "image_jxl": "jxl",
+        "jpegxs": "jxs",
+        "jpeg_xs": "jxs",
+        "image_jxs": "jxs",
+        "zstandard": "zstd",
+    }
+    return aliases.get(normalized, normalized)
 
 
 @dataclass(slots=True)
@@ -80,14 +96,18 @@ class FileBrowserConfig:
 class ImageDataStorageConfig:
     """Frame image payload storage settings."""
 
-    encoding: ImageDataStorageEncoding = "zstd"
+    encoding: ImageDataStorageEncoding = "jpg"
+    quality: int = 90
 
     def __post_init__(self) -> None:
-        self.encoding = str(self.encoding).lower()
+        self.encoding = _normalize_image_data_storage_encoding(self.encoding)
         if self.encoding not in IMAGE_DATA_STORAGE_ENCODINGS:
             raise ValueError(
-                "image data storage encoding must be one of: png, jpg, raw, zstd."
+                "image data storage encoding must be one of: png, jpg, jxl, jxs, raw, zstd."
             )
+        self.quality = int(self.quality)
+        if self.quality < 0 or self.quality > 100:
+            raise ValueError("image data storage quality must be between 0 and 100.")
 
 
 @dataclass(slots=True)
@@ -287,14 +307,18 @@ class PreprocessingConfig:
 class FrameStorageProcessingConfig:
     """Default frame storage parameters."""
 
-    image_encoding: ImageDataStorageEncoding = "zstd"
+    image_encoding: ImageDataStorageEncoding = "jpg"
+    image_quality: int = 90
 
     def __post_init__(self) -> None:
-        self.image_encoding = str(self.image_encoding).lower()
+        self.image_encoding = _normalize_image_data_storage_encoding(self.image_encoding)
         if self.image_encoding not in IMAGE_DATA_STORAGE_ENCODINGS:
             raise ValueError(
-                "frame storage image_encoding must be one of: png, jpg, raw, zstd."
+                "frame storage image_encoding must be one of: png, jpg, jxl, jxs, raw, zstd."
             )
+        self.image_quality = int(self.image_quality)
+        if self.image_quality < 0 or self.image_quality > 100:
+            raise ValueError("frame storage image_quality must be between 0 and 100.")
 
 
 @dataclass(slots=True)
@@ -487,6 +511,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "file_browser", "allowed_root_paths", "PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", _env_path_list)
 
     _set_from_env(settings, "image_data_storage", "encoding", "PELAGIA_IMAGE_DATA_STORAGE_ENCODING")
+    _set_from_env(settings, "image_data_storage", "quality", "PELAGIA_IMAGE_DATA_STORAGE_QUALITY", int)
 
     _set_from_env(settings, "api", "host", "PELAGIA_API_HOST")
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
@@ -599,6 +624,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.preprocessing", "crop_h", "PELAGIA_PREPROCESSING_CROP_H", int)
 
     _set_from_env(settings, "processing.frame_storage", "image_encoding", "PELAGIA_FRAME_STORAGE_IMAGE_ENCODING")
+    _set_from_env(settings, "processing.frame_storage", "image_quality", "PELAGIA_FRAME_STORAGE_IMAGE_QUALITY", int)
 
     _set_from_env(settings, "processing.thumbhash", "max_dim", "PELAGIA_THUMBHASH_MAX_DIM", int)
 
@@ -717,6 +743,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         ),
         image_data_storage=ImageDataStorageConfig(
             encoding=image_data_storage.get("encoding", ImageDataStorageConfig.encoding),
+            quality=int(image_data_storage.get("quality", ImageDataStorageConfig.quality)),
         ),
         api=APIConfig(
             host=str(api.get("host", APIConfig.host)),
@@ -1109,6 +1136,12 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 image_encoding=frame_storage.get(
                     "image_encoding",
                     image_data_storage.get("encoding", FrameStorageProcessingConfig.image_encoding),
+                ),
+                image_quality=int(
+                    frame_storage.get(
+                        "image_quality",
+                        image_data_storage.get("quality", FrameStorageProcessingConfig.image_quality),
+                    )
                 ),
             ),
             thumbhash=ThumbhashProcessingConfig(

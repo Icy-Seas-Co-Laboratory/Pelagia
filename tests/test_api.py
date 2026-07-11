@@ -1312,6 +1312,8 @@ def test_api_exposes_system_capabilities():
     assert body["api"]["endpoints"]["generate_background"] == "/frame/background"
     assert body["api"]["endpoints"]["queue_background"] == "/frame/background/jobs"
     assert "jpg" in body["supported"]["image_encodings"]
+    assert "jxl" in body["supported"]["image_encodings"]
+    assert "jxs" in body["supported"]["image_encodings"]
     assert "preprocessed" in body["supported"]["frame_payload_kinds"]
     assert "segmentation" in body["processing"]
     assert "preprocessing" in body["processing"]
@@ -1941,6 +1943,8 @@ def test_api_preprocessing_options_are_ui_ready():
         "recording",
     ]
     assert "jpg" in body["supported"]["image_encodings"]
+    assert "jxl" in body["supported"]["image_encodings"]
+    assert "jxs" in body["supported"]["image_encodings"]
     assert body["defaults"]["preprocessing"]["invert_intensity"] is True
     assert body["defaults"]["flatfield"]["flatfield_q"] == 0.9
     flatfield_fields = {field["key"]: field for field in body["fields"]["flatfield"]}
@@ -1966,7 +1970,7 @@ def test_api_preprocessing_options_are_ui_ready():
     assert background_fields["background_min_field_value"]["min"] == 0
     assert background_fields["background_max_field_value"]["type"] == "nullable-number"
     recording_fields = {field["key"]: field for field in body["fields"]["recording"]}
-    assert recording_fields["encoding"]["options"] == ["jpg", "png", "raw", "zstd"]
+    assert recording_fields["encoding"]["options"] == ["jpg", "jxl", "jxs", "png", "raw", "zstd"]
 
 
 def test_api_kvstore_includes_status_and_health():
@@ -3515,6 +3519,25 @@ def test_api_framedata_returns_matrix_and_png(monkeypatch):
     assert png_response.content.startswith(b"\x89PNG")
 
 
+def test_api_framedata_returns_jpeg_xs(monkeypatch):
+    from Pelagia.api.routes import assets
+
+    class FakeFrame:
+        def read(self):
+            return np.array([[0, 128], [255, 64]], dtype=np.uint8)
+
+    monkeypatch.setattr(assets, "retrieve_frame", lambda frame_id, context: FakeFrame())
+    monkeypatch.setattr(assets, "encode_image", lambda array, fmt: (b"jxs", "image/jxs"))
+    client, _, _ = make_client()
+
+    response = client.get("/assets/asset-1/framedata/2?format=jpeg-xs")
+
+    assert response.status_code == 200
+    assert response.content == b"jxs"
+    assert response.headers["content-type"] == "image/jxs"
+    assert response.headers["content-disposition"].endswith(".jxs\"")
+
+
 def test_api_asset_framedata_supports_head(monkeypatch):
     from Pelagia.api.routes import assets
 
@@ -3699,6 +3722,8 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
     assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
     assert repository.created_jobs[0]["payload"]["apply_mask"] is False
     assert repository.created_jobs[0]["payload"]["mask_path"] is None
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_encoding"] == "jpg"
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 90
     assert repository.created_jobs[0]["project_id"] == "project-1"
 
 
@@ -3869,6 +3894,8 @@ def test_api_queues_analyzed_assets_with_edited_metadata(tmp_path):
     assert repository.created_jobs[0]["payload"]["kind"] == "image_sequence"
     assert repository.created_jobs[0]["payload"]["recursive"] is False
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_encoding"] == "jpg"
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 90
 
 
 def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):

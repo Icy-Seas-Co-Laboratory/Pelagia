@@ -37,7 +37,7 @@ if APIRouter is not None:
     )
 
     ModelKind = Literal["identity", "keras_artifact", "oracle_builder_unet"]
-    RoiEncoding = Literal["png", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "raw", "zstd", "auto"]
 
     class RoiRefinementRequest(BaseModel):
         model_config = ConfigDict(protected_namespaces=())

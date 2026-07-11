@@ -35,6 +35,7 @@ PELAGIA_VIDEO_INGEST_N_TILE=""
 PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE=""
 PELAGIA_INIT_ON_START=""
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS=""
+PELAGIA_CONTROL_PYTHON="python"
 WORKER_ROWS=()
 
 load_stack_config() {
@@ -75,7 +76,14 @@ def scalar(value, default):
 def clean(value: object) -> str:
     text = str(value)
     if "\t" in text or "\n" in text:
-        raise SystemExit(f"Config values may not contain tabs/newlines: {text!r}")
+        raise SystemExit(f"Config values may not contain tabs or newlines: {text!r}")
+    return text
+
+
+def worker_field(value: object) -> str:
+    text = clean(value)
+    if "|" in text:
+        raise SystemExit(f"Worker values may not contain pipes: {text!r}")
     return text
 
 
@@ -131,6 +139,8 @@ kvstore = section("kvstore")
 file_browser = section("file_browser")
 api = section("api")
 worker_defaults = section("worker_defaults")
+worker_profiles = section("worker_profiles")
+worker_venvs = section("worker_venvs")
 processing = section("processing")
 video_ingest = processing.get("video_ingest", {})
 if not isinstance(video_ingest, dict):
@@ -145,6 +155,72 @@ kvstore_root = path_value(
     kvstore.get("root_path", kvstore.get("root")),
     Path(os.environ.get("PELAGIA_KVSTORE_ROOT", root_dir / "data" / "kvstore")),
 )
+
+
+def venv_path(value: object, *, label: str) -> tuple[str, str]:
+    if value is None or not str(value).strip():
+        return sys.executable, ""
+    path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+    if not path.is_absolute():
+        path = root_dir / path
+    executable = path / "bin" / "python"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise SystemExit(f"{label} must contain an executable bin/python: {path}")
+    return str(executable), str(path)
+
+
+default_venv = worker_venvs.get("default", os.environ.get("PELAGIA_WORKER_VENV"))
+if worker_profiles and worker_venvs:
+    raise SystemExit("Use either [worker_profiles] or the legacy [worker_venvs] table, not both.")
+
+
+def managed_venv(profile: object, *, label: str) -> str:
+    normalized = str(profile).strip().lower().replace("_", "-")
+    if normalized in {"cpu", "default"}:
+        return os.environ.get("PELAGIA_CPU_VENV", str(root_dir / ".venv"))
+    if normalized in {"gpu-ml", "ml-metal", "ml-cuda"}:
+        return os.environ.get("PELAGIA_GPU_ML_VENV", str(root_dir / ".venv-ml"))
+    raise SystemExit(f"{label} must be one of: cpu, gpu-ml, ml-metal, ml-cuda")
+
+
+capability_venvs: dict[str, object] = {}
+if worker_venvs:
+    default_venv = worker_venvs.get("default", os.environ.get("PELAGIA_WORKER_VENV"))
+    control_venv = worker_venvs.get("control", default_venv)
+    for raw_capability, value in worker_venvs.items():
+        if raw_capability in {"default", "control"}:
+            continue
+        stage = stage_aliases.get(str(raw_capability).strip())
+        if stage is None:
+            valid = ", ".join(sorted(stage_aliases))
+            raise SystemExit(f"Unknown [worker_venvs] capability {raw_capability!r}. Valid aliases: {valid}")
+        if not isinstance(value, str):
+            raise SystemExit(f"[worker_venvs].{raw_capability} must be a virtual-environment path")
+        capability_venvs[stage] = value
+else:
+    default_venv = managed_venv(worker_profiles.get("default", "cpu"), label="[worker_profiles].default")
+    control_venv = managed_venv(
+        worker_profiles.get("control", worker_profiles.get("default", "cpu")),
+        label="[worker_profiles].control",
+    )
+    for raw_capability, value in worker_profiles.items():
+        if raw_capability in {"default", "control"}:
+            continue
+        stage = stage_aliases.get(str(raw_capability).strip())
+        if stage is None:
+            valid = ", ".join(sorted(stage_aliases))
+            raise SystemExit(f"Unknown [worker_profiles] capability {raw_capability!r}. Valid aliases: {valid}")
+        capability_venvs[stage] = managed_venv(
+            value,
+            label=f"[worker_profiles].{raw_capability}",
+        )
+
+capability_venvs.setdefault(
+    "roi_refinement",
+    managed_venv("gpu-ml", label="ROI refinement environment"),
+)
+
+control_python, _ = venv_path(control_venv, label="worker control environment")
 
 
 def path_list_value(value: object, default: str = "") -> str:
@@ -206,6 +282,7 @@ config_rows = {
         stack.get("init_statement_timeout_ms"),
         os.environ.get("PELAGIA_INIT_STATEMENT_TIMEOUT_MS", "0"),
     ),
+    "control_python": control_python,
 }
 
 for key, value in config_rows.items():
@@ -237,6 +314,7 @@ if not workers:
 
 default_idle = worker_defaults.get("idle_sleep_seconds", os.environ.get("PELAGIA_IDLE_SLEEP_SECONDS", "2.0"))
 default_requeue = worker_defaults.get("requeue_interval_seconds", os.environ.get("PELAGIA_REQUEUE_INTERVAL_SECONDS", "30.0"))
+gpu_ml_stages = {"roi_refinement"}
 
 for index, worker in enumerate(workers, start=1):
     if not isinstance(worker, dict):
@@ -260,6 +338,23 @@ for index, worker in enumerate(workers, start=1):
             raise SystemExit(f"Unknown worker capability {raw_stage!r}. Valid aliases: {valid}")
         if stage not in stages:
             stages.append(stage)
+    selected_gpu_ml_stages = set(stages) & gpu_ml_stages
+    if selected_gpu_ml_stages and set(stages) - gpu_ml_stages:
+        raise SystemExit(
+            f"Worker {name!r} mixes GPU/ML capabilities with CPU capabilities. "
+            "Configure GPU/ML stages in a dedicated worker."
+        )
+    resolved_venvs = {capability_venvs.get(stage, default_venv) for stage in stages}
+    if len(resolved_venvs) != 1:
+        raise SystemExit(
+            f"Worker {name!r} resolves to multiple virtual environments. "
+            "Split its capabilities into dedicated workers."
+        )
+    worker_python, worker_venv = venv_path(
+        resolved_venvs.pop(),
+        label=f"Worker {name!r} virtual environment",
+    )
+    runtime_profile = "gpu-ml" if selected_gpu_ml_stages else "cpu"
     count = int(worker.get("count", 1))
     if count < 1:
         raise SystemExit(f"Worker {name!r} count must be >= 1")
@@ -269,8 +364,10 @@ for index, worker in enumerate(workers, start=1):
         suffix = "" if count == 1 else f"-{copy_index}"
         print(
             "worker\t"
-            f"{clean(process_name + suffix)}\t"
-            f"{clean(worker_id + suffix)}|{clean(','.join(stages))}|{clean(idle)}|{clean(requeue)}"
+            f"{worker_field(process_name + suffix)}\t"
+            f"{worker_field(worker_id + suffix)}|{worker_field(','.join(stages))}|"
+            f"{worker_field(idle)}|{worker_field(requeue)}|{worker_field(worker_python)}|"
+            f"{worker_field(worker_venv)}|{worker_field(runtime_profile)}"
         )
 PY
 )"
@@ -296,6 +393,7 @@ PY
                     api_cors_allow_origin_regex) PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX="$value" ;;
                     init_on_start) PELAGIA_INIT_ON_START="$value" ;;
                     init_statement_timeout_ms) PELAGIA_INIT_STATEMENT_TIMEOUT_MS="$value" ;;
+                    control_python) PELAGIA_CONTROL_PYTHON="$value" ;;
                 esac
                 ;;
             worker)
@@ -398,7 +496,7 @@ cleanup_stale_pid_files() {
 storage_is_ready() {
     PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
     PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
-    python -m Pelagia.cli.app check-system \
+    "$PELAGIA_CONTROL_PYTHON" -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
@@ -430,7 +528,7 @@ initialize_system() {
     if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" \
         PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
         PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
-        python -m Pelagia.cli.app init-system \
+        "$PELAGIA_CONTROL_PYTHON" -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then
@@ -461,7 +559,7 @@ start_stack() {
 
     if [[ "$PELAGIA_API_ENABLED" == "true" ]]; then
         start_process api \
-            python -m uvicorn Pelagia.api.app:create_app \
+            "$PELAGIA_CONTROL_PYTHON" -m uvicorn Pelagia.api.app:create_app \
             --factory \
             --host "$PELAGIA_API_HOST" \
             --port "$PELAGIA_API_PORT" \
@@ -470,20 +568,34 @@ start_stack() {
         echo "api disabled by config"
     fi
 
-    local row process_name rest worker_id stages idle requeue
+    local row process_name rest worker_id stages idle requeue worker_python worker_venv runtime_profile
     for row in "${WORKER_ROWS[@]}"; do
         process_name="${row%%$'\t'*}"
         rest="${row#*$'\t'}"
-        IFS='|' read -r worker_id stages idle requeue <<<"$rest"
-        start_process "$process_name" \
-            python -m Pelagia.cli.app worker_run \
-            --database-dsn "$PELAGIA_DATABASE_DSN" \
-            --schema "$PELAGIA_DATABASE_SCHEMA" \
-            --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
-            --worker-id "$worker_id" \
-            --stages "$stages" \
-            --idle-sleep-seconds "$idle" \
-            --requeue-interval-seconds "$requeue"
+        IFS='|' read -r worker_id stages idle requeue worker_python worker_venv runtime_profile <<<"$rest"
+        if [[ -n "$worker_venv" ]]; then
+            start_process "$process_name" \
+                env "VIRTUAL_ENV=$worker_venv" "PATH=$worker_venv/bin:$PATH" "PELAGIA_WORKER_PROFILE=$runtime_profile" \
+                "$worker_python" -m Pelagia.cli.app worker_run \
+                --database-dsn "$PELAGIA_DATABASE_DSN" \
+                --schema "$PELAGIA_DATABASE_SCHEMA" \
+                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+                --worker-id "$worker_id" \
+                --stages "$stages" \
+                --idle-sleep-seconds "$idle" \
+                --requeue-interval-seconds "$requeue"
+        else
+            start_process "$process_name" \
+                env "PELAGIA_WORKER_PROFILE=$runtime_profile" \
+                "$worker_python" -m Pelagia.cli.app worker_run \
+                --database-dsn "$PELAGIA_DATABASE_DSN" \
+                --schema "$PELAGIA_DATABASE_SCHEMA" \
+                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+                --worker-id "$worker_id" \
+                --stages "$stages" \
+                --idle-sleep-seconds "$idle" \
+                --requeue-interval-seconds "$requeue"
+        fi
     done
 
     echo "stack=$STACK_NAME"
@@ -494,12 +606,12 @@ start_stack() {
 }
 
 stop_stack() {
-    local row process_name rest worker_id stages idle requeue
+    local row process_name rest worker_id stages idle requeue worker_python worker_venv runtime_profile
     for row in "${WORKER_ROWS[@]}"; do
         process_name="${row%%$'\t'*}"
         rest="${row#*$'\t'}"
-        IFS='|' read -r worker_id stages idle requeue <<<"$rest"
-        python -m Pelagia.cli.app worker_shutdown "$worker_id" \
+        IFS='|' read -r worker_id stages idle requeue worker_python worker_venv runtime_profile <<<"$rest"
+        "$PELAGIA_CONTROL_PYTHON" -m Pelagia.cli.app worker_shutdown "$worker_id" \
             --database-dsn "$PELAGIA_DATABASE_DSN" \
             --schema "$PELAGIA_DATABASE_SCHEMA" \
             --reason "toml stack stop" >"$LOG_DIR/$process_name.shutdown.log" 2>&1 || true
@@ -524,6 +636,16 @@ status_stack() {
     done
 }
 
+validate_stack() {
+    local row process_name rest worker_id stages idle requeue worker_python worker_venv runtime_profile
+    for row in "${WORKER_ROWS[@]}"; do
+        process_name="${row%%$'\t'*}"
+        rest="${row#*$'\t'}"
+        IFS='|' read -r worker_id stages idle requeue worker_python worker_venv runtime_profile <<<"$rest"
+        echo "$process_name profile=$runtime_profile stages=$stages python=$worker_python"
+    done
+}
+
 load_stack_config
 
 case "$ACTION" in
@@ -540,8 +662,11 @@ case "$ACTION" in
     status)
         status_stack
         ;;
+    validate)
+        validate_stack
+        ;;
     *)
-        echo "usage: $0 [start|stop|restart|status] [workers.toml]" >&2
+        echo "usage: $0 [start|stop|restart|status|validate] [workers.toml]" >&2
         exit 2
         ;;
 esac

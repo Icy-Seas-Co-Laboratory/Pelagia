@@ -223,6 +223,7 @@ def build_background_payload_for_frames(
     context: AppContext | None = None,
     payload_kind: str = "original",
     encoding: str = "zstd",
+    quality: int | None = None,
 ) -> dict:
     """Build a mean background field from stored frames and store it in the KVStore."""
     resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
@@ -263,7 +264,12 @@ def build_background_payload_for_frames(
     if accumulator is None:
         raise ValueError("No frame data was loaded.")
     background = np.ascontiguousarray((accumulator / len(resolved_frame_ids)).astype(np.float32))
-    payload, payload_encoding, payload_format = encode_array_payload(background, encoding)
+    resolved_quality = ctx.config.processing.frame_storage.image_quality if quality is None else int(quality)
+    payload, payload_encoding, payload_format = encode_array_payload(
+        background,
+        encoding,
+        quality=resolved_quality,
+    )
     kvstore_key = ctx.kvstore.put_store(payload)
     metadata = {
         "frame_variant": "background",
@@ -275,6 +281,7 @@ def build_background_payload_for_frames(
         "kvstore_hash": kvstore_key,
         "kvstore_encoding": payload_encoding,
         "kvstore_format": payload_format,
+        "kvstore_quality": resolved_quality,
         "dtype": str(background.dtype),
         "shape": list(background.shape),
     }
@@ -282,6 +289,7 @@ def build_background_payload_for_frames(
         "background_payload_ref": kvstore_key,
         "background_payload_encoding": payload_encoding,
         "background_payload_format": payload_format,
+        "background_payload_quality": resolved_quality,
         "background_payload_dtype": str(background.dtype),
         "background_payload_shape": list(background.shape),
         "background_method": "mean",
@@ -298,6 +306,7 @@ def generate_background_for_frames(
     context: AppContext | None = None,
     payload_kind: str = "original",
     encoding: str = "zstd",
+    quality: int | None = None,
 ) -> dict:
     """
     Build a mean background field from stored frames and assign it to those frames.
@@ -310,6 +319,7 @@ def generate_background_for_frames(
         context=context,
         payload_kind=payload_kind,
         encoding=encoding,
+        quality=quality,
     )
     resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
     ctx = context

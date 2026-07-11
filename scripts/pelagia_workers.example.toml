@@ -41,6 +41,13 @@ cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\
 idle_sleep_seconds = 2.0
 requeue_interval_seconds = 30.0
 
+[worker_profiles]
+# The env manager owns these paths: cpu=.venv and gpu-ml=.venv-ml.
+# The default profile runs API, storage initialization, and non-ML workers.
+default = "cpu"
+# GPU/ML capabilities are always isolated from ingest, preprocess, and segment.
+roi_refinement = "gpu-ml"
+
 [[worker]]
 name = "ingest-1"
 capabilities = ["ingest"]

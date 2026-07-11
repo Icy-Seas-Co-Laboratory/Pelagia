@@ -16,7 +16,7 @@ Pelagia is designed for workflows where full source frames are large and mostly 
 
 Pelagia is split into a Python backend (`Pelagia`) and an optional SvelteKit
 frontend (`PelagiaView`). The backend owns storage, processing, the job queue,
-workers, and the HTTP API. PelagiaView connects to that API from a browser.
+workers, and the HTTP API. PelagiaView connects to that API from a browser. Power users may also be interested in leveraging the API directly via scripts (e.g., python, R, Julia) or through the command line interface (CLI) either locally or through SSH. 
 
 For operational procedures after installation, see the
 [End-User Operations Guide](docs/end-user-support.md). It links the reset,
@@ -52,21 +52,46 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+Use Python 3.12 for the current CPU codec and ML worker profiles.
+
 For development and tests, install the dev target instead:
 
 ```bash
 python -m pip install -r requirements-dev.txt
 ```
 
-For machines that will run learned ROI refinement models, install the optional
-ML dependencies after the normal backend install:
+For CPU/API/ingest/preprocess/segment workers, create and synchronize the CPU
+profile:
 
 ```bash
-python -m pip install -r requirements-ml.txt
+./scripts/pelagia_env.py sync cpu
+```
+
+For machines that will run learned ROI refinement models, install the optional
+ML profile in its separate environment:
+
+```bash
+./scripts/pelagia_env.py sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env.py sync ml-cuda
 ```
 
 Apple Metal users should use `requirements-ml-apple-metal.txt` instead of
-`requirements-ml.txt`.
+`requirements-ml.txt`. The CPU profile pins `imagecodecs 2026.6.26` with
+NumPy 2.1+, while the Apple Metal profile uses `imagecodecs 2026.3.6` with
+NumPy 2.0 because TensorFlow 2.18 requires `numpy<2.1`.
+
+For dedicated GPU/ML workers, create a second environment rather than adding
+TensorFlow to the API and CPU-worker environment:
+
+```bash
+./scripts/pelagia_env.py doctor all
+./scripts/pelagia_env.py doctor gpu-ml --require-gpu
+./scripts/pelagia_env.py doctor cpu --require-jpegxs
+```
+
+`pelagia env sync ...` and `pelagia env doctor ...` provide the same commands
+after the CPU environment is installed. Pass `--imagecodecs-wheel PATH` to
+`sync` when installing the internally built JPEG XS-enabled wheel.
 
 ### Configure Storage
 
@@ -191,6 +216,26 @@ You can also put it in `scripts/pelagia_workers.toml`:
 [stack]
 run_dir = "/scratch/Pelagia/.pelagia/run/dev-workers"
 ```
+
+The TOML stack chooses its Python interpreter from `[worker_profiles]` based on
+each worker's capabilities. `roi_refinement` is the GPU/ML capability and must
+be configured in a dedicated worker; it cannot be combined with ingest,
+preprocess, background, or segmentation stages.
+
+```toml
+[worker_profiles]
+default = "cpu"
+roi_refinement = "gpu-ml"
+```
+
+Validate the resolved worker profiles before starting services:
+
+```bash
+./scripts/pelagia_stack_from_toml.sh validate scripts/pelagia_workers.toml
+```
+
+For a GPU-only worker host, set `api.enabled = false` and
+`worker_profiles.control = "gpu-ml"` in its stack TOML.
 
 ### Verify The API
 
@@ -395,7 +440,12 @@ General list endpoints are intentionally shaped as limited searches. For example
 Frame metadata can be searched by range with
 `GET /assets/{asset_id}/frames?start_frame=1&end_frame=100`, and frame image data
 can be loaded with `GET /assets/{asset_id}/framedata/{frame_num}?format=png`.
-Supported frame data formats are `png`, `jpg`/`jpeg`, `matrix`, and `preview`.
+Supported frame data response formats are `png`, `jpg`/`jpeg`, `jxl`, `jxs`, `matrix`,
+and `preview`. Stored full-frame payloads default to `jpg` at quality `90`; set
+`[processing.frame_storage].image_encoding = "jxl"` or `"jxs"` to store JPEG XL
+or JPEG XS payloads. Both codecs use in-memory `imagecodecs` bindings. JPEG XS
+requires an `imagecodecs` source build with `libjxs` enabled because binary wheels
+do not include that optional codec.
 Preview requests return a small PNG placeholder and accept `preview_max_dim`, for example
 `GET /assets/{asset_id}/framedata/{frame_num}?format=preview&preview_max_dim=128`.
 

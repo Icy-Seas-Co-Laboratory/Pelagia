@@ -59,7 +59,8 @@ if APIRouter is not None:
         background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
         store: bool = True
-        encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
+        encoding: Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"] | None = None
+        quality: int | None = None
         response_format: Literal["metadata", "matrix"] = "metadata"
 
     class QueueFramePreprocessRequest(BaseModel):
@@ -85,7 +86,8 @@ if APIRouter is not None:
         background_min_field_value: int | float | None = None
         background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
-        encoding: Literal["png", "jpg", "raw", "zstd"] | None = None
+        encoding: Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"] | None = None
+        quality: int | None = None
         priority: int | None = None
         depends_on: list[str] | None = None
 
@@ -98,7 +100,8 @@ if APIRouter is not None:
         end_frame: int | None = None
         limit: int | None = None
         payload_kind: Literal["original", "raw", "preprocessed", "processed", "corrected"] = "original"
-        encoding: Literal["png", "jpg", "raw", "zstd"] = "zstd"
+        encoding: Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"] = "zstd"
+        quality: int | None = None
 
     class QueueFrameBackgroundRequest(FrameBackgroundRequest):
         priority: int | None = None
@@ -190,7 +193,7 @@ if APIRouter is not None:
         else:
             delivered = resized
             payload, media_type = encode_image(delivered, requested)
-            extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
+            extension = "jxs" if requested in {"jxs", "jpegxs", "jpeg-xs", "jpeg_xs"} else ("jxl" if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl"} else ("jpg" if requested in {"jpg", "jpeg"} else "png"))
             headers = size_headers
         delivered_height, delivered_width = np.asarray(delivered).shape[:2]
 
@@ -477,6 +480,7 @@ if APIRouter is not None:
                 processed,
                 context=context,
                 encoding=body.encoding,
+                quality=body.quality,
             )
 
         response = {
@@ -653,6 +657,7 @@ if APIRouter is not None:
                 else body.invert_intensity
             ),
             "encoding": body.encoding,
+            "quality": body.quality,
         }
         try:
             job = repository.create_job(
@@ -688,6 +693,7 @@ if APIRouter is not None:
                 context=get_context(request).for_project(scoped_project_id(request)),
                 payload_kind=body.payload_kind,
                 encoding=body.encoding,
+                quality=body.quality,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -712,6 +718,7 @@ if APIRouter is not None:
             "limit": body.limit,
             "payload_kind": body.payload_kind,
             "encoding": body.encoding,
+            "quality": body.quality,
         }
         payload = {key: value for key, value in payload.items() if value is not None}
         if body.dry_run:

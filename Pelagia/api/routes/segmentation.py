@@ -59,7 +59,7 @@ if APIRouter is not None:
         "clear_border",
     ]
     RoiAssemblyMethod = Literal["connected_components", "contours"]
-    RoiEncoding = Literal["png", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "raw", "zstd", "auto"]
 
     class SegmentFrameRequest(BaseModel):
         threshold: int | float | None = None

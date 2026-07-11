@@ -2,14 +2,16 @@ import io
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from Pelagia.config import CoreConfig
 from Pelagia.domain import FrameRecord
+from Pelagia.processing import frame_codec
 from Pelagia.processing import ingest as ingest_module
-from Pelagia.processing.frame_codec import decode_array_payload
+from Pelagia.processing.frame_codec import decode_array_payload, encode_array_payload
 from Pelagia.processing.frame_correction import (
     _bounded_field,
     _divide_by_field,
@@ -654,9 +656,136 @@ def test_store_frame_can_write_jpg_payload():
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "jpg"
     assert metadata["kvstore_format"] == "jpg"
+    assert metadata["kvstore_quality"] == 90
     decoded = decode_array_payload(ctx.kvstore.payload, metadata)
     assert decoded.shape == data.shape
     assert decoded.dtype == np.uint8
+
+
+def test_store_frame_can_write_jxl_payload():
+    pytest.importorskip("imagecodecs")
+
+    ctx = FakeContext()
+    data = np.arange(100, dtype=np.uint8).reshape(10, 10)
+
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+            "kvstore_encoding": "jxl",
+            "kvstore_quality": 90,
+        },
+    )
+
+    store_frame(frame, context=ctx)
+
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert metadata["kvstore_encoding"] == "jxl"
+    assert metadata["kvstore_format"] == "jxl"
+    assert metadata["kvstore_quality"] == 90
+    decoded = decode_array_payload(ctx.kvstore.payload, metadata)
+    assert decoded.shape == data.shape
+    assert decoded.dtype == np.uint8
+
+
+def test_store_frame_can_write_jxs_payload():
+    imagecodecs = pytest.importorskip("imagecodecs")
+    if not imagecodecs.JPEGXS.available:
+        pytest.skip("imagecodecs was not built with JPEG XS support")
+
+    ctx = FakeContext()
+    data = np.repeat(np.arange(32, dtype=np.uint8)[np.newaxis, :, np.newaxis], 32, axis=0)
+    data = np.repeat(data, 3, axis=2)
+
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+            "kvstore_encoding": "jxs",
+        },
+    )
+
+    store_frame(frame, context=ctx)
+
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert metadata["kvstore_encoding"] == "jxs"
+    assert metadata["kvstore_format"] == "jxs"
+    decoded = decode_array_payload(ctx.kvstore.payload, metadata)
+    assert decoded.shape == data.shape
+    assert decoded.dtype == data.dtype
+
+
+def test_jxl_encoder_uses_imagecodecs_in_memory_with_fast_effort(monkeypatch):
+    encode_calls: list[dict[str, object]] = []
+
+    def fake_encode(data, **kwargs):
+        encode_calls.append({"shape": data.shape, "dtype": data.dtype, **kwargs})
+        return b"jxl"
+
+    monkeypatch.setattr("imagecodecs.jpegxl_encode", fake_encode)
+
+    payload, encoding, payload_format = encode_array_payload(
+        np.arange(16, dtype=np.uint8).reshape(4, 4),
+        "jxl",
+    )
+
+    assert payload == b"jxl"
+    assert encoding == "jxl"
+    assert payload_format == "jxl"
+    assert encode_calls == [
+        {
+            "shape": (4, 4),
+            "dtype": np.dtype("uint8"),
+            "level": 90,
+            "effort": 1,
+            "numthreads": 4,
+        }
+    ]
+
+
+def test_jxs_encoder_uses_imagecodecs_and_preserves_grayscale_shape(monkeypatch):
+    encode_calls: list[np.ndarray] = []
+
+    def fake_encode(data):
+        encode_calls.append(data.copy())
+        return b"jxs"
+
+    codec = SimpleNamespace(
+        JPEGXS=SimpleNamespace(available=True),
+        jpegxs_encode=fake_encode,
+        jpegxs_decode=lambda payload: np.full((4, 4, 3), 17, dtype=np.uint8),
+    )
+    monkeypatch.setattr(frame_codec, "_imagecodecs", lambda: codec)
+
+    data = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    payload, encoding, payload_format = encode_array_payload(data, "jpeg-xs")
+    decoded = decode_array_payload(payload, {"kvstore_encoding": "jxs", "shape": [4, 4]})
+
+    assert payload == b"jxs"
+    assert encoding == "jxs"
+    assert payload_format == "jxs"
+    assert encode_calls[0].shape == (4, 4, 3)
+    assert np.array_equal(encode_calls[0][:, :, 0], data)
+    assert np.array_equal(encode_calls[0][:, :, 1], data)
+    assert np.array_equal(encode_calls[0][:, :, 2], data)
+    assert decoded.shape == data.shape
+    assert np.array_equal(decoded, np.full((4, 4), 17, dtype=np.uint8))
+
+
+def test_jxs_encoder_requires_an_imagecodecs_build_with_jpeg_xs(monkeypatch):
+    codec = SimpleNamespace(JPEGXS=SimpleNamespace(available=False))
+    monkeypatch.setattr(frame_codec, "_imagecodecs", lambda: codec)
+
+    with pytest.raises(RuntimeError, match="JPEG XS support is not available"):
+        encode_array_payload(np.zeros((4, 4, 3), dtype=np.uint8), "jxs")
 
 
 def test_store_frame_uses_configured_default_image_data_storage_encoding():

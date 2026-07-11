@@ -5,8 +5,8 @@ install targets for common environments.
 
 ## 1. Create A Virtual Environment
 
-Use Python 3.10 or newer. Python 3.11+ is preferred because TOML support is
-built into the standard library.
+Use Python 3.10 or newer for the base backend. The current CPU codec and ML
+profiles require Python 3.12 because current `imagecodecs` does.
 
 ```bash
 python3 -m venv .venv
@@ -23,6 +23,12 @@ storage support:
 python -m pip install -r requirements.txt
 ```
 
+For the API and CPU workers, synchronize the managed CPU profile instead:
+
+```bash
+./scripts/pelagia_env.py sync cpu
+```
+
 For development and tests:
 
 ```bash
@@ -30,10 +36,11 @@ python -m pip install -r requirements-dev.txt
 ```
 
 For machines that will run learned ROI refinement models such as the
-oracle-builder U-Net adapter:
+oracle-builder U-Net adapter, synchronize one of the managed ML profiles:
 
 ```bash
-python -m pip install -r requirements-ml.txt
+./scripts/pelagia_env.py sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env.py sync ml-cuda
 ```
 
 The ML install includes TensorFlow/Keras and is intentionally separate because
@@ -41,24 +48,52 @@ it is much heavier than the normal backend runtime. On Linux x86_64,
 `requirements-ml.txt` uses TensorFlow's `and-cuda` pip extra so NVIDIA GPU
 support is preferred when the driver/runtime can use it.
 
-For Apple Metal acceleration on macOS, use the separate Metal install target:
+The `ml-metal` profile installs the TensorFlow 2.18 / `tensorflow-metal` 1.2
+combination; `ml-cuda` installs the current TensorFlow CUDA target. Use
+`pelagia_env.py doctor gpu-ml --require-gpu` after synchronization to verify
+hardware visibility.
+
+## 2.1 Separate CPU And GPU/ML Workers
+
+Keep the API plus ingest, background, preprocess, and segment workers in the
+managed `cpu` profile (`.venv`). Use the managed ML profile (`.venv-ml`) for
+`roi_refinement` workers. The bootstrap script creates each environment,
+installs the appropriate requirements, and records its profile:
 
 ```bash
-python -m pip install -r requirements-ml-apple-metal.txt
+./scripts/pelagia_env.py sync cpu
+./scripts/pelagia_env.py sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env.py sync ml-cuda
 ```
 
-This target pins TensorFlow to the 2.18 series with `tensorflow-metal` 1.2.x,
-because newer TensorFlow releases may load incompatible plugin binaries before
-Apple publishes matching Metal wheels.
+Configure the TOML worker stack to select managed environments by capability:
 
-Verify hardware visibility after installing either ML target:
+```toml
+[worker_profiles]
+default = "cpu"
+roi_refinement = "gpu-ml"
+```
+
+`roi_refinement` is the GPU/ML capability and must have a dedicated worker;
+the stack rejects a worker that mixes it with CPU pipeline capabilities. Confirm
+the environment and resolved interpreters with:
 
 ```bash
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+./scripts/pelagia_env.py doctor all
+./scripts/pelagia_stack_from_toml.sh validate scripts/pelagia_workers.toml
 ```
 
-An empty list means TensorFlow installed successfully but did not discover a GPU
-backend in the current environment.
+The public `imagecodecs` wheel does not include JPEG XS. Install the internally
+built wheel while synchronizing the CPU profile, then require it in the doctor:
+
+```bash
+./scripts/pelagia_env.py sync cpu --imagecodecs-wheel /path/to/imagecodecs-*.whl
+./scripts/pelagia_env.py doctor cpu --require-jpegxs
+```
+
+On a GPU-only worker host, disable the API and set `control = "gpu-ml"` in
+`[worker_profiles]`; this uses the ML environment for stack lifecycle commands
+without starting CPU workers.
 
 ## 3. Configure Local Settings
 

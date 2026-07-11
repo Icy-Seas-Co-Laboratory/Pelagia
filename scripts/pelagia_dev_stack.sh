@@ -11,17 +11,40 @@ PELAGIA_DATABASE_SCHEMA="${PELAGIA_DATABASE_SCHEMA:-pelagia}"
 PELAGIA_KVSTORE_ROOT="${PELAGIA_KVSTORE_ROOT:-$ROOT_DIR/data/kvstore}"
 PELAGIA_API_HOST="${PELAGIA_API_HOST:-127.0.0.1}"
 PELAGIA_API_PORT="${PELAGIA_API_PORT:-8000}"
-PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,background_frames,preprocess_frames,segment,roi_refinement}"
+PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,background_frames,preprocess_frames,segment}"
 PELAGIA_WORKER_COUNT="${PELAGIA_WORKER_COUNT:-1}"
 PELAGIA_WORKER_COUNTS="${PELAGIA_WORKER_COUNTS:-}"
 PELAGIA_IDLE_SLEEP_SECONDS="${PELAGIA_IDLE_SLEEP_SECONDS:-2.0}"
 PELAGIA_REQUEUE_INTERVAL_SECONDS="${PELAGIA_REQUEUE_INTERVAL_SECONDS:-30.0}"
 PELAGIA_INIT_ON_START="${PELAGIA_INIT_ON_START:-auto}"
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS="${PELAGIA_INIT_STATEMENT_TIMEOUT_MS:-0}"
+PELAGIA_CPU_VENV="${PELAGIA_CPU_VENV:-$ROOT_DIR/.venv}"
+PELAGIA_GPU_ML_VENV="${PELAGIA_GPU_ML_VENV:-$ROOT_DIR/.venv-ml}"
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
 cd "$ROOT_DIR"
+
+venv_python() {
+    local venv_path="$1"
+    local label="$2"
+    if [[ ! -x "$venv_path/bin/python" ]]; then
+        echo "$label virtual environment must contain an executable bin/python: $venv_path" >&2
+        return 2
+    fi
+    echo "$venv_path/bin/python"
+}
+
+CPU_PYTHON="$(venv_python "$PELAGIA_CPU_VENV" "CPU")"
+
+worker_runtime_for_stage() {
+    local stage="$1"
+    if [[ "$stage" == "roi_refinement" ]]; then
+        printf 'gpu-ml|%s|%s\n' "$(venv_python "$PELAGIA_GPU_ML_VENV" "GPU/ML")" "$PELAGIA_GPU_ML_VENV"
+        return
+    fi
+    printf 'cpu|%s|%s\n' "$CPU_PYTHON" "$PELAGIA_CPU_VENV"
+}
 
 is_running() {
     local pid_file="$1"
@@ -134,7 +157,7 @@ worker_name_for_stage() {
 }
 
 storage_is_ready() {
-    python -m Pelagia.cli.app check-system \
+    "$CPU_PYTHON" -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
@@ -163,7 +186,7 @@ initialize_system() {
     esac
 
     echo "initializing storage..."
-    if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" python -m Pelagia.cli.app init-system \
+    if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" "$CPU_PYTHON" -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
         --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then
@@ -183,7 +206,7 @@ start_stack() {
     export PELAGIA_KVSTORE_ROOT
 
     start_process api \
-        python -m uvicorn Pelagia.api.app:create_app \
+        "$CPU_PYTHON" -m uvicorn Pelagia.api.app:create_app \
         --factory \
         --host "$PELAGIA_API_HOST" \
         --port "$PELAGIA_API_PORT"
@@ -194,18 +217,37 @@ start_stack() {
         if [[ -z "$stage" ]]; then
             continue
         fi
+        local runtime
+        if ! runtime="$(worker_runtime_for_stage "$stage")"; then
+            return 2
+        fi
+        IFS='|' read -r runtime_profile worker_python worker_venv <<<"$runtime"
         worker_count="$(worker_count_for_stage "$stage")"
         for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
             worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
-            start_process "$worker_id" \
-                python -m Pelagia.cli.app worker_run \
-                --database-dsn "$PELAGIA_DATABASE_DSN" \
-                --schema "$PELAGIA_DATABASE_SCHEMA" \
-                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
-                --worker-id "$worker_id" \
-                --stages "$stage" \
-                --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
-                --requeue-interval-seconds "$PELAGIA_REQUEUE_INTERVAL_SECONDS"
+            if [[ -n "$worker_venv" ]]; then
+                start_process "$worker_id" \
+                    env "VIRTUAL_ENV=$worker_venv" "PATH=$worker_venv/bin:$PATH" "PELAGIA_WORKER_PROFILE=$runtime_profile" \
+                    "$worker_python" -m Pelagia.cli.app worker_run \
+                    --database-dsn "$PELAGIA_DATABASE_DSN" \
+                    --schema "$PELAGIA_DATABASE_SCHEMA" \
+                    --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+                    --worker-id "$worker_id" \
+                    --stages "$stage" \
+                    --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
+                    --requeue-interval-seconds "$PELAGIA_REQUEUE_INTERVAL_SECONDS"
+            else
+                start_process "$worker_id" \
+                    env "PELAGIA_WORKER_PROFILE=$runtime_profile" \
+                    "$worker_python" -m Pelagia.cli.app worker_run \
+                    --database-dsn "$PELAGIA_DATABASE_DSN" \
+                    --schema "$PELAGIA_DATABASE_SCHEMA" \
+                    --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
+                    --worker-id "$worker_id" \
+                    --stages "$stage" \
+                    --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
+                    --requeue-interval-seconds "$PELAGIA_REQUEUE_INTERVAL_SECONDS"
+            fi
         done
     done
 
@@ -224,7 +266,7 @@ stop_stack() {
         worker_count="$(worker_count_for_stage "$stage")"
         for ((worker_index = 1; worker_index <= worker_count; worker_index++)); do
             worker_id="$(worker_name_for_stage "$stage" "$worker_index")"
-            python -m Pelagia.cli.app worker_shutdown "$worker_id" \
+            "$CPU_PYTHON" -m Pelagia.cli.app worker_shutdown "$worker_id" \
                 --database-dsn "$PELAGIA_DATABASE_DSN" \
                 --schema "$PELAGIA_DATABASE_SCHEMA" \
                 --reason "dev stack stop" >"$LOG_DIR/$worker_id.shutdown.log" 2>&1 || true

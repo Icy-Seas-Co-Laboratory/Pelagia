@@ -96,7 +96,16 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
             "kvstore_encoding",
             metadata.get("array_encoding", metadata.get("kvstore_format", default_encoding)),
         )
-        payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
+        default_quality = ctx.config.processing.frame_storage.image_quality
+        requested_quality = metadata.get(
+            "kvstore_quality",
+            metadata.get("array_quality", metadata.get("image_quality", default_quality)),
+        )
+        payload, kvstore_encoding, kvstore_format = encode_array_payload(
+            array,
+            requested_encoding,
+            quality=int(requested_quality),
+        )
         kvstore_key = kvstore.put_store(payload)
         preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
         width, height = frame.get_size()
@@ -112,6 +121,7 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                     "kvstore_hash": kvstore_key,
                     "kvstore_encoding": kvstore_encoding,
                     "kvstore_format": kvstore_format,
+                    "kvstore_quality": int(requested_quality),
                     "dtype": str(array.dtype),
                     "shape": list(array.shape),
                     "width": width,
@@ -247,6 +257,7 @@ def store_preprocessed_frame(
     *,
     context: AppContext | None = None,
     encoding: str | None = None,
+    quality: int | None = None,
 ) -> dict[str, Any]:
     data = frame.read()
     if data is None:
@@ -262,7 +273,16 @@ def store_preprocessed_frame(
 
     array = np.ascontiguousarray(data)
     requested_encoding = encoding or ctx.config.processing.frame_storage.image_encoding
-    payload, kvstore_encoding, kvstore_format = encode_array_payload(array, requested_encoding)
+    requested_quality = int(
+        quality
+        if quality is not None
+        else dict(frame.metadata or {}).get("kvstore_quality", ctx.config.processing.frame_storage.image_quality)
+    )
+    payload, kvstore_encoding, kvstore_format = encode_array_payload(
+        array,
+        requested_encoding,
+        quality=requested_quality,
+    )
     kvstore_key = kvstore.put_store(payload)
     preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
     metadata = metadata_without_none(
@@ -272,6 +292,7 @@ def store_preprocessed_frame(
             "kvstore_hash": kvstore_key,
             "kvstore_encoding": kvstore_encoding,
             "kvstore_format": kvstore_format,
+            "kvstore_quality": requested_quality,
             "dtype": str(array.dtype),
             "shape": list(array.shape),
             "frame_variant": "preprocessed",

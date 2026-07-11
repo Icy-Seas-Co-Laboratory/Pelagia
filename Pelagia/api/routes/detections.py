@@ -139,7 +139,7 @@ if APIRouter is not None:
             )
 
         payload, media_type = encode_image(delivered, requested)
-        extension = "jpg" if requested in {"jpg", "jpeg"} else "png"
+        extension = "jxs" if requested in {"jxs", "jpegxs", "jpeg-xs", "jpeg_xs"} else ("jxl" if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl"} else ("jpg" if requested in {"jpg", "jpeg"} else "png"))
         return Response(
             content=payload,
             media_type=media_type,
@@ -168,6 +168,8 @@ if APIRouter is not None:
             "content": {
                 "image/png": {},
                 "image/jpeg": {},
+                "image/jxl": {},
+                "image/jxs": {},
                 "application/json": {"schema": DetectionImageMatrixResponse.model_json_schema()},
             },
             "description": "Detection ROI/mask image bytes or matrix data.",

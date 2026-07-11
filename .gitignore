@@ -1,5 +1,6 @@
 .pelagia
 data/
+reports/
 
 # macOS
 .DS_Store

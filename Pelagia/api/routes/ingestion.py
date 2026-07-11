@@ -33,6 +33,7 @@ if APIRouter is not None:
         source_path: str
         n_tile: int | None = None
         image_encoding: str | None = None
+        image_quality: int | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -56,6 +57,7 @@ if APIRouter is not None:
         collections: str | list[str] | None = None
         n_tile: int | None = None
         image_encoding: str | None = None
+        image_quality: int | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     class IngestionAssetRequest(BaseModel):
@@ -71,6 +73,7 @@ if APIRouter is not None:
         metadata: dict[str, Any] = Field(default_factory=dict)
         n_tile: int | None = None
         image_encoding: str | None = None
+        image_quality: int | None = None
         recursive: bool | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
@@ -98,6 +101,7 @@ if APIRouter is not None:
         metadata: dict[str, Any] = Field(default_factory=dict)
         n_tile: int | None = None
         image_encoding: str | None = None
+        image_quality: int | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -155,15 +159,28 @@ if APIRouter is not None:
         if value is None:
             return None
         normalized = str(value).strip().lower()
-        if normalized not in {"zstd", "jpg", "png"}:
-            raise HTTPException(status_code=422, detail="image_encoding must be one of: zstd, jpg, png.")
+        if normalized in {"jpeg", "image/jpeg"}:
+            normalized = "jpg"
+        if normalized in {"jpegxl", "jpeg-xl", "jpeg_xl", "image/jxl"}:
+            normalized = "jxl"
+        if normalized in {"jpegxs", "jpeg-xs", "jpeg_xs", "image/jxs"}:
+            normalized = "jxs"
+        if normalized not in {"zstd", "jpg", "jxl", "jxs", "png", "raw"}:
+            raise HTTPException(status_code=422, detail="image_encoding must be one of: zstd, jpg, jxl, jxs, png, raw.")
         return normalized
+
+    def _normalize_image_quality(value: int | None, default: int) -> int:
+        quality = int(default if value is None else value)
+        if quality < 0 or quality > 100:
+            raise HTTPException(status_code=422, detail="image_quality must be between 0 and 100.")
+        return quality
 
     def _resolved_ingest_defaults(
         request: Request,
         *,
         n_tile: int | None = None,
         image_encoding: str | None = None,
+        image_quality: int | None = None,
     ) -> dict[str, Any]:
         defaults = request.app.state.context.config.processing
         ingest_defaults = defaults.video_ingest
@@ -173,6 +190,7 @@ if APIRouter is not None:
         return {
             "n_tile": ingest_defaults.n_tile if n_tile is None else n_tile,
             "image_encoding": _normalize_image_encoding(image_encoding) or frame_storage_defaults.image_encoding,
+            "image_quality": _normalize_image_quality(image_quality, frame_storage_defaults.image_quality),
             "adaptive_background_subtraction": preprocessing_defaults.adaptive_background_subtraction,
             "adaptive_background_period": preprocessing_defaults.adaptive_background_period,
             "apply_mask": preprocessing_defaults.apply_mask,
@@ -193,9 +211,11 @@ if APIRouter is not None:
             request,
             n_tile=getattr(global_body, "n_tile", None),
             image_encoding=getattr(global_body, "image_encoding", None),
+            image_quality=getattr(global_body, "image_quality", None),
         )
         n_tile = defaults["n_tile"] if asset.n_tile is None else asset.n_tile
         image_encoding = _normalize_image_encoding(asset.image_encoding) or defaults["image_encoding"]
+        image_quality = _normalize_image_quality(asset.image_quality, defaults["image_quality"])
         adaptive_background_period = (
             asset.adaptive_background_period
             if asset.adaptive_background_period is not None
@@ -243,6 +263,8 @@ if APIRouter is not None:
             "metadata": {
                 "kvstore_encoding": image_encoding,
                 "array_encoding": image_encoding,
+                "kvstore_quality": image_quality,
+                "array_quality": image_quality,
             },
         }
 
@@ -265,7 +287,12 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"Source path {str(exc)!r} was not found.") from exc
-        defaults = _resolved_ingest_defaults(request, n_tile=body.n_tile, image_encoding=body.image_encoding)
+        defaults = _resolved_ingest_defaults(
+            request,
+            n_tile=body.n_tile,
+            image_encoding=body.image_encoding,
+            image_quality=body.image_quality,
+        )
         asset_payloads = [asset.as_dict() for asset in assets]
         return as_response(
             {
@@ -280,6 +307,7 @@ if APIRouter is not None:
                     "assets": asset_payloads,
                     "n_tile": defaults["n_tile"],
                     "image_encoding": defaults["image_encoding"],
+                    "image_quality": defaults["image_quality"],
                     "adaptive_background_subtraction": defaults["adaptive_background_subtraction"],
                     "adaptive_background_period": defaults["adaptive_background_period"],
                     "apply_mask": defaults["apply_mask"],
@@ -399,6 +427,7 @@ if APIRouter is not None:
         frame_storage_defaults = defaults.frame_storage
         n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
         image_encoding = _normalize_image_encoding(body.image_encoding) or frame_storage_defaults.image_encoding
+        image_quality = _normalize_image_quality(body.image_quality, frame_storage_defaults.image_quality)
         adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
             if body.adaptive_background_subtraction is None
@@ -499,6 +528,8 @@ if APIRouter is not None:
                 "metadata": {
                     "kvstore_encoding": image_encoding,
                     "array_encoding": image_encoding,
+                    "kvstore_quality": image_quality,
+                    "array_quality": image_quality,
                 },
                 "padding": roi_padding,
                 "roi_encoding": roi_encoding,

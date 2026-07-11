@@ -20,15 +20,23 @@ api = ["fastapi", "uvicorn"]
 cli = ["typer"]
 postgres = ["psycopg[binary]"]
 kvstore-blake3 = ["blake3"]
+worker-cpu = [
+    "imagecodecs==2026.6.26",
+    "numpy>=2.1,<2.6",
+]
 ml = [
-    "tensorflow[and-cuda]; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "tensorflow; platform_system != 'Linux' or platform_machine != 'x86_64'",
-    "keras",
+    "tensorflow[and-cuda]>=2.21,<2.22; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "tensorflow>=2.21,<2.22; platform_system != 'Linux' or platform_machine != 'x86_64'",
+    "keras>=3.12,<3.15",
+    "imagecodecs==2026.6.26",
+    "numpy>=2.1,<2.6",
 ]
 ml-apple-metal = [
     "tensorflow>=2.18,<2.19; platform_system == 'Darwin'",
     "tensorflow-metal>=1.2,<1.3; platform_system == 'Darwin'",
-    "keras; platform_system == 'Darwin'",
+    "keras>=3.5,<3.15; platform_system == 'Darwin'",
+    "imagecodecs==2026.3.6; platform_system == 'Darwin'",
+    "numpy>=2.0,<2.1; platform_system == 'Darwin'",
 ]
 test = ["pytest"]
 

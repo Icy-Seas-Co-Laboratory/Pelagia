@@ -8,6 +8,8 @@ except ImportError:  # pragma: no cover
 import cv2
 import numpy as np
 
+from ...processing.frame_codec import encode_array_payload
+
 
 def pad_image_to_square(array, *, fill_value: int | float = 0) -> np.ndarray:
     """Center an image on a square canvas using the longest image dimension."""
@@ -198,6 +200,10 @@ def encode_image(array, fmt: str) -> tuple[bytes, str]:
     requested = fmt.lower()
     if requested == "jpg":
         requested = "jpeg"
+    if requested in {"jpegxl", "jpeg-xl", "jpeg_xl"}:
+        requested = "jxl"
+    if requested in {"jpegxs", "jpeg-xs", "jpeg_xs"}:
+        requested = "jxs"
     image = _prepare_image_for_encoding(array, requested)
     if requested == "png":
         ok, encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 4])
@@ -205,10 +211,16 @@ def encode_image(array, fmt: str) -> tuple[bytes, str]:
     elif requested == "jpeg":
         ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
         media_type = "image/jpeg"
+    elif requested == "jxl":
+        payload, _, _ = encode_array_payload(image, "jxl", quality=90)
+        return payload, "image/jxl"
+    elif requested == "jxs":
+        payload, _, _ = encode_array_payload(image, "jxs")
+        return payload, "image/jxs"
     else:
         raise HTTPException(
             status_code=422,
-            detail="Image data format must be one of: png, jpg, jpeg, matrix.",
+            detail="Image data format must be one of: png, jpg, jpeg, jxl, jxs, matrix.",
         )
     if not ok:
         raise HTTPException(

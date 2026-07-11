@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -200,3 +201,45 @@ def test_cli_create_project_user_membership_and_list(monkeypatch):
             "role": "viewer",
         }
     ]
+
+
+def test_cli_environment_sync_dry_run_reports_profile_commands(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "env",
+            "sync",
+            "cpu",
+            "--root",
+            str(tmp_path),
+            "--python",
+            sys.executable,
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Requirements file was not found" in result.output
+
+    (tmp_path / "requirements-worker-cpu.txt").write_text("", encoding="utf-8")
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "env",
+            "sync",
+            "cpu",
+            "--root",
+            str(tmp_path),
+            "--python",
+            sys.executable,
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["profile"] == "cpu"
+    assert body["venv"] == str(tmp_path / ".venv")
+    assert body["dry_run"] is True

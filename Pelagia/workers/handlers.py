@@ -438,6 +438,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
     encoding = payload.get("encoding")
+    quality = payload.get("quality")
     stored_rows = []
     progress = JobProgressReporter(
         job,
@@ -486,12 +487,14 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             ),
             force=True,
         )
-        result = generate_background_for_frames(
-            frame_ids,
-            context=context,
-            payload_kind=str(payload.get("background_payload_kind", "original")),
-            encoding=str(payload.get("background_encoding", "zstd")),
-        )
+        background_kwargs = {
+            "context": context,
+            "payload_kind": str(payload.get("background_payload_kind", "original")),
+            "encoding": str(payload.get("background_encoding", "zstd")),
+        }
+        if payload.get("background_quality") is not None:
+            background_kwargs["quality"] = payload.get("background_quality")
+        result = generate_background_for_frames(frame_ids, **background_kwargs)
         progress.update(
             0,
             secondary={
@@ -545,6 +548,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
                 processed,
                 context=context,
                 encoding=encoding,
+                quality=None if quality is None else int(quality),
             )
         )
         progress.update(
@@ -637,12 +641,14 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         if resolved_run_id is None:
             resolved_run_id = frame_record.run_id
 
-    result = generate_background_for_frames(
-        frame_ids,
-        context=context,
-        payload_kind=str(payload.get("payload_kind", "original")),
-        encoding=str(payload.get("encoding", "zstd")),
-    )
+    background_kwargs = {
+        "context": context,
+        "payload_kind": str(payload.get("payload_kind", "original")),
+        "encoding": str(payload.get("encoding", "zstd")),
+    }
+    if payload.get("quality") is not None:
+        background_kwargs["quality"] = payload.get("quality")
+    result = generate_background_for_frames(frame_ids, **background_kwargs)
     result.update(
         {
             "stage": PipelineStage.BACKGROUND_FRAMES.value,

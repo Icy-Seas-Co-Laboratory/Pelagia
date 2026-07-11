@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from Pelagia.config import CoreConfig
 from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
@@ -14,6 +15,7 @@ from Pelagia.workers.handlers import (
     roi_refinement_handler,
 )
 from Pelagia.workers.worker import Worker
+from Pelagia.workers.runtime import worker_runtime_profile
 
 
 class FakeRepository:
@@ -207,6 +209,15 @@ class FakeRepository:
 
 def make_context(repository):
     return AppContext(config=CoreConfig(), repository=repository, kvstore=None)
+
+
+def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
+    with pytest.raises(ValueError, match="explicit stages"):
+        worker_runtime_profile(None)
+    assert worker_runtime_profile([PipelineStage.SEGMENT]) == "cpu"
+    assert worker_runtime_profile([PipelineStage.ROI_REFINEMENT]) == "gpu-ml"
+    with pytest.raises(ValueError, match="dedicated worker"):
+        worker_runtime_profile([PipelineStage.SEGMENT, PipelineStage.ROI_REFINEMENT])
 
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):

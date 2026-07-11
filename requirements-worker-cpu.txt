@@ -1,0 +1,5 @@
+# CPU/API/ingest/preprocess/segment worker environment with the current
+# imagecodecs release line. JPEG XS still requires an internally built wheel
+# with libjxs enabled; install that wheel in place of the public wheel.
+-r requirements.txt
+-e ".[worker-cpu]"
