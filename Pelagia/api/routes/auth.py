@@ -13,6 +13,13 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..auth import MANAGE_ROLES, bearer_token, require_auth
     from ...services.projects import initialize_project_kvstore
+    from ...services.project_settings import (
+        merge_project_settings,
+        invalidate_project_settings,
+        resolve_project_settings,
+        resolve_project_storage_settings,
+        storage_settings_payload,
+    )
     from ...storage.postgres import DEFAULT_PROJECT_ID, PROJECT_ROLES
     from ._common import as_response, get_context, get_repository
 
@@ -37,6 +44,18 @@ if APIRouter is not None:
         kvstore_root_path: str | None = None
         is_active: bool = True
         metadata: dict[str, Any] = Field(default_factory=dict)
+
+    class UpdateProjectRequest(BaseModel):
+        project_name: str | None = None
+        description: str | None = None
+        kvstore_root_path: str | None = None
+        is_active: bool | None = None
+        metadata: dict[str, Any] | None = None
+
+    class UpdateProjectStorageSettingsRequest(BaseModel):
+        frame_encoding: str | None = None
+        frame_quality: int | None = None
+        roi_encoding: str | None = None
 
     class CreateUserRequest(BaseModel):
         username: str
@@ -286,6 +305,84 @@ if APIRouter is not None:
             membership = repository.add_project_member(auth.user_id, str(project["id"]), role="admin")
         kvstore = initialize_project_kvstore(get_context(request), project)
         return as_response({"project": project, "membership": membership, "kvstore": kvstore})
+
+    @projects_router.patch("/{project_id}")
+    def update_project(request: Request, project_id: str, body: UpdateProjectRequest) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        _require_project_management(auth, repository, str(project["id"]))
+        updated = repository.update_project(
+            str(project["id"]),
+            project_name=body.project_name,
+            description=body.description,
+            kvstore_root_path=body.kvstore_root_path,
+            is_active=body.is_active,
+            metadata=body.metadata,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        invalidate_project_settings(get_context(request), str(project["id"]))
+        return as_response({"project": updated})
+
+    @projects_router.get("/{project_id}/storage-settings")
+    def get_project_storage_settings(request: Request, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        _require_project_management(auth, repository, str(project["id"]))
+        effective = resolve_project_storage_settings(
+            get_context(request),
+            str(project["id"]),
+        )
+        return as_response(
+            {
+                "project_id": project["id"],
+                "configured": (project.get("settings") or {}).get("storage", {}),
+                "effective": effective.as_dict(),
+            }
+        )
+
+    @projects_router.patch("/{project_id}/storage-settings")
+    def update_project_storage_settings(
+        request: Request,
+        project_id: str,
+        body: UpdateProjectStorageSettingsRequest,
+    ) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        _require_project_management(auth, repository, str(project["id"]))
+        try:
+            patch = storage_settings_payload(
+                frame_encoding=body.frame_encoding,
+                frame_quality=body.frame_quality,
+                roi_encoding=body.roi_encoding,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not patch:
+            raise HTTPException(status_code=422, detail="Provide at least one storage setting.")
+        settings = merge_project_settings(project.get("settings"), patch)
+        updated = repository.update_project(str(project["id"]), settings=settings)
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        context = get_context(request)
+        invalidate_project_settings(context, str(project["id"]))
+        effective = resolve_project_settings(context, str(project["id"]))
+        return as_response(
+            {
+                "project": updated,
+                "configured": settings.get("storage", {}),
+                "effective": effective.storage.as_dict(),
+            }
+        )
 
     @projects_router.delete("/{project_id}")
     def delete_project(request: Request, project_id: str) -> dict:

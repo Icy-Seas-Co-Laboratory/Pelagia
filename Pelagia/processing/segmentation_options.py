@@ -41,7 +41,7 @@ MASK_AUGMENTATION_STEPS = [
     "clear_border",
 ]
 ROI_ASSEMBLY_METHODS = ["connected_components", "contours"]
-ROI_ENCODINGS = ["zstd", "png", "jpg", "jxl", "raw", "auto"]
+ROI_ENCODINGS = ["zstd", "png", "jpg", "jxl", "jxs", "raw", "auto"]
 
 
 def resolve_segmentation_options(

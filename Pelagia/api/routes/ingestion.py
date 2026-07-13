@@ -27,6 +27,9 @@ def _sha256_file(path: Path) -> str:
 
 if APIRouter is not None:
     from ..auth import require_project_write
+    from ...services.project_settings import resolve_project_storage_settings
+    from ...services.job_commands import ExtractFramesCommand
+    from ...processing.codec_registry import normalize_image_encoding
     from ._common import as_response, get_repository
 
     class QueueVideoRequest(BaseModel):
@@ -158,16 +161,10 @@ if APIRouter is not None:
     def _normalize_image_encoding(value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = str(value).strip().lower()
-        if normalized in {"jpeg", "image/jpeg"}:
-            normalized = "jpg"
-        if normalized in {"jpegxl", "jpeg-xl", "jpeg_xl", "image/jxl"}:
-            normalized = "jxl"
-        if normalized in {"jpegxs", "jpeg-xs", "jpeg_xs", "image/jxs"}:
-            normalized = "jxs"
-        if normalized not in {"zstd", "jpg", "jxl", "jxs", "png", "raw"}:
+        try:
+            return normalize_image_encoding(value)
+        except ValueError:
             raise HTTPException(status_code=422, detail="image_encoding must be one of: zstd, jpg, jxl, jxs, png, raw.")
-        return normalized
 
     def _normalize_image_quality(value: int | None, default: int) -> int:
         quality = int(default if value is None else value)
@@ -178,6 +175,7 @@ if APIRouter is not None:
     def _resolved_ingest_defaults(
         request: Request,
         *,
+        project_id: str | None = None,
         n_tile: int | None = None,
         image_encoding: str | None = None,
         image_quality: int | None = None,
@@ -186,17 +184,22 @@ if APIRouter is not None:
         ingest_defaults = defaults.video_ingest
         preprocessing_defaults = defaults.preprocessing
         roi_recording_defaults = defaults.roi_recording
-        frame_storage_defaults = defaults.frame_storage
+        storage_settings = resolve_project_storage_settings(
+            request.app.state.context,
+            project_id,
+            frame_encoding=image_encoding,
+            frame_quality=image_quality,
+        )
         return {
             "n_tile": ingest_defaults.n_tile if n_tile is None else n_tile,
-            "image_encoding": _normalize_image_encoding(image_encoding) or frame_storage_defaults.image_encoding,
-            "image_quality": _normalize_image_quality(image_quality, frame_storage_defaults.image_quality),
+            "image_encoding": storage_settings.frame_encoding,
+            "image_quality": storage_settings.frame_quality,
             "adaptive_background_subtraction": preprocessing_defaults.adaptive_background_subtraction,
             "adaptive_background_period": preprocessing_defaults.adaptive_background_period,
             "apply_mask": preprocessing_defaults.apply_mask,
             "mask_path": preprocessing_defaults.mask_path,
             "roi_padding": roi_recording_defaults.padding,
-            "roi_encoding": roi_recording_defaults.roi_encoding,
+            "roi_encoding": storage_settings.roi_encoding,
         }
 
     def _job_payload_for_asset(
@@ -204,11 +207,13 @@ if APIRouter is not None:
         asset: IngestionAssetRequest,
         *,
         global_body: QueueAssetsRequest | QueueVideoRequest,
+        project_id: str | None,
         collections: list[str],
         checksum_status: str,
     ) -> dict[str, Any]:
         defaults = _resolved_ingest_defaults(
             request,
+            project_id=project_id,
             n_tile=getattr(global_body, "n_tile", None),
             image_encoding=getattr(global_body, "image_encoding", None),
             image_quality=getattr(global_body, "image_quality", None),
@@ -238,7 +243,7 @@ if APIRouter is not None:
                 return body_value
             return defaults[default_name]
 
-        return {
+        return ExtractFramesCommand.from_payload({
             "source_path": str(Path(asset.path).expanduser().resolve()),
             "kind": asset.kind,
             "n_tile": n_tile,
@@ -266,11 +271,11 @@ if APIRouter is not None:
                 "kvstore_quality": image_quality,
                 "array_quality": image_quality,
             },
-        }
+        }).to_payload()
 
     @router.post("/analyze")
     def analyze_ingestion_source(request: Request, body: AnalyzeIngestionRequest) -> dict:
-        require_project_write(request)
+        auth = require_project_write(request)
         source_path = _resolve_allowed_import_path(request, body.source_path)
         if not source_path.exists():
             raise HTTPException(status_code=404, detail=f"Source path {str(source_path)!r} was not found.")
@@ -289,6 +294,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Source path {str(exc)!r} was not found.") from exc
         defaults = _resolved_ingest_defaults(
             request,
+            project_id=auth.project_id,
             n_tile=body.n_tile,
             image_encoding=body.image_encoding,
             image_quality=body.image_quality,
@@ -394,6 +400,7 @@ if APIRouter is not None:
                 request,
                 asset,
                 global_body=body,
+                project_id=auth.project_id,
                 collections=collections,
                 checksum_status=checksum_status,
             )
@@ -420,14 +427,21 @@ if APIRouter is not None:
 
     @router.post("/videos")
     def queue_video_ingestion(request: Request, body: QueueVideoRequest) -> dict:
-        defaults = request.app.state.context.config.processing
-        ingest_defaults = defaults.video_ingest
-        preprocessing_defaults = defaults.preprocessing
-        roi_recording_defaults = defaults.roi_recording
-        frame_storage_defaults = defaults.frame_storage
-        n_tile = ingest_defaults.n_tile if body.n_tile is None else body.n_tile
-        image_encoding = _normalize_image_encoding(body.image_encoding) or frame_storage_defaults.image_encoding
-        image_quality = _normalize_image_quality(body.image_quality, frame_storage_defaults.image_quality)
+        repository = get_repository(request)
+        auth = require_project_write(request)
+        defaults = _resolved_ingest_defaults(
+            request,
+            project_id=auth.project_id,
+            n_tile=body.n_tile,
+            image_encoding=body.image_encoding,
+            image_quality=body.image_quality,
+        )
+        processing_defaults = request.app.state.context.config.processing
+        preprocessing_defaults = processing_defaults.preprocessing
+        roi_recording_defaults = processing_defaults.roi_recording
+        n_tile = defaults["n_tile"]
+        image_encoding = defaults["image_encoding"]
+        image_quality = defaults["image_quality"]
         adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
             if body.adaptive_background_subtraction is None
@@ -445,16 +459,12 @@ if APIRouter is not None:
             if body.roi_padding is None
             else body.roi_padding
         )
-        roi_encoding = (
-            roi_recording_defaults.roi_encoding if body.roi_encoding is None else body.roi_encoding
-        )
+        roi_encoding = defaults["roi_encoding"] if body.roi_encoding is None else body.roi_encoding
         if n_tile < 1:
             raise HTTPException(status_code=422, detail="n_tile must be >= 1.")
         if adaptive_background_period < 1:
             raise HTTPException(status_code=422, detail="adaptive_background_period must be >= 1.")
 
-        repository = get_repository(request)
-        auth = require_project_write(request)
         source_path = Path(body.source_path).expanduser().resolve()
         if not source_path.exists() or not source_path.is_file():
             raise HTTPException(
@@ -517,7 +527,7 @@ if APIRouter is not None:
             project_id=auth.project_id,
             run_id=run_id,
             asset_id=asset_id,
-            payload={
+            payload=ExtractFramesCommand.from_payload({
                 "source_path": str(source_path),
                 "n_tile": n_tile,
                 "adaptive_background_subtraction": adaptive_background_subtraction,
@@ -535,7 +545,7 @@ if APIRouter is not None:
                 "roi_encoding": roi_encoding,
                 "collections": collections,
                 "checksum_status": checksum_status,
-            },
+            }).to_payload(),
             summary=f"extract_frames queued for {source_path.name}",
         )
         return as_response(

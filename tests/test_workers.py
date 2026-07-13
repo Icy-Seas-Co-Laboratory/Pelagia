@@ -376,6 +376,8 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
     assert result["segment_job_id"] == "segment-job-1"
     assert repo.created_jobs[0]["stage"] == PipelineStage.SEGMENT.value
     assert repo.created_jobs[0]["payload"] == {
+        "command_type": "segment_frames",
+        "command_version": 1,
         "frame_ids": [10],
         "padding": 4,
         "roi_encoding": "raw",

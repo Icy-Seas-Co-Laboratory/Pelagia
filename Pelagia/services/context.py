@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from ..config import CoreConfig
 from ..observability import DatabaseLogger
@@ -19,6 +20,7 @@ class AppContext:
     logger: DatabaseLogger | None = None
     active_project_id: str | None = None
     _project_kvstores: dict[str, BlobStore] = field(default_factory=dict)
+    _project_settings_cache: dict[str, tuple[dict[str, Any], float]] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, config: CoreConfig | None = None) -> "AppContext":

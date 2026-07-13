@@ -812,6 +812,31 @@ def test_store_frame_uses_configured_default_image_data_storage_encoding():
     assert metadata["kvstore_format"] == "raw_ndarray_c_order"
 
 
+def test_store_frame_uses_project_storage_encoding_when_not_overridden():
+    ctx = FakeContext()
+    ctx.active_project_id = "project-1"
+    ctx.repository.get_project = lambda project_id: {
+        "settings": {"storage": {"frame": {"encoding": "raw"}}}
+    }
+    data = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+        },
+    )
+
+    store_frame(frame, context=ctx)
+
+    assert ctx.kvstore.payload == data.tobytes(order="C")
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert metadata["kvstore_encoding"] == "raw"
+
+
 def test_store_frame_preserves_data_when_flatfield_metadata_is_present():
     ctx = FakeContext()
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)

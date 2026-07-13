@@ -7,6 +7,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal
 
+from .processing.codec_registry import STORAGE_ENCODINGS, normalize_image_encoding
+
 try:
     import tomllib
 except ImportError:  # pragma: no cover - Python 3.10 fallback
@@ -17,24 +19,15 @@ except ImportError:  # pragma: no cover - Python 3.10 fallback
 
 
 ImageDataStorageEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"]
-IMAGE_DATA_STORAGE_ENCODINGS = {"png", "jpg", "jxl", "jxs", "raw", "zstd"}
+IMAGE_DATA_STORAGE_ENCODINGS = set(STORAGE_ENCODINGS)
 _TOML_NULL_SENTINEL = "__PELAGIA_TOML_NULL__"
 
 
 def _normalize_image_data_storage_encoding(value: object) -> str:
-    normalized = str(value).strip().lower().replace("-", "_")
-    aliases = {
-        "jpeg": "jpg",
-        "image_jpeg": "jpg",
-        "jpegxl": "jxl",
-        "jpeg_xl": "jxl",
-        "image_jxl": "jxl",
-        "jpegxs": "jxs",
-        "jpeg_xs": "jxs",
-        "image_jxs": "jxs",
-        "zstandard": "zstd",
-    }
-    return aliases.get(normalized, normalized)
+    try:
+        return normalize_image_encoding(value)
+    except ValueError:
+        return str(value).strip().lower().replace("-", "_")
 
 
 @dataclass(slots=True)

@@ -568,6 +568,7 @@ class PostgresRepository:
         description: str | None = None,
         kvstore_root_path: str | None = None,
         is_active: bool = True,
+        settings: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_key = self._normalize_project_key(project_key)
@@ -577,8 +578,8 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.projects
-                    (project_key, project_name, description, kvstore_root_path, is_active, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    (project_key, project_name, description, kvstore_root_path, is_active, settings, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                     RETURNING *;
                     """,
                     (
@@ -587,6 +588,7 @@ class PostgresRepository:
                         description,
                         kvstore_root_path,
                         is_active,
+                        json.dumps(json_ready(settings or {})),
                         json.dumps(json_ready(metadata or {})),
                     ),
                 )
@@ -646,6 +648,55 @@ class PostgresRepository:
                     (self._normalize_project_key(project_key),),
                 )
                 return cursor.fetchone()
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        project_name: str | None = None,
+        description: str | None = None,
+        kvstore_root_path: str | None = None,
+        is_active: bool | None = None,
+        settings: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if project_name is not None:
+            updates.append("project_name = %s")
+            params.append(project_name)
+        if description is not None:
+            updates.append("description = %s")
+            params.append(description)
+        if kvstore_root_path is not None:
+            updates.append("kvstore_root_path = %s")
+            params.append(kvstore_root_path)
+        if is_active is not None:
+            updates.append("is_active = %s")
+            params.append(is_active)
+        if settings is not None:
+            updates.append("settings = %s::jsonb")
+            params.append(json.dumps(json_ready(settings)))
+        if metadata is not None:
+            updates.append("metadata = metadata || %s::jsonb")
+            params.append(json.dumps(json_ready(metadata)))
+        if not updates:
+            return self.get_project(project_id)
+        params.append(project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.projects
+                    SET {', '.join(updates)}
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    tuple(params),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
 
     def deactivate_project(
         self,
@@ -2837,6 +2888,8 @@ class PostgresRepository:
         refinement_state: str | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
+        sort_by: str = "asset_frame",
+        sort_dir: str = "asc",
         limit: int = 1000,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -2897,6 +2950,17 @@ class PostgresRepository:
         elif refinement_state in {"no-detections", "no_detections"}:
             state_clauses.append("detection_count = 0")
         state_where = f"WHERE {' AND '.join(state_clauses)}" if state_clauses else ""
+        sort_key = str(sort_by or "asset_frame").lower()
+        direction = "DESC" if str(sort_dir or "asc").lower() == "desc" else "ASC"
+        order_by_options = {
+            "asset_frame": f"asset_filename {direction} NULLS LAST, asset_id {direction}, frame_index {direction}",
+            "frame": f"frame_index {direction}, asset_filename ASC NULLS LAST, asset_id ASC",
+            "captured_at": f"captured_at {direction} NULLS LAST, asset_filename ASC NULLS LAST, frame_index ASC",
+            "filename": f"asset_filename {direction} NULLS LAST, frame_index ASC",
+            "roi_count": f"detection_count {direction}, asset_filename ASC NULLS LAST, frame_index ASC",
+            "refined_count": f"refined_detection_count {direction}, asset_filename ASC NULLS LAST, frame_index ASC",
+        }
+        order_by = order_by_options.get(sort_key, order_by_options["asset_frame"])
 
         query = f"""
             WITH frame_processing_counts AS (
@@ -2981,7 +3045,7 @@ class PostgresRepository:
                     SELECT *
                     FROM frame_processing_state
                     {state_where}
-                    ORDER BY asset_filename ASC NULLS LAST, asset_id ASC, frame_index ASC
+                    ORDER BY {order_by}
                     LIMIT %s OFFSET %s
                     """,
                     tuple(params + [limit, max(0, int(offset))]),

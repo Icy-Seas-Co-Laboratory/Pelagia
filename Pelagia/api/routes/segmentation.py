@@ -25,6 +25,8 @@ if APIRouter is not None:
         segmentation_capabilities,
         segment_frame_kwargs,
     )
+    from ...services.project_settings import resolve_project_storage_settings
+    from ...services.job_commands import SegmentFramesCommand
     from ._common import (
         as_response,
         detection_summary,
@@ -59,7 +61,7 @@ if APIRouter is not None:
         "clear_border",
     ]
     RoiAssemblyMethod = Literal["connected_components", "contours"]
-    RoiEncoding = Literal["png", "jpg", "jxl", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
 
     class SegmentFrameRequest(BaseModel):
         threshold: int | float | None = None
@@ -172,8 +174,14 @@ if APIRouter is not None:
 
     def _resolve_options(request: Request, body: SegmentFrameRequest | QueueSegmentationRequest) -> dict[str, dict[str, Any]]:
         try:
+            overrides = _segmentation_overrides(body)
+            if overrides.get("roi_encoding") is None:
+                overrides["roi_encoding"] = resolve_project_storage_settings(
+                    get_context(request),
+                    scoped_project_id(request),
+                ).roi_encoding
             return resolve_segmentation_options(
-                _segmentation_overrides(body),
+                overrides,
                 get_context(request).config.processing,
             )
         except ValueError as exc:
@@ -429,6 +437,7 @@ if APIRouter is not None:
             "limit": body.limit,
             **flat_options,
         }
+        payload = SegmentFramesCommand.from_payload(payload).to_payload()
         if body.dry_run:
             return as_response(
                 {

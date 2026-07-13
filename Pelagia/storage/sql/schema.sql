@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS {schema}.projects (
     description text,
     kvstore_root_path text,
     is_active boolean NOT NULL DEFAULT true,
+    settings jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     updated_at timestamptz NOT NULL DEFAULT NOW()
@@ -135,8 +136,31 @@ ALTER TABLE {schema}.projects
     ADD COLUMN IF NOT EXISTS description text,
     ADD COLUMN IF NOT EXISTS kvstore_root_path text,
     ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS settings jsonb NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+
+UPDATE {schema}.projects AS projects
+SET settings = jsonb_set(
+    projects.settings,
+    '{storage,frame}',
+    jsonb_strip_nulls(
+        jsonb_build_object(
+            'encoding', legacy.frame_storage->'image_encoding',
+            'quality', legacy.frame_storage->'image_quality'
+        )
+    ),
+    true
+)
+FROM (
+    SELECT
+        id,
+        COALESCE(metadata #> '{processing,frame_storage}', metadata->'frame_storage') AS frame_storage
+    FROM {schema}.projects
+) AS legacy
+WHERE projects.id = legacy.id
+  AND legacy.frame_storage IS NOT NULL
+  AND projects.settings #> '{storage,frame}' IS NULL;
 
 ALTER TABLE {schema}.project_memberships
     ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,

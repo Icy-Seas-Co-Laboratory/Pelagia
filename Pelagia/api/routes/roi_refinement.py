@@ -26,6 +26,7 @@ if APIRouter is not None:
     )
     from ...processing.capabilities import roi_refinement_capabilities
     from ...services.models import ModelService
+    from ...services.job_commands import RoiRefinementCommand
     from ._common import (
         as_response,
         detection_summary,
@@ -37,7 +38,7 @@ if APIRouter is not None:
     )
 
     ModelKind = Literal["identity", "keras_artifact", "oracle_builder_unet"]
-    RoiEncoding = Literal["png", "jpg", "jxl", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
 
     class RoiRefinementRequest(BaseModel):
         model_config = ConfigDict(protected_namespaces=())
@@ -432,6 +433,7 @@ if APIRouter is not None:
             "allow_frame_expansion": body.allow_frame_expansion,
         }
         payload = {key: value for key, value in payload.items() if value is not None}
+        payload = RoiRefinementCommand.from_payload(payload).to_payload()
         run_id = body.run_id or first_detection.get("run_id")
         asset_id = body.asset_id or first_detection.get("asset_id")
         if body.dry_run:

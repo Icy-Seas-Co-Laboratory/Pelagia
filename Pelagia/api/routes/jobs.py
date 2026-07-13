@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 from ...domain import JobStatus, PipelineStage
+from ...services.job_commands import command_from_payload, command_model
 
 try:
     from fastapi import APIRouter, HTTPException, Query, Request
@@ -167,6 +168,10 @@ if APIRouter is not None:
         repository = get_repository(request)
         auth = require_project_write(request)
         try:
+            if command_model(body.stage) is not None:
+                payload = command_from_payload(body.stage, body.payload).to_payload()
+            else:
+                payload = body.payload
             job = repository.create_job(
                 body.stage,
                 project_id=auth.project_id,
@@ -175,12 +180,14 @@ if APIRouter is not None:
                 status=body.status,
                 priority=body.priority,
                 max_attempts=body.max_attempts,
-                payload=body.payload,
+                payload=payload,
                 depends_on=body.depends_on,
                 summary=body.summary,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"job": as_response(job)}
 
     @router.get("/events")

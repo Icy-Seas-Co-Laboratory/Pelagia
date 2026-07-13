@@ -12,6 +12,7 @@ from .segmentation_options import (
     segmentation_capabilities,
 )
 from ..services.models import ModelService
+from .codec_registry import image_codec_available
 
 
 def system_capabilities(config: CoreConfig) -> dict[str, Any]:
@@ -58,6 +59,10 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
             "pipeline_stages": [stage.value for stage in PipelineStage],
             "job_statuses": [status.value for status in JobStatus],
             "image_encodings": sorted(IMAGE_DATA_STORAGE_ENCODINGS),
+            "image_codec_availability": {
+                encoding: image_codec_available(encoding)
+                for encoding in sorted(IMAGE_DATA_STORAGE_ENCODINGS)
+            },
             "frame_payload_kinds": FRAME_PAYLOAD_KINDS,
             "roi_encoding_options": ROI_ENCODINGS,
         },

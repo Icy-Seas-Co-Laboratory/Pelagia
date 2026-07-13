@@ -19,6 +19,8 @@ if APIRouter is not None:
     from ...processing.frame_correction import generate_background_for_frames
     from ...processing.frame_preprocess import preprocess_frame_for_segmentation
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
+    from ...processing.codec_registry import image_extension
+    from ...services.job_commands import FrameBackgroundCommand, PreprocessFramesCommand
     from ._common import (
         as_response,
         detection_summary,
@@ -193,7 +195,7 @@ if APIRouter is not None:
         else:
             delivered = resized
             payload, media_type = encode_image(delivered, requested)
-            extension = "jxs" if requested in {"jxs", "jpegxs", "jpeg-xs", "jpeg_xs"} else ("jxl" if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl"} else ("jpg" if requested in {"jpg", "jpeg"} else "png"))
+            extension = image_extension(requested)
             headers = size_headers
         delivered_height, delivered_width = np.asarray(delivered).shape[:2]
 
@@ -294,6 +296,8 @@ if APIRouter is not None:
         refinement_state: str | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
+        sort_by: Literal["asset_frame", "frame", "captured_at", "filename", "roi_count", "refined_count"] = "asset_frame",
+        sort_dir: Literal["asc", "desc"] = "asc",
         limit: int = 1000,
         offset: int = 0,
     ) -> dict:
@@ -309,6 +313,8 @@ if APIRouter is not None:
             refinement_state=refinement_state,
             start_frame=start_frame,
             end_frame=end_frame,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
             limit=limit,
             offset=offset,
         )
@@ -659,6 +665,7 @@ if APIRouter is not None:
             "encoding": body.encoding,
             "quality": body.quality,
         }
+        payload = PreprocessFramesCommand.from_payload(payload).to_payload()
         try:
             job = repository.create_job(
                 PipelineStage.PREPROCESS_FRAMES,
@@ -721,6 +728,7 @@ if APIRouter is not None:
             "quality": body.quality,
         }
         payload = {key: value for key, value in payload.items() if value is not None}
+        payload = FrameBackgroundCommand.from_payload(payload).to_payload()
         if body.dry_run:
             return as_response(
                 {

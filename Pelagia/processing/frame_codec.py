@@ -3,13 +3,18 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .codec_registry import normalize_image_encoding
+
 
 DEFAULT_LOSSY_IMAGE_QUALITY = 90
 DEFAULT_JXL_EFFORT = 1
 
 
 def encode_array_payload(array: np.ndarray, encoding: object, *, quality: int | None = None) -> tuple[bytes, str, str]:
-    requested = str(encoding or "zstd").lower()
+    try:
+        requested = normalize_image_encoding(encoding or "zstd")
+    except ValueError:
+        requested = str(encoding or "zstd").lower()
     if requested in {"raw", "raw_ndarray_c_order"}:
         return array.tobytes(order="C"), "raw", "raw_ndarray_c_order"
 
@@ -65,6 +70,10 @@ def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray
             metadata.get("array_encoding", metadata.get("kvstore_format", "png")),
         )
     ).lower()
+    try:
+        encoding = normalize_image_encoding(encoding)
+    except ValueError:
+        pass
 
     if encoding in {"png", "image/png"}:
         decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)

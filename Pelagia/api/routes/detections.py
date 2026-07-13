@@ -14,6 +14,7 @@ if APIRouter is not None:
     from ..schemas import DetectionDetailResponse, DetectionImageMatrixResponse, DetectionsListResponse
     from ..auth import scoped_project_id
     from ...processing.frame_codec import decode_array_payload
+    from ...processing.codec_registry import image_extension
     from ._common import as_response, detection_summary, get_repository, page_metadata
     from ._images import (
         add_scale_bar,
@@ -139,7 +140,7 @@ if APIRouter is not None:
             )
 
         payload, media_type = encode_image(delivered, requested)
-        extension = "jxs" if requested in {"jxs", "jpegxs", "jpeg-xs", "jpeg_xs"} else ("jxl" if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl"} else ("jpg" if requested in {"jpg", "jpeg"} else "png"))
+        extension = image_extension(requested)
         return Response(
             content=payload,
             media_type=media_type,

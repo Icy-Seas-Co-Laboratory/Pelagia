@@ -8,7 +8,7 @@ except ImportError:  # pragma: no cover
 import cv2
 import numpy as np
 
-from ...processing.frame_codec import encode_array_payload
+from ...processing.codec_registry import encode_image_response
 
 
 def pad_image_to_square(array, *, fill_value: int | float = 0) -> np.ndarray:
@@ -197,102 +197,9 @@ def resize_image_to_dimension(
 
 
 def encode_image(array, fmt: str) -> tuple[bytes, str]:
-    requested = fmt.lower()
-    if requested == "jpg":
-        requested = "jpeg"
-    if requested in {"jpegxl", "jpeg-xl", "jpeg_xl"}:
-        requested = "jxl"
-    if requested in {"jpegxs", "jpeg-xs", "jpeg_xs"}:
-        requested = "jxs"
-    image = _prepare_image_for_encoding(array, requested)
-    if requested == "png":
-        ok, encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 4])
-        media_type = "image/png"
-    elif requested == "jpeg":
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        media_type = "image/jpeg"
-    elif requested == "jxl":
-        payload, _, _ = encode_array_payload(image, "jxl", quality=90)
-        return payload, "image/jxl"
-    elif requested == "jxs":
-        payload, _, _ = encode_array_payload(image, "jxs")
-        return payload, "image/jxs"
-    else:
-        raise HTTPException(
-            status_code=422,
-            detail="Image data format must be one of: png, jpg, jpeg, jxl, jxs, matrix.",
-        )
-    if not ok:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Image data could not be encoded as {requested}.",
-        )
-    return encoded.tobytes(), media_type
-
-
-def _prepare_image_for_encoding(array, fmt: str) -> np.ndarray:
-    """Convert scientific frame arrays into browser-encodable image arrays."""
-    image = np.asarray(array)
-    if image.ndim < 2:
-        raise HTTPException(status_code=422, detail="Image encoding requires at least 2D image data.")
-    if image.shape[0] < 1 or image.shape[1] < 1:
-        raise HTTPException(status_code=422, detail="Image encoding requires non-empty image data.")
-
-    image = _normalize_image_channels(image)
-    if image.dtype == np.uint8:
-        return np.ascontiguousarray(image)
-    if fmt == "png" and image.dtype == np.uint16:
-        return np.ascontiguousarray(image)
-    return _normalize_to_uint8(image)
-
-
-def _normalize_image_channels(image: np.ndarray) -> np.ndarray:
-    if image.ndim == 2:
-        return image
-    if image.ndim == 3 and image.shape[2] in {1, 3, 4}:
-        return image[:, :, 0] if image.shape[2] == 1 else image
-    squeezed = np.squeeze(image)
-    if squeezed.ndim == 2:
-        return squeezed
-    if squeezed.ndim == 3 and squeezed.shape[2] in {1, 3, 4}:
-        return squeezed[:, :, 0] if squeezed.shape[2] == 1 else squeezed
-    raise HTTPException(
-        status_code=422,
-        detail="Image encoding supports grayscale, RGB, or RGBA image arrays.",
-    )
-
-
-def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
-    if image.dtype == np.bool_:
-        return np.ascontiguousarray(image.astype(np.uint8) * 255)
-
-    if np.issubdtype(image.dtype, np.integer):
-        info = np.iinfo(image.dtype)
-        clipped = np.clip(image, info.min, info.max).astype(np.float32)
-        if info.min == 0 and info.max <= 255:
-            return np.ascontiguousarray(clipped.astype(np.uint8))
-        return _scale_numeric_to_uint8(clipped)
-
-    if np.issubdtype(image.dtype, np.floating):
-        return _scale_numeric_to_uint8(image.astype(np.float32, copy=False))
-
-    raise HTTPException(status_code=422, detail="Image encoding requires numeric image data.")
-
-
-def _scale_numeric_to_uint8(image: np.ndarray) -> np.ndarray:
-    finite = np.isfinite(image)
-    if not np.any(finite):
-        return np.zeros(image.shape, dtype=np.uint8)
-
-    finite_values = image[finite]
-    min_value = float(np.min(finite_values))
-    max_value = float(np.max(finite_values))
-    safe = np.nan_to_num(image, nan=min_value, neginf=min_value, posinf=max_value)
-
-    if min_value >= 0.0 and max_value <= 1.0:
-        scaled = safe * 255.0
-    elif max_value > min_value:
-        scaled = (safe - min_value) * (255.0 / (max_value - min_value))
-    else:
-        scaled = np.zeros(image.shape, dtype=np.float32)
-    return np.ascontiguousarray(np.clip(scaled, 0, 255).astype(np.uint8))
+    try:
+        return encode_image_response(array, fmt)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

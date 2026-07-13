@@ -13,6 +13,7 @@ if APIRouter is not None:
     from ..auth import scoped_project_id
     from ...processing.frame_correction import divide_background, flatfield_correction as apply_flatfield_array_correction
     from ...processing.frame_store import retrieve_frame
+    from ...processing.codec_registry import image_extension
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository, page_metadata
     from ._images import encode_image, preview_image, scale_image
 
@@ -283,7 +284,7 @@ if APIRouter is not None:
             )
 
         payload, media_type = encode_image(scale_image(array, scale), requested)
-        extension = "jxs" if requested in {"jxs", "jpegxs", "jpeg-xs", "jpeg_xs"} else ("jxl" if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl"} else ("jpg" if requested in {"jpg", "jpeg"} else "png"))
+        extension = image_extension(requested)
         return Response(
             content=payload,
             media_type=media_type,

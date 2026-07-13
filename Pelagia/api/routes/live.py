@@ -51,6 +51,7 @@ if APIRouter is not None:
         resolve_segmentation_options,
         segment_frame_kwargs,
     )
+    from ...services.project_settings import resolve_project_storage_settings
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository
 
     router = APIRouter(prefix="/live", tags=["live"])
@@ -882,7 +883,7 @@ if APIRouter is not None:
         min_width_plus_height: int | float | None = None,
         max_width_plus_height: int | float | None = None,
         padding: int | None = None,
-        roi_encoding: str | None = "png",
+        roi_encoding: str | None = None,
         zstd_min_bytes: int | None = None,
         store_roi_payload_min_area: int | float | None = None,
         store_roi_payload_min_width: int | float | None = None,
@@ -986,6 +987,11 @@ if APIRouter is not None:
         try:
             local_values = locals()
             overrides = _option_overrides(request, local_values, option_names)
+            if overrides.get("roi_encoding") is None:
+                overrides["roi_encoding"] = resolve_project_storage_settings(
+                    context,
+                    project_id,
+                ).roi_encoding
             resolved_options = resolve_segmentation_options(
                 overrides,
                 context.config.processing,

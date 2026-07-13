@@ -15,6 +15,7 @@ from ..observability import configure_core_logging
 from ..services.context import AppContext
 from ..services.projects import initialize_project_kvstore
 from ..services.stores import StoreService
+from ..services.job_commands import ExtractFramesCommand, PreprocessFramesCommand, SegmentFramesCommand
 from ..storage.blob_store import initialize_kvstore, reset_kvstore
 from ..utils.serialization import json_ready
 from ..version import build_info
@@ -225,7 +226,7 @@ if typer is not None:
             "min_perimeter": roi_filter_defaults.min_perimeter if min_perimeter is None else min_perimeter,
             "max_perimeter": roi_filter_defaults.max_perimeter if max_perimeter is None else max_perimeter,
             "padding": roi_recording_defaults.padding if padding is None else padding,
-            "roi_encoding": roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding,
+            "roi_encoding": roi_encoding,
             "zstd_min_bytes": roi_recording_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes,
         }
 
@@ -980,6 +981,7 @@ if typer is not None:
             payload,
             project_id=project_id,
         )
+        payload = PreprocessFramesCommand.from_payload(payload).to_payload()
         job = context.repository.create_job(
             PipelineStage.PREPROCESS_FRAMES,
             project_id=project_id,
@@ -1150,6 +1152,7 @@ if typer is not None:
             payload,
             project_id=project_id,
         )
+        payload = SegmentFramesCommand.from_payload(payload).to_payload()
         job = context.repository.create_job(
             PipelineStage.SEGMENT,
             project_id=project_id,
@@ -1227,7 +1230,7 @@ if typer is not None:
             project_id=project_id,
             run_id=resolved_run_id,
             asset_id=resolved_asset_id,
-            payload={
+            payload=ExtractFramesCommand.from_payload({
                 "source_path": str(resolved),
                 "kind": AssetKind.IMAGE_SEQUENCE.value if resolved.is_dir() else AssetKind.VIDEO.value,
                 "n_tile": resolved_n_tile,
@@ -1240,7 +1243,7 @@ if typer is not None:
                 "roi_encoding": resolved_roi_encoding,
                 "collections": normalized_collections,
                 "checksum_status": "computed" if compute_checksum else "deferred",
-            },
+            }).to_payload(),
             summary=f"extract_frames queued for {resolved.name}",
         )
         result = {
@@ -1325,7 +1328,7 @@ if typer is not None:
                 project_id=project_id,
                 run_id=resolved_run_id,
                 asset_id=resolved_asset_id,
-                payload={
+                payload=ExtractFramesCommand.from_payload({
                     "source_path": str(source_path),
                     "kind": source.kind,
                     "recursive": source.recursive,
@@ -1339,7 +1342,7 @@ if typer is not None:
                     "roi_encoding": resolved_roi_encoding,
                     "collections": normalized_collections,
                     "checksum_status": "computed" if compute_checksum else "deferred",
-                },
+                }).to_payload(),
                 summary=f"extract_frames queued for {source_path.name}",
             )
             queued.append(

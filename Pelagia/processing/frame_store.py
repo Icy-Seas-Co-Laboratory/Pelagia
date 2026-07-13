@@ -12,6 +12,7 @@ from ..utils.serialization import json_ready
 from ._logging import log_processing_event, processing_core_logger
 from .frame_codec import decode_array_payload, encode_array_payload
 from .frame_model import FrameData
+from ..services.project_settings import resolve_project_storage_settings
 from .thumbhash import compute_thumbhash
 
 
@@ -91,15 +92,24 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
         if ctx.repository is None:
             raise RuntimeError("A PostgresRepository is required to record frame metadata.")
 
-        default_encoding = ctx.config.processing.frame_storage.image_encoding
-        requested_encoding = metadata.get(
-            "kvstore_encoding",
-            metadata.get("array_encoding", metadata.get("kvstore_format", default_encoding)),
+        storage_settings = resolve_project_storage_settings(ctx, project_id)
+        requested_encoding = (
+            metadata.get("kvstore_encoding")
+            or metadata.get("array_encoding")
+            or metadata.get("kvstore_format")
+            or storage_settings.frame_encoding
         )
-        default_quality = ctx.config.processing.frame_storage.image_quality
-        requested_quality = metadata.get(
-            "kvstore_quality",
-            metadata.get("array_quality", metadata.get("image_quality", default_quality)),
+        requested_quality = next(
+            (
+                value
+                for value in (
+                    metadata.get("kvstore_quality"),
+                    metadata.get("array_quality"),
+                    metadata.get("image_quality"),
+                )
+                if value is not None
+            ),
+            storage_settings.frame_quality,
         )
         payload, kvstore_encoding, kvstore_format = encode_array_payload(
             array,
@@ -272,12 +282,14 @@ def store_preprocessed_frame(
         raise RuntimeError("A PostgresRepository is required to record preprocessed frame metadata.")
 
     array = np.ascontiguousarray(data)
-    requested_encoding = encoding or ctx.config.processing.frame_storage.image_encoding
-    requested_quality = int(
-        quality
-        if quality is not None
-        else dict(frame.metadata or {}).get("kvstore_quality", ctx.config.processing.frame_storage.image_quality)
+    storage_settings = resolve_project_storage_settings(
+        ctx,
+        project_id,
+        frame_encoding=encoding,
+        frame_quality=quality,
     )
+    requested_encoding = storage_settings.frame_encoding
+    requested_quality = storage_settings.frame_quality
     payload, kvstore_encoding, kvstore_format = encode_array_payload(
         array,
         requested_encoding,

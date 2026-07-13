@@ -20,6 +20,15 @@ from ..processing.frame_store import retrieve_frame, store_preprocessed_frame
 from ..processing.oracle_unet_refiner import resolve_refinement_model
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..services.context import AppContext
+from ..services.project_settings import resolve_project_storage_settings
+from ..services.job_commands import (
+    ExtractFramesCommand,
+    FrameBackgroundCommand,
+    FrameSelection,
+    PreprocessFramesCommand,
+    RoiRefinementCommand,
+    SegmentFramesCommand,
+)
 from .progress import JobProgressReporter
 
 
@@ -168,7 +177,8 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     if context.repository is None:
         raise RuntimeError("Extract frames handler requires a PostgresRepository.")
 
-    payload = _job_payload(job)
+    command = ExtractFramesCommand.from_payload(_job_payload(job))
+    payload = command.to_payload()
     project_id = _job_project_id(job, context)
     run_id = _job_identifier(job, "run_id", payload)
     asset_id = _job_identifier(job, "asset_id", payload)
@@ -357,12 +367,14 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
-            payload={
-                "frame_ids": result["frame_ids"],
-                "padding": payload.get("padding", roi_recording_defaults.padding),
-                "roi_encoding": payload.get("roi_encoding", roi_recording_defaults.roi_encoding),
-                "collections": collections,
-            },
+            payload=SegmentFramesCommand(
+                selection=FrameSelection(frame_ids=tuple(result["frame_ids"])),
+                options={
+                    "padding": payload.get("padding", roi_recording_defaults.padding),
+                    "roi_encoding": payload.get("roi_encoding", roi_recording_defaults.roi_encoding),
+                    "collections": collections,
+                },
+            ).to_payload(),
             depends_on=[str(job["id"])],
             summary=f"segment queued for {len(frame_rows)} extracted frames",
         )
@@ -376,7 +388,8 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     if context.repository is None:
         raise RuntimeError("Preprocess frames handler requires a PostgresRepository.")
 
-    payload = _job_payload(job)
+    command = PreprocessFramesCommand.from_payload(_job_payload(job))
+    payload = command.to_payload()
     project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
@@ -593,7 +606,8 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     if context.repository is None:
         raise RuntimeError("Background frames handler requires a PostgresRepository.")
 
-    payload = _job_payload(job)
+    command = FrameBackgroundCommand.from_payload(_job_payload(job))
+    payload = command.to_payload()
     project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
@@ -669,7 +683,8 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     if context.repository is None:
         raise RuntimeError("ROI detection handler requires a PostgresRepository.")
 
-    payload = _job_payload(job)
+    command = SegmentFramesCommand.from_payload(_job_payload(job))
+    payload = command.to_payload()
     project_id = _job_project_id(job, context)
     asset_id = job.get("asset_id") or payload.get("asset_id")
     frame_ids = _payload_frame_ids(payload)
@@ -701,7 +716,13 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     detections = []
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
-    resolved_options = resolve_segmentation_options(payload, context.config.processing)
+    segmentation_payload = dict(payload)
+    if segmentation_payload.get("roi_encoding") is None:
+        segmentation_payload["roi_encoding"] = resolve_project_storage_settings(
+            context,
+            project_id,
+        ).roi_encoding
+    resolved_options = resolve_segmentation_options(segmentation_payload, context.config.processing)
     frame_payload_kind = resolved_options["source"]["frame_payload_kind"]
     frame_kwargs = segment_frame_kwargs(resolved_options)
     progress = JobProgressReporter(
@@ -863,7 +884,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     if context.repository is None:
         raise RuntimeError("ROI refinement handler requires a PostgresRepository.")
 
-    payload = _job_payload(job)
+    command = RoiRefinementCommand.from_payload(_job_payload(job))
+    payload = command.to_payload()
     project_id = _job_project_id(job, context)
     detection_ids = [str(detection_id) for detection_id in payload.get("detection_ids", []) if detection_id]
     if not detection_ids:
@@ -917,6 +939,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         getattr(model, "method_name", None) or model.__class__.__name__
     )
     options = _roi_refinement_options_from_payload(payload, context)
+    if payload.get("encoding") is None:
+        options.encoding = resolve_project_storage_settings(context, project_id).roi_encoding
     allow_frame_expansion = bool(payload.get("allow_frame_expansion", True))
     expansion_payload_kind = str(payload.get("expansion_frame_payload_kind", "preprocessed"))
     frame_loader = None
