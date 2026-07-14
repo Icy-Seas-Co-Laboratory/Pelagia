@@ -28,6 +28,9 @@ class _FakeRepository:
     def initialize_schema(self):
         self.initialized = True
 
+    def schema_status(self):
+        return {"schema": "pelagia", "ready": True, "missing_tables": []}
+
     def purge_all(self):
         self.purged = True
         return {"schema": "pelagia", "total_rows_deleted": 0}
@@ -257,6 +260,23 @@ def test_cli_reset_allows_projectless_system_without_kvstore(monkeypatch):
     }
     assert repo.initialized is True
     assert repo.purged is True
+
+
+def test_cli_check_system_treats_projectless_storage_as_ready(monkeypatch):
+    _install_fake_context(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.app, ["check-system"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["ready"] is True
+    assert body["kvstore"] == {
+        "required": False,
+        "initialized": True,
+        "project_count": 0,
+        "stores": [],
+    }
 
 
 def test_cli_reset_resets_configured_project_kvstores(monkeypatch, tmp_path):

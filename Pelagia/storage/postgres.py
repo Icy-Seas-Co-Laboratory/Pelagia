@@ -4778,19 +4778,20 @@ class PostgresRepository:
                 project_id = project_id or job_row.get("project_id")
                 run_id = run_id or job_row.get("run_id")
                 asset_id = asset_id or job_row.get("asset_id")
-        self._append_log(
-            cursor,
-            event_type=event_type,
-            message=_event_message(event_type, log_payload),
-            level=_event_level(event_type),
-            logger="pelagia.jobs",
-            project_id=project_id,
-            run_id=run_id,
-            asset_id=asset_id,
-            job_id=job_id,
-            worker_id=worker_id,
-            payload=log_payload,
-        )
+        if project_id is not None:
+            self._append_log(
+                cursor,
+                event_type=event_type,
+                message=_event_message(event_type, log_payload),
+                level=_event_level(event_type),
+                logger="pelagia.jobs",
+                project_id=project_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                job_id=job_id,
+                worker_id=worker_id,
+                payload=log_payload,
+            )
         return row
 
     def _append_worker_event(

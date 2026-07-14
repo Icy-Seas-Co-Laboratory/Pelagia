@@ -89,6 +89,16 @@ if typer is not None:
             raise RuntimeError("A PostgresRepository is required for this command.")
         return context.repository
 
+    def _list_all_projects(repository, *, active_only: bool) -> list[dict]:
+        projects = []
+        offset = 0
+        while True:
+            page = repository.list_projects(active_only=active_only, limit=100, offset=offset)
+            projects.extend(page)
+            if len(page) < 100:
+                return projects
+            offset += len(page)
+
     def _echo_json(payload: object) -> None:
         typer.echo(json.dumps(json_ready(payload), indent=2, sort_keys=True))
 
@@ -712,18 +722,30 @@ if typer is not None:
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> None:
-        config = _config_from_options(kvstore_root, database_dsn, schema)
-        context = AppContext.from_config(config)
+        context = _context_from_options(kvstore_root, database_dsn, schema)
         database_status = (
             context.repository.schema_status()
             if context.repository is not None
             else {"ready": False, "missing_tables": ["repository"]}
         )
-        kvstore_status = (
-            context.kvstore.status(deep=False)
-            if context.kvstore is not None
-            else {"initialized": False}
-        )
+        projects = _list_all_projects(context.repository, active_only=True) if context.repository is not None else []
+        project_stores = []
+        for project in projects:
+            store = context.kvstore_for_project(str(project["id"]), initialize=False)
+            project_stores.append(
+                {
+                    "project_id": project["id"],
+                    "project_key": project.get("project_key"),
+                    "root_path": project.get("kvstore_root_path"),
+                    "initialized": bool(store is not None and store.initialized),
+                }
+            )
+        kvstore_status = {
+            "required": bool(projects),
+            "initialized": all(store["initialized"] for store in project_stores),
+            "project_count": len(projects),
+            "stores": project_stores,
+        }
         ready = bool(database_status.get("ready")) and bool(kvstore_status.get("initialized"))
         result = {
             "build": build_info(),
@@ -1412,14 +1434,7 @@ if typer is not None:
             raise RuntimeError("Reset requires a PostgresRepository.")
         config = context.config
         context.repository.initialize_schema()
-        projects = []
-        offset = 0
-        while True:
-            page = context.repository.list_projects(active_only=False, limit=100, offset=offset)
-            projects.extend(page)
-            if len(page) < 100:
-                break
-            offset += len(page)
+        projects = _list_all_projects(context.repository, active_only=False)
 
         kvstore_results = []
         seen_roots: set[str] = set()

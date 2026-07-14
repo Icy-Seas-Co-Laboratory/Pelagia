@@ -98,6 +98,39 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
 
+def test_postgres_worker_can_start_without_any_projects(postgres_repo):
+    assert postgres_repo.list_projects(active_only=False) == []
+
+    worker = postgres_repo.touch_worker(
+        "projectless-worker",
+        status="idle",
+        capabilities=[PipelineStage.EXTRACT_FRAMES.value],
+        pid=12345,
+        shutdown_requested=False,
+    )
+
+    assert worker["worker_id"] == "projectless-worker"
+    assert worker["status"] == "idle"
+    shutdown = postgres_repo.request_worker_shutdown("projectless-worker", reason="test")
+    assert shutdown is not None
+    stopped = postgres_repo.touch_worker(
+        "projectless-worker",
+        status="stopped",
+        capabilities=[PipelineStage.EXTRACT_FRAMES.value],
+        pid=12345,
+        shutdown_requested=False,
+    )
+    assert stopped["status"] == "stopped"
+    events = postgres_repo.list_job_events(limit=100)
+    event_types = {
+        event["event_type"]
+        for event in events
+        if event["payload"].get("worker_id") == "projectless-worker"
+    }
+    assert {"worker.touched", "worker.shutdown_requested"} <= event_types
+    assert postgres_repo.list_logs(worker_id="projectless-worker") == []
+
+
 @pytest.fixture()
 def postgres_repo():
     if postgres.psycopg is None:
