@@ -150,6 +150,37 @@ def test_cli_create_dev_login_bootstraps_user_project_and_session(monkeypatch):
     assert repo.sessions["token-1"]["ttl_seconds"] == 120
 
 
+def test_cli_create_dev_login_bootstraps_projectless_admin(monkeypatch):
+    repo = _install_fake_context(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "create-dev-login",
+            "--username",
+            "ada",
+            "--password",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["username"] == "ada"
+    assert body["password"] == "secret"
+    assert body["password_applied"] is True
+    assert body["project_creation_required"] is True
+    assert body["project"] is None
+    assert body["kvstore"] is None
+    assert body["membership"] is None
+    assert body["token"] is None
+    assert body["session"] is None
+    assert repo.projects_by_key == {}
+    assert repo.memberships == {}
+    assert repo.sessions == {}
+
+
 def test_cli_create_dev_login_does_not_print_password_for_existing_user(monkeypatch):
     repo = _install_fake_context(monkeypatch)
     repo.create_user("ada", password="old-secret", is_admin=True)

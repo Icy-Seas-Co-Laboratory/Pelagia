@@ -139,7 +139,7 @@ dev_project_key = "default"
 
 ### Initialize And Run The Backend
 
-Initialize database tables and storage:
+Initialize the database schema and bootstrap the admin user:
 
 ```bash
 python -m Pelagia.cli.app init-system
@@ -153,9 +153,13 @@ python -m Pelagia.cli.app migrate-db
 python -m Pelagia.cli.app check-system
 ```
 
-`create-dev-login` creates the default project if needed, creates or reuses the
-admin user, adds project membership, and prints a JSON response containing a
-session token. For manual setup use:
+With the default projectless configuration, `create-dev-login` creates or
+reuses the admin user without creating a project or KV store. On first login,
+the API returns `project_creation_required`; repeat the login with a
+`create_project` payload containing the project key and KV-store directory and
+name. Supplying `--project-key` preserves the one-command development flow by
+creating that project, adding membership, and returning a session token. For
+manual setup use:
 
 ```bash
 python -m Pelagia.cli.app create-user ada --password secret --admin

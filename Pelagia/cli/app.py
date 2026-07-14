@@ -653,6 +653,21 @@ if typer is not None:
                 display_name=auth_config.bootstrap_admin_display_name or "Pelagia Dev Admin",
                 is_admin=True,
             )
+        if resolved_project_key is None:
+            _echo_json(
+                {
+                    "username": resolved_username,
+                    "password": resolved_password if user_created else None,
+                    "password_applied": user_created,
+                    "project_creation_required": True,
+                    "project": None,
+                    "kvstore": None,
+                    "membership": None,
+                    "token": None,
+                    "session": None,
+                }
+            )
+            return
         project = context.repository.get_project_by_key(resolved_project_key)
         project_kvstore = None
         if project is None:
