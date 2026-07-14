@@ -15,14 +15,10 @@ Pelagia has two linked storage layers:
 - KVStore payloads: full-frame image bytes, preprocessed frame bytes, generated
   background payloads, and related large binary data.
 
-The built-in CLI reset clears PostgreSQL rows and reinitializes the configured
-top-level KVStore. It preserves the database schema and recreates the default
-project.
-
-Important current limitation: project-specific KVStores under
-`<kvstore.root_path>/projects/<project_id>` or explicit
-`projects.kvstore_root_path` locations are not automatically deleted by the CLI
-reset. Remove those directories manually when you want a full physical reset.
+The built-in CLI reset discovers every project KVStore, clears and reinitializes
+each available store, then clears PostgreSQL rows. It preserves the database
+schema but does not create a default project or KVStore. A system with no
+projects or stores is valid and resets PostgreSQL normally.
 
 ## Development Reset
 
@@ -66,24 +62,18 @@ KVStore directories.
 python -m Pelagia.cli.app check-system
 ```
 
-3. Reset the database rows and top-level KVStore.
+3. Reset the database rows and all configured project KVStores.
 
 ```bash
 python -m Pelagia.cli.app reset --delete
 ```
 
-4. Remove project KVStore directories that are no longer referenced.
+4. Review the `kvstores.results` entries in the command output. Stores marked
+`reset` were cleared; `missing` means the configured path did not contain an
+initialized store. Remove the now-empty store directories manually only when
+you also want their configuration files removed.
 
-For the default local layout:
-
-```bash
-rm -rf ./data/kvstore/projects
-```
-
-If projects used explicit KVStore roots, remove those directories too. Only
-delete directories that you have confirmed are Pelagia KVStores.
-
-5. Recreate the default login or your real users and projects.
+5. Recreate the admin login. The first UI login can create the first project.
 
 ```bash
 python -m Pelagia.cli.app create-dev-login \
@@ -98,20 +88,14 @@ python -m Pelagia.cli.app create-dev-login \
 python -m Pelagia.cli.app check-system
 ```
 
-## Reset Only PostgreSQL Rows
+## Reset A Projectless System
 
-The CLI does not currently expose a database-only reset command. If you clear
-PostgreSQL without clearing KVStore, the KVStore will contain orphaned payloads.
-That is usually safe but wastes disk space.
-
-For development systems, prefer:
+The same command works when no projects or KVStores exist. In that case it
+resets only PostgreSQL and reports a KVStore count of zero:
 
 ```bash
 python -m Pelagia.cli.app reset --delete
 ```
-
-For production-like systems, restore from a known backup or use PostgreSQL
-administration tools only after taking a fresh backup.
 
 ## Reset Only KVStore
 
@@ -132,8 +116,8 @@ If the KVStore path already contains data, use the full reset procedure instead.
 ## Recreate The Schema Without Deleting Data
 
 `init-system` is safe to run repeatedly. It applies the current schema template,
-creates missing tables, adds missing columns where supported, and initializes
-the configured KVStore if needed.
+creates missing tables, and adds missing columns where supported. Project
+KVStores are created when projects are created.
 
 ```bash
 python -m Pelagia.cli.app init-system
@@ -155,11 +139,8 @@ python -m Pelagia.cli.app reset --delete
 
 `KVStore is not initialized`
 
-Run:
-
-```bash
-python -m Pelagia.cli.app init-system
-```
+Create or select a project with a configured KVStore. Projectless system reset
+does not require a KVStore.
 
 `Project status shows missing KVStore data after reset`
 

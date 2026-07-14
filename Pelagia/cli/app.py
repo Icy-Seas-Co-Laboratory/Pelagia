@@ -16,7 +16,7 @@ from ..services.context import AppContext
 from ..services.projects import initialize_project_kvstore
 from ..services.job_commands import ExtractFramesCommand, PreprocessFramesCommand, SegmentFramesCommand
 from ..services.pipeline import PipelineService
-from ..storage.blob_store import create_named_kvstore, initialize_kvstore, named_kvstore_path, reset_kvstore
+from ..storage.blob_store import create_kvstore, create_named_kvstore, initialize_kvstore, named_kvstore_path, reset_kvstore
 from ..utils.serialization import json_ready
 from ..version import build_info
 
@@ -1407,21 +1407,91 @@ if typer is not None:
             typer.echo("Refusing to reset Pelagia storage without --delete.")
             raise typer.Exit(code=2)
 
-        config = _config_from_options(kvstore_root, database_dsn, schema)
-        context = AppContext.from_config(config)
-        if context.repository is None or context.kvstore is None:
-            raise RuntimeError("Reset requires both a PostgresRepository and KVStore.")
-
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        if context.repository is None:
+            raise RuntimeError("Reset requires a PostgresRepository.")
+        config = context.config
         context.repository.initialize_schema()
+        projects = []
+        offset = 0
+        while True:
+            page = context.repository.list_projects(active_only=False, limit=100, offset=offset)
+            projects.extend(page)
+            if len(page) < 100:
+                break
+            offset += len(page)
+
+        kvstore_results = []
+        seen_roots: set[str] = set()
+        for project in projects:
+            root_path = project.get("kvstore_root_path")
+            if not root_path:
+                kvstore_results.append(
+                    {
+                        "project_id": project.get("id"),
+                        "project_key": project.get("project_key"),
+                        "root_path": None,
+                        "status": "not_configured",
+                    }
+                )
+                continue
+            resolved_root = str(Path(root_path).expanduser().resolve(strict=False))
+            if resolved_root in seen_roots:
+                kvstore_results.append(
+                    {
+                        "project_id": project.get("id"),
+                        "project_key": project.get("project_key"),
+                        "root_path": resolved_root,
+                        "status": "shared_store_already_reset",
+                    }
+                )
+                continue
+            seen_roots.add(resolved_root)
+            store = create_kvstore(resolved_root, config.kvstore)
+            if not store.initialized:
+                kvstore_results.append(
+                    {
+                        "project_id": project.get("id"),
+                        "project_key": project.get("project_key"),
+                        "root_path": resolved_root,
+                        "status": "missing",
+                    }
+                )
+                continue
+            try:
+                reset_result = reset_kvstore(store, config.kvstore)
+            except Exception as exc:
+                kvstore_results.append(
+                    {
+                        "project_id": project.get("id"),
+                        "project_key": project.get("project_key"),
+                        "root_path": resolved_root,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+            else:
+                kvstore_results.append(
+                    {
+                        "project_id": project.get("id"),
+                        "project_key": project.get("project_key"),
+                        "root_path": resolved_root,
+                        "status": "reset",
+                        "result": reset_result,
+                    }
+                )
         database_result = context.repository.purge_all()
-        kvstore_result = reset_kvstore(context.kvstore, config.kvstore)
         typer.echo(
             json.dumps(
                 json_ready(
                     {
                         "deleted": True,
                         "database": database_result,
-                        "kvstore": kvstore_result,
+                        "kvstores": {
+                            "project_count": len(projects),
+                            "reset_count": sum(result["status"] == "reset" for result in kvstore_results),
+                            "results": kvstore_results,
+                        },
                     }
                 ),
                 indent=2,

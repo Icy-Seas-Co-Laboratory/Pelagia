@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sys
 
 import pytest
@@ -22,9 +23,14 @@ class _FakeRepository:
         self.memberships = {}
         self.sessions = {}
         self.initialized = False
+        self.purged = False
 
     def initialize_schema(self):
         self.initialized = True
+
+    def purge_all(self):
+        self.purged = True
+        return {"schema": "pelagia", "total_rows_deleted": 0}
 
     def create_user(self, username, **kwargs):
         user = {
@@ -226,12 +232,59 @@ def test_cli_create_project_user_membership_and_list(monkeypatch):
             "description": None,
             "id": "project-1",
             "is_active": True,
-            "kvstore_root_path": None,
+            "kvstore_root_path": str((Path("data/kvstores") / "survey").resolve()),
             "project_key": "survey",
             "project_name": "Survey",
             "role": "viewer",
         }
     ]
+
+
+def test_cli_reset_allows_projectless_system_without_kvstore(monkeypatch):
+    repo = _install_fake_context(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.app, ["reset", "--delete"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["deleted"] is True
+    assert body["database"]["total_rows_deleted"] == 0
+    assert body["kvstores"] == {
+        "project_count": 0,
+        "reset_count": 0,
+        "results": [],
+    }
+    assert repo.initialized is True
+    assert repo.purged is True
+
+
+def test_cli_reset_resets_configured_project_kvstores(monkeypatch, tmp_path):
+    repo = _install_fake_context(monkeypatch)
+    root_path = tmp_path / "stores" / "reef"
+    repo.create_project("reef", kvstore_root_path=str(root_path))
+    reset_calls = []
+
+    class _ProjectStore:
+        initialized = True
+
+    monkeypatch.setattr(cli_module, "create_kvstore", lambda root, config: _ProjectStore())
+    monkeypatch.setattr(
+        cli_module,
+        "reset_kvstore",
+        lambda store, config: reset_calls.append(store) or {"root_path": str(root_path)},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.app, ["reset", "--delete"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["kvstores"]["project_count"] == 1
+    assert body["kvstores"]["reset_count"] == 1
+    assert body["kvstores"]["results"][0]["status"] == "reset"
+    assert len(reset_calls) == 1
+    assert repo.purged is True
 
 
 def test_cli_environment_sync_dry_run_reports_profile_commands(tmp_path):
