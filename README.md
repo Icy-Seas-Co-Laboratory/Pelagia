@@ -154,12 +154,12 @@ python -m Pelagia.cli.app check-system
 ```
 
 With the default projectless configuration, `create-dev-login` creates or
-reuses the admin user without creating a project or KV store. On first login,
-the API returns `project_creation_required`; repeat the login with a
-`create_project` payload containing the project key and KV-store directory and
-name. Supplying `--project-key` preserves the one-command development flow by
-creating that project, adding membership, and returning a session token. For
-manual setup use:
+reuses the admin user without creating a project or KV store. The first login
+returns an authenticated projectless session with `project: null` and
+`project_creation_required: true`. Use that token with `POST /projects`, then
+`POST /auth/switch-project` to obtain a project-scoped session. Supplying
+`--project-key` preserves the one-command development flow by creating that
+project, adding membership, and returning a session token. For manual setup use:
 
 ```bash
 python -m Pelagia.cli.app create-user ada --password secret --admin
@@ -280,19 +280,23 @@ http://127.0.0.1:8000
 
 PelagiaView should log in before loading project resources:
 
-1. `POST /auth/login` with `username`, `password`, and either `project_key` or `project_id`.
+1. `POST /auth/login` with `username` and `password`; include `project_key` or
+   `project_id` when selecting an existing project.
 2. Store the returned `token` for the browser session.
 3. Send `Authorization: Bearer <token>` on API calls.
 4. Use `GET /auth/me` to restore the active user/project after refresh.
 5. Use `GET /projects` and `POST /auth/switch-project` to move between projects.
    `GET /projects?include_all_names=true` also includes `all_project_names`
    for global project-name pickers while leaving `projects` scoped to the user.
-6. User admins can create projects with `POST /projects`. User admins and
+6. When no project exists, a user admin receives a projectless token with
+   `project: null` and `project_creation_required: true`. Use it with
+   `POST /projects`, then call `POST /auth/switch-project`.
+7. User admins can create projects with `POST /projects`. User admins and
    project managers/admins can soft-delete non-default projects with
    `DELETE /projects/{project_id_or_key}`.
-7. Logged-in users can list users in their active project with `GET /users`.
+8. Logged-in users can list users in their active project with `GET /users`.
    User admins can pass `include_all_projects=true` for a global user list.
-8. User admins and project managers/admins can manage user accounts with
+9. User admins and project managers/admins can manage user accounts with
    `POST /users`, `POST /users/{user_id_or_username}/reset-password`,
    `POST /users/{user_id_or_username}/deactivate`, and
    `DELETE /users/{user_id_or_username}`. Project managers/admins are scoped

@@ -97,6 +97,10 @@ if APIRouter is not None:
         if include_all_projects and not auth.is_admin:
             raise HTTPException(status_code=403, detail="Admin permission is required to export all projects.")
 
+    def _require_export_scope(auth, include_all_projects: bool) -> None:
+        if auth.project_id is None and not include_all_projects:
+            raise HTTPException(status_code=403, detail="Select or create a project before exporting project data.")
+
     @router.get("")
     def io_index(request: Request) -> dict[str, Any]:
         require_auth(request)
@@ -171,6 +175,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> Response:
         auth = require_auth(request)
+        _require_export_scope(auth, include_all_projects)
         _require_table_export_permission(auth, [table_name], include_all_projects)
         try:
             payload = ExportService(get_repository(request)).table_export(
@@ -209,6 +214,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> Response:
         auth = require_auth(request)
+        _require_export_scope(auth, include_all_projects)
         resolved_tables = tables or ["runs", "raw_assets", "frames", "detection_candidate"]
         _require_table_export_permission(auth, resolved_tables, include_all_projects)
         try:
@@ -245,6 +251,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> Response:
         auth = require_auth(request)
+        _require_export_scope(auth, include_all_projects)
         if include_all_projects and not auth.is_admin:
             raise HTTPException(status_code=403, detail="Admin permission is required to export all projects.")
         try:
@@ -288,6 +295,7 @@ if APIRouter is not None:
         offset: int = 0,
     ) -> Response:
         auth = require_auth(request)
+        _require_export_scope(auth, include_all_projects)
         if include_all_projects and not auth.is_admin:
             raise HTTPException(status_code=403, detail="Admin permission is required to export all projects.")
         try:

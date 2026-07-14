@@ -112,7 +112,9 @@ if APIRouter is not None:
                 "display_name": session.get("display_name"),
                 "is_admin": session.get("is_admin"),
             },
-            "project": {
+            "project": None
+            if session.get("project_id") is None
+            else {
                 "id": session["project_id"],
                 "project_key": session["project_key"],
                 "project_name": session["project_name"],
@@ -257,18 +259,13 @@ if APIRouter is not None:
                     limit=1,
                     offset=0,
                 ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "project_creation_required",
-                            "message": "No project exists. Repeat login with create_project including kvstore_directory and kvstore_name.",
-                        },
-                    ) from exc
-                raise
+                    project = None
+                else:
+                    raise
         try:
             result = repository.create_session(
                 str(user["id"]),
-                str(project["id"]),
+                None if project is None else str(project["id"]),
                 ttl_seconds=_session_ttl_seconds(request, body.ttl_seconds),
                 user_agent=request.headers.get("user-agent"),
                 remote_addr=None if request.client is None else request.client.host,
@@ -279,6 +276,8 @@ if APIRouter is not None:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         response = _session_response(repository, result["token"])
+        if project is None:
+            response["project_creation_required"] = True
         if project_created:
             response["project_created"] = True
             response["kvstore"] = project_kvstore
@@ -289,7 +288,7 @@ if APIRouter is not None:
         auth = require_auth(request)
         repository = get_repository(request)
         user = repository.get_user(auth.user_id)
-        project = repository.get_project(auth.project_id)
+        project = None if auth.project_id is None else repository.get_project(auth.project_id)
         return as_response(
             {
                 "auth": auth.as_dict(),

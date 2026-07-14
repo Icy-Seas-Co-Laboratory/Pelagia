@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS {schema}.project_memberships (
 CREATE TABLE IF NOT EXISTS {schema}.user_sessions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id uuid NOT NULL REFERENCES {schema}.users(id) ON DELETE CASCADE,
-    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    project_id uuid REFERENCES {schema}.projects(id) ON DELETE CASCADE,
     token_hash text NOT NULL UNIQUE,
     user_agent text,
     remote_addr text,
@@ -157,6 +157,7 @@ ALTER TABLE {schema}.project_memberships
     ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
 
 ALTER TABLE {schema}.user_sessions
+    ALTER COLUMN project_id DROP NOT NULL,
     ADD COLUMN IF NOT EXISTS user_agent text,
     ADD COLUMN IF NOT EXISTS remote_addr text,
     ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb,

@@ -779,7 +779,7 @@ class PostgresRepository:
     def create_session(
         self,
         user_id: str,
-        project_id: str,
+        project_id: str | None,
         *,
         ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
         user_agent: str | None = None,
@@ -789,11 +789,15 @@ class PostgresRepository:
         user = self.get_user(user_id)
         if user is None or not user.get("is_active"):
             raise ValueError("Cannot create a session for an inactive or missing user.")
-        project = self.get_project(project_id)
-        if project is None or not project.get("is_active"):
-            raise ValueError("Cannot create a session for an inactive or missing project.")
-        if not user.get("is_admin") and self.get_project_membership(user_id, project_id) is None:
-            raise PermissionError("User is not a member of the requested project.")
+        if project_id is None:
+            if not user.get("is_admin"):
+                raise PermissionError("Only user admins may create a session without a project.")
+        else:
+            project = self.get_project(project_id)
+            if project is None or not project.get("is_active"):
+                raise ValueError("Cannot create a session for an inactive or missing project.")
+            if not user.get("is_admin") and self.get_project_membership(user_id, project_id) is None:
+                raise PermissionError("User is not a member of the requested project.")
 
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_seconds)))
@@ -861,16 +865,19 @@ class PostgresRepository:
                         users.is_admin,
                         projects.project_key,
                         projects.project_name,
-                        COALESCE(memberships.role, CASE WHEN users.is_admin THEN 'admin' END) AS project_role
+                        COALESCE(
+                            memberships.role,
+                            CASE WHEN sessions.project_id IS NOT NULL AND users.is_admin THEN 'admin' END
+                        ) AS project_role
                     FROM {self.schema}.user_sessions sessions
                     JOIN {self.schema}.users users ON users.id = sessions.user_id
-                    JOIN {self.schema}.projects projects ON projects.id = sessions.project_id
+                    LEFT JOIN {self.schema}.projects projects ON projects.id = sessions.project_id
                     LEFT JOIN {self.schema}.project_memberships memberships
                       ON memberships.user_id = sessions.user_id
                      AND memberships.project_id = sessions.project_id
                     WHERE sessions.id = %s
                       AND users.is_active
-                      AND projects.is_active
+                      AND (sessions.project_id IS NULL OR projects.is_active)
                     """,
                     (session["id"],),
                 )

@@ -981,6 +981,8 @@ class FakeRepository:
         user = self.get_user(user_id)
         if user is None:
             raise ValueError("missing user")
+        if project_id is None and not user.get("is_admin"):
+            raise PermissionError("Only user admins may create a session without a project.")
         if not user.get("is_admin") and (user_id, project_id) not in self.memberships:
             raise PermissionError("User is not a member of the requested project.")
         token = f"token-{len(self.sessions) + 1}"
@@ -1003,19 +1005,19 @@ class FakeRepository:
         if session is None or session.get("revoked_at"):
             return None
         user = self.get_user(session["user_id"])
-        project = self.get_project(session["project_id"])
-        if project is None or not project.get("is_active", True):
+        project = None if session["project_id"] is None else self.get_project(session["project_id"])
+        if session["project_id"] is not None and (project is None or not project.get("is_active", True)):
             return None
         role = self.memberships.get((session["user_id"], session["project_id"]))
-        if user and user.get("is_admin") and role is None:
+        if session["project_id"] is not None and user and user.get("is_admin") and role is None:
             role = "admin"
         return {
             **session,
             "username": user["username"],
             "display_name": user["display_name"],
             "is_admin": user["is_admin"],
-            "project_key": project["project_key"],
-            "project_name": project["project_name"],
+            "project_key": None if project is None else project["project_key"],
+            "project_name": None if project is None else project["project_name"],
             "project_role": role,
         }
 
@@ -1466,36 +1468,49 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
     assert duplicate.status_code == 409
 
 
-def test_api_first_login_creates_named_project_kvstore(tmp_path):
+def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_path):
     client, repository, _ = make_client(auth_enabled=True)
     repository.projects.clear()
 
-    required = client.post(
+    login = client.post(
         "/auth/login",
         json={"username": "admin", "password": "secret"},
     )
+    assert login.status_code == 200
+    login_body = login.json()
+    assert login_body["project"] is None
+    assert login_body["project_creation_required"] is True
+    headers = {"Authorization": f"Bearer {login_body['token']}"}
+
+    project_scoped = client.get("/assets", headers=headers)
+    project_export = client.get("/io/export/table/runs", headers=headers)
     created = client.post(
-        "/auth/login",
+        "/projects",
+        headers=headers,
         json={
-            "username": "admin",
-            "password": "secret",
-            "create_project": {
-                "project_key": "first-project",
-                "kvstore_directory": str(tmp_path / "stores"),
-                "kvstore_name": "first-store",
-            },
+            "project_key": "first-project",
+            "kvstore_directory": str(tmp_path / "stores"),
+            "kvstore_name": "first-store",
         },
     )
 
-    assert required.status_code == 409
-    assert required.json()["detail"]["code"] == "project_creation_required"
+    assert project_scoped.status_code == 403
+    assert project_export.status_code == 403
     assert created.status_code == 200
     body = created.json()
-    assert body["project_created"] is True
     assert body["project"]["project_key"] == "first-project"
     assert body["kvstore"]["initialized"] is True
     assert body["kvstore"]["root_path"] == str((tmp_path / "stores" / "first-store").resolve())
     assert repository.projects[body["project"]["id"]]["kvstore_root_path"] == body["kvstore"]["root_path"]
+
+    switched = client.post(
+        "/auth/switch-project",
+        headers=headers,
+        json={"project_key": body["project"]["project_key"]},
+    )
+
+    assert switched.status_code == 200
+    assert switched.json()["project"]["id"] == body["project"]["id"]
 
 
 def test_api_project_delete_is_soft_delete_and_requires_manager():

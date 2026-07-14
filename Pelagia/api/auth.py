@@ -17,9 +17,9 @@ MANAGE_ROLES = {"manager", "admin"}
 class AuthContext:
     user_id: str
     username: str
-    project_id: str
-    project_key: str
-    role: str
+    project_id: str | None
+    project_key: str | None
+    role: str | None
     is_admin: bool = False
     session_id: str | None = None
 
@@ -92,13 +92,18 @@ def get_optional_auth_context(request: Request) -> AuthContext | None:
     session = get_repository(request).get_session(token)
     if session is None:
         raise HTTPException(status_code=401, detail="Invalid or expired Pelagia session token.")
-    role = session.get("project_role") or ("admin" if session.get("is_admin") else "viewer")
+    project_id = None if session.get("project_id") is None else str(session["project_id"])
+    role = (
+        None
+        if project_id is None
+        else session.get("project_role") or ("admin" if session.get("is_admin") else "viewer")
+    )
     auth = AuthContext(
         user_id=str(session["user_id"]),
         username=str(session["username"]),
-        project_id=str(session["project_id"]),
-        project_key=str(session["project_key"]),
-        role=str(role),
+        project_id=project_id,
+        project_key=None if session.get("project_key") is None else str(session["project_key"]),
+        role=None if role is None else str(role),
         is_admin=bool(session.get("is_admin")),
         session_id=str(session["id"]),
     )
@@ -115,6 +120,8 @@ def require_auth(request: Request) -> AuthContext:
 
 def require_project_read(request: Request) -> AuthContext:
     auth = require_auth(request)
+    if auth.project_id is None:
+        raise HTTPException(status_code=403, detail="Select or create a project before accessing project resources.")
     if auth.is_admin or auth.role in READ_ROLES:
         return auth
     raise HTTPException(status_code=403, detail="Project read permission is required.")
@@ -122,6 +129,8 @@ def require_project_read(request: Request) -> AuthContext:
 
 def require_project_write(request: Request) -> AuthContext:
     auth = require_auth(request)
+    if auth.project_id is None:
+        raise HTTPException(status_code=403, detail="Select or create a project before accessing project resources.")
     if auth.is_admin or auth.role in WRITE_ROLES:
         return auth
     raise HTTPException(status_code=403, detail="Project write permission is required.")
@@ -129,6 +138,8 @@ def require_project_write(request: Request) -> AuthContext:
 
 def require_project_manager(request: Request) -> AuthContext:
     auth = require_auth(request)
+    if auth.project_id is None:
+        raise HTTPException(status_code=403, detail="Select or create a project before accessing project resources.")
     if auth.is_admin or auth.role in MANAGE_ROLES:
         return auth
     raise HTTPException(status_code=403, detail="Project manager permission is required.")
@@ -141,5 +152,7 @@ def require_admin(request: Request) -> AuthContext:
     raise HTTPException(status_code=403, detail="Admin permission is required.")
 
 
-def scoped_project_id(request: Request) -> str | None:
-    return require_project_read(request).project_id
+def scoped_project_id(request: Request) -> str:
+    auth = require_project_read(request)
+    assert auth.project_id is not None
+    return auth.project_id

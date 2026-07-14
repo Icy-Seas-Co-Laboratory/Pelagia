@@ -41,6 +41,7 @@ def test_render_schema_loads_sql_resource():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
     assert "project_id uuid" in rendered
     assert "payload_ref text" in rendered
+    assert "project_id uuid REFERENCES pelagia_unit.projects(id) ON DELETE CASCADE" in rendered
     assert "job_id uuid REFERENCES pelagia_unit.processing_jobs(id) ON DELETE SET NULL" in rendered
     assert "UNIQUE (candidate_detection_id)" not in rendered
     assert "DROP CONSTRAINT IF EXISTS detections_refined_candidate_detection_id_key" in rendered
@@ -50,10 +51,16 @@ def test_render_schema_loads_sql_resource():
 def test_packaged_migrations_are_discoverable_and_rendered():
     migrations = postgres.available_migrations()
 
-    assert [migration["migration_id"] for migration in migrations] == ["0001_processing_status"]
+    assert [migration["migration_id"] for migration in migrations] == [
+        "0001_processing_status",
+        "0002_projectless_admin_sessions",
+    ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
     assert "{schema}" not in rendered
+    projectless_sessions = postgres.render_migration(migrations[1], "pelagia_unit")
+    assert "ALTER COLUMN project_id DROP NOT NULL" in projectless_sessions
+    assert "{schema}" not in projectless_sessions
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -85,8 +92,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 1
-    assert status["migrations"]["applied_count"] == 1
+    assert status["migrations"]["available_count"] == 2
+    assert status["migrations"]["applied_count"] == 2
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -739,9 +746,7 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
 
 
 def test_postgres_repository_manages_users_projects_memberships_and_sessions(postgres_repo):
-    default_project = postgres_repo.get_project_by_key("default")
-    assert default_project is not None
-    assert str(default_project["id"]) == DEFAULT_PROJECT_ID
+    assert postgres_repo.get_project_by_key("default") is None
 
     user = postgres_repo.create_user(
         "Ada",
@@ -811,6 +816,16 @@ def test_postgres_repository_manages_users_projects_memberships_and_sessions(pos
         postgres_repo.create_session(str(user["id"]), str(other_project["id"]))
 
     admin = postgres_repo.create_user("Admin", password="secret", is_admin=True)
+    projectless_admin_session = postgres_repo.create_session(str(admin["id"]), None)
+    resolved_projectless = postgres_repo.get_session(projectless_admin_session["token"])
+    assert resolved_projectless is not None
+    assert resolved_projectless["is_admin"] is True
+    assert resolved_projectless["project_id"] is None
+    assert resolved_projectless["project_key"] is None
+    assert resolved_projectless["project_role"] is None
+    with pytest.raises(PermissionError):
+        postgres_repo.create_session(str(user["id"]), None)
+
     admin_session = postgres_repo.create_session(str(admin["id"]), str(other_project["id"]))
     assert postgres_repo.get_session(admin_session["token"])["is_admin"] is True
     deactivated = postgres_repo.deactivate_project(
