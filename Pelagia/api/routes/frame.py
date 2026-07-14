@@ -21,6 +21,7 @@ if APIRouter is not None:
     from ...processing.frame_store import retrieve_frame, store_preprocessed_frame
     from ...processing.codec_registry import image_extension
     from ...services.job_commands import FrameBackgroundCommand, PreprocessFramesCommand
+    from ...services.pipeline import PipelineService
     from ._common import (
         as_response,
         detection_summary,
@@ -85,6 +86,8 @@ if APIRouter is not None:
         crop_w: int | None = None
         crop_h: int | None = None
         background_correction: bool | None = None
+        background_window_stride: int | None = None
+        background_window_width: int | None = None
         background_min_field_value: int | float | None = None
         background_max_field_value: int | float | None = None
         invert_intensity: bool | None = None
@@ -588,23 +591,28 @@ if APIRouter is not None:
 
         run_id = body.run_id
         asset_id = body.asset_id
-        if asset_id is None and frame_ids:
-            first_frame = repository.get_frame_record(frame_ids[0], project_id=auth.project_id)
-            if first_frame is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Frame {frame_ids[0]!r} was not found.",
-                )
-            run_id = run_id or first_frame.run_id
-            asset_id = first_frame.asset_id
+        selected_frames = []
+        for frame_id in dict.fromkeys(frame_ids):
+            frame = repository.get_frame_record(frame_id, project_id=auth.project_id)
+            if frame is None:
+                raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
+            selected_frames.append(frame)
+        selected_asset_ids = {frame.asset_id for frame in selected_frames}
+        selected_run_ids = {frame.run_id for frame in selected_frames if frame.run_id is not None}
+        if asset_id is not None and selected_asset_ids and selected_asset_ids != {asset_id}:
+            raise HTTPException(status_code=422, detail="frame_ids must belong to the requested asset_id.")
+        if asset_id is None and len(selected_asset_ids) == 1:
+            asset_id = next(iter(selected_asset_ids))
+        if run_id is None and len(selected_run_ids) == 1:
+            run_id = next(iter(selected_run_ids))
 
-        if asset_id is None:
+        if asset_id is None and not frame_ids:
             raise HTTPException(
                 status_code=422,
                 detail="Preprocess jobs require asset_id or at least one frame_id.",
             )
 
-        if run_id is None:
+        if run_id is None and asset_id is not None:
             asset = repository.get_asset(asset_id, project_id=auth.project_id)
             if asset is None:
                 raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
@@ -647,6 +655,8 @@ if APIRouter is not None:
                 if body.background_correction is None
                 else body.background_correction
             ),
+            "background_window_stride": body.background_window_stride,
+            "background_window_width": body.background_window_width,
             "background_min_field_value": (
                 preprocessing_defaults.background_min_field_value
                 if body.background_min_field_value is None
@@ -667,7 +677,7 @@ if APIRouter is not None:
         }
         payload = PreprocessFramesCommand.from_payload(payload).to_payload()
         try:
-            job = repository.create_job(
+            job = PipelineService(get_context(request)).queue(
                 PipelineStage.PREPROCESS_FRAMES,
                 project_id=auth.project_id,
                 run_id=run_id,
@@ -695,9 +705,8 @@ if APIRouter is not None:
                 }
             )
         try:
-            result = generate_background_for_frames(
+            result = PipelineService(get_context(request).for_project(scoped_project_id(request))).generate_background(
                 frame_ids,
-                context=get_context(request).for_project(scoped_project_id(request)),
                 payload_kind=body.payload_kind,
                 encoding=body.encoding,
                 quality=body.quality,
@@ -743,7 +752,7 @@ if APIRouter is not None:
         if asset_id is None:
             raise HTTPException(status_code=422, detail="Background jobs require an asset_id or resolvable frame_ids.")
         try:
-            job = repository.create_job(
+            job = PipelineService(get_context(request)).queue(
                 PipelineStage.BACKGROUND_FRAMES,
                 project_id=auth.project_id,
                 run_id=run_id,

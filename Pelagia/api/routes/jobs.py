@@ -4,7 +4,6 @@ from typing import Any
 from uuid import UUID
 
 from ...domain import JobStatus, PipelineStage
-from ...services.job_commands import command_from_payload, command_model
 
 try:
     from fastapi import APIRouter, HTTPException, Query, Request
@@ -16,7 +15,8 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..schemas import JobDetailResponse, JobsClearResponse, JobsListResponse, JobsSummaryResponse
     from ..auth import require_project_write, scoped_project_id
-    from ._common import as_response, get_repository
+    from ...services.pipeline import PipelineService
+    from ._common import as_response, get_context, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
         return min(max(1, 100 if limit is None else limit), 1000)
@@ -165,14 +165,9 @@ if APIRouter is not None:
 
     @router.post("", response_model=JobDetailResponse, response_model_exclude_none=True)
     def create_job(request: Request, body: CreateJobRequest) -> dict:
-        repository = get_repository(request)
         auth = require_project_write(request)
         try:
-            if command_model(body.stage) is not None:
-                payload = command_from_payload(body.stage, body.payload).to_payload()
-            else:
-                payload = body.payload
-            job = repository.create_job(
+            job = PipelineService(get_context(request)).queue(
                 body.stage,
                 project_id=auth.project_id,
                 run_id=body.run_id,
@@ -180,7 +175,7 @@ if APIRouter is not None:
                 status=body.status,
                 priority=body.priority,
                 max_attempts=body.max_attempts,
-                payload=payload,
+                payload=body.payload,
                 depends_on=body.depends_on,
                 summary=body.summary,
             )

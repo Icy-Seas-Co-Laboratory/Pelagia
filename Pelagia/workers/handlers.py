@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +13,14 @@ from ..processing.detection_refinement import (
     refine_detections,
     refined_storage_candidate_detection_id,
 )
-from ..processing.frame_correction import generate_background_for_frames
+from ..processing.frame_correction import ensure_asset_background_windows, generate_background_for_frames
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
-from ..processing.frame_store import retrieve_frame, store_preprocessed_frame
+from ..processing.frame_store import retrieve_frame, store_preprocessed_frames
 from ..processing.oracle_unet_refiner import resolve_refinement_model
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..services.context import AppContext
 from ..services.project_settings import resolve_project_storage_settings
+from ..services.pipeline import PipelineService
 from ..services.job_commands import (
     ExtractFramesCommand,
     FrameBackgroundCommand,
@@ -30,27 +30,9 @@ from ..services.job_commands import (
     SegmentFramesCommand,
 )
 from .progress import JobProgressReporter
+from .registry import HandlerRegistry
 
-
-JobHandler = Callable[[dict[str, Any], AppContext], dict[str, Any]]
-
-
-class HandlerRegistry:
-    """Maps pipeline stages to processing functions."""
-
-    def __init__(self) -> None:
-        self._handlers: dict[PipelineStage, JobHandler] = {}
-
-    def register(self, stage: PipelineStage, handler: JobHandler) -> None:
-        """Register a callable for a pipeline stage."""
-        self._handlers[stage] = handler
-
-    def handle(self, job: dict[str, Any], context: AppContext) -> dict[str, Any]:
-        """Dispatch a leased job to its registered handler."""
-        stage = PipelineStage(job["stage"])
-        if stage not in self._handlers:
-            raise KeyError(f"No worker handler registered for stage {stage.value!r}.")
-        return self._handlers[stage](job, context)
+PREPROCESS_DB_BATCH_SIZE = 25
 
 
 def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
@@ -362,7 +344,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     if payload.get("enqueue_segment"):
         roi_recording_defaults = context.config.processing.roi_recording
-        segment_job = context.repository.create_job(
+        segment_job = PipelineService(context).queue(
             PipelineStage.SEGMENT,
             project_id=project_id,
             run_id=run_id,
@@ -418,6 +400,8 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
 
     resolved_asset_id = None if asset_id is None else str(asset_id)
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
+    resolved_asset_ids: set[str] = set()
+    resolved_run_ids: set[str] = set()
     flatfield_defaults = context.config.processing.flatfield
     preprocessing_defaults = context.config.processing.preprocessing
     flatfield_correction = payload.get("flatfield_correction", flatfield_defaults.flatfield_correction)
@@ -452,7 +436,22 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
     encoding = payload.get("encoding")
     quality = payload.get("quality")
+    processed_frames = []
     stored_rows = []
+
+    def flush_preprocessed_frames() -> None:
+        if not processed_frames:
+            return
+        stored_rows.extend(
+            store_preprocessed_frames(
+                processed_frames,
+                context=context,
+                project_id=project_id,
+                encoding=encoding,
+                quality=None if quality is None else int(quality),
+            )
+        )
+        processed_frames.clear()
     progress = JobProgressReporter(
         job,
         context,
@@ -477,10 +476,11 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
             resolved_asset_id = frame_record.asset_id
-        elif frame_record.asset_id != resolved_asset_id:
-            raise ValueError("Preprocess jobs may only process frames from one asset.")
+        resolved_asset_ids.add(frame_record.asset_id)
         if resolved_run_id is None:
             resolved_run_id = frame_record.run_id
+        if frame_record.run_id is not None:
+            resolved_run_ids.add(frame_record.run_id)
         if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
             missing_background_frame_ids.append(frame_id)
 
@@ -507,14 +507,16 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         }
         if payload.get("background_quality") is not None:
             background_kwargs["quality"] = payload.get("background_quality")
-        result = generate_background_for_frames(frame_ids, **background_kwargs)
+        if payload.get("background_window_stride") is not None:
+            background_kwargs["window_stride"] = payload["background_window_stride"]
+        if payload.get("background_window_width") is not None:
+            background_kwargs["window_width"] = payload["background_window_width"]
+        result = ensure_asset_background_windows(frame_ids, **background_kwargs)
         progress.update(
             0,
             secondary={
                 "background_generation": "completed",
-                "background_payload_ref": result.get("background_payload_ref"),
-                "background_source_frame_count": result.get("frame_count"),
-                "updated_background_frame_count": result.get("updated_frame_count"),
+                "background_window_count": len(result.get("windows") or []),
                 "reason": reason,
             },
             message=(
@@ -555,23 +557,21 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             invert_intensity=invert_intensity,
             context=context,
         )
-        stored_rows.append(
-            store_preprocessed_frame(
-                frame_id,
-                processed,
-                context=context,
-                encoding=encoding,
-                quality=None if quality is None else int(quality),
-            )
-        )
+        processed_frames.append((frame_id, processed))
+        if len(processed_frames) >= PREPROCESS_DB_BATCH_SIZE:
+            flush_preprocessed_frames()
         progress.update(
             index,
             current={"frame_id": frame_id, "index": index},
             message=f"Preprocessed {index}/{len(frame_ids)} frames",
         )
 
-    if resolved_run_id is None or resolved_asset_id is None:
-        raise ValueError("Preprocess job could not resolve run_id and asset_id.")
+    if not resolved_asset_ids:
+        raise ValueError("Preprocess job could not resolve selected frames.")
+    result_asset_id = resolved_asset_id if len(resolved_asset_ids) == 1 else None
+    result_run_id = resolved_run_id if len(resolved_run_ids) <= 1 else None
+
+    flush_preprocessed_frames()
 
     progress.finish(
         completed=len(stored_rows),
@@ -581,8 +581,10 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     result = {
         "stage": PipelineStage.PREPROCESS_FRAMES.value,
         "project_id": project_id,
-        "run_id": resolved_run_id,
-        "asset_id": resolved_asset_id,
+        "run_id": result_run_id,
+        "asset_id": result_asset_id,
+        "run_ids": sorted(resolved_run_ids),
+        "asset_ids": sorted(resolved_asset_ids),
         "frame_count": len(stored_rows),
         "frame_ids": frame_ids,
         "preprocessed_frame_ids": [str(row.get("id")) for row in stored_rows],
@@ -1046,11 +1048,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
 
 def default_handler_registry() -> HandlerRegistry:
-    """Build the default worker stage registry."""
-    registry = HandlerRegistry()
-    registry.register(PipelineStage.EXTRACT_FRAMES, extract_frames_handler)
-    registry.register(PipelineStage.BACKGROUND_FRAMES, background_frames_handler)
-    registry.register(PipelineStage.PREPROCESS_FRAMES, preprocess_frames_handler)
-    registry.register(PipelineStage.SEGMENT, roi_detection_handler)
-    registry.register(PipelineStage.ROI_REFINEMENT, roi_refinement_handler)
-    return registry
+    """Build the default worker stage registry (legacy import location)."""
+    from .registry import default_handler_registry as build_registry
+
+    return build_registry()

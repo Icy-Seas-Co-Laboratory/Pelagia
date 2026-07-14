@@ -307,6 +307,7 @@ def generate_background_for_frames(
     payload_kind: str = "original",
     encoding: str = "zstd",
     quality: int | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     """
     Build a mean background field from stored frames and assign it to those frames.
@@ -327,6 +328,7 @@ def generate_background_for_frames(
         from .frame_store import default_context
 
         ctx = default_context()
+    background_metadata = {**dict(result["background_metadata"] or {}), **dict(metadata or {})}
     rows = ctx.repository.update_frame_background_payloads(
         resolved_frame_ids,
         project_id=getattr(ctx, "active_project_id", None),
@@ -336,9 +338,82 @@ def generate_background_for_frames(
         payload_format=str(result["background_payload_format"]),
         payload_dtype=str(result["background_payload_dtype"]),
         payload_shape=list(result["background_payload_shape"] or []),
-        metadata=dict(result["background_metadata"] or {}),
+        metadata=background_metadata,
     )
     return {
         **result,
         "updated_frame_count": len(rows),
     }
+
+
+def ensure_asset_background_windows(
+    frame_ids: list[str] | tuple[str, ...],
+    *,
+    context: AppContext,
+    payload_kind: str = "original",
+    encoding: str = "zstd",
+    quality: int | None = None,
+    window_stride: int | None = None,
+    window_width: int | None = None,
+) -> dict:
+    """Ensure selected frames have an asset-wide, fixed-stride background field."""
+    if context.repository is None:
+        raise RuntimeError("A PostgresRepository is required to generate backgrounds.")
+    defaults = context.config.processing.preprocessing
+    stride = defaults.background_window_stride if window_stride is None else int(window_stride)
+    width = defaults.background_window_width if window_width is None else int(window_width)
+    if stride < 1 or width < 1 or stride % 2 == 0 or width % 2 == 0:
+        raise ValueError("background_window_stride and background_window_width must be positive odd integers.")
+
+    targets_by_asset: dict[str, list[FrameRecord]] = {}
+    for frame_id in dict.fromkeys(str(value) for value in frame_ids):
+        record = context.repository.get_frame_record(frame_id, project_id=context.active_project_id)
+        if record is None:
+            raise KeyError(f"Frame {frame_id!r} was not found.")
+        targets_by_asset.setdefault(record.asset_id, []).append(record)
+
+    windows: list[dict] = []
+    application_half_width = stride // 2
+    source_half_width = width // 2
+    for asset_id, targets in targets_by_asset.items():
+        rows = context.repository.list_frames(asset_id, project_id=context.active_project_id, limit=None)
+        frames = [FrameRecord.from_row(row) for row in rows]
+        by_center: dict[int, list[FrameRecord]] = {}
+        for target in targets:
+            center = ((target.frame_index + application_half_width) // stride) * stride
+            by_center.setdefault(center, []).append(target)
+        for center, window_targets in by_center.items():
+            first_index = center - source_half_width
+            last_index = center + source_half_width
+            sources = [frame for frame in frames if first_index <= frame.frame_index <= last_index]
+            if not sources:
+                raise ValueError(f"No available frames for background window centered at {center}.")
+            current_metadata = window_targets[0].background_metadata
+            if (
+                window_targets[0].background_payload_ref
+                and current_metadata.get("background_window_center") == center
+                and current_metadata.get("background_window_stride") == stride
+                and current_metadata.get("background_window_width") == width
+                and current_metadata.get("background_source_payload_kind") == payload_kind
+            ):
+                windows.append({"asset_id": asset_id, "center": center, "reused": True, "frame_ids": [str(frame.id) for frame in sources]})
+                continue
+            source_ids = [str(frame.id) for frame in sources if frame.id is not None]
+            result = generate_background_for_frames(
+                source_ids,
+                context=context,
+                payload_kind=payload_kind,
+                encoding=encoding,
+                quality=quality,
+                metadata={
+                    "background_window_center": center,
+                    "background_window_start": first_index,
+                    "background_window_end": last_index,
+                    "background_window_stride": stride,
+                    "background_window_width": width,
+                    "background_application_start": center - application_half_width,
+                    "background_application_end": center + application_half_width,
+                },
+            )
+            windows.append({"asset_id": asset_id, "center": center, "reused": False, **result})
+    return {"window_stride": stride, "window_width": width, "windows": windows}

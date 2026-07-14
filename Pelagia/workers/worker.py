@@ -10,7 +10,8 @@ from threading import Event
 from ..domain import PipelineStage
 from ..observability import get_core_logger
 from ..services.context import AppContext
-from .handlers import HandlerRegistry, mark_job_frame_stage_failed
+from .common import mark_job_frame_stage_failed
+from .registry import HandlerRegistry
 from .runtime import worker_runtime_profile
 
 

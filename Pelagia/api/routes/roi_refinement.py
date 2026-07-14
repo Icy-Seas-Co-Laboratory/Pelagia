@@ -27,6 +27,7 @@ if APIRouter is not None:
     from ...processing.capabilities import roi_refinement_capabilities
     from ...services.models import ModelService
     from ...services.job_commands import RoiRefinementCommand
+    from ...services.pipeline import PipelineService
     from ._common import (
         as_response,
         detection_summary,
@@ -450,7 +451,7 @@ if APIRouter is not None:
                 }
             )
         try:
-            job = repository.create_job(
+            job = PipelineService(get_context(request)).queue(
                 PipelineStage.ROI_REFINEMENT,
                 project_id=auth.project_id,
                 run_id=run_id,

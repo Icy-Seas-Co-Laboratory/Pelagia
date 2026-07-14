@@ -482,13 +482,13 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
         preprocessed.append((frame, kwargs))
         return frame
 
-    def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
-        stored.append((frame_id, frame, kwargs))
-        return {"id": frame_id}
+    def fake_store_preprocessed_frames(frames, **kwargs):
+        stored.append((list(frames), kwargs))
+        return [{"id": frame_id} for frame_id, _ in frames]
 
     monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
     monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", fake_preprocess_frame)
-    monkeypatch.setattr("Pelagia.workers.handlers.store_preprocessed_frame", fake_store_preprocessed_frame)
+    monkeypatch.setattr("Pelagia.workers.handlers.store_preprocessed_frames", fake_store_preprocessed_frames)
 
     result = preprocess_frames_handler(
         {
@@ -512,7 +512,66 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert retrieved == [("frame-1", context, "original")]
     assert preprocessed[0][1]["flatfield_correction"] is False
     assert preprocessed[0][1]["background_correction"] is True
-    assert stored[0][2]["encoding"] == "jpg"
+    assert stored[0][1]["encoding"] == "jpg"
+    assert stored[0][0][0][0] == "frame-1"
+
+
+def test_preprocess_frames_handler_accepts_frame_ids_from_multiple_assets(monkeypatch):
+    class MixedAssetRepository(FakeRepository):
+        def get_frame_record(self, frame_id, **kwargs):
+            records = {
+                "frame-1": ("asset-1", "run-1"),
+                "frame-2": ("asset-2", "run-2"),
+            }
+            asset_id, run_id = records.get(frame_id, (None, None))
+            if asset_id is None:
+                return None
+            return FrameRecord(
+                id=frame_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                frame_index=1,
+                width=4,
+                height=4,
+                kvstore_hash="kvstore-key",
+                preview_thumbhash=b"thumb",
+                background_kvstore_hash="background-key",
+                background_payload_ref="background-key",
+            )
+
+    repository = MixedAssetRepository()
+    context = make_context(repository)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, **kwargs: FrameData(
+            sourcePath="/tmp",
+            filename=f"{frame_id}.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            metadata={"frame_id": frame_id},
+        ),
+    )
+    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
+    )
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess-mixed",
+            "project_id": "project-1",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "payload": {"frame_ids": ["frame-1", "frame-2"], "background_correction": False},
+        },
+        context,
+    )
+
+    assert result["asset_id"] is None
+    assert result["run_id"] is None
+    assert result["asset_ids"] == ["asset-1", "asset-2"]
+    assert result["run_ids"] == ["run-1", "run-2"]
+    assert result["preprocessed_frame_ids"] == ["frame-1", "frame-2"]
 
 
 def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
@@ -521,7 +580,7 @@ def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
     background_generated = False
     calls = []
 
-    def fake_generate_background_for_frames(frame_ids, **kwargs):
+    def fake_ensure_asset_background_windows(frame_ids, **kwargs):
         nonlocal background_generated
         background_generated = True
         calls.append((frame_ids, kwargs))
@@ -553,14 +612,14 @@ def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
         return frame
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.generate_background_for_frames",
-        fake_generate_background_for_frames,
+            "Pelagia.workers.handlers.ensure_asset_background_windows",
+            fake_ensure_asset_background_windows,
     )
     monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
     monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", fake_preprocess_frame)
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frame",
-        lambda frame_id, frame, **kwargs: {"id": frame_id},
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
     )
 
     result = preprocess_frames_handler(
@@ -600,7 +659,7 @@ def test_preprocess_frames_handler_skips_background_generation_when_present(monk
     calls = []
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.generate_background_for_frames",
+        "Pelagia.workers.handlers.ensure_asset_background_windows",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
     monkeypatch.setattr(
@@ -616,8 +675,8 @@ def test_preprocess_frames_handler_skips_background_generation_when_present(monk
     )
     monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frame",
-        lambda frame_id, frame, **kwargs: {"id": frame_id},
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
     )
 
     result = preprocess_frames_handler(
@@ -669,14 +728,14 @@ def test_preprocess_frames_handler_regenerates_stale_background_reference(monkey
         )
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.generate_background_for_frames",
+        "Pelagia.workers.handlers.ensure_asset_background_windows",
         fake_generate_background_for_frames,
     )
     monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
     monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frame",
-        lambda frame_id, frame, **kwargs: {"id": frame_id},
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
     )
 
     result = preprocess_frames_handler(
@@ -719,8 +778,8 @@ def test_preprocess_frames_handler_uses_project_context(monkeypatch):
     )
     monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frame",
-        lambda frame_id, frame, **kwargs: {"id": frame_id},
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
     )
 
     result = preprocess_frames_handler(

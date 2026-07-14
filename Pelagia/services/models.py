@@ -136,6 +136,7 @@ class ModelService:
         artifact_registry: ArtifactRegistry | None = None,
     ):
         self.repository = repository
+        self.catalog = None if repository is None else getattr(repository, "catalog", repository)
         self.config = config or CoreConfig.load()
         self.artifact_registry = artifact_registry or ArtifactRegistry(self.config)
 
@@ -152,7 +153,7 @@ class ModelService:
         """Register or update model metadata."""
         if self.repository is None:
             raise RuntimeError("A PostgresRepository is required to register model metadata.")
-        return self.repository.register_model(model, project_id=project_id)
+        return self.catalog.register_model(model, project_id=project_id)
 
     def list_model_artifacts(self) -> list[dict[str, Any]]:
         """List packaged and local model manifests."""

@@ -12,6 +12,7 @@ class JobService:
 
     def __init__(self, repository: PostgresRepository):
         self.repository = repository
+        self.jobs = getattr(repository, "jobs", repository)
 
     def enqueue(
         self,
@@ -22,21 +23,28 @@ class JobService:
         asset_id: str | None = None,
         payload: dict[str, Any] | None = None,
         depends_on: Sequence[str] | None = None,
+        priority: int | None = None,
+        status: JobStatus = JobStatus.QUEUED,
+        max_attempts: int | None = None,
+        summary: str | None = None,
     ) -> dict[str, Any]:
         """Create a queued processing job."""
         resolved_payload = dict(payload or {})
         if command_model(stage) is not None:
             resolved_payload = command_from_payload(stage, resolved_payload).to_payload()
-        return self.repository.create_job(
+        return self.jobs.create_job(
             stage,
             project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
-            status=JobStatus.QUEUED,
+            status=status,
+            priority=priority,
+            max_attempts=max_attempts,
             payload=resolved_payload,
             depends_on=depends_on or [],
+            summary=summary,
         )
 
     def claim(self, worker_id: str, stages: Sequence[PipelineStage] | None = None) -> list[dict[str, Any]]:
         """Claim available jobs for a worker."""
-        return self.repository.claim_jobs(worker_id=worker_id, stages=stages)
+        return self.jobs.claim_jobs(worker_id=worker_id, stages=stages)

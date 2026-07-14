@@ -29,8 +29,9 @@ if APIRouter is not None:
     from ..auth import require_project_write
     from ...services.project_settings import resolve_project_storage_settings
     from ...services.job_commands import ExtractFramesCommand
+    from ...services.pipeline import PipelineService
     from ...processing.codec_registry import normalize_image_encoding
-    from ._common import as_response, get_repository
+    from ._common import as_response, get_context, get_repository
 
     class QueueVideoRequest(BaseModel):
         source_path: str
@@ -404,7 +405,7 @@ if APIRouter is not None:
                 collections=collections,
                 checksum_status=checksum_status,
             )
-            job = repository.create_job(
+            job = PipelineService(get_context(request)).queue(
                 PipelineStage.EXTRACT_FRAMES,
                 project_id=auth.project_id,
                 run_id=run_id,
@@ -522,7 +523,7 @@ if APIRouter is not None:
             )
         )
         registration = repository.register_planned_run(planned_run, project_id=auth.project_id)
-        job = repository.create_job(
+        job = PipelineService(get_context(request)).queue(
             PipelineStage.EXTRACT_FRAMES,
             project_id=auth.project_id,
             run_id=run_id,

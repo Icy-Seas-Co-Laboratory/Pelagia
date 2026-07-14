@@ -285,6 +285,8 @@ class PreprocessingConfig:
     mask_path: str | None = None
     adaptive_background_subtraction: bool = False
     adaptive_background_period: int = 50
+    background_window_stride: int = 51
+    background_window_width: int = 51
     background_correction: bool = False
     background_min_field_value: float = 1.0
     background_max_field_value: float | None = None
@@ -606,6 +608,8 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.preprocessing", "mask_path", "PELAGIA_PREPROCESSING_MASK_PATH")
     _set_from_env(settings, "processing.preprocessing", "adaptive_background_subtraction", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_SUBTRACTION", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "adaptive_background_period", "PELAGIA_PREPROCESSING_ADAPTIVE_BACKGROUND_PERIOD", int)
+    _set_from_env(settings, "processing.preprocessing", "background_window_stride", "PELAGIA_PREPROCESSING_BACKGROUND_WINDOW_STRIDE", int)
+    _set_from_env(settings, "processing.preprocessing", "background_window_width", "PELAGIA_PREPROCESSING_BACKGROUND_WINDOW_WIDTH", int)
     _set_from_env(settings, "processing.preprocessing", "background_correction", "PELAGIA_PREPROCESSING_BACKGROUND_CORRECTION", _env_bool)
     _set_from_env(settings, "processing.preprocessing", "background_min_field_value", "PELAGIA_PREPROCESSING_BACKGROUND_MIN_FIELD_VALUE", float)
     _set_from_env(settings, "processing.preprocessing", "background_max_field_value", "PELAGIA_PREPROCESSING_BACKGROUND_MAX_FIELD_VALUE", float)
@@ -1099,6 +1103,18 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                     preprocessing.get(
                         "adaptive_background_period",
                         PreprocessingConfig.adaptive_background_period,
+                    )
+                ),
+                background_window_stride=int(
+                    preprocessing.get(
+                        "background_window_stride",
+                        PreprocessingConfig().background_window_stride,
+                    )
+                ),
+                background_window_width=int(
+                    preprocessing.get(
+                        "background_window_width",
+                        PreprocessingConfig().background_window_width,
                     )
                 ),
                 background_correction=bool(

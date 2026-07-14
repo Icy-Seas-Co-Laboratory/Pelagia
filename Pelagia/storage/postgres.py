@@ -157,6 +157,14 @@ class PostgresRepository:
         _require_psycopg()
         self.config = config
         self.schema = validate_schema_name(config.database.schema_name)
+        # Scoped views are the preferred application-facing dependencies.  Keep
+        # this facade intact while the underlying SQL moves out incrementally.
+        from .scoped import CatalogRepository, FrameRepository, IdentityRepository, JobRepository
+
+        self.identity = IdentityRepository(self)
+        self.catalog = CatalogRepository(self)
+        self.frames = FrameRepository(self)
+        self.jobs = JobRepository(self)
 
     def connect(self):
         return psycopg.connect(
@@ -2170,6 +2178,59 @@ class PostgresRepository:
             raise KeyError(frame_id)
         return row
 
+    def update_frame_preprocessed_payloads(
+        self,
+        payloads: Sequence[dict[str, Any]],
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Persist preprocessed payload metadata in one database transaction."""
+        if not payloads:
+            return []
+        frame_ids = [str(payload["frame_id"]) for payload in payloads]
+        statement = f"""
+            UPDATE {self.schema}.frames
+            SET
+                preprocessed_kvstore_hash = %s,
+                preprocessed_preview_thumbhash = %s,
+                preprocessed_payload_ref = %s,
+                preprocessed_payload_encoding = %s,
+                preprocessed_payload_format = %s,
+                preprocessed_payload_dtype = %s,
+                preprocessed_payload_shape = %s::jsonb,
+                preprocessed_metadata = %s::jsonb
+            WHERE id = %s
+        """
+        parameters = [
+            (
+                payload["kvstore_hash"],
+                payload["preview_thumbhash"],
+                payload["payload_ref"],
+                payload["payload_encoding"],
+                payload["payload_format"],
+                payload["payload_dtype"],
+                json.dumps(json_ready(list(payload["payload_shape"]))),
+                json.dumps(json_ready(payload.get("metadata") or {})),
+                payload["frame_id"],
+            )
+            for payload in payloads
+        ]
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                self._ensure_project_scope(cursor, project_id, frame_ids=frame_ids)
+                cursor.executemany(statement, parameters)
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.frames WHERE id = ANY(%s)",
+                    (frame_ids,),
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        rows_by_id = {str(row["id"]): row for row in rows}
+        missing = [frame_id for frame_id in frame_ids if frame_id not in rows_by_id]
+        if missing:
+            raise KeyError(missing[0])
+        return [rows_by_id[frame_id] for frame_id in frame_ids]
+
     def update_frame_background_payloads(
         self,
         frame_ids: Sequence[str],
@@ -4146,6 +4207,151 @@ class PostgresRepository:
                     )
             connection.commit()
         return row
+
+    def plan_preprocess_frames(
+        self,
+        *,
+        project_id: str,
+        filters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Resolve project frames for backend-owned preprocessing queue planning."""
+        resolved_project_id = self._required_project_id(project_id, "plan_preprocess_frames")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id,
+            run_id=filters.get("run_id"),
+            asset_id=filters.get("asset_id"),
+            collection=None,
+            preprocessing_status=filters.get("preprocessing_status"),
+            start_frame=filters.get("start_frame"),
+            end_frame=filters.get("end_frame"),
+        )
+        collections = [str(value) for value in filters.get("collection") or [] if value]
+        if collections:
+            clauses.append("status.collections && %s::text[]")
+            params.append(collections)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index,
+                           COALESCE(frames.payload_ref, frames.kvstore_hash) AS payload_ref
+                    FROM {self.schema}.frame_processing_status status
+                    JOIN {self.schema}.frames frames ON frames.id = status.frame_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY COALESCE(frames.payload_ref, frames.kvstore_hash) ASC NULLS LAST,
+                             status.frame_id ASC
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
+    def plan_segment_frames(self, *, project_id: str, filters: dict[str, Any], payload_kind: str) -> list[dict[str, Any]]:
+        resolved_project_id = self._required_project_id(project_id, "plan_segment_frames")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
+            collection=None, candidate_detection_status=filters.get("candidate_detection_status"),
+            preprocessing_status=filters.get("preprocessing_status"), start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
+        )
+        collections = [str(value) for value in filters.get("collection") or [] if value]
+        if collections:
+            clauses.append("status.collections && %s::text[]")
+            params.append(collections)
+        payload_ref = "COALESCE(frames.preprocessed_payload_ref, frames.preprocessed_kvstore_hash)" if payload_kind in {"preprocessed", "processed", "corrected"} else "COALESCE(frames.payload_ref, frames.kvstore_hash)"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index, {payload_ref} AS payload_ref
+                    FROM {self.schema}.frame_processing_status status JOIN {self.schema}.frames frames ON frames.id = status.frame_id
+                    WHERE {' AND '.join(clauses)} ORDER BY {payload_ref} ASC NULLS LAST, status.frame_id ASC""", tuple(params))
+                return cursor.fetchall()
+
+    def plan_roi_refinement_detections(self, *, project_id: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        resolved_project_id = self._required_project_id(project_id, "plan_roi_refinement_detections")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"), collection=None,
+            roi_refinement_status=filters.get("roi_refinement_status"), start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
+        )
+        collections = [str(value) for value in filters.get("collection") or [] if value]
+        if collections:
+            clauses.append("status.collections && %s::text[]")
+            params.append(collections)
+        if "refined" not in set(filters.get("refinement_state") or ["unrefined"]):
+            clauses.append(f"NOT EXISTS (SELECT 1 FROM {self.schema}.detections_refined refined WHERE refined.candidate_detection_id = detections.id)")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id, detections.roi_index
+                    FROM {self.schema}.detection_candidate detections
+                    JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
+                    WHERE {' AND '.join(clauses)} ORDER BY detections.frame_id ASC, detections.roi_index ASC, detections.id ASC""", tuple(params))
+                return cursor.fetchall()
+
+    def create_preprocess_jobs(
+        self,
+        *,
+        project_id: str,
+        jobs: Sequence[dict[str, Any]],
+        eligible_statuses: Sequence[str],
+        priority: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Create planned preprocessing jobs and queue their frames atomically."""
+        if not jobs:
+            return []
+        resolved_project_id = self._required_project_id(project_id, "create_preprocess_jobs")
+        created: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                all_frame_ids = [frame_id for job in jobs for frame_id in job["frame_ids"]]
+                self._ensure_project_scope(cursor, resolved_project_id, frame_ids=all_frame_ids)
+                normalized_statuses = [self._normalize_frame_processing_status(status) for status in eligible_statuses]
+                cursor.execute(
+                    f"""
+                    SELECT frame_id
+                    FROM {self.schema}.frame_processing_status
+                    WHERE project_id = %s
+                      AND frame_id = ANY(%s::uuid[])
+                      AND preprocessing_status = ANY(%s)
+                    FOR UPDATE
+                    """,
+                    (resolved_project_id, all_frame_ids, normalized_statuses),
+                )
+                eligible_frame_ids = {str(row["frame_id"]) for row in cursor.fetchall()}
+                missing = [frame_id for frame_id in all_frame_ids if frame_id not in eligible_frame_ids]
+                if missing:
+                    raise ValueError(
+                        "Some frames are no longer eligible for preprocessing: " + ", ".join(missing[:10])
+                    )
+                for job in jobs:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.processing_jobs
+                            (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, summary)
+                        VALUES (%s, %s, %s, 'preprocess_frames'::{self.schema}.stage_name,
+                                'queued'::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s)
+                        RETURNING *
+                        """,
+                        (
+                            resolved_project_id,
+                            job.get("run_id"),
+                            job.get("asset_id"),
+                            priority if priority is not None else self.config.queue.default_priority,
+                            self.config.queue.max_attempts,
+                            json.dumps(json_ready(job["payload"])),
+                            job["summary"],
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    self._append_job_event(cursor, row["id"], "job.created", {"stage": "preprocess_frames", "status": "queued", "project_id": resolved_project_id})
+                    self._upsert_frame_stage_status_in_cursor(
+                        cursor,
+                        project_id=resolved_project_id,
+                        frame_ids=job["frame_ids"],
+                        stage=PipelineStage.PREPROCESS_FRAMES.value,
+                        status=JobStatus.QUEUED.value,
+                        job_id=str(row["id"]),
+                    )
+                    created.append(row)
+                self._touch_processing_status_snapshot_in_cursor(cursor, project_id=resolved_project_id)
+            connection.commit()
+        return created
 
     def update_job_payload(self, job_id: str, payload: dict[str, Any], summary: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:

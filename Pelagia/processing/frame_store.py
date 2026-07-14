@@ -1,7 +1,7 @@
 import json
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -269,59 +269,117 @@ def store_preprocessed_frame(
     encoding: str | None = None,
     quality: int | None = None,
 ) -> dict[str, Any]:
-    data = frame.read()
-    if data is None:
-        raise ValueError("Preprocessed frame has no numpy data to store.")
-
     ctx = context or default_context()
-    project_id = _frame_project_id(ctx, frame_id, fallback=_active_project_id(ctx))
-    kvstore = _kvstore_for_project(ctx, project_id)
-    if kvstore is None:
-        raise RuntimeError("A KVStore is required to store preprocessed frame data.")
     if ctx.repository is None:
         raise RuntimeError("A PostgresRepository is required to record preprocessed frame metadata.")
-
-    array = np.ascontiguousarray(data)
-    storage_settings = resolve_project_storage_settings(
-        ctx,
-        project_id,
-        frame_encoding=encoding,
-        frame_quality=quality,
-    )
-    requested_encoding = storage_settings.frame_encoding
-    requested_quality = storage_settings.frame_quality
-    payload, kvstore_encoding, kvstore_format = encode_array_payload(
-        array,
-        requested_encoding,
-        quality=requested_quality,
-    )
-    kvstore_key = kvstore.put_store(payload)
-    preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
-    metadata = metadata_without_none(
-        {
-            **dict(frame.metadata or {}),
-            "kvstore_key": kvstore_key,
-            "kvstore_hash": kvstore_key,
-            "kvstore_encoding": kvstore_encoding,
-            "kvstore_format": kvstore_format,
-            "kvstore_quality": requested_quality,
-            "dtype": str(array.dtype),
-            "shape": list(array.shape),
-            "frame_variant": "preprocessed",
-        }
+    project_id = _frame_project_id(ctx, frame_id, fallback=_active_project_id(ctx))
+    prepared = _prepare_preprocessed_payload(
+        frame_id,
+        frame,
+        context=ctx,
+        project_id=project_id,
+        encoding=encoding,
+        quality=quality,
     )
     return ctx.repository.update_frame_preprocessed_payload(
         frame_id,
         project_id=project_id,
-        kvstore_hash=kvstore_key,
-        preview_thumbhash=preview_thumbhash,
-        payload_ref=kvstore_key,
-        payload_encoding=kvstore_encoding,
-        payload_format=kvstore_format,
-        payload_dtype=str(array.dtype),
-        payload_shape=list(array.shape),
-        metadata=metadata,
+        **{key: value for key, value in prepared.items() if key != "frame_id"},
     )
+
+
+def store_preprocessed_frames(
+    frames: Sequence[tuple[str, FrameData]],
+    *,
+    context: AppContext | None = None,
+    encoding: str | None = None,
+    quality: int | None = None,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Store payloads, then commit their metadata in one database transaction."""
+    if not frames:
+        return []
+    ctx = context or default_context()
+    if ctx.repository is None:
+        raise RuntimeError("A PostgresRepository is required to record preprocessed frame metadata.")
+    resolved_project_id = project_id
+    if resolved_project_id is None:
+        resolved_project_id = _frame_project_id(ctx, frames[0][0], fallback=_active_project_id(ctx))
+    prepared = [
+        _prepare_preprocessed_payload(
+            frame_id,
+            frame,
+            context=ctx,
+            project_id=resolved_project_id,
+            encoding=encoding,
+            quality=quality,
+        )
+        for frame_id, frame in frames
+    ]
+    updater = getattr(ctx.repository, "update_frame_preprocessed_payloads", None)
+    if callable(updater):
+        return updater(prepared, project_id=resolved_project_id)
+    return [
+        ctx.repository.update_frame_preprocessed_payload(
+            item["frame_id"],
+            project_id=resolved_project_id,
+            **{key: value for key, value in item.items() if key != "frame_id"},
+        )
+        for item in prepared
+    ]
+
+
+def _prepare_preprocessed_payload(
+    frame_id: str,
+    frame: FrameData,
+    *,
+    context: AppContext,
+    project_id: str | None,
+    encoding: str | None,
+    quality: int | None,
+) -> dict[str, Any]:
+    data = frame.read()
+    if data is None:
+        raise ValueError("Preprocessed frame has no numpy data to store.")
+    kvstore = _kvstore_for_project(context, project_id)
+    if kvstore is None:
+        raise RuntimeError("A KVStore is required to store preprocessed frame data.")
+    array = np.ascontiguousarray(data)
+    storage_settings = resolve_project_storage_settings(
+        context,
+        project_id,
+        frame_encoding=encoding,
+        frame_quality=quality,
+    )
+    payload, kvstore_encoding, kvstore_format = encode_array_payload(
+        array,
+        storage_settings.frame_encoding,
+        quality=storage_settings.frame_quality,
+    )
+    kvstore_key = kvstore.put_store(payload)
+    return {
+        "frame_id": frame_id,
+        "kvstore_hash": kvstore_key,
+        "preview_thumbhash": compute_thumbhash(array, max_dim=context.config.processing.thumbhash.max_dim),
+        "payload_ref": kvstore_key,
+        "payload_encoding": kvstore_encoding,
+        "payload_format": kvstore_format,
+        "payload_dtype": str(array.dtype),
+        "payload_shape": list(array.shape),
+        "metadata": metadata_without_none(
+            {
+                **dict(frame.metadata or {}),
+                "kvstore_key": kvstore_key,
+                "kvstore_hash": kvstore_key,
+                "kvstore_encoding": kvstore_encoding,
+                "kvstore_format": kvstore_format,
+                "kvstore_quality": storage_settings.frame_quality,
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "frame_variant": "preprocessed",
+            }
+        ),
+    }
 
 
 def retrieve_frame(

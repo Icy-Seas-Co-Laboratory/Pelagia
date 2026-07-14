@@ -270,6 +270,8 @@ def preprocessing_capabilities(config: ProcessingConfig) -> dict[str, Any]:
                 _field("background_limit", "Background Frame Limit", "nullable-integer", minimum=1),
                 _field("background_payload_kind", "Background Payload Kind", "enum", options=FRAME_PAYLOAD_KINDS, default="original"),
                 _field("background_encoding", "Background Encoding", "enum", options=sorted(IMAGE_DATA_STORAGE_ENCODINGS), default="zstd"),
+                _field("background_window_stride", "Background Window Stride", "integer", minimum=1, step=1, config_section="processing.preprocessing"),
+                _field("background_window_width", "Background Window Width", "integer", minimum=1, step=2, config_section="processing.preprocessing"),
                 _field("background_min_field_value", "Background Min Field Value", "number", minimum=0, step=1, config_section="processing.preprocessing"),
                 _field("background_max_field_value", "Background Max Field Value", "nullable-number", minimum=0, step=1, config_section="processing.preprocessing"),
                 _field("adaptive_background_subtraction", "Adaptive Background Subtraction", "boolean", config_section="processing.preprocessing"),

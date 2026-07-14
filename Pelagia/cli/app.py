@@ -16,6 +16,7 @@ from ..services.context import AppContext
 from ..services.projects import initialize_project_kvstore
 from ..services.stores import StoreService
 from ..services.job_commands import ExtractFramesCommand, PreprocessFramesCommand, SegmentFramesCommand
+from ..services.pipeline import PipelineService
 from ..storage.blob_store import initialize_kvstore, reset_kvstore
 from ..utils.serialization import json_ready
 from ..version import build_info
@@ -982,7 +983,7 @@ if typer is not None:
             project_id=project_id,
         )
         payload = PreprocessFramesCommand.from_payload(payload).to_payload()
-        job = context.repository.create_job(
+        job = PipelineService(context).queue(
             PipelineStage.PREPROCESS_FRAMES,
             project_id=project_id,
             run_id=resolved_run_id,
@@ -1153,7 +1154,7 @@ if typer is not None:
             project_id=project_id,
         )
         payload = SegmentFramesCommand.from_payload(payload).to_payload()
-        job = context.repository.create_job(
+        job = PipelineService(context).queue(
             PipelineStage.SEGMENT,
             project_id=project_id,
             run_id=resolved_run_id,
@@ -1225,7 +1226,7 @@ if typer is not None:
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue frame extraction.")
         project_id = _project_id_from_key(context, project_key)
-        job = context.repository.create_job(
+        job = PipelineService(context).queue(
             PipelineStage.EXTRACT_FRAMES,
             project_id=project_id,
             run_id=resolved_run_id,
@@ -1323,7 +1324,7 @@ if typer is not None:
                 project_key=project_key,
                 compute_checksum=compute_checksum,
             )
-            job = context.repository.create_job(
+            job = PipelineService(context).queue(
                 PipelineStage.EXTRACT_FRAMES,
                 project_id=project_id,
                 run_id=resolved_run_id,

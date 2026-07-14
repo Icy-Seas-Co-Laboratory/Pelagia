@@ -27,6 +27,7 @@ if APIRouter is not None:
     )
     from ...services.project_settings import resolve_project_storage_settings
     from ...services.job_commands import SegmentFramesCommand
+    from ...services.pipeline import PipelineService
     from ._common import (
         as_response,
         detection_summary,
@@ -451,8 +452,8 @@ if APIRouter is not None:
                 }
             )
         try:
-            job = repository.create_job(
-                "segment",
+            job = PipelineService(get_context(request)).queue(
+                PipelineStage.SEGMENT,
                 project_id=auth.project_id,
                 run_id=run_id,
                 asset_id=asset_id,

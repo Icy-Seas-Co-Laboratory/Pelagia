@@ -16,6 +16,7 @@ from Pelagia.processing.frame_correction import (
     _bounded_field,
     _divide_by_field,
     apply_flatfield_correction,
+    ensure_asset_background_windows,
     flatfield_correction,
     generate_background_for_frames,
 )
@@ -346,6 +347,67 @@ def test_generate_background_for_frames_stores_mean_field(monkeypatch):
         decoded,
         np.array([[20, 30], [40, 50]], dtype=np.float32),
     )
+
+
+def test_asset_background_windows_use_fixed_stride_and_wider_sources(monkeypatch):
+    records = {
+        f"frame-{index}": FrameRecord(
+            id=f"frame-{index}",
+            asset_id="asset-1",
+            run_id="run-1",
+            frame_index=index - 1,
+            width=2,
+            height=2,
+            kvstore_hash=None,
+            preview_thumbhash=None,
+        )
+        for index in range(1, 18)
+    }
+
+    class Repository:
+        def get_frame_record(self, frame_id, *, project_id=None):
+            return records.get(frame_id)
+
+        def list_frames(self, asset_id, *, project_id=None, limit=None):
+            assert asset_id == "asset-1"
+            return [
+                {
+                    "id": record.id,
+                    "asset_id": record.asset_id,
+                    "run_id": record.run_id,
+                    "frame_index": record.frame_index,
+                    "width": record.width,
+                    "height": record.height,
+                }
+                for record in records.values()
+            ]
+
+    calls = []
+
+    def fake_generate(frame_ids, **kwargs):
+        calls.append((frame_ids, kwargs))
+        return {"background_payload_ref": "background-key", "updated_frame_count": len(frame_ids)}
+
+    context = SimpleNamespace(
+        repository=Repository(),
+        config=CoreConfig(),
+        active_project_id="project-1",
+    )
+    monkeypatch.setattr("Pelagia.processing.frame_correction.generate_background_for_frames", fake_generate)
+
+    result = ensure_asset_background_windows(
+        ["frame-12"],
+        context=context,
+        window_stride=5,
+        window_width=5,
+    )
+
+    assert calls[0][0] == ["frame-9", "frame-10", "frame-11", "frame-12", "frame-13"]
+    metadata = calls[0][1]["metadata"]
+    assert metadata["background_window_center"] == 10
+    assert metadata["background_application_start"] == 8
+    assert metadata["background_application_end"] == 12
+    assert result["windows"][0]["center"] == 10
 
 
 def test_frame_infers_full_frame_geometry_from_data():
