@@ -14,10 +14,9 @@ from ..domain import AssetKind, JobStatus, PipelineStage, PlannedRun, RawAssetMa
 from ..observability import configure_core_logging
 from ..services.context import AppContext
 from ..services.projects import initialize_project_kvstore
-from ..services.stores import StoreService
 from ..services.job_commands import ExtractFramesCommand, PreprocessFramesCommand, SegmentFramesCommand
 from ..services.pipeline import PipelineService
-from ..storage.blob_store import initialize_kvstore, reset_kvstore
+from ..storage.blob_store import create_named_kvstore, initialize_kvstore, named_kvstore_path, reset_kvstore
 from ..utils.serialization import json_ready
 from ..version import build_info
 
@@ -479,13 +478,12 @@ if typer is not None:
         }
 
     @app.command("init-kvstore")
-    def init_kvstore(root: Optional[Path] = None) -> None:
+    def init_kvstore(directory: Path, store_name: str) -> None:
         config = CoreConfig.load()
-        if root is not None:
-            config.kvstore.root_path = root
-        service = StoreService.from_config(config.kvstore)
-        service.ensure_initialized(config.kvstore)
-        typer.echo(f"KVStore ready at {service.store.root_path}")
+        store = create_named_kvstore(directory, store_name, config.kvstore)
+        if not store.initialized:
+            initialize_kvstore(store, config.kvstore)
+        typer.echo(f"KVStore ready at {store.root_path}")
 
     @app.command("init-system")
     def init_system(
@@ -560,7 +558,8 @@ if typer is not None:
         project_key: str,
         project_name: Optional[str] = None,
         description: Optional[str] = None,
-        kvstore_root_path: Optional[Path] = None,
+        kvstore_directory: Optional[Path] = None,
+        kvstore_name: Optional[str] = None,
         inactive: bool = False,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -569,12 +568,15 @@ if typer is not None:
         context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to create projects.")
+        directory = kvstore_directory or context.config.kvstore.directory
+        store_name = kvstore_name or project_key
         project = context.repository.create_project(
             project_key,
             project_name=project_name,
             description=description,
-            kvstore_root_path=None if kvstore_root_path is None else str(kvstore_root_path),
+            kvstore_root_path=str(named_kvstore_path(directory, store_name)),
             is_active=not inactive,
+            metadata={"kvstore": {"directory": str(directory), "store_name": store_name}},
         )
         kvstore = initialize_project_kvstore(context, project)
         _echo_json({"project": project, "kvstore": kvstore})
@@ -654,9 +656,19 @@ if typer is not None:
         project = context.repository.get_project_by_key(resolved_project_key)
         project_kvstore = None
         if project is None:
+            store_name = resolved_project_key
             project = context.repository.create_project(
                 resolved_project_key,
                 project_name=project_name or resolved_project_key.title(),
+                kvstore_root_path=str(
+                    named_kvstore_path(context.config.kvstore.directory, store_name)
+                ),
+                metadata={
+                    "kvstore": {
+                        "directory": str(context.config.kvstore.directory),
+                        "store_name": store_name,
+                    }
+                },
             )
             project_kvstore = initialize_project_kvstore(context, project)
         membership = context.repository.add_project_member(str(user["id"]), str(project["id"]), role=role)

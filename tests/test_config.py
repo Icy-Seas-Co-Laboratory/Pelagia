@@ -86,16 +86,16 @@ def test_core_config_loads_packaged_defaults_without_local_config():
 
     assert config.database.schema_name == "pelagia"
     assert config.kvstore.backend == "kvstore2"
-    assert config.kvstore.root_path.as_posix() == "data/kvstore"
+    assert config.kvstore.directory.as_posix() == "data/kvstores"
     assert config.kvstore.max_blob_bytes == 68_719_476_736
-    assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstore"
+    assert config.file_browser.root_path_kvstore.as_posix() == "data/kvstores"
     assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
     assert config.file_browser.allowed_root_paths == []
     assert config.image_data_storage.encoding == "jpg"
     assert config.image_data_storage.quality == 90
     assert config.auth.enabled is True
     assert config.auth.session_ttl_seconds == 604800
-    assert config.auth.dev_project_key == "default"
+    assert config.auth.dev_project_key is None
     assert config.auth.bootstrap_admin_username is None
     assert config.auth.bootstrap_admin_password is None
     assert config.artifacts.local_root.as_posix() == ".pelagia"

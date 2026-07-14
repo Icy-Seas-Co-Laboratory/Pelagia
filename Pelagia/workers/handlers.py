@@ -716,8 +716,10 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         }
 
     detections = []
-    resolved_asset_id = None if asset_id is None else str(asset_id)
-    resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
+    frame_ids_by_run: dict[str, list[str]] = {}
+    detections_by_run: dict[str, list[DetectionRecord]] = {}
+    asset_ids: set[str] = set()
+    run_ids: set[str] = set()
     segmentation_payload = dict(payload)
     if segmentation_payload.get("roi_encoding") is None:
         segmentation_payload["roi_encoding"] = resolve_project_storage_settings(
@@ -748,12 +750,13 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
-        if resolved_asset_id is None:
-            resolved_asset_id = frame_record.asset_id
-        elif frame_record.asset_id != resolved_asset_id:
-            raise ValueError("Segment jobs may only process frames from one asset.")
-        if resolved_run_id is None:
-            resolved_run_id = frame_record.run_id
+        if not frame_record.run_id:
+            raise ValueError(f"Frame {frame_id!r} does not include a run_id.")
+        resolved_frame_run_id = str(frame_record.run_id)
+        asset_ids.add(str(frame_record.asset_id))
+        run_ids.add(resolved_frame_run_id)
+        frame_ids_by_run.setdefault(resolved_frame_run_id, []).append(frame_id)
+        detections_by_run.setdefault(resolved_frame_run_id, [])
 
         try:
             frame = retrieve_frame(frame_id, context=context, payload_kind=frame_payload_kind)
@@ -761,14 +764,14 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
             if "payload_kind" not in str(exc):
                 raise
             frame = retrieve_frame(frame_id, context=context)
-        detections.extend(
-            segment_frame(
-                frame,
-                frame_record=frame_record,
-                **frame_kwargs,
-                context=context,
-            )
+        frame_detections = segment_frame(
+            frame,
+            frame_record=frame_record,
+            **frame_kwargs,
+            context=context,
         )
+        detections.extend(frame_detections)
+        detections_by_run[resolved_frame_run_id].extend(frame_detections)
         progress.update(
             index,
             current={"frame_id": frame_id, "index": index},
@@ -776,15 +779,16 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
             message=f"Segmented {index}/{len(frame_ids)} frames",
         )
 
-    if resolved_run_id is None or resolved_asset_id is None:
-        raise ValueError("Segment job could not resolve run_id and asset_id.")
-
-    inserted = context.repository.replace_frame_detections(
-        resolved_run_id,
-        frame_ids,
-        detections,
-        project_id=project_id,
-    )
+    inserted = []
+    for resolved_frame_run_id, run_frame_ids in frame_ids_by_run.items():
+        inserted.extend(
+            context.repository.replace_frame_detections(
+                resolved_frame_run_id,
+                run_frame_ids,
+                detections_by_run[resolved_frame_run_id],
+                project_id=project_id,
+            )
+        )
     _mark_frame_stage_status(
         context,
         project_id=project_id,
@@ -797,7 +801,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
         context,
         project_id=project_id,
         frame_ids=frame_ids,
-        asset_id=resolved_asset_id,
+        asset_id=next(iter(asset_ids)) if len(asset_ids) == 1 else None,
     )
     _touch_processing_status_snapshot(context, project_id=project_id)
     progress.finish(
@@ -808,8 +812,10 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     return {
         "stage": PipelineStage.SEGMENT.value,
         "project_id": project_id,
-        "run_id": resolved_run_id,
-        "asset_id": resolved_asset_id,
+        "run_id": next(iter(run_ids)) if len(run_ids) == 1 else None,
+        "asset_id": next(iter(asset_ids)) if len(asset_ids) == 1 else None,
+        "run_ids": sorted(run_ids),
+        "asset_ids": sorted(asset_ids),
         "frame_count": len(frame_ids),
         "detection_count": len(inserted),
         "frame_ids": frame_ids,

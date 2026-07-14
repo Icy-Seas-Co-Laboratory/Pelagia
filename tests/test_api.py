@@ -40,6 +40,7 @@ class FakeRepository:
         self.preprocessed_payload_ref = None
         self.sandbox_frames = {}
         self.deleted_sandbox_frames = []
+        self.deleted_assets = []
         self.users = {
             "ada": {
                 "id": "user-1",
@@ -145,6 +146,19 @@ class FakeRepository:
         if asset_id != "asset-1":
             return 0
         return 12
+
+    def delete_asset(self, asset_id, *, project_id=None):
+        if asset_id != "asset-1" or not self._visible(asset_id, project_id):
+            return None
+        self.deleted_assets.append(asset_id)
+        return {
+            "asset": {"id": asset_id, "run_id": "run-1", "kind": "video"},
+            "frame_count": 12,
+            "candidate_detection_count": 7,
+            "refined_detection_count": 3,
+            "generated_kvstore_keys": ["frame-key"],
+            "unreferenced_kvstore_keys": ["frame-key"],
+        }
 
     def list_frames(self, asset_id, **kwargs):
         if not self._visible(asset_id, kwargs.get("project_id")):
@@ -1063,6 +1077,7 @@ class FakeKVStore2Status:
 def make_client(*, auth_enabled=False):
     config = CoreConfig()
     config.auth.enabled = auth_enabled
+    config.auth.dev_project_key = "default"
     config.kvstore.root_path = Path(tempfile.mkdtemp(prefix="pelagia-api-test-kvstore-"))
     app = create_app(config)
     repository = FakeRepository()
@@ -1192,6 +1207,37 @@ def test_api_lists_system_status_without_live_database():
     assert body["kvstore"]["total_file_bytes"] == 4096
     assert body["kvstore"]["total_physical_file_bytes"] == 4096
     assert body["kvstore"]["total_storage_file_bytes"] == 4096
+
+
+def test_api_reports_system_usage_and_preserves_system_use_discovery():
+    client, _, _ = make_client()
+
+    usage_response = client.get("/system/usage")
+    use_response = client.get("/system/use")
+
+    assert usage_response.status_code == 200
+    usage = usage_response.json()
+    assert usage["host"]["hostname"]
+    assert usage["cpu"]["logical_cpus"] is not None
+    assert usage["memory"]["total_bytes"] is not None
+    assert usage["storage"]["kvstore_default"]["available"] is True
+    assert usage["storage"]["raw_assets_default"]["available"] is True
+    assert "status" in usage["stress"]
+
+    assert use_response.status_code == 200
+    use = use_response.json()
+    assert use["storage"] == usage["storage"]
+    assert use["common_flows"]["system_usage"] == "GET /system/usage"
+
+
+def test_api_system_usage_requires_admin():
+    client, _, _ = make_client(auth_enabled=True)
+    user_headers = auth_headers(client, username="ada", project_key="default")
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+
+    assert client.get("/system/usage").status_code == 401
+    assert client.get("/system/usage", headers=user_headers).status_code == 403
+    assert client.get("/system/usage", headers=admin_headers).status_code == 200
 
 
 def test_api_normalizes_kvstore2_system_status_size_fields():
@@ -1378,7 +1424,12 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
     denied = client.post(
         "/projects",
         headers=user_headers,
-        json={"project_key": "survey", "project_name": "Survey"},
+        json={
+            "project_key": "survey",
+            "project_name": "Survey",
+            "kvstore_directory": str(project_kvstore_root.parent),
+            "kvstore_name": project_kvstore_root.name,
+        },
     )
     created = client.post(
         "/projects",
@@ -1387,13 +1438,18 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
             "project_key": "survey",
             "project_name": "Survey",
             "description": "Field survey data.",
-            "kvstore_root_path": str(project_kvstore_root),
+            "kvstore_directory": str(project_kvstore_root.parent),
+            "kvstore_name": project_kvstore_root.name,
         },
     )
     duplicate = client.post(
         "/projects",
         headers=admin_headers,
-        json={"project_key": "survey"},
+        json={
+            "project_key": "survey",
+            "kvstore_directory": str(project_kvstore_root.parent),
+            "kvstore_name": project_kvstore_root.name,
+        },
     )
 
     assert denied.status_code == 403
@@ -1408,6 +1464,38 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
     assert (project_kvstore_root / "config.json").exists()
     assert repo.memberships[("user-admin", body["project"]["id"])] == "admin"
     assert duplicate.status_code == 409
+
+
+def test_api_first_login_creates_named_project_kvstore(tmp_path):
+    client, repository, _ = make_client(auth_enabled=True)
+    repository.projects.clear()
+
+    required = client.post(
+        "/auth/login",
+        json={"username": "admin", "password": "secret"},
+    )
+    created = client.post(
+        "/auth/login",
+        json={
+            "username": "admin",
+            "password": "secret",
+            "create_project": {
+                "project_key": "first-project",
+                "kvstore_directory": str(tmp_path / "stores"),
+                "kvstore_name": "first-store",
+            },
+        },
+    )
+
+    assert required.status_code == 409
+    assert required.json()["detail"]["code"] == "project_creation_required"
+    assert created.status_code == 200
+    body = created.json()
+    assert body["project_created"] is True
+    assert body["project"]["project_key"] == "first-project"
+    assert body["kvstore"]["initialized"] is True
+    assert body["kvstore"]["root_path"] == str((tmp_path / "stores" / "first-store").resolve())
+    assert repository.projects[body["project"]["id"]]["kvstore_root_path"] == body["kvstore"]["root_path"]
 
 
 def test_api_project_delete_is_soft_delete_and_requires_manager():
@@ -1430,7 +1518,7 @@ def test_api_project_delete_is_soft_delete_and_requires_manager():
     assert repo.projects["project-2"]["metadata"]["deleted_by_user_id"] == "user-1"
 
     default_delete = client.delete("/projects/default", headers=admin_headers)
-    assert default_delete.status_code == 422
+    assert default_delete.status_code == 200
 
 
 def test_api_logged_in_users_can_list_active_project_users():
@@ -3039,6 +3127,18 @@ def test_api_asset_detail_includes_frame_count():
     assert response.status_code == 200
     assert response.json()["asset"]["id"] == "asset-1"
     assert response.json()["asset"]["frame_count"] == 12
+
+
+def test_api_asset_delete_reports_candidate_and_refined_detection_counts():
+    client, repository, kvstore = make_client()
+
+    response = client.delete("/assets/asset-1")
+
+    assert response.status_code == 200
+    assert response.json()["candidate_detection_count"] == 7
+    assert response.json()["refined_detection_count"] == 3
+    assert repository.deleted_assets == ["asset-1"]
+    assert kvstore.deleted_keys == ["frame-key"]
 
 
 def test_api_filters_asset_detections():

@@ -914,6 +914,119 @@ def test_postgres_repository_filters_core_reads_by_project(postgres_repo):
     assert postgres_repo.list_logs(project_id=DEFAULT_PROJECT_ID) == []
 
 
+def test_postgres_repository_delete_asset_removes_candidate_and_refined_detections(postgres_repo):
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    project = postgres_repo.create_project(f"delete-asset-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    postgres_repo.register_planned_run(
+        PlannedRun(
+            manifest=RunManifest(
+                run_id=run_id,
+                run_key=f"delete-asset-{uuid.uuid4().hex}",
+                instrument="pytest",
+                source_path="/tmp/delete-asset.avi",
+                source_type=AssetKind.VIDEO.value,
+                created_at=datetime.now(timezone.utc),
+                assets=[
+                    RawAssetManifest(
+                        asset_id=asset_id,
+                        filename="delete-asset.avi",
+                        path="/tmp/delete-asset.avi",
+                        kind=AssetKind.VIDEO,
+                        size_bytes=123,
+                        checksum="sha256:delete-asset",
+                    )
+                ],
+            ),
+            jobs=[],
+        ),
+        project_id=project_id,
+    )
+    frame = postgres_repo.replace_frames(
+        run_id,
+        [
+            FrameRecord(
+                asset_id=asset_id,
+                frame_index=1,
+                width=4,
+                height=3,
+                kvstore_hash="delete-asset-frame-key",
+                preview_thumbhash=b"thumb",
+                payload_ref="delete-asset-frame-key",
+            )
+        ],
+    )[0]
+    candidate = postgres_repo.replace_detections(
+        run_id,
+        asset_id,
+        [
+            DetectionRecord(
+                run_id=run_id,
+                frame_id=str(frame["id"]),
+                roi_index=1,
+                bbox_x=0,
+                bbox_y=0,
+                bbox_w=2,
+                bbox_h=2,
+                area=4,
+                perimeter=8,
+                major_axis_length=2,
+                minor_axis_length=2,
+                min_gray_value=1,
+                mean_gray_value=2.0,
+                roi_payload=b"candidate-roi",
+                mask_payload=b"candidate-mask",
+            )
+        ],
+    )[0]
+    refined = postgres_repo.upsert_refined_detections(
+        [
+            (
+                str(candidate["id"]),
+                DetectionRecord(
+                    run_id=run_id,
+                    frame_id=str(frame["id"]),
+                    roi_index=1,
+                    bbox_x=0,
+                    bbox_y=0,
+                    bbox_w=2,
+                    bbox_h=2,
+                    area=4,
+                    perimeter=8,
+                    major_axis_length=2,
+                    minor_axis_length=2,
+                    min_gray_value=1,
+                    mean_gray_value=2.0,
+                    roi_payload=b"refined-roi",
+                    mask_payload=b"refined-mask",
+                ),
+            )
+        ],
+        project_id=project_id,
+    )[0]
+
+    deleted = postgres_repo.delete_asset(asset_id, project_id=project_id)
+
+    assert deleted is not None
+    assert deleted["candidate_detection_count"] == 1
+    assert deleted["refined_detection_count"] == 1
+    assert postgres_repo.get_detection(str(candidate["id"]), project_id=project_id) is None
+    assert postgres_repo.get_refined_detection(str(refined["id"]), project_id=project_id) is None
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*) AS count FROM {postgres_repo.schema}.detection_candidate WHERE id = %s",
+                (candidate["id"],),
+            )
+            assert cursor.fetchone()["count"] == 0
+            cursor.execute(
+                f"SELECT COUNT(*) AS count FROM {postgres_repo.schema}.detections_refined WHERE id = %s",
+                (refined["id"],),
+            )
+            assert cursor.fetchone()["count"] == 0
+
+
 def test_postgres_repository_creates_and_deletes_project_scoped_live_frame_copy(postgres_repo):
     run_id = str(uuid.uuid4())
     asset_id = str(uuid.uuid4())

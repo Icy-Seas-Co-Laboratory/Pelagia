@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - Python 3.10 fallback
 ImageDataStorageEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"]
 IMAGE_DATA_STORAGE_ENCODINGS = set(STORAGE_ENCODINGS)
 _TOML_NULL_SENTINEL = "__PELAGIA_TOML_NULL__"
+DEFAULT_KVSTORE_DIRECTORY = Path("./data/kvstores")
 
 
 def _normalize_image_data_storage_encoding(value: object) -> str:
@@ -56,7 +57,7 @@ class KVStoreConfig:
     """Large blob store settings."""
 
     backend: str = "kvstore"
-    root_path: Path = Path("./data/kvstore")
+    directory: Path = DEFAULT_KVSTORE_DIRECTORY
     hash_algorithm: str = "sha256"
     prefix_length: int = 3
     max_db_bytes: int = 4 * 1024 * 1024 * 1024
@@ -74,6 +75,15 @@ class KVStoreConfig:
         self.backend = aliases.get(self.backend, self.backend)
         if self.backend not in {"kvstore", "kvstore2"}:
             raise ValueError("kvstore backend must be one of: kvstore, kvstore2.")
+
+    @property
+    def root_path(self) -> Path:
+        """Compatibility alias for the directory containing named KVStores."""
+        return self.directory
+
+    @root_path.setter
+    def root_path(self, value: Path) -> None:
+        self.directory = Path(value)
 
 
 @dataclass(slots=True)
@@ -126,7 +136,7 @@ class AuthConfig:
 
     enabled: bool = True
     session_ttl_seconds: int = 7 * 24 * 60 * 60
-    dev_project_key: str = "default"
+    dev_project_key: str | None = None
     bootstrap_admin_username: str | None = None
     bootstrap_admin_password: str | None = None
     bootstrap_admin_display_name: str | None = None
@@ -494,7 +504,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "queue", "heartbeat_interval_seconds", "PELAGIA_QUEUE_HEARTBEAT_SECONDS", int)
 
     _set_from_env(settings, "kvstore", "backend", "PELAGIA_KVSTORE_BACKEND")
-    _set_from_env(settings, "kvstore", "root_path", "PELAGIA_KVSTORE_ROOT", Path)
+    _set_from_env(settings, "kvstore", "directory", "PELAGIA_KVSTORE_DIRECTORY", Path)
     _set_from_env(settings, "kvstore", "hash_algorithm", "PELAGIA_KVSTORE_HASH")
     _set_from_env(settings, "kvstore", "prefix_length", "PELAGIA_KVSTORE_PREFIX_LENGTH", int)
     _set_from_env(settings, "kvstore", "max_db_bytes", "PELAGIA_KVSTORE_MAX_DB_BYTES", int)
@@ -713,7 +723,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         ),
         kvstore=KVStoreConfig(
             backend=str(kvstore.get("backend", KVStoreConfig.backend)),
-            root_path=Path(kvstore.get("root_path", KVStoreConfig.root_path)),
+            directory=Path(kvstore.get("directory", DEFAULT_KVSTORE_DIRECTORY)),
             hash_algorithm=str(kvstore.get("hash_algorithm", KVStoreConfig.hash_algorithm)),
             prefix_length=int(kvstore.get("prefix_length", KVStoreConfig.prefix_length)),
             max_db_bytes=int(kvstore.get("max_db_bytes", KVStoreConfig.max_db_bytes)),
@@ -724,7 +734,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             root_path_kvstore=Path(
                 file_browser.get(
                     "root_path_kvstore",
-                    kvstore.get("root_path", FileBrowserConfig.root_path_kvstore),
+                    kvstore.get("directory", FileBrowserConfig.root_path_kvstore),
                 )
             ),
             root_path_import_dir=Path(
@@ -754,7 +764,11 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             session_ttl_seconds=int(
                 auth.get("session_ttl_seconds", AuthConfig.session_ttl_seconds)
             ),
-            dev_project_key=str(auth.get("dev_project_key", AuthConfig.dev_project_key)),
+            dev_project_key=(
+                None
+                if auth.get("dev_project_key", AuthConfig.dev_project_key) is None
+                else str(auth.get("dev_project_key", AuthConfig.dev_project_key))
+            ),
             bootstrap_admin_username=auth.get(
                 "bootstrap_admin_username",
                 AuthConfig.bootstrap_admin_username,

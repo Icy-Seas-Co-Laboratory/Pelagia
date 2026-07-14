@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "opencv-python",
+    "psutil>=5.9",
     "tomli; python_version < '3.11'",
     "thumbhash>=0.1.2",
     "zstandard",

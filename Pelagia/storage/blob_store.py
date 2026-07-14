@@ -17,6 +17,24 @@ def create_kvstore(root_path: str | Path, config: KVStoreConfig) -> BlobStore:
     return KVStore(root_path)
 
 
+def named_kvstore_path(directory: str | Path, store_name: str) -> Path:
+    """Return a named KVStore path rooted directly under ``directory``."""
+    resolved_directory = Path(directory).expanduser().resolve(strict=False)
+    normalized_name = str(store_name).strip()
+    if not normalized_name or normalized_name in {".", ".."} or Path(normalized_name).name != normalized_name:
+        raise ValueError("KVStore name must be a single non-empty directory name.")
+    return resolved_directory / normalized_name
+
+
+def create_named_kvstore(
+    directory: str | Path,
+    store_name: str,
+    config: KVStoreConfig,
+) -> BlobStore:
+    """Create a store handle at ``directory / store_name`` without initializing it."""
+    return create_kvstore(named_kvstore_path(directory, store_name), config)
+
+
 def initialize_kvstore(store: BlobStore, config: KVStoreConfig, *, overwrite: bool = False) -> None:
     """Initialize a configured blob store, hiding backend-specific options."""
     if isinstance(store, KVStore2):

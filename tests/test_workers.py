@@ -574,6 +574,85 @@ def test_preprocess_frames_handler_accepts_frame_ids_from_multiple_assets(monkey
     assert result["preprocessed_frame_ids"] == ["frame-1", "frame-2"]
 
 
+def test_roi_detection_handler_accepts_frame_ids_from_multiple_assets(monkeypatch):
+    class MixedAssetRepository(FakeRepository):
+        def get_frame_record(self, frame_id, **kwargs):
+            records = {
+                "frame-1": ("asset-1", "run-1"),
+                "frame-2": ("asset-2", "run-2"),
+            }
+            asset_id, run_id = records.get(frame_id, (None, None))
+            if asset_id is None:
+                return None
+            return FrameRecord(
+                id=frame_id,
+                run_id=run_id,
+                asset_id=asset_id,
+                frame_index=1,
+                width=4,
+                height=4,
+                kvstore_hash="kvstore-key",
+                preview_thumbhash=b"thumb",
+            )
+
+    repository = MixedAssetRepository()
+    context = make_context(repository).for_project("project-1")
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, **kwargs: FrameData(
+            sourcePath="/tmp",
+            filename=f"{frame_id}.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            metadata={"frame_id": frame_id},
+        ),
+    )
+
+    def fake_segment_frame(frame, *, frame_record, **kwargs):
+        return [
+            DetectionRecord(
+                run_id=frame_record.run_id,
+                frame_id=frame_record.id,
+                roi_index=0,
+                bbox_x=0,
+                bbox_y=0,
+                bbox_w=1,
+                bbox_h=1,
+                area=1.0,
+                perimeter=4.0,
+                major_axis_length=1.0,
+                minor_axis_length=1.0,
+                min_gray_value=0,
+                mean_gray_value=0.0,
+                roi_payload=b"roi",
+            )
+        ]
+
+    monkeypatch.setattr("Pelagia.workers.handlers.segment_frame", fake_segment_frame)
+
+    result = roi_detection_handler(
+        {
+            "id": "job-segment-mixed",
+            "project_id": "project-1",
+            "stage": PipelineStage.SEGMENT.value,
+            "payload": {"frame_ids": ["frame-1", "frame-2"]},
+        },
+        context,
+    )
+
+    assert result["asset_id"] is None
+    assert result["run_id"] is None
+    assert result["asset_ids"] == ["asset-1", "asset-2"]
+    assert result["run_ids"] == ["run-1", "run-2"]
+    assert [(run_id, frame_ids) for run_id, frame_ids, _ in repository.replaced_detections] == [
+        ("run-1", ["frame-1"]),
+        ("run-2", ["frame-2"]),
+    ]
+    assert repository.frame_status_count_refreshes == [
+        {"project_id": "project-1", "frame_ids": ["frame-1", "frame-2"], "asset_id": None}
+    ]
+
+
 def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)

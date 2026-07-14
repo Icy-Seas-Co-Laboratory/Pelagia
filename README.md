@@ -412,7 +412,7 @@ Useful endpoint groups:
 - `GET /projects`, `POST /projects`, `DELETE /projects/{project_id_or_key}`
 - `GET /users`, `POST /users`, `POST /users/{user_id_or_username}/reset-password`,
   `POST /users/{user_id_or_username}/deactivate`, `DELETE /users/{user_id_or_username}`
-- `GET /system`, `/system/status`, `/system/status/{project_id_or_key}`, `/system/use`, `/system/config`
+- `GET /system`, `/system/status`, `/system/status/{project_id_or_key}`, `/system/usage`, `/system/use`, `/system/config`
 - `POST /system/initialize`
 - `POST /ingestion/analyze`, `POST /ingestion/assets`, `POST /ingestion/videos`
 - `POST /frame/preprocess`, `POST /frame/preprocess/jobs`

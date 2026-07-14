@@ -7,7 +7,8 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    from ._common import as_response, get_context, get_kvstore, kvstore_status
+    from ..auth import require_project_read
+    from ._common import as_response, get_context, kvstore_status
 
     router = APIRouter(prefix="/kvstore", tags=["kvstore"])
 
@@ -46,11 +47,13 @@ if APIRouter is not None:
         deep_status: bool = False,
         include_health: bool = False,
     ) -> dict:
-        context = get_context(request)
+        auth = require_project_read(request)
+        context = get_context(request).for_project(auth.project_id)
         status = _store_status(context.kvstore, deep=deep_status)
         return as_response(
             {
-                "root_path": context.config.kvstore.root_path,
+                "directory": context.config.kvstore.directory,
+                "root_path": None if context.kvstore is None else context.kvstore.root_path,
                 "configured_hash_algorithm": context.config.kvstore.hash_algorithm,
                 "configured_prefix_length": context.config.kvstore.prefix_length,
                 "status": status,
@@ -60,11 +63,18 @@ if APIRouter is not None:
 
     @router.get("/status")
     def get_store_status(request: Request, deep: bool = False) -> dict:
-        return kvstore_status(get_kvstore(request), deep=deep)
+        auth = require_project_read(request)
+        kvstore = get_context(request).kvstore_for_project(auth.project_id, initialize=False)
+        if kvstore is None:
+            return {"configured": False, "initialized": False}
+        return kvstore_status(kvstore, deep=deep)
 
     @router.get("/health")
     def get_store_health(request: Request) -> dict:
-        kvstore = get_kvstore(request)
+        auth = require_project_read(request)
+        kvstore = get_context(request).kvstore_for_project(auth.project_id, initialize=False)
+        if kvstore is None:
+            return {"healthy": False, "errors": ["Project KVStore is not configured."]}
         if not kvstore.initialized:
             return {
                 "healthy": False,

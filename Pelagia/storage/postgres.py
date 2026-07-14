@@ -382,7 +382,6 @@ class PostgresRepository:
                     before[table] = cursor.fetchone()["count"]
                 table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
                 cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
-                self._ensure_default_project(cursor)
             connection.commit()
         return {
             "schema": self.schema,
@@ -1708,6 +1707,207 @@ class PostgresRepository:
                     tuple(params),
                 )
                 return cursor.fetchone()
+
+    def update_asset_collections(
+        self,
+        asset_id: str,
+        collections: Any,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        resolved_collections = normalize_collections(collections)
+        clauses = ["id = %s"]
+        params: list[Any] = [asset_id]
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.raw_assets
+                    SET
+                        collections = %s,
+                        metadata = jsonb_set(metadata, '{{collections}}', %s::jsonb, true)
+                    WHERE {' AND '.join(clauses)}
+                    RETURNING *;
+                    """,
+                    (resolved_collections, json.dumps(json_ready(resolved_collections)), *params),
+                )
+                asset = cursor.fetchone()
+                if asset is None:
+                    connection.rollback()
+                    return None
+
+                status_params: list[Any] = [resolved_collections, str(asset["id"])]
+                status_clauses = ["asset_id = %s"]
+                if project_id:
+                    status_clauses.append("project_id = %s")
+                    status_params.append(project_id)
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.frame_processing_status
+                    SET collections = %s, updated_at = NOW()
+                    WHERE {' AND '.join(status_clauses)};
+                    """,
+                    tuple(status_params),
+                )
+            connection.commit()
+        return asset
+
+    def delete_asset(self, asset_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+        clauses = ["assets.id = %s"]
+        params: list[Any] = [asset_id]
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
+        where = " AND ".join(clauses)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT assets.*,
+                           COUNT(DISTINCT frames.id) AS frame_count
+                    FROM {self.schema}.raw_assets assets
+                    LEFT JOIN {self.schema}.frames frames ON frames.asset_id = assets.id
+                    WHERE {where}
+                    GROUP BY assets.id;
+                    """,
+                    tuple(params),
+                )
+                asset = cursor.fetchone()
+                if asset is None:
+                    connection.rollback()
+                    return None
+
+                cursor.execute(
+                    f"""
+                    SELECT
+                        (
+                            SELECT COUNT(*)
+                            FROM {self.schema}.detection_candidate detections
+                            JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                            WHERE frames.asset_id = %s
+                        ) AS candidate_detection_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM {self.schema}.detections_refined refined
+                            WHERE refined.frame_id IN (
+                                SELECT id FROM {self.schema}.frames WHERE asset_id = %s
+                            )
+                            OR refined.candidate_detection_id IN (
+                                SELECT detections.id
+                                FROM {self.schema}.detection_candidate detections
+                                JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                                WHERE frames.asset_id = %s
+                            )
+                        ) AS refined_detection_count;
+                    """,
+                    (asset_id, asset_id, asset_id),
+                )
+                detection_counts = cursor.fetchone() or {}
+
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT payload_ref
+                    FROM (
+                        SELECT frames.kvstore_hash AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                        UNION ALL
+                        SELECT frames.payload_ref AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                        UNION ALL
+                        SELECT frames.preprocessed_kvstore_hash AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                        UNION ALL
+                        SELECT frames.preprocessed_payload_ref AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                        UNION ALL
+                        SELECT frames.background_kvstore_hash AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                        UNION ALL
+                        SELECT frames.background_payload_ref AS payload_ref
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id = %s
+                    ) refs
+                    WHERE payload_ref IS NOT NULL AND payload_ref <> '';
+                    """,
+                    (asset_id, asset_id, asset_id, asset_id, asset_id, asset_id),
+                )
+                payload_refs = sorted({str(row["payload_ref"]) for row in cursor.fetchall() if row.get("payload_ref")})
+
+                unreferenced_refs: list[str] = []
+                for payload_ref in payload_refs:
+                    cursor.execute(
+                        f"""
+                        SELECT COUNT(*) AS count
+                        FROM {self.schema}.frames frames
+                        WHERE frames.asset_id <> %s
+                          AND (
+                            frames.kvstore_hash = %s
+                            OR frames.payload_ref = %s
+                            OR frames.preprocessed_kvstore_hash = %s
+                            OR frames.preprocessed_payload_ref = %s
+                            OR frames.background_kvstore_hash = %s
+                            OR frames.background_payload_ref = %s
+                          );
+                        """,
+                        (asset_id, payload_ref, payload_ref, payload_ref, payload_ref, payload_ref, payload_ref),
+                    )
+                    ref_row = cursor.fetchone()
+                    if int(ref_row["count"] if ref_row is not None else 0) == 0:
+                        unreferenced_refs.append(payload_ref)
+
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.detections_refined refined
+                    WHERE refined.frame_id IN (
+                        SELECT id FROM {self.schema}.frames WHERE asset_id = %s
+                    )
+                    OR refined.candidate_detection_id IN (
+                        SELECT detections.id
+                        FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        WHERE frames.asset_id = %s
+                    );
+                    """,
+                    (asset_id, asset_id),
+                )
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.detection_candidate detections
+                    USING {self.schema}.frames frames
+                    WHERE detections.frame_id = frames.id
+                      AND frames.asset_id = %s;
+                    """,
+                    (asset_id,),
+                )
+
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.raw_assets
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (asset_id,),
+                )
+                deleted = cursor.fetchone()
+            connection.commit()
+        if deleted is None:
+            return None
+        return {
+            "asset": deleted,
+            "frame_count": int(asset.get("frame_count") or 0),
+            "candidate_detection_count": int(detection_counts.get("candidate_detection_count") or 0),
+            "refined_detection_count": int(detection_counts.get("refined_detection_count") or 0),
+            "generated_kvstore_keys": payload_refs,
+            "unreferenced_kvstore_keys": unreferenced_refs,
+        }
 
     def count_frames(self, asset_id: str, *, project_id: str | None = None) -> int:
         clauses = ["frames.asset_id = %s"]
@@ -4274,8 +4474,12 @@ class PostgresRepository:
         if collections:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
-        if "refined" not in set(filters.get("refinement_state") or ["unrefined"]):
-            clauses.append(f"NOT EXISTS (SELECT 1 FROM {self.schema}.detections_refined refined WHERE refined.candidate_detection_id = detections.id)")
+        refinement_clause = self._candidate_refinement_state_clause(
+            schema=self.schema,
+            refinement_states=filters.get("refinement_state"),
+        )
+        if refinement_clause:
+            clauses.append(refinement_clause)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id, detections.roi_index
@@ -4283,6 +4487,21 @@ class PostgresRepository:
                     JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
                     WHERE {' AND '.join(clauses)} ORDER BY detections.frame_id ASC, detections.roi_index ASC, detections.id ASC""", tuple(params))
                 return cursor.fetchall()
+
+    @staticmethod
+    def _candidate_refinement_state_clause(*, schema: str, refinement_states: Sequence[str] | None) -> str | None:
+        states = {str(state).strip().lower() for state in (refinement_states or ["unrefined"]) if str(state).strip()}
+        if not states or states == {"refined", "unrefined"}:
+            return None
+        exists_clause = (
+            f"EXISTS (SELECT 1 FROM {schema}.detections_refined refined "
+            "WHERE refined.candidate_detection_id = detections.id)"
+        )
+        if states == {"refined"}:
+            return exists_clause
+        if states == {"unrefined"}:
+            return f"NOT {exists_clause}"
+        return None
 
     def create_preprocess_jobs(
         self,
@@ -4576,7 +4795,6 @@ class PostgresRepository:
     ) -> dict[str, Any]:
         resolved_payload = {"worker_id": worker_id}
         resolved_payload.update(payload or {})
-        resolved_payload.setdefault("project_id", DEFAULT_PROJECT_ID)
         return self._append_job_event(cursor, None, event_type, resolved_payload)
 
     def list_job_events(

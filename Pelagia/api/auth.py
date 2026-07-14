@@ -54,7 +54,12 @@ def _auth_enabled(request: Request) -> bool:
 def _dev_auth_context(request: Request) -> AuthContext:
     context = get_context(request)
     auth_config = getattr(context.config, "auth", None)
-    project_key = str(getattr(auth_config, "dev_project_key", "default"))
+    project_key = getattr(auth_config, "dev_project_key", None)
+    if not project_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Auth-disabled mode requires auth.dev_project_key to name an existing project.",
+        )
     project = get_repository(request).get_project_by_key(project_key)
     if project is None:
         raise HTTPException(
@@ -127,6 +132,13 @@ def require_project_manager(request: Request) -> AuthContext:
     if auth.is_admin or auth.role in MANAGE_ROLES:
         return auth
     raise HTTPException(status_code=403, detail="Project manager permission is required.")
+
+
+def require_admin(request: Request) -> AuthContext:
+    auth = require_auth(request)
+    if auth.is_admin:
+        return auth
+    raise HTTPException(status_code=403, detail="Admin permission is required.")
 
 
 def scoped_project_id(request: Request) -> str | None:

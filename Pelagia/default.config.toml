@@ -18,10 +18,10 @@ lease_seconds = 300
 heartbeat_interval_seconds = 30
 
 [kvstore]
-# Cold storage for large frame payloads.
+# Parent directory for named, project-scoped stores containing large frame payloads.
 # Options: kvstore, kvstore2. Existing stores should keep kvstore unless migrated.
 backend = "kvstore2"
-root_path = "./data/kvstore"
+directory = "./data/kvstores"
 # Options: sha256, blake3.
 hash_algorithm = "blake3"
 # Number of hash-prefix characters used to shard object storage paths.
@@ -36,7 +36,7 @@ max_blob_bytes = 68_719_476_736
 # Server-side roots exposed through /live/files for local file/folder selection.
 # The file API cannot browse outside root_path_kvstore, root_path_import_dir,
 # or explicitly listed allowed_root_paths.
-root_path_kvstore = "./data/kvstore"
+root_path_kvstore = "./data/kvstores"
 root_path_import_dir = "./data/import"
 allowed_root_paths = []
 
@@ -53,8 +53,8 @@ quality = 90
 enabled = true
 # Default session lifetime for login and project-switch tokens.
 session_ttl_seconds = 604800
-# Project used when auth.enabled=false.
-dev_project_key = "default"
+# Project used when auth.enabled=false. Configure this after creating a project.
+dev_project_key = null
 # Optional bootstrap credentials for scripted local setup.
 bootstrap_admin_username = null
 bootstrap_admin_password = null

@@ -10,11 +10,12 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    from ..auth import require_auth
+    from ..auth import require_admin, require_auth
     from ..schemas import OptionsResponse, SystemCapabilitiesResponse
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
     from ...storage.blob_store import initialize_kvstore
+    from ...services.system_usage import SystemUsageService
     from ...version import __version__, build_info
     from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
 
@@ -45,7 +46,7 @@ if APIRouter is not None:
                 },
                 "kvstore": {
                     "backend": config.kvstore.backend,
-                    "root_path": config.kvstore.root_path,
+                    "directory": config.kvstore.directory,
                     "hash_algorithm": config.kvstore.hash_algorithm,
                     "prefix_length": config.kvstore.prefix_length,
                     "max_db_bytes": config.kvstore.max_db_bytes,
@@ -88,7 +89,7 @@ if APIRouter is not None:
     @router.get("/status")
     def get_system_status(request: Request, deep_kvstore: bool = False) -> dict:
         repository = get_repository(request)
-        kvstore = get_kvstore(request)
+        kvstore = get_context(request).kvstore
         postgres = {"healthy": False}
         try:
             postgres = postgres_ping(repository)
@@ -101,7 +102,11 @@ if APIRouter is not None:
                 "build": build_info(),
                 "postgres": postgres,
                 "database": database_status,
-                "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
+                "kvstore": (
+                    kvstore_status(kvstore, deep=deep_kvstore)
+                    if kvstore is not None
+                    else {"configured": False, "initialized": False}
+                ),
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
             }
@@ -159,8 +164,7 @@ if APIRouter is not None:
             }
         )
 
-    @router.get("/use")
-    def get_system_use() -> dict:
+    def _system_discovery() -> dict:
         return {
             "capabilities": [
                 "register video assets and queue frame extraction",
@@ -188,8 +192,21 @@ if APIRouter is not None:
                 "worker_status": "GET /workers",
                 "system_status": "GET /system/status",
                 "project_system_status": "GET /system/status/{project_id_or_key}",
+                "system_usage": "GET /system/usage",
             },
         }
+
+    def _system_usage(request: Request) -> dict:
+        require_admin(request)
+        return as_response(SystemUsageService(get_context(request)).snapshot())
+
+    @router.get("/usage")
+    def get_system_usage(request: Request) -> dict:
+        return _system_usage(request)
+
+    @router.get("/use")
+    def get_system_use(request: Request) -> dict:
+        return {**_system_usage(request), **_system_discovery()}
 
     @router.post("/initialize")
     def initialize_system(request: Request) -> dict:
@@ -198,10 +215,7 @@ if APIRouter is not None:
         if context.repository is not None:
             context.repository.initialize_schema()
             initialized["postgres"] = True
-        if context.kvstore is not None and not context.kvstore.initialized:
-            initialize_kvstore(context.kvstore, context.config.kvstore)
-            initialized["kvstore"] = True
-        if context.repository is None and context.kvstore is None:
+        if context.repository is None:
             raise HTTPException(status_code=503, detail="No system stores are configured.")
         if context.logger is not None and initialized["postgres"]:
             context.logger.info(

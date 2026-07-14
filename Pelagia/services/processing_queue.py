@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from ..services.context import AppContext
 from .job_commands import PreprocessFramesCommand, RoiRefinementCommand, SegmentFramesCommand, FrameSelection
 
 
-Ordering = Literal["optimized", "input"]
+PREPROCESS_FRAMES_PER_JOB = 1_000
+SEGMENT_FRAMES_PER_JOB = 1_000
+ROI_REFINEMENT_DETECTIONS_PER_JOB = 10_000
 
 
 @dataclass(frozen=True, slots=True)
 class PreprocessQueueRequest:
     filters: dict[str, Any]
     options: dict[str, Any]
-    max_units: int = 250
-    ordering: Ordering = "optimized"
     priority: int | None = None
     dry_run: bool = False
 
@@ -32,27 +32,19 @@ class ProcessingQueueService:
         self.repository = context.repository
 
     def queue_preprocess(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
-        if request.max_units < 1 or request.max_units > 10_000:
-            raise ValueError("batch.max_units must be between 1 and 10000.")
-        if request.ordering not in {"optimized", "input"}:
-            raise ValueError("batch.ordering must be 'optimized' or 'input'.")
         filters = {**request.filters}
         filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
         frames = self._plan_by_assets("plan_preprocess_frames", project_id=project_id, filters=filters)
-        if request.ordering == "input":
-            frames.sort(key=lambda row: (str(row["asset_id"]), int(row["frame_index"]), str(row["frame_id"])))
-            ordering = "asset_frame"
-        else:
-            frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
-            ordering = "kvstore_hash"
-        batches = [frames[index:index + request.max_units] for index in range(0, len(frames), request.max_units)]
+        frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
+        batches = self._batches(frames, PREPROCESS_FRAMES_PER_JOB)
         planned_jobs = [self._job_for_batch(batch, request.options) for batch in batches]
         result = {
             "stage": "preprocess_frames",
             "unit": "frames",
             "matched_count": len(frames),
             "job_count": len(planned_jobs),
-            "ordering": ordering,
+            "ordering": "kvstore_hash",
+            "max_units_per_job": PREPROCESS_FRAMES_PER_JOB,
             "batch_sizes": [len(batch) for batch in batches],
             "sample_frame_ids": [str(row["frame_id"]) for row in frames[:20]],
             "dry_run": request.dry_run,
@@ -74,20 +66,50 @@ class ProcessingQueueService:
         frames = self._plan_by_assets(
             "plan_segment_frames", project_id=project_id, filters=filters, payload_kind=payload_kind
         )
-        return self._queue_frame_stage("segment", frames, request, project_id=project_id, command=SegmentFramesCommand, ordering="kvstore_hash")
+        return self._queue_frame_stage(
+            "segment",
+            frames,
+            request,
+            project_id=project_id,
+            command=SegmentFramesCommand,
+            max_units=SEGMENT_FRAMES_PER_JOB,
+            ordering="kvstore_hash",
+        )
 
     def queue_roi_refinement(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
         detections = self._plan_by_assets(
             "plan_roi_refinement_detections", project_id=project_id, filters=request.filters
         )
-        return self._queue_detection_stage(detections, request, project_id=project_id)
+        return self._queue_detection_stage(
+            detections,
+            request,
+            project_id=project_id,
+            max_units=ROI_REFINEMENT_DETECTIONS_PER_JOB,
+        )
 
-    def _queue_frame_stage(self, stage: str, frames: list[dict[str, Any]], request: PreprocessQueueRequest, *, project_id: str, command, ordering: str) -> dict[str, Any]:
-        if request.max_units < 1 or request.max_units > 10_000:
-            raise ValueError("batch.max_units must be between 1 and 10000.")
+    def _queue_frame_stage(
+        self,
+        stage: str,
+        frames: list[dict[str, Any]],
+        request: PreprocessQueueRequest,
+        *,
+        project_id: str,
+        command,
+        max_units: int,
+        ordering: str,
+    ) -> dict[str, Any]:
         frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
-        batches = [frames[index:index + request.max_units] for index in range(0, len(frames), request.max_units)]
-        result = {"stage": stage, "unit": "frames", "matched_count": len(frames), "job_count": len(batches), "ordering": ordering, "batch_sizes": [len(batch) for batch in batches], "dry_run": request.dry_run}
+        batches = self._batches(frames, max_units)
+        result = {
+            "stage": stage,
+            "unit": "frames",
+            "matched_count": len(frames),
+            "job_count": len(batches),
+            "ordering": ordering,
+            "max_units_per_job": max_units,
+            "batch_sizes": [len(batch) for batch in batches],
+            "dry_run": request.dry_run,
+        }
         if request.dry_run:
             return result
         jobs = []
@@ -98,12 +120,26 @@ class ProcessingQueueService:
             jobs.append(self.repository.create_job(stage, project_id=project_id, run_id=next(iter(runs)) if len(runs) == 1 else None, asset_id=next(iter(assets)) if len(assets) == 1 else None, priority=request.priority, payload=payload, summary=f"{stage} queued for {len(frame_ids)} frames"))
         return {**result, "job_ids": [str(job["id"]) for job in jobs]}
 
-    def _queue_detection_stage(self, detections: list[dict[str, Any]], request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
-        if request.max_units < 1 or request.max_units > 10_000:
-            raise ValueError("batch.max_units must be between 1 and 10000.")
+    def _queue_detection_stage(
+        self,
+        detections: list[dict[str, Any]],
+        request: PreprocessQueueRequest,
+        *,
+        project_id: str,
+        max_units: int,
+    ) -> dict[str, Any]:
         detections.sort(key=lambda row: (str(row["frame_id"]), int(row.get("roi_index") or 0), str(row["detection_id"])))
-        batches = [detections[index:index + request.max_units] for index in range(0, len(detections), request.max_units)]
-        result = {"stage": "roi_refinement", "unit": "detections", "matched_count": len(detections), "job_count": len(batches), "ordering": "frame_id", "batch_sizes": [len(batch) for batch in batches], "dry_run": request.dry_run}
+        batches = self._batches(detections, max_units)
+        result = {
+            "stage": "roi_refinement",
+            "unit": "detections",
+            "matched_count": len(detections),
+            "job_count": len(batches),
+            "ordering": "frame_id",
+            "max_units_per_job": max_units,
+            "batch_sizes": [len(batch) for batch in batches],
+            "dry_run": request.dry_run,
+        }
         if request.dry_run:
             return result
         jobs = []
@@ -126,6 +162,10 @@ class ProcessingQueueService:
         for asset_id in asset_ids:
             rows.extend(planner(project_id=project_id, filters={**base_filters, "asset_id": asset_id}, **kwargs))
         return rows
+
+    @staticmethod
+    def _batches(units: list[dict[str, Any]], max_units: int) -> list[list[dict[str, Any]]]:
+        return [units[index:index + max_units] for index in range(0, len(units), max_units)]
 
     @staticmethod
     def _job_for_batch(batch: list[dict[str, Any]], options: dict[str, Any]) -> dict[str, Any]:

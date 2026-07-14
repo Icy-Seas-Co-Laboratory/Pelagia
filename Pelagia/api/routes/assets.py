@@ -2,6 +2,7 @@ from __future__ import annotations
 
 try:
     from fastapi import APIRouter, HTTPException, Request, Response
+    from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -10,7 +11,7 @@ if APIRouter is not None:
     import numpy as np
 
     from ..schemas import AssetDetailResponse, AssetsListResponse, DetectionsListResponse, FramesListResponse
-    from ..auth import scoped_project_id
+    from ..auth import require_project_write, scoped_project_id
     from ...processing.frame_correction import divide_background, flatfield_correction as apply_flatfield_array_correction
     from ...processing.frame_store import retrieve_frame
     from ...processing.codec_registry import image_extension
@@ -18,6 +19,16 @@ if APIRouter is not None:
     from ._images import encode_image, preview_image, scale_image
 
     router = APIRouter(prefix="/assets", tags=["assets"])
+
+    class AssetUpdateRequest(BaseModel):
+        collections: list[str] | str | None = Field(default=None)
+
+    def _delete_unreferenced_payload(context, key: str) -> dict:
+        try:
+            context.kvstore.key_delete(key)
+            return {"key": key, "deleted": True, "missing": False}
+        except KeyError:
+            return {"key": key, "deleted": False, "missing": True}
 
     @router.get("", response_model=AssetsListResponse)
     def list_assets(
@@ -116,6 +127,42 @@ if APIRouter is not None:
         asset = dict(asset)
         asset["frame_count"] = repository.count_frames(asset_id, project_id=project_id)
         return {"asset": as_response(asset)}
+
+    @router.patch("/{asset_id}", response_model=AssetDetailResponse)
+    def update_asset(request: Request, asset_id: str, body: AssetUpdateRequest) -> dict:
+        auth = require_project_write(request)
+        repository = get_repository(request)
+        asset = repository.update_asset_collections(
+            asset_id,
+            body.collections,
+            project_id=auth.project_id,
+        )
+        if asset is None:
+            raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
+        asset = dict(asset)
+        asset["frame_count"] = repository.count_frames(asset_id, project_id=auth.project_id)
+        return {"asset": as_response(asset)}
+
+    @router.delete("/{asset_id}")
+    def delete_asset(request: Request, asset_id: str) -> dict:
+        auth = require_project_write(request)
+        context = get_context(request).for_project(auth.project_id)
+        result = get_repository(request).delete_asset(asset_id, project_id=auth.project_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
+        deleted = [_delete_unreferenced_payload(context, str(key)) for key in result.get("unreferenced_kvstore_keys", [])]
+        return as_response(
+            {
+                "status": "deleted",
+                "asset_id": asset_id,
+                "asset": result.get("asset"),
+                "frame_count": result.get("frame_count", 0),
+                "candidate_detection_count": result.get("candidate_detection_count", 0),
+                "refined_detection_count": result.get("refined_detection_count", 0),
+                "generated_kvstore_keys": result.get("generated_kvstore_keys", []),
+                "deleted_kvstore_keys": deleted,
+            }
+        )
 
     @router.get("/{asset_id}/frames", response_model=FramesListResponse)
     def list_frames(

@@ -89,16 +89,6 @@ CREATE TABLE IF NOT EXISTS {schema}.projects (
     updated_at timestamptz NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO {schema}.projects (id, project_key, project_name, description, metadata)
-VALUES (
-    '00000000-0000-0000-0000-000000000001'::uuid,
-    'default',
-    'Default',
-    'Default project for existing Pelagia data.',
-    '{"system_default": true}'::jsonb
-)
-ON CONFLICT (project_key) DO NOTHING;
-
 CREATE TABLE IF NOT EXISTS {schema}.project_memberships (
     user_id uuid NOT NULL REFERENCES {schema}.users(id) ON DELETE CASCADE,
     project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,

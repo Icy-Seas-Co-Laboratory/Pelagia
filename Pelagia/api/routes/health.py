@@ -17,7 +17,7 @@ if APIRouter is not None:
         return {
             "status": "ok",
             "postgres_configured": context.repository is not None,
-            "kvstore_configured": context.kvstore is not None,
+            "kvstore_configured": bool(context._project_kvstores),
         }
 
     @router.get("/postgres")
