@@ -1,5 +1,7 @@
 """Apply flatfield/background correction and generate reusable backgrounds."""
 
+from collections import Counter
+
 import numpy as np
 
 from ..domain import FrameRecord
@@ -9,6 +11,16 @@ from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 from .timing import measure_phase
+
+
+def _nominal_frame_geometry(frames: list[FrameRecord]) -> tuple[int, int]:
+    geometries = Counter((frame.width, frame.height) for frame in frames)
+    if not geometries:
+        raise ValueError("Cannot determine nominal frame geometry without frames.")
+    return max(
+        geometries,
+        key=lambda geometry: (geometries[geometry], geometry[0] * geometry[1]),
+    )
 
 
 def _flatfield_profile(array: np.ndarray, *, q: float, axis: int) -> np.ndarray:
@@ -312,6 +324,7 @@ def build_background_payload_for_frames(
         "background_source_payload_kind": payload_kind,
         "background_source_frame_ids": resolved_frame_ids,
         "background_source_frame_count": len(resolved_frame_ids),
+        "background_layout": "nominal_frame",
         "kvstore_key": kvstore_key,
         "kvstore_hash": kvstore_key,
         "kvstore_encoding": payload_encoding,
@@ -378,6 +391,7 @@ def generate_background_for_frames(
         )
     return {
         **result,
+        "background_metadata": background_metadata,
         "updated_frame_count": len(rows),
     }
 
@@ -441,6 +455,7 @@ def ensure_asset_background_windows(
                 limit=None,
             )
         frames = [FrameRecord.from_row(row) for row in rows]
+        nominal_width, nominal_height = _nominal_frame_geometry(frames)
         by_center: dict[int, list[FrameRecord]] = {}
         for target in targets:
             # Fixed boundaries let neighboring jobs reuse the same background payload.
@@ -449,9 +464,18 @@ def ensure_asset_background_windows(
         for center, window_targets in by_center.items():
             first_index = center - source_half_width
             last_index = center + source_half_width
-            sources = [frame for frame in frames if first_index <= frame.frame_index <= last_index]
+            sources = [
+                frame
+                for frame in frames
+                if first_index <= frame.frame_index <= last_index
+                and frame.width == nominal_width
+                and frame.height == nominal_height
+            ]
             if not sources:
-                raise ValueError(f"No available frames for background window centered at {center}.")
+                raise ValueError(
+                    "No nominal-sized frames for background window "
+                    f"centered at {center} with geometry {nominal_width}x{nominal_height}."
+                )
             current_metadata = window_targets[0].background_metadata
             if (
                 window_targets[0].background_payload_ref
@@ -459,8 +483,41 @@ def ensure_asset_background_windows(
                 and current_metadata.get("background_window_stride") == stride
                 and current_metadata.get("background_window_width") == width
                 and current_metadata.get("background_source_payload_kind") == payload_kind
+                and current_metadata.get("background_nominal_width") == nominal_width
+                and current_metadata.get("background_nominal_height") == nominal_height
             ):
-                windows.append({"asset_id": asset_id, "center": center, "reused": True, "frame_ids": [str(frame.id) for frame in sources]})
+                reused_background = window_targets[0]
+                missing_target_ids = [
+                    str(target.id)
+                    for target in window_targets
+                    if target.id is not None
+                    and target.background_payload_ref != reused_background.background_payload_ref
+                ]
+                if missing_target_ids:
+                    context.repository.update_frame_background_payloads(
+                        missing_target_ids,
+                        project_id=context.active_project_id,
+                        kvstore_hash=str(
+                            reused_background.background_kvstore_hash
+                            or reused_background.background_payload_ref
+                        ),
+                        payload_ref=str(reused_background.background_payload_ref),
+                        payload_encoding=str(reused_background.background_payload_encoding),
+                        payload_format=str(reused_background.background_payload_format),
+                        payload_dtype=str(reused_background.background_payload_dtype),
+                        payload_shape=list(reused_background.background_payload_shape or []),
+                        metadata=current_metadata,
+                    )
+                windows.append(
+                    {
+                        "asset_id": asset_id,
+                        "center": center,
+                        "nominal_width": nominal_width,
+                        "nominal_height": nominal_height,
+                        "reused": True,
+                        "frame_ids": [str(frame.id) for frame in sources],
+                    }
+                )
                 continue
             source_ids = [str(frame.id) for frame in sources if frame.id is not None]
             result = generate_background_for_frames(
@@ -477,7 +534,36 @@ def ensure_asset_background_windows(
                     "background_window_width": width,
                     "background_application_start": center - application_half_width,
                     "background_application_end": center + application_half_width,
+                    "background_nominal_width": nominal_width,
+                    "background_nominal_height": nominal_height,
                 },
             )
-            windows.append({"asset_id": asset_id, "center": center, "reused": False, **result})
+            source_id_set = set(source_ids)
+            additional_target_ids = [
+                str(target.id)
+                for target in window_targets
+                if target.id is not None and str(target.id) not in source_id_set
+            ]
+            if additional_target_ids:
+                context.repository.update_frame_background_payloads(
+                    additional_target_ids,
+                    project_id=context.active_project_id,
+                    kvstore_hash=str(result["background_payload_ref"]),
+                    payload_ref=str(result["background_payload_ref"]),
+                    payload_encoding=str(result["background_payload_encoding"]),
+                    payload_format=str(result["background_payload_format"]),
+                    payload_dtype=str(result["background_payload_dtype"]),
+                    payload_shape=list(result["background_payload_shape"] or []),
+                    metadata=dict(result["background_metadata"] or {}),
+                )
+            windows.append(
+                {
+                    "asset_id": asset_id,
+                    "center": center,
+                    "nominal_width": nominal_width,
+                    "nominal_height": nominal_height,
+                    "reused": False,
+                    **result,
+                }
+            )
     return {"window_stride": stride, "window_width": width, "windows": windows}

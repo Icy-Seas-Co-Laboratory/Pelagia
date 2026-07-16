@@ -48,6 +48,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "jobs": "/jobs",
                 "jobs_summary": "/jobs/summary",
                 "processing_status_summary": "/processing/status/summary",
+                "processing_status_facets": "/processing/status/facets",
                 "processing_status_frames": "/processing/status/frames",
                 "processing_status_frame_ids": "/processing/status/frames/ids",
                 "processing_status_rebuild": "/processing/status/rebuild",

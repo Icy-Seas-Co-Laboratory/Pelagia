@@ -56,9 +56,40 @@ curl -H "Authorization: Bearer $PELAGIA_TOKEN" \
   "http://127.0.0.1:8000/processing/status/summary?asset_id=$ASSET_ID&candidate_detection_status=succeeded&has_refined_rois=false"
 ```
 
-The response includes `summary` and `snapshot`. The snapshot contains a
-`status_version` that changes when the project/session status summary changes or
-when processing writes touch the project status state.
+The response includes `summary` and `snapshot`. Snapshots are project-wide. The
+`status_version` changes when processing writes touch the project status state.
+Unfiltered summaries are cached until that happens; filtered summary requests
+do not rebuild or write the project snapshot.
+
+### Faceted Summary
+
+Use the faceted endpoint for queue pages that need counts for many assets or
+filter options. It compiles all grouped counts in one backend request instead
+of issuing one summary request per asset:
+
+```bash
+curl -H "Authorization: Bearer $PELAGIA_TOKEN" \
+  "http://127.0.0.1:8000/processing/status/facets?preprocessing_status=succeeded"
+```
+
+The response contains the normal `summary` and `snapshot`, plus:
+
+```json
+{
+  "facets": {
+    "assets": {"asset-uuid": 1200},
+    "collections": {"cruise-a": 5000},
+    "preprocessing_status": {"succeeded": 4500, "failed": 20},
+    "candidate_detection_status": {"unknown": 4520},
+    "roi_refinement_status": {"unknown": 4520},
+    "refinement_state": {"refined": 300, "unrefined": 45}
+  }
+}
+```
+
+`asset_id` and `collection` may be repeated or comma-separated on this endpoint.
+Multiple values use OR semantics within their group. All returned facet counts
+describe the same filtered frame set as `summary`.
 
 ### Frame Rows
 
@@ -91,7 +122,9 @@ This endpoint is intended for high-cardinality workflows. It returns IDs plus a
 
 ## Filters
 
-The summary, rows, and IDs endpoints support the same filters:
+The summary, faceted summary, rows, and IDs endpoints support the same filters.
+The faceted endpoint additionally accepts multiple `asset_id` and `collection`
+values:
 
 - `run_id`
 - `asset_id`
@@ -136,11 +169,11 @@ non-derived status values where there is no stored artifact proving success.
 
 For PelagiaView or another client:
 
-1. Fetch `/processing/status/summary` when connecting to a project.
-2. Use `/processing/status/frames/ids` for filtering large frame sets.
-3. Page with `next_cursor` until no cursor is returned.
-4. Re-fetch `/processing/status/summary` periodically or after job completion.
-5. If `snapshot.status_version` changes, refresh any cached matching ID sets.
+1. Fetch `/processing/status/facets` once for queue-page totals and option counts.
+2. Do not issue one `/summary` request per asset or collection.
+3. Use `/processing/status/frames/ids` for filtering large frame sets.
+4. Page with `next_cursor` until no cursor is returned.
+5. Re-fetch facets after job completion or when `snapshot.status_version` changes.
 
 For projects around 1e6 frames, prefer the ID endpoint and cursor pagination.
 Avoid unbounded requests from browser code.

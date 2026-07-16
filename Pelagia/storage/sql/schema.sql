@@ -942,6 +942,16 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_roi_refinement
     ON {schema}.frame_processing_status (project_id, roi_refinement_status, asset_id, frame_index, frame_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_updated
     ON {schema}.frame_processing_status (project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_run
+    ON {schema}.frame_processing_status (project_id, run_id, asset_id, frame_index);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_frame_index
+    ON {schema}.frame_processing_status (project_id, frame_index);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_has_candidates
+    ON {schema}.frame_processing_status (project_id, asset_id)
+    WHERE candidate_detection_count > 0;
+CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_has_refined
+    ON {schema}.frame_processing_status (project_id, asset_id)
+    WHERE refined_detection_count > 0;
 CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_collections
     ON {schema}.frame_processing_status USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);

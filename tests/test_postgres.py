@@ -54,6 +54,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert [migration["migration_id"] for migration in migrations] == [
         "0001_processing_status",
         "0002_projectless_admin_sessions",
+        "0003_processing_status_summary_indexes",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -61,6 +62,9 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     projectless_sessions = postgres.render_migration(migrations[1], "pelagia_unit")
     assert "ALTER COLUMN project_id DROP NOT NULL" in projectless_sessions
     assert "{schema}" not in projectless_sessions
+    summary_indexes = postgres.render_migration(migrations[2], "pelagia_unit")
+    assert "frame_processing_status_has_candidates" in summary_indexes
+    assert "{schema}" not in summary_indexes
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -92,8 +96,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 2
-    assert status["migrations"]["applied_count"] == 2
+    assert status["migrations"]["available_count"] == 3
+    assert status["migrations"]["applied_count"] == 3
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -757,6 +761,12 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
     assert summary["refined_detection_count"] == 1
     assert summary["unrefined_candidate_count"] == 1
     assert summary["by_status"]["preprocessing"] == {"unknown": 1, "working": 1}
+
+    facets = postgres_repo.get_frame_status_facets(project_id=DEFAULT_PROJECT_ID)
+    assert facets["summary"]["total_frame_count"] == 2
+    assert facets["facets"]["assets"] == {asset_id: 2}
+    assert facets["facets"]["preprocessing_status"] == {"unknown": 1, "working": 1}
+    assert facets["facets"]["refinement_state"] == {"refined": 1, "unrefined": 1}
 
     snapshot = postgres_repo.get_or_create_processing_status_snapshot(
         project_id=DEFAULT_PROJECT_ID,

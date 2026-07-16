@@ -50,7 +50,17 @@ REQUIRED_SCHEMA_TABLES = (
 DEFAULT_PROJECT_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_PROJECT_KEY = "default"
 PROJECT_ROLES = {"viewer", "editor", "manager", "admin"}
-FRAME_PROCESSING_STATUSES = {"unknown", "queued", "leased", "working", "succeeded", "failed", "cancelled", "dead_lettered"}
+FRAME_PROCESSING_STATUS_VALUES = (
+    "unknown",
+    "queued",
+    "leased",
+    "working",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "dead_lettered",
+)
+FRAME_PROCESSING_STATUSES = set(FRAME_PROCESSING_STATUS_VALUES)
 PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
@@ -3402,7 +3412,9 @@ class PostgresRepository:
         project_id: str,
         run_id: str | None = None,
         asset_id: str | None = None,
+        asset_ids: Sequence[str] | None = None,
         collection: str | None = None,
+        collections: Sequence[str] | None = None,
         preprocessing_status: Sequence[str] | None = None,
         candidate_detection_status: Sequence[str] | None = None,
         roi_refinement_status: Sequence[str] | None = None,
@@ -3420,9 +3432,15 @@ class PostgresRepository:
         if asset_id:
             clauses.append("status.asset_id = %s")
             params.append(asset_id)
+        if asset_ids:
+            clauses.append("status.asset_id = ANY(%s::uuid[])")
+            params.append(list(dict.fromkeys(str(value) for value in asset_ids if value)))
         if collection:
-            clauses.append("%s = ANY(status.collections)")
+            clauses.append("status.collections @> ARRAY[%s]::text[]")
             params.append(collection)
+        if collections:
+            clauses.append("status.collections && %s::text[]")
+            params.append(list(dict.fromkeys(str(value) for value in collections if value)))
         for column, values in (
             ("preprocessing_status", preprocessing_status),
             ("candidate_detection_status", candidate_detection_status),
@@ -3449,6 +3467,52 @@ class PostgresRepository:
             clauses.append("(status.asset_id, status.frame_index, status.frame_id) > (%s::uuid, %s, %s::uuid)")
             params.extend([cursor_asset_id, cursor_frame_index, cursor_frame_id])
         return clauses, params
+
+    @staticmethod
+    def _frame_status_summary_columns() -> str:
+        columns = [
+            "COUNT(*)::bigint AS total_frame_count",
+            "COUNT(*) FILTER (WHERE preprocessing_status = 'succeeded')::bigint AS preprocessing_succeeded_count",
+            "COUNT(*) FILTER (WHERE candidate_detection_status = 'succeeded')::bigint AS candidate_detection_succeeded_count",
+            "COUNT(*) FILTER (WHERE roi_refinement_status = 'succeeded')::bigint AS roi_refinement_succeeded_count",
+            "COUNT(*) FILTER (WHERE candidate_detection_count > 0)::bigint AS frames_with_candidates_count",
+            "COUNT(*) FILTER (WHERE refined_detection_count > 0)::bigint AS frames_with_refined_rois_count",
+            "COALESCE(SUM(candidate_detection_count), 0)::bigint AS candidate_detection_count",
+            "COALESCE(SUM(refined_detection_count), 0)::bigint AS refined_detection_count",
+            "COALESCE(SUM(unrefined_candidate_count), 0)::bigint AS unrefined_candidate_count",
+            "MAX(updated_at) AS updated_at",
+        ]
+        for stage in ("preprocessing", "candidate_detection", "roi_refinement"):
+            for status in FRAME_PROCESSING_STATUS_VALUES:
+                columns.append(
+                    f"COUNT(*) FILTER (WHERE {stage}_status = '{status}')::bigint "
+                    f"AS {stage}_{status}_count"
+                )
+        return ",\n".join(columns)
+
+    @staticmethod
+    def _frame_status_summary_from_row(row: dict[str, Any] | None) -> dict[str, Any]:
+        row = row or {}
+        by_status: dict[str, dict[str, int]] = {}
+        for stage in ("preprocessing", "candidate_detection", "roi_refinement"):
+            counts = {
+                status: int(row.get(f"{stage}_{status}_count") or 0)
+                for status in FRAME_PROCESSING_STATUS_VALUES
+            }
+            by_status[stage] = {status: count for status, count in counts.items() if count > 0}
+        return {
+            "total_frame_count": row.get("total_frame_count", 0),
+            "preprocessing_succeeded_count": row.get("preprocessing_succeeded_count", 0),
+            "candidate_detection_succeeded_count": row.get("candidate_detection_succeeded_count", 0),
+            "roi_refinement_succeeded_count": row.get("roi_refinement_succeeded_count", 0),
+            "frames_with_candidates_count": row.get("frames_with_candidates_count", 0),
+            "frames_with_refined_rois_count": row.get("frames_with_refined_rois_count", 0),
+            "candidate_detection_count": row.get("candidate_detection_count", 0),
+            "refined_detection_count": row.get("refined_detection_count", 0),
+            "unrefined_candidate_count": row.get("unrefined_candidate_count", 0),
+            "updated_at": row.get("updated_at"),
+            "by_status": by_status,
+        }
 
     def ensure_frame_status_rows(
         self,
@@ -3922,69 +3986,126 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    WITH filtered AS (
-                        SELECT *
+                    SELECT {self._frame_status_summary_columns()}
+                    FROM {self.schema}.frame_processing_status status
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
+                row = cursor.fetchone()
+        return self._frame_status_summary_from_row(row)
+
+    def get_frame_status_facets(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_ids: Sequence[str] | None = None,
+        collections: Sequence[str] | None = None,
+        preprocessing_status: Sequence[str] | None = None,
+        candidate_detection_status: Sequence[str] | None = None,
+        roi_refinement_status: Sequence[str] | None = None,
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "get_frame_status_facets")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id,
+            run_id=run_id,
+            asset_ids=asset_ids,
+            collections=collections,
+            preprocessing_status=preprocessing_status,
+            candidate_detection_status=candidate_detection_status,
+            roi_refinement_status=roi_refinement_status,
+            has_candidates=has_candidates,
+            has_refined_rois=has_refined_rois,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH filtered AS MATERIALIZED (
+                        SELECT
+                            asset_id,
+                            collections,
+                            preprocessing_status,
+                            candidate_detection_status,
+                            roi_refinement_status,
+                            candidate_detection_count,
+                            refined_detection_count,
+                            unrefined_candidate_count,
+                            updated_at
                         FROM {self.schema}.frame_processing_status status
                         WHERE {' AND '.join(clauses)}
                     ),
-                    totals AS (
-                        SELECT
-                            COUNT(*)::bigint AS total_frame_count,
-                            COUNT(*) FILTER (WHERE preprocessing_status = 'succeeded')::bigint AS preprocessing_succeeded_count,
-                            COUNT(*) FILTER (WHERE candidate_detection_status = 'succeeded')::bigint AS candidate_detection_succeeded_count,
-                            COUNT(*) FILTER (WHERE roi_refinement_status = 'succeeded')::bigint AS roi_refinement_succeeded_count,
-                            COUNT(*) FILTER (WHERE candidate_detection_count > 0)::bigint AS frames_with_candidates_count,
-                            COUNT(*) FILTER (WHERE refined_detection_count > 0)::bigint AS frames_with_refined_rois_count,
-                            COALESCE(SUM(candidate_detection_count), 0)::bigint AS candidate_detection_count,
-                            COALESCE(SUM(refined_detection_count), 0)::bigint AS refined_detection_count,
-                            COALESCE(SUM(unrefined_candidate_count), 0)::bigint AS unrefined_candidate_count,
-                            MAX(updated_at) AS updated_at
-                        FROM filtered
+                    summary AS (
+                        SELECT {self._frame_status_summary_columns()}
+                        FROM filtered status
                     ),
-                    preprocessing_counts AS (
-                        SELECT preprocessing_status AS status, COUNT(*)::bigint AS frame_count
+                    asset_counts AS (
+                        SELECT asset_id::text AS value, COUNT(*)::bigint AS unit_count
                         FROM filtered
-                        GROUP BY preprocessing_status
+                        GROUP BY asset_id
                     ),
-                    candidate_detection_counts AS (
-                        SELECT candidate_detection_status AS status, COUNT(*)::bigint AS frame_count
+                    collection_counts AS (
+                        SELECT collection AS value, COUNT(*)::bigint AS unit_count
                         FROM filtered
-                        GROUP BY candidate_detection_status
-                    ),
-                    roi_refinement_counts AS (
-                        SELECT roi_refinement_status AS status, COUNT(*)::bigint AS frame_count
-                        FROM filtered
-                        GROUP BY roi_refinement_status
+                        CROSS JOIN LATERAL unnest(collections) AS collection
+                        GROUP BY collection
                     )
                     SELECT
-                        totals.*,
-                        jsonb_build_object(
-                            'preprocessing',
-                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM preprocessing_counts), '{{}}'::jsonb),
-                            'candidate_detection',
-                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM candidate_detection_counts), '{{}}'::jsonb),
-                            'roi_refinement',
-                            COALESCE((SELECT jsonb_object_agg(status, frame_count) FROM roi_refinement_counts), '{{}}'::jsonb)
-                        ) AS by_status
-                    FROM totals
+                        summary.*,
+                        COALESCE(
+                            (SELECT jsonb_object_agg(value, unit_count) FROM asset_counts),
+                            '{{}}'::jsonb
+                        ) AS asset_facets,
+                        COALESCE(
+                            (SELECT jsonb_object_agg(value, unit_count) FROM collection_counts),
+                            '{{}}'::jsonb
+                        ) AS collection_facets
+                    FROM summary
                     """,
                     tuple(params),
                 )
                 row = cursor.fetchone() or {}
-        by_status = row.get("by_status") or {}
+        summary = self._frame_status_summary_from_row(row)
         return {
-            "total_frame_count": row.get("total_frame_count", 0),
-            "preprocessing_succeeded_count": row.get("preprocessing_succeeded_count", 0),
-            "candidate_detection_succeeded_count": row.get("candidate_detection_succeeded_count", 0),
-            "roi_refinement_succeeded_count": row.get("roi_refinement_succeeded_count", 0),
-            "frames_with_candidates_count": row.get("frames_with_candidates_count", 0),
-            "frames_with_refined_rois_count": row.get("frames_with_refined_rois_count", 0),
-            "candidate_detection_count": row.get("candidate_detection_count", 0),
-            "refined_detection_count": row.get("refined_detection_count", 0),
-            "unrefined_candidate_count": row.get("unrefined_candidate_count", 0),
-            "updated_at": row.get("updated_at"),
-            "by_status": by_status,
+            "summary": summary,
+            "facets": {
+                "assets": row.get("asset_facets") or {},
+                "collections": row.get("collection_facets") or {},
+                "preprocessing_status": summary["by_status"]["preprocessing"],
+                "candidate_detection_status": summary["by_status"]["candidate_detection"],
+                "roi_refinement_status": summary["by_status"]["roi_refinement"],
+                "refinement_state": {
+                    "refined": summary["refined_detection_count"],
+                    "unrefined": summary["unrefined_candidate_count"],
+                },
+            },
         }
+
+    def get_processing_status_snapshot(
+        self,
+        *,
+        project_id: str,
+    ) -> dict[str, Any] | None:
+        resolved_project_id = self._required_project_id(project_id, "get_processing_status_snapshot")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.schema}.project_processing_status_snapshots
+                    WHERE project_id = %s
+                      AND session_id IS NULL
+                    """,
+                    (resolved_project_id,),
+                )
+                return cursor.fetchone()
 
     def get_or_create_processing_status_snapshot(
         self,

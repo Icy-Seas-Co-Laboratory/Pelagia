@@ -611,12 +611,39 @@ class FakeRepository:
             },
         }
 
+    def get_frame_status_facets(self, **kwargs):
+        summary = self.get_frame_status_summary(**kwargs)
+        return {
+            "summary": summary,
+            "facets": {
+                "assets": {"asset-1": 2},
+                "collections": {"test": 2},
+                "preprocessing_status": summary["by_status"]["preprocessing"],
+                "candidate_detection_status": summary["by_status"]["candidate_detection"],
+                "roi_refinement_status": summary["by_status"]["roi_refinement"],
+                "refinement_state": {"refined": 3, "unrefined": 4},
+            },
+        }
+
+    def get_processing_status_snapshot(self, **kwargs):
+        project_id = kwargs.get("project_id")
+        return next(
+            (
+                snapshot
+                for snapshot in reversed(self.processing_status_snapshots)
+                if snapshot["project_id"] == project_id and snapshot.get("session_id") is None
+            ),
+            None,
+        )
+
     def get_or_create_processing_status_snapshot(self, **kwargs):
         snapshot = {
             "id": f"snapshot-{len(self.processing_status_snapshots) + 1}",
             "project_id": kwargs.get("project_id"),
             "session_id": kwargs.get("session_id"),
             "status_version": 1,
+            "generated_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
             "summary": kwargs.get("summary") or {},
         }
         self.processing_status_snapshots.append(snapshot)
@@ -3522,7 +3549,7 @@ def test_api_reports_frame_processing_state():
     assert body["page"] == {"limit": 5, "offset": 0, "count": 2, "next_offset": None}
 
 
-def test_api_processing_status_summary_creates_project_session_snapshot():
+def test_api_filtered_processing_status_summary_does_not_rebuild_snapshot():
     client, repo, _ = make_client()
 
     response = client.get(
@@ -3537,7 +3564,10 @@ def test_api_processing_status_summary_creates_project_session_snapshot():
     assert body["summary"]["total_frame_count"] == 2
     assert body["summary"]["candidate_detection_count"] == 7
     assert body["snapshot"]["project_id"] == "project-1"
-    assert body["snapshot"]["summary"]["total_frame_count"] == 2
+    assert body["snapshot"]["status_version"] == 0
+    assert body["snapshot"]["summary"] == {}
+    assert len(repo.frame_status_filter_calls) == 1
+    assert repo.processing_status_snapshots == []
     call = repo.frame_status_filter_calls[0]
     assert call["project_id"] == "project-1"
     assert call["collection"] == "test"
@@ -3548,16 +3578,38 @@ def test_api_processing_status_summary_creates_project_session_snapshot():
     assert call["has_refined_rois"] is True
 
 
-def test_api_processing_status_snapshot_uses_authenticated_session():
-    client, _, _ = make_client(auth_enabled=True)
+def test_api_processing_status_snapshot_is_project_scoped():
+    client, repo, _ = make_client(auth_enabled=True)
     headers = auth_headers(client)
 
     response = client.get("/processing/status/summary", headers=headers)
+    cached_response = client.get("/processing/status/summary", headers=headers)
+
+    assert response.status_code == 200
+    assert cached_response.status_code == 200
+    body = response.json()
+    assert body["snapshot"]["project_id"] == "project-1"
+    assert body["snapshot"]["session_id"] is None
+    assert len(repo.frame_status_filter_calls) == 1
+
+
+def test_api_processing_status_facets_group_counts_in_one_request():
+    client, repo, _ = make_client()
+
+    response = client.get(
+        "/processing/status/facets?asset_id=asset-1&collection=test"
+        "&preprocessing_status=succeeded"
+    )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["snapshot"]["project_id"] == "project-1"
-    assert body["snapshot"]["session_id"] == "session-1"
+    assert body["summary"]["total_frame_count"] == 2
+    assert body["facets"]["assets"] == {"asset-1": 2}
+    assert body["facets"]["collections"] == {"test": 2}
+    assert body["facets"]["refinement_state"] == {"refined": 3, "unrefined": 4}
+    assert len(repo.frame_status_filter_calls) == 1
+    assert repo.frame_status_filter_calls[0]["asset_ids"] == ["asset-1"]
+    assert repo.frame_status_filter_calls[0]["collections"] == ["test"]
 
 
 def test_api_processing_status_frames_and_ids_are_filterable():

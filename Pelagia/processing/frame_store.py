@@ -48,6 +48,28 @@ def metadata_without_none(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in metadata.items() if value is not None}
 
 
+def _fit_background_to_frame(
+    background: np.ndarray,
+    frame_shape: Sequence[int],
+    metadata: dict[str, Any],
+) -> np.ndarray:
+    if metadata.get("background_layout") != "nominal_frame":
+        return background
+    target_shape = tuple(int(value) for value in frame_shape)
+    if tuple(background.shape) == target_shape:
+        return background
+    if len(target_shape) != background.ndim:
+        raise ValueError(
+            f"Background shape {tuple(background.shape)} is incompatible with frame shape {target_shape}."
+        )
+    if any(target > available for target, available in zip(target_shape, background.shape)):
+        raise ValueError(
+            f"Background shape {tuple(background.shape)} cannot cover frame shape {target_shape}."
+        )
+    slices = tuple(slice(0, size) for size in target_shape)
+    return np.ascontiguousarray(background[slices])
+
+
 def _active_project_id(ctx: AppContext) -> str | None:
     return getattr(ctx, "active_project_id", None)
 
@@ -522,6 +544,11 @@ def retrieve_frame(
             background_payload = kvstore.get_store(background_key)
         with measure_phase("load.background_decode"):
             decoded_background = decode_array_payload(background_payload, background_metadata)
+            decoded_background = _fit_background_to_frame(
+                decoded_background,
+                array.shape,
+                background_metadata,
+            )
         frame_data.update_background(decoded_background)
         frame_data.metadata["background_payload_ref"] = background_key
         frame_data.metadata["background_payload_encoding"] = record.background_payload_encoding

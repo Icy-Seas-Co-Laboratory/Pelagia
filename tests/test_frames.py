@@ -22,7 +22,7 @@ from Pelagia.processing.frame_correction import (
     generate_background_for_frames,
 )
 from Pelagia.processing.frame_model import FrameData
-from Pelagia.processing.frame_store import retrieve_frame, store_frame
+from Pelagia.processing.frame_store import _fit_background_to_frame, retrieve_frame, store_frame
 from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.thumbhash import compute_thumbhash
 from Pelagia.services.context import AppContext
@@ -419,6 +419,108 @@ def test_asset_background_windows_use_fixed_stride_and_wider_sources(monkeypatch
     assert metadata["background_application_start"] == 8
     assert metadata["background_application_end"] == 12
     assert result["windows"][0]["center"] == 10
+
+
+def test_asset_background_windows_exclude_partial_frames_and_assign_nominal_background(monkeypatch):
+    records = {
+        f"frame-{index}": FrameRecord(
+            id=f"frame-{index}",
+            asset_id="asset-1",
+            run_id="run-1",
+            frame_index=index,
+            width=2048,
+            height=4096 if index == 12 else 8192,
+            kvstore_hash=f"kv-{index}",
+            preview_thumbhash=b"thumb",
+        )
+        for index in range(8, 13)
+    }
+
+    class Repository:
+        def __init__(self):
+            self.background_updates = []
+
+        def get_frame_records(self, frame_ids, *, project_id=None):
+            return [records[frame_id] for frame_id in frame_ids]
+
+        def list_frames(self, asset_id, *, project_id=None, limit=None):
+            return [
+                {
+                    "id": record.id,
+                    "asset_id": record.asset_id,
+                    "run_id": record.run_id,
+                    "frame_index": record.frame_index,
+                    "width": record.width,
+                    "height": record.height,
+                }
+                for record in records.values()
+            ]
+
+        def update_frame_background_payloads(self, frame_ids, **kwargs):
+            self.background_updates.append((list(frame_ids), kwargs))
+            return [{"id": frame_id} for frame_id in frame_ids]
+
+    calls = []
+
+    def fake_generate(frame_ids, **kwargs):
+        calls.append((list(frame_ids), kwargs["metadata"]))
+        metadata = {"background_layout": "nominal_frame", **kwargs["metadata"]}
+        return {
+            "background_payload_ref": "background-key",
+            "background_payload_encoding": "zstd",
+            "background_payload_format": "zstd_ndarray_c_order",
+            "background_payload_dtype": "uint8",
+            "background_payload_shape": [8192, 2048],
+            "background_metadata": metadata,
+            "updated_frame_count": len(frame_ids),
+        }
+
+    repository = Repository()
+    context = SimpleNamespace(
+        repository=repository,
+        config=CoreConfig(),
+        active_project_id="project-1",
+    )
+    monkeypatch.setattr("Pelagia.processing.frame_correction.generate_background_for_frames", fake_generate)
+
+    result = ensure_asset_background_windows(
+        ["frame-10", "frame-12"],
+        context=context,
+        window_stride=5,
+        window_width=5,
+    )
+
+    assert calls == [
+        (
+            ["frame-8", "frame-9", "frame-10", "frame-11"],
+            {
+                "background_window_center": 10,
+                "background_window_start": 8,
+                "background_window_end": 12,
+                "background_window_stride": 5,
+                "background_window_width": 5,
+                "background_application_start": 8,
+                "background_application_end": 12,
+                "background_nominal_width": 2048,
+                "background_nominal_height": 8192,
+            },
+        )
+    ]
+    assert repository.background_updates[0][0] == ["frame-12"]
+    assert repository.background_updates[0][1]["payload_shape"] == [8192, 2048]
+    assert result["windows"][0]["nominal_height"] == 8192
+
+
+def test_nominal_background_is_trimmed_to_partial_frame_shape():
+    background = np.arange(8 * 2, dtype=np.uint8).reshape(8, 2)
+
+    trimmed = _fit_background_to_frame(
+        background,
+        (4, 2),
+        {"background_layout": "nominal_frame"},
+    )
+
+    np.testing.assert_array_equal(trimmed, background[:4, :])
 
 
 def test_frame_infers_full_frame_geometry_from_data():

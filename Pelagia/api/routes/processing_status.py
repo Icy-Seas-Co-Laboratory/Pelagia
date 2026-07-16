@@ -10,10 +10,12 @@ if APIRouter is not None:
     from ..auth import require_project_read, require_project_write
     from ..schemas import (
         ProcessingStatusFrameIdsResponse,
+        ProcessingStatusFacetsResponse,
         ProcessingStatusFramesResponse,
         ProcessingStatusRebuildResponse,
         ProcessingStatusSummaryResponse,
     )
+    from ...services.processing_status import ProcessingStatusService
     from ._common import as_response, get_repository, page_metadata
 
     router = APIRouter(prefix="/processing/status", tags=["processing-status"])
@@ -67,9 +69,6 @@ if APIRouter is not None:
             "end_frame": end_frame,
         }
 
-    def _has_filters(filters: dict) -> bool:
-        return any(value not in (None, [], "") for value in filters.values())
-
     @router.get("/summary", response_model=ProcessingStatusSummaryResponse)
     def get_frame_status_summary(
         request: Request,
@@ -99,23 +98,48 @@ if APIRouter is not None:
             end_frame=end_frame,
         )
         try:
-            summary = repository.get_frame_status_summary(
+            result = ProcessingStatusService(repository).summary(
                 project_id=auth.project_id,
-                **filters,
-            )
-            snapshot_summary = (
-                repository.get_frame_status_summary(project_id=auth.project_id)
-                if _has_filters(filters)
-                else summary
-            )
-            snapshot = repository.get_or_create_processing_status_snapshot(
-                project_id=auth.project_id,
-                session_id=auth.session_id,
-                summary=snapshot_summary,
+                filters=filters,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return as_response({"summary": summary, "snapshot": snapshot})
+        return as_response(result)
+
+    @router.get("/facets", response_model=ProcessingStatusFacetsResponse)
+    def get_frame_status_facets(
+        request: Request,
+        run_id: str | None = None,
+        asset_id: list[str] | None = Query(None),
+        collection: list[str] | None = Query(None),
+        preprocessing_status: list[str] | None = Query(None),
+        candidate_detection_status: list[str] | None = Query(None),
+        roi_refinement_status: list[str] | None = Query(None),
+        has_candidates: bool | None = None,
+        has_refined_rois: bool | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+    ) -> dict:
+        auth = require_project_read(request)
+        repository = get_repository(request)
+        filters = {
+            "run_id": run_id,
+            "asset_ids": _query_values(asset_id),
+            "collections": _query_values(collection),
+            **_status_filters(preprocessing_status, candidate_detection_status, roi_refinement_status),
+            "has_candidates": has_candidates,
+            "has_refined_rois": has_refined_rois,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        }
+        try:
+            result = ProcessingStatusService(repository).facets(
+                project_id=auth.project_id,
+                filters=filters,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return as_response(result)
 
     @router.get("/frames/ids", response_model=ProcessingStatusFrameIdsResponse)
     def list_frame_status_ids(

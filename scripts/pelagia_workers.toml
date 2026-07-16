@@ -24,8 +24,8 @@ root_path_import_dir = "./data/import"
 allowed_root_paths = []
 
 [processing.video_ingest]
-opencv_threads = 1
-decoder_threads = 1
+opencv_threads = 2
+decoder_threads = 2
 
 [api]
 enabled = true

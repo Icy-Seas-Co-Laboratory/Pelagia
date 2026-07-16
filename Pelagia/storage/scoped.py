@@ -71,6 +71,7 @@ class FrameRepository(RepositoryScope):
             "upsert_frame_stage_status", "refresh_frame_status_counts",
             "rebuild_frame_status", "touch_processing_status_snapshot",
             "list_frame_status", "list_frame_status_ids", "get_frame_status_summary",
+            "get_frame_status_facets", "get_processing_status_snapshot",
             "get_or_create_processing_status_snapshot",
         }
     )

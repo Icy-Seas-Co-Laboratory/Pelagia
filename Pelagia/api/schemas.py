@@ -249,6 +249,21 @@ class ProcessingStatusSummaryResponse(FlexibleModel):
     snapshot: ProcessingStatusSnapshot
 
 
+class ProcessingStatusFacets(FlexibleModel):
+    assets: dict[str, int] = Field(default_factory=dict)
+    collections: dict[str, int] = Field(default_factory=dict)
+    preprocessing_status: dict[str, int] = Field(default_factory=dict)
+    candidate_detection_status: dict[str, int] = Field(default_factory=dict)
+    roi_refinement_status: dict[str, int] = Field(default_factory=dict)
+    refinement_state: dict[str, int] = Field(default_factory=dict)
+
+
+class ProcessingStatusFacetsResponse(FlexibleModel):
+    summary: ProcessingStatusSummary
+    facets: ProcessingStatusFacets
+    snapshot: ProcessingStatusSnapshot
+
+
 class ProcessingStatusFramesResponse(FlexibleModel):
     frames: list[FrameProcessingStatus] = Field(default_factory=list)
     next_cursor: str | None = None
