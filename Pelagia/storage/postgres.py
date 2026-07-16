@@ -2092,6 +2092,39 @@ class PostgresRepository:
             return None
         return FrameRecord.from_row(row)
 
+    def get_frame_records(
+        self,
+        frame_ids: Sequence[str],
+        *,
+        project_id: str | None = None,
+    ) -> list[FrameRecord]:
+        """Load selected frame records in caller-provided order."""
+        resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
+        if not resolved_frame_ids:
+            return []
+        clauses = ["frames.id = ANY(%s)"]
+        params: list[Any] = [resolved_frame_ids]
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT frames.*
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        records_by_id = {
+            str(row["id"]): FrameRecord.from_row(row)
+            for row in rows
+        }
+        return [records_by_id[frame_id] for frame_id in resolved_frame_ids if frame_id in records_by_id]
+
     def create_live_frame_copy(
         self,
         frame_id: str,
@@ -4612,11 +4645,12 @@ class PostgresRepository:
         summary: str | None = None,
         log_message: str | None = None,
     ) -> dict[str, Any] | None:
-        current = self.get_job(job_id)
-        if current is None:
-            return None
-        logs_tail = list(current.get("logs_tail") or [])
+        logs_tail = None
         if log_message:
+            current = self.get_job(job_id)
+            if current is None:
+                return None
+            logs_tail = list(current.get("logs_tail") or [])
             logs_tail.append(log_message)
             logs_tail = logs_tail[-20:]
         with self.connect() as connection:
@@ -4626,7 +4660,7 @@ class PostgresRepository:
                     UPDATE {self.schema}.processing_jobs
                     SET progress = %s::jsonb,
                         summary = COALESCE(%s, summary),
-                        logs_tail = %s::jsonb,
+                        logs_tail = COALESCE(%s::jsonb, logs_tail),
                         updated_at = NOW()
                     WHERE id = %s
                     RETURNING *;
@@ -4634,7 +4668,7 @@ class PostgresRepository:
                     (
                         json.dumps(json_ready(progress)),
                         summary,
-                        json.dumps(json_ready(logs_tail)),
+                        None if logs_tail is None else json.dumps(json_ready(logs_tail)),
                         job_id,
                     ),
                 )

@@ -21,6 +21,18 @@ from .timing import measure_phase
 
 _DEFAULT_CONTEXT: AppContext | None = None
 _CORE_LOGGER = processing_core_logger("frame_store")
+FRAME_DB_WORK_UNIT_SIZE = 25
+
+
+def frame_id_work_units(
+    frame_ids: Sequence[str],
+    *,
+    size: int = FRAME_DB_WORK_UNIT_SIZE,
+):
+    """Yield bounded frame-id groups used for paired database reads and writes."""
+    resolved_size = max(1, int(size))
+    for start in range(0, len(frame_ids), resolved_size):
+        yield list(frame_ids[start : start + resolved_size])
 
 
 def default_context() -> AppContext:
@@ -419,6 +431,7 @@ def retrieve_frame(
     context: AppContext | None = None,
     *,
     payload_kind: str = "original",
+    frame_record: FrameRecord | None = None,
 ) -> FrameData:
     started = time.perf_counter()
     ctx = context or default_context()
@@ -428,35 +441,38 @@ def retrieve_frame(
     if ctx.repository is None:
         raise RuntimeError("A PostgresRepository is required to load frame metadata.")
 
-    with measure_phase("load.database_query"):
-        with ctx.repository.connect() as connection:
-            with connection.cursor() as cursor:
-                if project_id:
-                    cursor.execute(
-                        f"""
-                        SELECT frames.*, assets.project_id AS project_id
-                        FROM {ctx.repository.schema}.frames frames
-                        JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
-                        WHERE frames.id = %s AND assets.project_id = %s
-                        """,
-                        (id, project_id),
-                    )
-                else:
-                    cursor.execute(
-                        f"""
-                        SELECT frames.*, assets.project_id AS project_id
-                        FROM {ctx.repository.schema}.frames frames
-                        JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
-                        WHERE frames.id = %s
-                        """,
-                        (id,),
-                    )
-                row = cursor.fetchone()
-    if row is None:
-        raise KeyError(id)
-
-    record = FrameRecord.from_row(row)
-    project_id = None if row.get("project_id") is None else str(row["project_id"])
+    record = frame_record
+    if record is None:
+        with measure_phase("load.database_query"):
+            with ctx.repository.connect() as connection:
+                with connection.cursor() as cursor:
+                    if project_id:
+                        cursor.execute(
+                            f"""
+                            SELECT frames.*, assets.project_id AS project_id
+                            FROM {ctx.repository.schema}.frames frames
+                            JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
+                            WHERE frames.id = %s AND assets.project_id = %s
+                            """,
+                            (id, project_id),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            SELECT frames.*, assets.project_id AS project_id
+                            FROM {ctx.repository.schema}.frames frames
+                            JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
+                            WHERE frames.id = %s
+                            """,
+                            (id,),
+                        )
+                    row = cursor.fetchone()
+        if row is None:
+            raise KeyError(id)
+        record = FrameRecord.from_row(row)
+        project_id = None if row.get("project_id") is None else str(row["project_id"])
+    elif str(record.id) != str(id):
+        raise ValueError(f"Frame record {record.id!r} does not match requested frame {id!r}.")
     kvstore = _kvstore_for_project(ctx, project_id)
     if kvstore is None:
         raise RuntimeError("A KVStore is required to retrieve frame data.")

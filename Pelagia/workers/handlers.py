@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..domain import JobStatus, PipelineStage
-from ..domain import DetectionRecord
+from ..domain import DetectionRecord, FrameRecord, JobStatus, PipelineStage
 from ..domain import normalize_collections
 from ..processing import ingest as ingest_module
 from ..processing.detection_candidate import segment_frame
@@ -15,7 +14,7 @@ from ..processing.detection_refinement import (
 )
 from ..processing.frame_correction import ensure_asset_background_windows, generate_background_for_frames
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
-from ..processing.frame_store import retrieve_frame, store_preprocessed_frames
+from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
 from ..processing.oracle_unet_refiner import resolve_refinement_model
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
@@ -32,9 +31,6 @@ from ..services.job_commands import (
 )
 from .progress import JobProgressReporter
 from .registry import HandlerRegistry
-
-PREPROCESS_DB_BATCH_SIZE = 25
-
 
 def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
     payload = job.get("payload") or {}
@@ -439,22 +435,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
     encoding = payload.get("encoding")
     quality = payload.get("quality")
-    processed_frames = []
     stored_rows = []
-
-    def flush_preprocessed_frames() -> None:
-        if not processed_frames:
-            return
-        stored_rows.extend(
-            store_preprocessed_frames(
-                processed_frames,
-                context=context,
-                project_id=project_id,
-                encoding=encoding,
-                quality=None if quality is None else int(quality),
-            )
-        )
-        processed_frames.clear()
     progress = JobProgressReporter(
         job,
         context,
@@ -472,21 +453,30 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         job_id=None if job.get("id") is None else str(job.get("id")),
     )
 
+    frame_records: dict[str, FrameRecord] = {}
     missing_background_frame_ids = []
-    for frame_id in frame_ids:
+    for work_frame_ids in frame_id_work_units(frame_ids):
         with measure_phase("selection.frame_metadata_lookup"):
-            frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
-        if frame_record is None:
-            raise KeyError(f"Frame {frame_id!r} was not found.")
-        if resolved_asset_id is None:
-            resolved_asset_id = frame_record.asset_id
-        resolved_asset_ids.add(frame_record.asset_id)
-        if resolved_run_id is None:
-            resolved_run_id = frame_record.run_id
-        if frame_record.run_id is not None:
-            resolved_run_ids.add(frame_record.run_id)
-        if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
-            missing_background_frame_ids.append(frame_id)
+            work_records = context.repository.get_frame_records(
+                work_frame_ids,
+                project_id=project_id,
+            )
+        records_by_id = {str(record.id): record for record in work_records}
+        missing_frame_ids = [frame_id for frame_id in work_frame_ids if frame_id not in records_by_id]
+        if missing_frame_ids:
+            raise KeyError(f"Frame {missing_frame_ids[0]!r} was not found.")
+        frame_records.update(records_by_id)
+        for frame_id in work_frame_ids:
+            frame_record = records_by_id[frame_id]
+            if resolved_asset_id is None:
+                resolved_asset_id = frame_record.asset_id
+            resolved_asset_ids.add(frame_record.asset_id)
+            if resolved_run_id is None:
+                resolved_run_id = frame_record.run_id
+            if frame_record.run_id is not None:
+                resolved_run_ids.add(frame_record.run_id)
+            if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
+                missing_background_frame_ids.append(frame_id)
 
     background_generation_result = None
 
@@ -534,48 +524,82 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     if background_correction and missing_background_frame_ids:
         background_generation_result = generate_preprocess_background("missing_background_payload")
 
-    for index, frame_id in enumerate(frame_ids, start=1):
-        try:
-            frame = retrieve_frame(frame_id, context=context, payload_kind="original")
-        except KeyError:
-            if not background_correction or background_generation_result is not None:
-                raise
-            background_generation_result = generate_preprocess_background("background_retrieve_failed")
-            frame = retrieve_frame(frame_id, context=context, payload_kind="original")
-        processed = preprocess_frame_for_segmentation(
-            frame,
-            flatfield_correction=flatfield_correction,
-            flatfield_q=flatfield_q,
-            flatfield_axis=flatfield_axis,
-            flatfield_min_field_value=flatfield_min_field_value,
-            flatfield_max_field_value=flatfield_max_field_value,
-            apply_mask=apply_mask,
-            crop_enabled=crop_enabled,
-            crop_x=crop_x,
-            crop_y=crop_y,
-            crop_w=crop_w,
-            crop_h=crop_h,
-            background_correction=background_correction,
-            background_min_field_value=background_min_field_value,
-            background_max_field_value=background_max_field_value,
-            invert_intensity=invert_intensity,
-            context=context,
+    completed_count = 0
+    for work_frame_ids in frame_id_work_units(frame_ids):
+        if background_generation_result is not None:
+            with measure_phase("selection.frame_metadata_lookup"):
+                refreshed_records = context.repository.get_frame_records(
+                    work_frame_ids,
+                    project_id=project_id,
+                )
+            frame_records.update({str(record.id): record for record in refreshed_records})
+        processed_frames = []
+        for frame_id in work_frame_ids:
+            try:
+                frame = retrieve_frame(
+                    frame_id,
+                    context=context,
+                    payload_kind="original",
+                    frame_record=frame_records[frame_id],
+                )
+            except KeyError:
+                if not background_correction or background_generation_result is not None:
+                    raise
+                background_generation_result = generate_preprocess_background("background_retrieve_failed")
+                refreshed = context.repository.get_frame_records(
+                    work_frame_ids,
+                    project_id=project_id,
+                )
+                refreshed_by_id = {str(record.id): record for record in refreshed}
+                if frame_id not in refreshed_by_id:
+                    raise KeyError(f"Frame {frame_id!r} was not found.")
+                frame_records.update(refreshed_by_id)
+                frame = retrieve_frame(
+                    frame_id,
+                    context=context,
+                    payload_kind="original",
+                    frame_record=refreshed_by_id[frame_id],
+                )
+            processed = preprocess_frame_for_segmentation(
+                frame,
+                flatfield_correction=flatfield_correction,
+                flatfield_q=flatfield_q,
+                flatfield_axis=flatfield_axis,
+                flatfield_min_field_value=flatfield_min_field_value,
+                flatfield_max_field_value=flatfield_max_field_value,
+                apply_mask=apply_mask,
+                crop_enabled=crop_enabled,
+                crop_x=crop_x,
+                crop_y=crop_y,
+                crop_w=crop_w,
+                crop_h=crop_h,
+                background_correction=background_correction,
+                background_min_field_value=background_min_field_value,
+                background_max_field_value=background_max_field_value,
+                invert_intensity=invert_intensity,
+                context=context,
+            )
+            processed_frames.append((frame_id, processed))
+        stored_rows.extend(
+            store_preprocessed_frames(
+                processed_frames,
+                context=context,
+                project_id=project_id,
+                encoding=encoding,
+                quality=None if quality is None else int(quality),
+            )
         )
-        processed_frames.append((frame_id, processed))
-        if len(processed_frames) >= PREPROCESS_DB_BATCH_SIZE:
-            flush_preprocessed_frames()
+        completed_count += len(work_frame_ids)
         progress.update(
-            index,
-            current={"frame_id": frame_id, "index": index},
-            message=f"Preprocessed {index}/{len(frame_ids)} frames",
+            completed_count,
+            current={"frame_id": work_frame_ids[-1], "index": completed_count},
+            message=f"Preprocessed {completed_count}/{len(frame_ids)} frames",
         )
 
     if not resolved_asset_ids:
         raise ValueError("Preprocess job could not resolve selected frames.")
     result_asset_id = resolved_asset_id if len(resolved_asset_ids) == 1 else None
     result_run_id = resolved_run_id if len(resolved_run_ids) <= 1 else None
-
-    flush_preprocessed_frames()
 
     progress.finish(
         completed=len(stored_rows),

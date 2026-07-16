@@ -243,28 +243,49 @@ def build_background_payload_for_frames(
     if ctx.repository is None:
         raise RuntimeError("A PostgresRepository is required to record background metadata.")
 
-    from .frame_store import retrieve_frame
+    from .frame_store import frame_id_work_units, retrieve_frame
 
     accumulator: np.ndarray | None = None
     frame_shape: tuple[int, ...] | None = None
-    for frame_id in resolved_frame_ids:
-        frame = retrieve_frame(frame_id, context=ctx, payload_kind=payload_kind)
-        with measure_phase("background.accumulate"):
-            data = frame.read()
-            if data is None:
-                raise ValueError(f"Frame {frame_id!r} has no image data.")
-            array = np.asarray(data, dtype=np.float32)
-            if array.ndim < 2:
-                raise ValueError(f"Frame {frame_id!r} data must have at least two dimensions.")
-            if frame_shape is None:
-                frame_shape = tuple(array.shape)
-                # Float64 accumulation avoids drift when wide windows contain many frames.
-                accumulator = np.zeros(frame_shape, dtype=np.float64)
-            elif tuple(array.shape) != frame_shape:
-                raise ValueError(
-                    f"Frame {frame_id!r} shape {tuple(array.shape)} does not match {frame_shape}."
-                )
-            accumulator += array
+    bulk_loader = getattr(ctx.repository, "get_frame_records", None)
+    for work_frame_ids in frame_id_work_units(resolved_frame_ids):
+        records_by_id = {}
+        if callable(bulk_loader):
+            with measure_phase("background.frame_metadata_lookup"):
+                records_by_id = {
+                    str(record.id): record
+                    for record in bulk_loader(
+                        work_frame_ids,
+                        project_id=getattr(ctx, "active_project_id", None),
+                    )
+                }
+            missing = [frame_id for frame_id in work_frame_ids if frame_id not in records_by_id]
+            if missing:
+                raise KeyError(f"Frame {missing[0]!r} was not found.")
+        for frame_id in work_frame_ids:
+            retrieve_kwargs = {
+                "context": ctx,
+                "payload_kind": payload_kind,
+            }
+            if records_by_id:
+                retrieve_kwargs["frame_record"] = records_by_id[frame_id]
+            frame = retrieve_frame(frame_id, **retrieve_kwargs)
+            with measure_phase("background.accumulate"):
+                data = frame.read()
+                if data is None:
+                    raise ValueError(f"Frame {frame_id!r} has no image data.")
+                array = np.asarray(data, dtype=np.float32)
+                if array.ndim < 2:
+                    raise ValueError(f"Frame {frame_id!r} data must have at least two dimensions.")
+                if frame_shape is None:
+                    frame_shape = tuple(array.shape)
+                    # Float64 accumulation avoids drift when wide windows contain many frames.
+                    accumulator = np.zeros(frame_shape, dtype=np.float64)
+                elif tuple(array.shape) != frame_shape:
+                    raise ValueError(
+                        f"Frame {frame_id!r} shape {tuple(array.shape)} does not match {frame_shape}."
+                    )
+                accumulator += array
 
     if accumulator is None:
         raise ValueError("No frame data was loaded.")
@@ -380,16 +401,34 @@ def ensure_asset_background_windows(
     if stride < 1 or width < 1 or stride % 2 == 0 or width % 2 == 0:
         raise ValueError("background_window_stride and background_window_width must be positive odd integers.")
 
+    from .frame_store import frame_id_work_units
+
     targets_by_asset: dict[str, list[FrameRecord]] = {}
-    for frame_id in dict.fromkeys(str(value) for value in frame_ids):
+    selected_frame_ids = list(dict.fromkeys(str(value) for value in frame_ids))
+    bulk_loader = getattr(context.repository, "get_frame_records", None)
+    for work_frame_ids in frame_id_work_units(selected_frame_ids):
         with measure_phase("selection.frame_metadata_lookup"):
-            record = context.repository.get_frame_record(
-                frame_id,
-                project_id=context.active_project_id,
-            )
-        if record is None:
-            raise KeyError(f"Frame {frame_id!r} was not found.")
-        targets_by_asset.setdefault(record.asset_id, []).append(record)
+            if callable(bulk_loader):
+                records = bulk_loader(work_frame_ids, project_id=context.active_project_id)
+            else:
+                records = [
+                    context.repository.get_frame_record(
+                        frame_id,
+                        project_id=context.active_project_id,
+                    )
+                    for frame_id in work_frame_ids
+                ]
+        records_by_id = {
+            str(record.id): record
+            for record in records
+            if record is not None
+        }
+        missing = [frame_id for frame_id in work_frame_ids if frame_id not in records_by_id]
+        if missing:
+            raise KeyError(f"Frame {missing[0]!r} was not found.")
+        for frame_id in work_frame_ids:
+            record = records_by_id[frame_id]
+            targets_by_asset.setdefault(record.asset_id, []).append(record)
 
     windows: list[dict] = []
     application_half_width = stride // 2

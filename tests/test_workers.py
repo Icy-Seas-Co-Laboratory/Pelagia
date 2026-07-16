@@ -49,6 +49,9 @@ class FakeRepository:
         self.project_calls.append(("get_asset", kwargs.get("project_id")))
         return self.assets.get(asset_id)
 
+    def get_project(self, project_id):
+        return {"id": project_id, "kvstore_root_path": None}
+
     def claim_jobs(self, worker_id, stages=None):
         return list(self.claimed_jobs)
 
@@ -128,6 +131,13 @@ class FakeRepository:
                 [4, 4] if frame_id in self.frames_with_background else []
             ),
         )
+
+    def get_frame_records(self, frame_ids, **kwargs):
+        return [
+            record
+            for frame_id in frame_ids
+            if (record := self.get_frame_record(frame_id, **kwargs)) is not None
+        ]
 
     def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
         self.project_calls.append(("replace_frame_detections", kwargs.get("project_id")))
@@ -471,7 +481,7 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     preprocessed = []
     stored = []
 
-    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original", frame_record=None):
         retrieved.append((frame_id, context, payload_kind))
         return FrameData(
             sourcePath="/tmp",
@@ -520,6 +530,70 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert preprocessed[0][1]["background_correction"] is True
     assert stored[0][1]["encoding"] == "jpg"
     assert stored[0][0][0][0] == "frame-1"
+
+
+def test_preprocess_frames_handler_processes_database_work_units(monkeypatch):
+    class WorkUnitRepository(FakeRepository):
+        def __init__(self):
+            super().__init__()
+            self.record_batches = []
+
+        def get_frame_records(self, frame_ids, **kwargs):
+            self.record_batches.append(list(frame_ids))
+            return [
+                FrameRecord(
+                    id=frame_id,
+                    run_id="run-1",
+                    asset_id="asset-1",
+                    frame_index=index,
+                    width=4,
+                    height=4,
+                    kvstore_hash=f"kv-{frame_id}",
+                    preview_thumbhash=b"thumb",
+                )
+                for index, frame_id in enumerate(frame_ids)
+            ]
+
+    repository = WorkUnitRepository()
+    context = make_context(repository)
+    frame_ids = [f"frame-{index}" for index in range(26)]
+    stored_batches = []
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, **kwargs: FrameData(
+            sourcePath="/tmp",
+            filename=f"{frame_id}.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+            metadata={"frame_id": frame_id},
+        ),
+    )
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.preprocess_frame_for_segmentation",
+        lambda frame, **kwargs: frame,
+    )
+
+    def fake_store(frames, **kwargs):
+        stored_batches.append([frame_id for frame_id, _ in frames])
+        return [{"id": frame_id} for frame_id, _ in frames]
+
+    monkeypatch.setattr("Pelagia.workers.handlers.store_preprocessed_frames", fake_store)
+
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess-units",
+            "project_id": "project-1",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "payload": {"frame_ids": frame_ids, "background_correction": False},
+        },
+        context,
+    )
+
+    assert repository.record_batches == [frame_ids[:25], frame_ids[25:]]
+    assert stored_batches == [frame_ids[:25], frame_ids[25:]]
+    assert result["frame_count"] == 26
+    assert result["timings"]["phase_counts"]["selection.frame_metadata_lookup"] == 2
 
 
 def test_preprocess_frames_handler_accepts_frame_ids_from_multiple_assets(monkeypatch):
@@ -677,7 +751,7 @@ def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
             "updated_frame_count": len(frame_ids),
         }
 
-    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original", frame_record=None):
         return FrameData(
             sourcePath="/tmp",
             filename="frame.png",
@@ -749,7 +823,7 @@ def test_preprocess_frames_handler_skips_background_generation_when_present(monk
     )
     monkeypatch.setattr(
         "Pelagia.workers.handlers.retrieve_frame",
-        lambda frame_id, context=None, payload_kind="original": FrameData(
+        lambda frame_id, context=None, payload_kind="original", frame_record=None: FrameData(
             sourcePath="/tmp",
             filename="frame.png",
             frameNumber=1,
@@ -798,7 +872,7 @@ def test_preprocess_frames_handler_regenerates_stale_background_reference(monkey
             "updated_frame_count": len(frame_ids),
         }
 
-    def fake_retrieve_frame(frame_id, context=None, payload_kind="original"):
+    def fake_retrieve_frame(frame_id, context=None, payload_kind="original", frame_record=None):
         nonlocal retrieve_calls
         retrieve_calls += 1
         if retrieve_calls == 1:
@@ -853,7 +927,7 @@ def test_preprocess_frames_handler_uses_project_context(monkeypatch):
 
     monkeypatch.setattr(
         "Pelagia.workers.handlers.retrieve_frame",
-        lambda frame_id, context=None, payload_kind="original": FrameData(
+        lambda frame_id, context=None, payload_kind="original", frame_record=None: FrameData(
             sourcePath="/tmp",
             filename="frame.png",
             frameNumber=1,

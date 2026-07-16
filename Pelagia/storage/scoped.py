@@ -58,7 +58,7 @@ class FrameRepository(RepositoryScope):
     operations = frozenset(
         {
             "replace_frames", "list_frames", "get_frame", "get_frame_by_asset_index",
-            "list_frame_records", "get_frame_record", "create_live_frame_copy",
+            "list_frame_records", "get_frame_record", "get_frame_records", "create_live_frame_copy",
             "list_live_frame_copies", "count_frame_payload_references",
             "delete_live_frame_copy", "update_frame_preprocessed_payload",
             "update_frame_preprocessed_payloads",
