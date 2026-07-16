@@ -1,3 +1,5 @@
+"""Encode and decode numpy frame arrays for KVStore persistence."""
+
 from typing import Any
 
 import cv2
@@ -27,17 +29,10 @@ def encode_array_payload(array: np.ndarray, encoding: object, *, quality: int | 
         return encoded.tobytes(), "png", "png"
 
     if requested in {"jpg", "jpeg", "image/jpeg"}:
-        resolved_quality = _normalize_lossy_quality(quality)
-        ok, encoded = cv2.imencode(
-            ".jpg",
+        return _encode_jpg_payload(
             array,
-            [cv2.IMWRITE_JPEG_QUALITY, resolved_quality],
-        )
-        if not ok:
-            raise ValueError(
-                f"Frame array with dtype {array.dtype} and shape {array.shape} cannot be encoded as JPG."
-            )
-        return encoded.tobytes(), "jpg", "jpg"
+            quality=_normalize_lossy_quality(quality),
+        ), "jpg", "jpg"
 
     if requested in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl", "image/jxl"}:
         return _encode_jxl_payload(
@@ -82,10 +77,7 @@ def decode_array_payload(payload: bytes, metadata: dict[str, Any]) -> np.ndarray
         return np.ascontiguousarray(decoded)
 
     if encoding in {"jpg", "jpeg", "image/jpeg"}:
-        decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-        if decoded is None:
-            raise ValueError("Stored frame payload could not be decoded as JPG.")
-        return np.ascontiguousarray(decoded)
+        return _decode_jpg_payload(payload)
 
     if encoding in {"jxl", "jpegxl", "jpeg-xl", "jpeg_xl", "image/jxl"}:
         return _decode_jxl_payload(payload)
@@ -115,6 +107,35 @@ def _normalize_lossy_quality(value: int | None) -> int:
     if quality < 0 or quality > 100:
         raise ValueError("Image quality must be between 0 and 100.")
     return quality
+
+
+def _encode_jpg_payload(array: np.ndarray, *, quality: int) -> bytes:
+    imagecodecs = _imagecodecs()
+    _require_imagecodec(imagecodecs, "JPEG", "JPEG")
+    image = np.asarray(array)
+    # Pelagia/OpenCV arrays are BGR; imagecodecs expects RGB channel order.
+    if image.ndim == 3 and image.shape[2] in {3, 4}:
+        image = image[:, :, 2::-1]
+    elif image.ndim == 3 and image.shape[2] == 1:
+        image = image[:, :, 0]
+    image = np.ascontiguousarray(image)
+    try:
+        return bytes(imagecodecs.jpeg_encode(image, level=int(quality)))
+    except Exception as exc:
+        raise RuntimeError(f"JPEG encoding failed: {exc}") from exc
+
+
+def _decode_jpg_payload(payload: bytes) -> np.ndarray:
+    imagecodecs = _imagecodecs()
+    _require_imagecodec(imagecodecs, "JPEG", "JPEG")
+    try:
+        decoded = np.asarray(imagecodecs.jpeg_decode(payload))
+    except Exception as exc:
+        raise RuntimeError(f"JPEG decoding failed: {exc}") from exc
+    # Keep decoded color frames compatible with existing OpenCV-facing code.
+    if decoded.ndim == 3 and decoded.shape[2] == 3:
+        decoded = decoded[:, :, ::-1]
+    return np.ascontiguousarray(decoded)
 
 
 def _encode_jxl_payload(array: np.ndarray, *, quality: int) -> bytes:
@@ -186,7 +207,7 @@ def _imagecodecs():
         import imagecodecs
     except ImportError as exc:
         raise RuntimeError(
-            "JPEG XL and JPEG XS frame storage require the 'imagecodecs' Python package. "
-            "Install Pelagia with its core dependencies or choose image_encoding='zstd', 'png', 'jpg', or 'raw'."
+            "JPEG, JPEG XL, and JPEG XS frame storage require the 'imagecodecs' Python package. "
+            "Install Pelagia with its core dependencies or choose image_encoding='zstd', 'png', or 'raw'."
         ) from exc
     return imagecodecs

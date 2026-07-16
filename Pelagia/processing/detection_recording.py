@@ -1,3 +1,5 @@
+"""Convert candidate ROIs into persistable detection records and payloads."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -11,6 +13,7 @@ from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 from .mask_augmentation import as_binary_mask
 from .roi_assembly import CandidateRoi
+from .timing import measure_phase
 
 
 def frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
@@ -98,7 +101,11 @@ def build_candidate_detection_record(
     if store_roi_payload:
         if roi_array is None:
             raise RuntimeError("ROI payload was requested but no ROI array was prepared.")
-        payload, array_encoding, array_format = encode_array_payload(roi_array, selected_encoding)
+        with measure_phase("segmentation.roi_encode"):
+            payload, array_encoding, array_format = encode_array_payload(
+                roi_array,
+                selected_encoding,
+            )
         roi_dtype = str(roi_array.dtype)
         roi_shape = list(roi_array.shape)
     else:
@@ -111,7 +118,11 @@ def build_candidate_detection_record(
     if always_store_mask:
         if mask_crop is None:
             raise RuntimeError("Mask payload was requested but no mask crop was prepared.")
-        mask_payload, mask_encoding, mask_format = encode_array_payload(mask_crop, selected_encoding)
+        with measure_phase("segmentation.mask_encode"):
+            mask_payload, mask_encoding, mask_format = encode_array_payload(
+                mask_crop,
+                selected_encoding,
+            )
         mask_dtype = str(mask_crop.dtype)
         mask_shape = list(mask_crop.shape)
     else:
@@ -128,6 +139,7 @@ def build_candidate_detection_record(
         candidate.bbox_h,
     )
 
+    # Cropped/preprocessed frames carry their original-frame offset in bbox_x/y.
     frame_x_offset = int(getattr(processed_frame, "bbox_x", 0) or 0)
     frame_y_offset = int(getattr(processed_frame, "bbox_y", 0) or 0)
     object_bbox = (
@@ -205,6 +217,7 @@ def choose_roi_encoding(roi: np.ndarray, encoding: str | None, zstd_min_bytes: i
     requested = str(encoding or defaults.roi_encoding).lower()
     resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
     if requested == "auto":
+        # Small crops favor image compression; larger arrays favor fast lossless zstd.
         return "png" if roi.nbytes < resolved_zstd_min_bytes else "zstd"
     return requested
 

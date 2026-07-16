@@ -1,3 +1,5 @@
+"""Discover, decode, tile, and persist image and video sources."""
+
 import os
 import shutil
 import subprocess
@@ -16,6 +18,7 @@ from .defaults import default_processing_config
 from .frame_model import FrameData
 from .frame_store import store_frame
 from .frame_time import parse_filename_timestamp_utc, timestamp_for_frame
+from .timing import measure_phase
 
 
 _CORE_LOGGER = processing_core_logger("ingest")
@@ -487,10 +490,12 @@ def ingest_image_folder(
     stored_frames: list[dict[str, Any]] = []
     try:
         for frame_index, image_path in enumerate(image_files, start=1):
-            image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+            with measure_phase("ingest.image_decode"):
+                image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
             if image is None:
                 raise ValueError(f"Could not read image file: {image_path}")
-            image = convert_frame_to_grayscale(image)
+            with measure_phase("ingest.grayscale"):
+                image = convert_frame_to_grayscale(image)
             metadata_for_frame = frame_metadata.copy()
             metadata_for_frame.update(
                 {
@@ -704,10 +709,11 @@ def ingest_video_file(
     frame_metadata["apply_mask"] = bool(apply_mask)
     frame_metadata["mask_path"] = mask_path
 
-    video, video_decode_mode = _open_video_capture(
-        input_path,
-        prefer_software_decode=prefer_software_decode,
-    )
+    with measure_phase("ingest.video_open"):
+        video, video_decode_mode = _open_video_capture(
+            input_path,
+            prefer_software_decode=prefer_software_decode,
+        )
     ingest_payload["video_decode_mode"] = video_decode_mode
     if not video.isOpened():
         duration_ms = (time.perf_counter() - started) * 1000
@@ -834,12 +840,16 @@ def ingest_video_file(
 
     def store_source_frame(frame: np.ndarray) -> None:
         nonlocal frame_buffer, n
-        frame = convert_frame_to_grayscale(frame)
+        with measure_phase("ingest.grayscale"):
+            frame = convert_frame_to_grayscale(frame)
         frame_buffer.append(frame)
         if len(frame_buffer) == n_tile:
             source_start = n - len(frame_buffer) + 1
             source_end = n
-            store_tile(np.vstack(frame_buffer), source_start, source_end)
+            # Multi-frame tiles are stacked vertically to preserve the legacy line-scan layout.
+            with measure_phase("ingest.tile_assembly"):
+                tile = np.vstack(frame_buffer)
+            store_tile(tile, source_start, source_end)
             frame_buffer = []
         n += 1
 
@@ -849,17 +859,21 @@ def ingest_video_file(
             return
         source_start = n - len(frame_buffer)
         source_end = n - 1
-        store_tile(np.vstack(frame_buffer), source_start, source_end, partial_tile=True)
+        with measure_phase("ingest.tile_assembly"):
+            tile = np.vstack(frame_buffer)
+        store_tile(tile, source_start, source_end, partial_tile=True)
         frame_buffer = []
 
     try:
         while video.isOpened():
-            good_return, frame = video.read()
+            with measure_phase("ingest.video_decode"):
+                good_return, frame = video.read()
             if not good_return:
                 break
             if frame is not None:
                 store_source_frame(frame)
 
+        # Retry only when OpenCV opened the source but produced no usable frames.
         if n == 1 and prefer_software_decode:
             width, height = _video_dimensions(video, input_path)
             fallback_payload = {

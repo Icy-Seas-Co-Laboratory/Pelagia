@@ -1,3 +1,5 @@
+"""Resolve flat job options into grouped segmentation configuration."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
@@ -65,6 +67,7 @@ def resolve_segmentation_options(
         str(frame_payload_kind).lower() in {"original", "raw"},
     )
     threshold = values.get("threshold")
+    # A bare legacy threshold implies manual mode and skips default mask cleanup.
     explicit_manual_threshold = threshold is not None and values.get("threshold_method") is None
     threshold_method = _normalize_method(
         _get(values, "threshold_method", "manual" if explicit_manual_threshold else thresholding.method),

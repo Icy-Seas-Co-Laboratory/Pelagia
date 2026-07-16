@@ -16,6 +16,7 @@ from Pelagia.processing.frame_correction import (
     _bounded_field,
     _divide_by_field,
     apply_flatfield_correction,
+    divide_background,
     ensure_asset_background_windows,
     flatfield_correction,
     generate_background_for_frames,
@@ -298,6 +299,16 @@ def test_divide_by_field_maps_zero_divisor_to_255_for_float_data():
     np.testing.assert_array_equal(corrected, np.array([255.0], dtype=np.float32))
 
 
+def test_divide_background_promotes_uint8_field_for_calculation():
+    data = np.array([[50, 100, 200]], dtype=np.uint8)
+    background = np.array([[50, 100, 200]], dtype=np.uint8)
+
+    corrected = divide_background(data, background=background)
+
+    assert corrected.dtype == np.uint8
+    np.testing.assert_array_equal(corrected, np.full((1, 3), 255, dtype=np.uint8))
+
+
 def test_generate_background_for_frames_stores_mean_field(monkeypatch):
     class BackgroundKVStore:
         def __init__(self):
@@ -323,7 +334,7 @@ def test_generate_background_for_frames_stores_mean_field(monkeypatch):
 
     frames = {
         "frame-1": FrameData("/tmp/", "a.png", 1, data=np.array([[10, 20], [30, 40]], dtype=np.uint8)),
-        "frame-2": FrameData("/tmp/", "b.png", 2, data=np.array([[30, 40], [50, 60]], dtype=np.uint8)),
+        "frame-2": FrameData("/tmp/", "b.png", 2, data=np.array([[33, 43], [53, 63]], dtype=np.uint8)),
     }
 
     def fake_retrieve_frame(frame_id, *, context, payload_kind):
@@ -338,14 +349,14 @@ def test_generate_background_for_frames_stores_mean_field(monkeypatch):
     assert result["background_payload_ref"] == "background-key"
     assert result["updated_frame_count"] == 2
     assert ctx.repository.updated[0] == ["frame-1", "frame-2"]
-    assert ctx.repository.updated[1]["payload_dtype"] == "float32"
+    assert ctx.repository.updated[1]["payload_dtype"] == "uint8"
     decoded = decode_array_payload(
         ctx.kvstore.payload,
-        {"kvstore_encoding": "zstd", "dtype": "float32", "shape": [2, 2]},
+        {"kvstore_encoding": "zstd", "dtype": "uint8", "shape": [2, 2]},
     )
     np.testing.assert_array_equal(
         decoded,
-        np.array([[20, 30], [40, 50]], dtype=np.float32),
+        np.array([[22, 32], [42, 52]], dtype=np.uint8),
     )
 
 
@@ -722,6 +733,75 @@ def test_store_frame_can_write_jpg_payload():
     decoded = decode_array_payload(ctx.kvstore.payload, metadata)
     assert decoded.shape == data.shape
     assert decoded.dtype == np.uint8
+
+
+def test_jpg_codec_uses_native_grayscale_imagecodecs_path(monkeypatch):
+    encode_calls: list[dict[str, object]] = []
+    grayscale = np.arange(16, dtype=np.uint8).reshape(4, 4)
+
+    def fake_encode(data, **kwargs):
+        encode_calls.append({"data": data.copy(), **kwargs})
+        return b"jpg"
+
+    codec = SimpleNamespace(
+        JPEG=SimpleNamespace(available=True),
+        jpeg_encode=fake_encode,
+        jpeg_decode=lambda payload: grayscale.copy(),
+    )
+    monkeypatch.setattr(frame_codec, "_imagecodecs", lambda: codec)
+
+    payload, encoding, payload_format = encode_array_payload(grayscale, "jpg", quality=87)
+    decoded = decode_array_payload(payload, {"kvstore_encoding": "jpg"})
+
+    assert payload == b"jpg"
+    assert encoding == "jpg"
+    assert payload_format == "jpg"
+    assert encode_calls[0]["level"] == 87
+    assert np.array_equal(encode_calls[0]["data"], grayscale)
+    assert np.array_equal(decoded, grayscale)
+
+
+def test_jpg_codec_accepts_color_and_preserves_bgr_channels(monkeypatch):
+    encode_calls: list[np.ndarray] = []
+    rgb = np.array([[[30, 20, 10], [60, 50, 40]]], dtype=np.uint8)
+
+    def fake_encode(data, **kwargs):
+        encode_calls.append(data.copy())
+        return b"jpg"
+
+    codec = SimpleNamespace(
+        JPEG=SimpleNamespace(available=True),
+        jpeg_encode=fake_encode,
+        jpeg_decode=lambda payload: rgb.copy(),
+    )
+    monkeypatch.setattr(frame_codec, "_imagecodecs", lambda: codec)
+
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    payload, _, _ = encode_array_payload(bgr, "jpg")
+    decoded = decode_array_payload(payload, {"kvstore_encoding": "jpg"})
+
+    assert np.array_equal(encode_calls[0], rgb)
+    assert np.array_equal(decoded, bgr)
+    assert decoded.flags.c_contiguous
+
+
+def test_imagecodecs_decodes_legacy_opencv_jpg_as_bgr():
+    pytest.importorskip("imagecodecs")
+    bgr = np.zeros((32, 96, 3), dtype=np.uint8)
+    bgr[:, :32] = (255, 0, 0)
+    bgr[:, 32:64] = (0, 255, 0)
+    bgr[:, 64:] = (0, 0, 255)
+    ok, encoded = frame_codec.cv2.imencode(
+        ".jpg",
+        bgr,
+        [frame_codec.cv2.IMWRITE_JPEG_QUALITY, 95],
+    )
+    assert ok
+
+    expected = frame_codec.cv2.imdecode(encoded, frame_codec.cv2.IMREAD_UNCHANGED)
+    decoded = decode_array_payload(encoded.tobytes(), {"kvstore_encoding": "jpg"})
+
+    np.testing.assert_allclose(decoded, expected, atol=2)
 
 
 def test_store_frame_can_write_jxl_payload():

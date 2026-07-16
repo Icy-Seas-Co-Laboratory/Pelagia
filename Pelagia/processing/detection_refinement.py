@@ -1,3 +1,5 @@
+"""Refine candidate ROI masks with tiled models and reconcile overlaps."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
@@ -14,6 +16,7 @@ from .frame_model import FrameData
 from .frame_preprocess import as_binary_mask, as_grayscale_array
 from .roi_assembly import assemble_candidate_rois
 from .roi_filter import filter_candidate_rois
+from .timing import measure_phase
 
 
 RefinementFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -148,12 +151,24 @@ class DetectionRefinementResult:
             }
         )
         requested_encoding = encoding or self.candidate_detection.roi_encoding or "png"
-        roi_payload, roi_encoding, roi_format = encode_array_payload(self.roi, requested_encoding)
-        mask_payload, mask_encoding, mask_format = encode_array_payload(self.refined_mask, requested_encoding)
-        bbox = self.bbox or _mask_bbox_in_frame(self.refined_mask, self.crop_bbox or _detection_crop_bbox(self.candidate_detection))
-        crop_bbox = self.crop_bbox or _detection_crop_bbox(self.candidate_detection)
-        area, perimeter, major_axis, minor_axis = _mask_measurements(self.refined_mask)
-        min_gray, mean_gray = _gray_stats(self.roi, self.refined_mask)
+        with measure_phase("refinement.roi_encode"):
+            roi_payload, roi_encoding, roi_format = encode_array_payload(
+                self.roi,
+                requested_encoding,
+            )
+        with measure_phase("refinement.mask_encode"):
+            mask_payload, mask_encoding, mask_format = encode_array_payload(
+                self.refined_mask,
+                requested_encoding,
+            )
+        with measure_phase("refinement.measurements"):
+            bbox = self.bbox or _mask_bbox_in_frame(
+                self.refined_mask,
+                self.crop_bbox or _detection_crop_bbox(self.candidate_detection),
+            )
+            crop_bbox = self.crop_bbox or _detection_crop_bbox(self.candidate_detection)
+            area, perimeter, major_axis, minor_axis = _mask_measurements(self.refined_mask)
+            min_gray, mean_gray = _gray_stats(self.roi, self.refined_mask)
         return replace(
             self.candidate_detection,
             bbox_x=int(bbox[0]),
@@ -328,17 +343,27 @@ def predict_refined_tile_masks(
     if resolved_options.batch_size:
         prediction_chunks = []
         for start in range(0, len(tiles), resolved_options.batch_size):
-            prediction_chunks.append(
-                np.asarray(resolved_model.predict(refinement_batch_from_tiles(tiles[start:start + resolved_options.batch_size])))
-            )
+            with measure_phase("refinement.batch_assembly"):
+                batch = refinement_batch_from_tiles(
+                    tiles[start:start + resolved_options.batch_size]
+                )
+            with measure_phase("refinement.model_inference"):
+                prediction_chunks.append(np.asarray(resolved_model.predict(batch)))
         predictions = np.concatenate(prediction_chunks, axis=0)
     else:
-        predictions = np.asarray(resolved_model.predict(refinement_batch_from_tiles(tiles)))
+        with measure_phase("refinement.batch_assembly"):
+            batch = refinement_batch_from_tiles(tiles)
+        with measure_phase("refinement.model_inference"):
+            predictions = np.asarray(resolved_model.predict(batch))
     if predictions.ndim != 3 or predictions.shape[0] != len(tiles):
         raise ValueError("Refinement model must return a KxHxW mask batch.")
     if predictions.shape[1:3] != tiles[0].image.shape[:2]:
         raise ValueError("Refinement model output tile size does not match input tile size.")
-    return [_prediction_to_mask(prediction, threshold=resolved_options.output_threshold) for prediction in predictions]
+    with measure_phase("refinement.prediction_threshold"):
+        return [
+            _prediction_to_mask(prediction, threshold=resolved_options.output_threshold)
+            for prediction in predictions
+        ]
 
 
 def merge_refined_tiles(
@@ -394,13 +419,17 @@ def refine_detection(
             raise ValueError(
                 "Detection does not include ROI payload data and no frame_loader was supplied."
             )
-        full_frame = as_grayscale_array(frame_loader(detection.frame_id))
+        loaded_frame = frame_loader(detection.frame_id)
+        with measure_phase("refinement.frame_prepare"):
+            full_frame = as_grayscale_array(loaded_frame)
         frame_loaded = True
         roi_source = "frame"
         roi = _crop_detection_roi_from_frame(detection, full_frame)
     else:
-        roi = as_grayscale_array(decode_detection_roi(detection))
-    candidate_mask = decode_detection_candidate_mask(detection, roi=roi)
+        with measure_phase("refinement.roi_decode"):
+            roi = as_grayscale_array(decode_detection_roi(detection))
+    with measure_phase("refinement.mask_decode"):
+        candidate_mask = decode_detection_candidate_mask(detection, roi=roi)
     if candidate_mask.shape[:2] != roi.shape[:2]:
         raise ValueError(
             f"Candidate mask shape {candidate_mask.shape[:2]} does not match ROI shape {roi.shape[:2]}."
@@ -413,19 +442,21 @@ def refine_detection(
     refined_mask = candidate_mask
 
     for iteration in range(resolved_options.max_iterations):
-        last_tiles = build_roi_tiles(
-            detection,
-            roi,
-            refined_mask,
-            options=resolved_options,
-            crop_bbox=crop_bbox,
-        )
+        with measure_phase("refinement.tile_build"):
+            last_tiles = build_roi_tiles(
+                detection,
+                roi,
+                refined_mask,
+                options=resolved_options,
+                crop_bbox=crop_bbox,
+            )
         tile_masks = predict_refined_tile_masks(
             last_tiles,
             model=resolved_model,
             options=resolved_options,
         )
-        refined_mask = merge_refined_tiles(last_tiles, tile_masks, roi.shape[:2])
+        with measure_phase("refinement.tile_merge"):
+            refined_mask = merge_refined_tiles(last_tiles, tile_masks, roi.shape[:2])
         touched = mask_touches_uncovered_edge(
             refined_mask,
             crop_bbox=crop_bbox,
@@ -438,7 +469,9 @@ def refine_detection(
         if frame_loader is None:
             break
         if full_frame is None:
-            full_frame = as_grayscale_array(frame_loader(detection.frame_id))
+            loaded_frame = frame_loader(detection.frame_id)
+            with measure_phase("refinement.frame_prepare"):
+                full_frame = as_grayscale_array(loaded_frame)
             frame_loaded = True
         new_crop_bbox = _expanded_crop_bbox(
             crop_bbox,
@@ -448,13 +481,14 @@ def refine_detection(
         )
         if new_crop_bbox == crop_bbox:
             break
-        roi, refined_mask = _expand_roi_and_mask_from_frame(
-            full_frame,
-            current_roi=roi,
-            current_mask=refined_mask,
-            current_crop_bbox=crop_bbox,
-            new_crop_bbox=new_crop_bbox,
-        )
+        with measure_phase("refinement.roi_expansion"):
+            roi, refined_mask = _expand_roi_and_mask_from_frame(
+                full_frame,
+                current_roi=roi,
+                current_mask=refined_mask,
+                current_crop_bbox=crop_bbox,
+                new_crop_bbox=new_crop_bbox,
+            )
         crop_bbox = new_crop_bbox
         expansion_count += 1
         if iteration == resolved_options.max_iterations - 1:
@@ -528,8 +562,10 @@ def refine_detections(
             options=resolved_options,
             method=method,
         )
-    results = _non_empty_refinement_results(results)
-    return reconcile_overlapping_refinements(results, options=resolved_options)
+    with measure_phase("refinement.result_filter"):
+        results = _non_empty_refinement_results(results)
+    with measure_phase("refinement.overlap_reconciliation"):
+        return reconcile_overlapping_refinements(results, options=resolved_options)
 
 
 def discover_residual_refinements(
@@ -632,6 +668,7 @@ def reconcile_overlapping_refinements(
         return resolved_results
 
     kept: list[DetectionRefinementResult] = []
+    # Larger, stronger refinements claim overlaps before smaller fragments are considered.
     sorted_results = sorted(resolved_results, key=_reconciliation_sort_key)
     for current in sorted_results:
         consumed_by: DetectionRefinementResult | None = None
@@ -705,18 +742,20 @@ def _residual_candidate_detections(
         or result.candidate_detection.metadata.get("assembly_method")
         or "connected_components"
     )
-    assembled = assemble_candidate_rois(
-        residual_mask,
-        method=str(assembly_method),
-        connectivity=options.residual_roi_assembly_connectivity,
-    )
-    candidates = filter_candidate_rois(
-        assembled,
-        min_area=options.residual_min_area,
-        min_width=options.residual_min_width,
-        min_height=options.residual_min_height,
-        min_width_plus_height=options.residual_min_width_plus_height,
-    )
+    with measure_phase("refinement.residual_assembly"):
+        assembled = assemble_candidate_rois(
+            residual_mask,
+            method=str(assembly_method),
+            connectivity=options.residual_roi_assembly_connectivity,
+        )
+    with measure_phase("refinement.residual_filter"):
+        candidates = filter_candidate_rois(
+            assembled,
+            min_area=options.residual_min_area,
+            min_width=options.residual_min_width,
+            min_height=options.residual_min_height,
+            min_width_plus_height=options.residual_min_width_plus_height,
+        )
     result.metadata["residual_discovery_remaining_pixels"] = int(np.count_nonzero(residual_mask))
     result.metadata["residual_discovery_candidate_count"] = len(candidates)
     if not candidates:

@@ -1,3 +1,5 @@
+"""Derive UTC frame timestamps from source filenames and frame rates."""
+
 import re
 from datetime import datetime, timedelta, timezone
 

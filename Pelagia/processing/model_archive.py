@@ -1,3 +1,5 @@
+"""Archive Keras models into portable formats with reproducibility metadata."""
+
 import os
 import io
 import json

@@ -1,3 +1,5 @@
+"""Export Keras models and verify SavedModel inference parity."""
+
 from __future__ import annotations
 
 import time

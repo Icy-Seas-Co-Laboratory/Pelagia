@@ -1,3 +1,5 @@
+"""Morphological cleanup operations for binary segmentation masks."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence

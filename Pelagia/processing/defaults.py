@@ -1,3 +1,5 @@
+"""Resolve processing defaults for routines called outside an application context."""
+
 from __future__ import annotations
 
 from ..config import CoreConfig, ProcessingConfig

@@ -1,3 +1,5 @@
+"""Analyze ingest sources and produce reproducible source manifests."""
+
 from __future__ import annotations
 
 import hashlib
@@ -194,6 +196,7 @@ def analyze_video_asset(
     probe_metadata, warnings = _ffprobe_video(resolved)
     opencv_metadata, opencv_warnings = _opencv_video_probe(resolved)
     warnings.extend(opencv_warnings)
+    # ffprobe is canonical; OpenCV only fills fields missing from container metadata.
     if opencv_metadata:
         probe_metadata.update({key: value for key, value in opencv_metadata.items() if value is not None})
     if "source_frame_count" not in probe_metadata and probe_metadata.get("opencv_source_frame_count"):

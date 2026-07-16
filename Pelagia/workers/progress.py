@@ -3,6 +3,7 @@ from __future__ import annotations
 from time import monotonic
 from typing import Any
 
+from ..processing.timing import measure_phase
 from ..services.context import AppContext
 
 
@@ -85,12 +86,13 @@ class JobProgressReporter:
             },
             "message": message,
         }
-        update_job_progress(
-            job_id,
-            progress,
-            summary=message,
-            log_message=None,
-        )
+        with measure_phase("progress.database_update"):
+            update_job_progress(
+                job_id,
+                progress,
+                summary=message,
+                log_message=None,
+            )
         self.last_emit_at = now
         self.last_completed = completed_int
 

@@ -1,3 +1,5 @@
+"""Apply geometric and payload-storage filters to candidate ROIs."""
+
 from __future__ import annotations
 
 from .roi_assembly import CandidateRoi, renumber_candidate_rois

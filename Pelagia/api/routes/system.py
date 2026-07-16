@@ -197,7 +197,7 @@ if APIRouter is not None:
         }
 
     def _system_usage(request: Request) -> dict:
-        require_admin(request)
+        require_auth(request)
         return as_response(SystemUsageService(get_context(request)).snapshot())
 
     @router.get("/usage")

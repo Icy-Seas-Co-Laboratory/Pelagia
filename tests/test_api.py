@@ -1232,13 +1232,15 @@ def test_api_reports_system_usage_and_preserves_system_use_discovery():
     assert use["common_flows"]["system_usage"] == "GET /system/usage"
 
 
-def test_api_system_usage_requires_admin():
+def test_api_system_usage_requires_authentication_but_not_admin():
     client, _, _ = make_client(auth_enabled=True)
     user_headers = auth_headers(client, username="ada", project_key="default")
     admin_headers = auth_headers(client, username="admin", project_key="default")
 
     assert client.get("/system/usage").status_code == 401
-    assert client.get("/system/usage", headers=user_headers).status_code == 403
+    assert client.get("/system/use").status_code == 401
+    assert client.get("/system/usage", headers=user_headers).status_code == 200
+    assert client.get("/system/use", headers=user_headers).status_code == 200
     assert client.get("/system/usage", headers=admin_headers).status_code == 200
 
 

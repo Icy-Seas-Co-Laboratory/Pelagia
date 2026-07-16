@@ -1,3 +1,5 @@
+"""Assemble binary-mask components into stable candidate ROIs."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -65,6 +67,7 @@ def assemble_connected_components(mask: np.ndarray, *, connectivity: int = 8) ->
         width = int(stats[label, cv2.CC_STAT_WIDTH])
         height = int(stats[label, cv2.CC_STAT_HEIGHT])
         area = float(stats[label, cv2.CC_STAT_AREA])
+        # Candidate masks are bbox-local even though bbox coordinates are frame-relative.
         component_mask = np.ascontiguousarray(
             (labels[y:y + height, x:x + width] == label).astype(np.uint8) * 255
         )
@@ -104,6 +107,7 @@ def assemble_contours(mask: np.ndarray) -> list[CandidateRoi]:
         if contour.size == 0:
             continue
         x, y, width, height = cv2.boundingRect(contour)
+        # Shift only the contour used to draw the local mask; retain the frame contour below.
         local_contour = np.ascontiguousarray(contour - np.array([[[x, y]]], dtype=contour.dtype))
         component_mask = np.zeros((int(height), int(width)), dtype=np.uint8)
         cv2.drawContours(component_mask, [local_contour], -1, 255, thickness=cv2.FILLED)

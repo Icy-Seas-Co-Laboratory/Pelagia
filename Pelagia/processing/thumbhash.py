@@ -1,3 +1,5 @@
+"""Generate compact frame previews using the ThumbHash format."""
+
 from __future__ import annotations
 
 import base64

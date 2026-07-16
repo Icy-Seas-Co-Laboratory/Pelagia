@@ -95,6 +95,15 @@ class Worker:
                 result = self.handlers.handle(job, job_context)
                 self.context.repository.complete_job(job["id"], result=result)
                 duration_ms = (time.perf_counter() - started) * 1000
+                timings = (result or {}).get("timings")
+                if timings:
+                    get_core_logger("worker").info(
+                        "Worker %s completed job %s stage=%s timings=%s",
+                        self.worker_id,
+                        job_id,
+                        stage,
+                        timings,
+                    )
                 if self.context.logger is not None:
                     self.context.logger.info(
                         "job.handler_completed",
@@ -107,6 +116,7 @@ class Worker:
                         payload={
                             "stage": stage,
                             "result_keys": sorted((result or {}).keys()),
+                            "timings": timings,
                         },
                     )
             except Exception as exc:

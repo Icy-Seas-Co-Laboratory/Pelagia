@@ -1,3 +1,5 @@
+"""Load and adapt oracle-builder U-Net artifacts for ROI refinement."""
+
 from __future__ import annotations
 
 import json
@@ -374,6 +376,7 @@ def load_oracle_builder_unet_predictor(
             f"artifact must be one of: {', '.join(sorted(SUPPORTED_ORACLE_ARTIFACTS))}."
         )
     errors: list[str] = []
+    # Auto mode prefers the portable Keras artifact before SavedModel fallback.
     if artifact in {"auto", "keras"}:
         if resolved_run.final_keras_path.exists():
             try:

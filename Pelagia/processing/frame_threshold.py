@@ -1,3 +1,5 @@
+"""Binary thresholding algorithms used by candidate segmentation."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -172,6 +174,7 @@ def threshold_hysteresis(
     if num <= 1:
         return np.zeros_like(image, dtype=np.uint8)
 
+    # Promote complete weak components only when they contain a strong seed.
     connected_labels = np.unique(labels[strong])
     connected_labels = connected_labels[connected_labels != 0]
     mask = np.isin(labels, connected_labels).astype(np.uint8) * 255

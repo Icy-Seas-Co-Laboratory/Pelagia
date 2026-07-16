@@ -1,9 +1,12 @@
+"""Canonical image codec names, metadata, availability, and HTTP encoding."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
 
 @dataclass(frozen=True, slots=True)
 class ImageCodec:
@@ -51,13 +54,17 @@ def image_media_type(value: object, *, response: bool = True) -> str:
 
 def image_codec_available(value: object) -> bool:
     name = normalize_image_encoding(value)
-    if name in {"png", "jpg", "raw", "zstd"}:
+    if name in {"png", "raw", "zstd"}:
         return True
     try:
         import imagecodecs
     except ImportError:
         return False
-    attribute = "JPEGXL" if name == "jxl" else "JPEGXS"
+    attribute = {
+        "jpg": "JPEG",
+        "jxl": "JPEGXL",
+        "jxs": "JPEGXS",
+    }[name]
     codec = getattr(imagecodecs, attribute, None)
     return bool(codec is not None and getattr(codec, "available", False))
 
@@ -72,10 +79,10 @@ def encode_image_response(array, value: object, *, quality: int = 95) -> tuple[b
             raise RuntimeError("Image data could not be encoded as png.")
         return encoded.tobytes(), image_media_type(name)
     if name == "jpg":
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
-        if not ok:
-            raise RuntimeError("Image data could not be encoded as jpg.")
-        return encoded.tobytes(), image_media_type(name)
+        from .frame_codec import encode_array_payload
+
+        payload, _, _ = encode_array_payload(image, name, quality=int(quality))
+        return payload, image_media_type(name)
     from .frame_codec import encode_array_payload
 
     payload, _, _ = encode_array_payload(image, name, quality=90 if name == "jxl" else None)
@@ -127,6 +134,7 @@ def _scale_numeric_to_uint8(image: np.ndarray) -> np.ndarray:
     finite = np.isfinite(image)
     if not np.any(finite):
         return np.zeros(image.shape, dtype=np.uint8)
+    # Response conversion uses observed finite range rather than dtype range.
     finite_values = image[finite]
     min_value = float(np.min(finite_values))
     max_value = float(np.max(finite_values))

@@ -1,3 +1,5 @@
+"""Best-effort structured logging helpers for processing routines."""
+
 from __future__ import annotations
 
 from typing import Any

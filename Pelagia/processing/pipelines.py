@@ -1,3 +1,5 @@
+"""Shared result and callable protocols for processing components."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

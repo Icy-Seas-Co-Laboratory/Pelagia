@@ -247,6 +247,7 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     }
 
     result = extract_frames_handler(job, context)
+    timings = result.pop("timings")
 
     assert result == {
         "stage": PipelineStage.EXTRACT_FRAMES.value,
@@ -257,6 +258,8 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
         "frame_count": 2,
         "frame_ids": [10, 11],
     }
+    assert timings["schema_version"] == 1
+    assert timings["unit_count"] == 2
 
     args, kwargs = calls[0]
     assert args == ("/tmp/source.avi",)
@@ -509,6 +512,9 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert result["stage"] == PipelineStage.PREPROCESS_FRAMES.value
     assert result["frame_count"] == 1
     assert result["preprocessed_frame_ids"] == ["frame-1"]
+    assert result["timings"]["schema_version"] == 1
+    assert result["timings"]["unit_count"] == 1
+    assert result["timings"]["phase_counts"]["selection.frame_metadata_lookup"] == 1
     assert retrieved == [("frame-1", context, "original")]
     assert preprocessed[0][1]["flatfield_correction"] is False
     assert preprocessed[0][1]["background_correction"] is True
@@ -932,6 +938,8 @@ def test_background_frames_handler_generates_background_for_frame_batch(monkeypa
     assert result["run_id"] == "run-1"
     assert result["asset_id"] == "asset-1"
     assert result["background_payload_ref"] == "background-key"
+    assert result["timings"]["unit_count"] == 1
+    assert result["timings"]["phase_counts"]["selection.frame_metadata_lookup"] == 1
     assert calls == [
         (
             ["frame-1"],
@@ -1011,6 +1019,8 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
     assert result["frame_count"] == 1
     assert result["detection_count"] == 1
     assert result["detection_ids"] == ["det-1"]
+    assert result["timings"]["unit_count"] == 1
+    assert result["timings"]["phase_counts"]["segmentation.database_update"] == 1
     assert retrieved == [("frame-1", context)]
     assert segmented[0][1]["threshold"] == 100
     assert segmented[0][1]["min_perimeter"] == 3
@@ -1109,6 +1119,9 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     assert result["detection_ids"] == ["det-1"]
     assert result["refined_detection_ids"] == ["refined-det-1"]
     assert result["refinement_method"] == "identity"
+    assert result["timings"]["unit_count"] == 1
+    assert result["timings"]["phase_counts"]["refinement.model_inference"] == 1
+    assert result["timings"]["phase_counts"]["refinement.database_update"] == 1
     assert result["resolved_options"]["batch_size"] == 1
     assert result["resolved_options"]["allow_frame_expansion"] is False
     assert repo.refined_detections[0][0][0] == "det-1"

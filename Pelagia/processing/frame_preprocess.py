@@ -1,3 +1,5 @@
+"""Prepare stored frames for segmentation using configured corrections."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -8,6 +10,7 @@ import numpy as np
 from .defaults import default_processing_config
 from .frame_correction import divide_background, flatfield_correction as correct_flatfield
 from .frame_model import FrameData
+from .timing import measure_phase
 
 
 def as_grayscale_array(data: np.ndarray) -> np.ndarray:
@@ -157,7 +160,8 @@ def preprocess_frame_for_segmentation(
     if data is None:
         raise ValueError("Frame has no image data to preprocess.")
 
-    image = as_grayscale_array(data)
+    with measure_phase("processing.grayscale"):
+        image = as_grayscale_array(data)
     original_image_shape = image.shape
     processing_defaults = (
         context.config.processing.preprocessing
@@ -198,41 +202,43 @@ def preprocess_frame_for_segmentation(
 
     source_mask = mask if mask is not None else frame.mask
     source_background = background if background is not None else frame.bkg
-    crop_bounds = _resolve_crop_bounds(
-        image.shape,
-        crop_enabled=resolved_crop_enabled,
-        crop_x=resolved_crop_x,
-        crop_y=resolved_crop_y,
-        crop_w=resolved_crop_w,
-        crop_h=resolved_crop_h,
-    )
-    if crop_bounds is not None:
-        x0, y0, x1, y1 = crop_bounds
-        image = np.ascontiguousarray(image[y0:y1, x0:x1])
-        if source_mask is not None:
-            source_mask = crop_frame_data(
-                source_mask,
-                crop_x=x0,
-                crop_y=y0,
-                crop_w=x1 - x0,
-                crop_h=y1 - y0,
-            )
-        if (
-            isinstance(source_background, np.ndarray)
-            and source_background.shape[:2] == original_image_shape[:2]
-        ):
-            source_background = crop_frame_data(
-                source_background,
-                crop_x=x0,
-                crop_y=y0,
-                crop_w=x1 - x0,
-                crop_h=y1 - y0,
-            )
-    else:
-        x0 = y0 = 0
+    with measure_phase("processing.crop"):
+        crop_bounds = _resolve_crop_bounds(
+            image.shape,
+            crop_enabled=resolved_crop_enabled,
+            crop_x=resolved_crop_x,
+            crop_y=resolved_crop_y,
+            crop_w=resolved_crop_w,
+            crop_h=resolved_crop_h,
+        )
+        if crop_bounds is not None:
+            x0, y0, x1, y1 = crop_bounds
+            image = np.ascontiguousarray(image[y0:y1, x0:x1])
+            if source_mask is not None:
+                source_mask = crop_frame_data(
+                    source_mask,
+                    crop_x=x0,
+                    crop_y=y0,
+                    crop_w=x1 - x0,
+                    crop_h=y1 - y0,
+                )
+            if (
+                isinstance(source_background, np.ndarray)
+                and source_background.shape[:2] == original_image_shape[:2]
+            ):
+                source_background = crop_frame_data(
+                    source_background,
+                    crop_x=x0,
+                    crop_y=y0,
+                    crop_w=x1 - x0,
+                    crop_h=y1 - y0,
+                )
+        else:
+            x0 = y0 = 0
 
     if resolved_apply_mask and source_mask is not None:
-        image = apply_frame_mask(image, source_mask)
+        with measure_phase("processing.mask"):
+            image = apply_frame_mask(image, source_mask)
 
     resolved_flatfield_correction = (
         flatfield_defaults.flatfield_correction if flatfield_correction is None else flatfield_correction
@@ -251,28 +257,31 @@ def preprocess_frame_for_segmentation(
     )
 
     if resolved_flatfield_correction:
-        image = correct_flatfield(
-            image,
-            q=resolved_flatfield_q,
-            axis=resolved_flatfield_axis,
-            min_field_value=resolved_flatfield_min_field_value,
-            max_field_value=resolved_flatfield_max_field_value,
-        )
+        with measure_phase("processing.flatfield"):
+            image = correct_flatfield(
+                image,
+                q=resolved_flatfield_q,
+                axis=resolved_flatfield_axis,
+                min_field_value=resolved_flatfield_min_field_value,
+                max_field_value=resolved_flatfield_max_field_value,
+            )
 
     if resolved_background_correction:
         if source_background is None:
             raise ValueError(
                 "background_correction requires a generated background field on the frame."
             )
-        image = divide_background(
-            image,
-            background=source_background,
-            min_field_value=resolved_background_min_field_value,
-            max_field_value=resolved_background_max_field_value,
-        )
+        with measure_phase("processing.background_correction"):
+            image = divide_background(
+                image,
+                background=source_background,
+                min_field_value=resolved_background_min_field_value,
+                max_field_value=resolved_background_max_field_value,
+            )
 
     if resolved_invert_intensity:
-        image = invert_image_intensity(image)
+        with measure_phase("processing.invert_intensity"):
+            image = invert_image_intensity(image)
 
     metadata = dict(frame.metadata or {})
     preprocessing_steps = list(metadata.get("preprocessing_steps") or [])

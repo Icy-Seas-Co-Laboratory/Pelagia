@@ -1,3 +1,5 @@
+"""Build frontend-facing descriptions of available processing features."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass

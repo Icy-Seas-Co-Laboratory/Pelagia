@@ -1,3 +1,5 @@
+"""Threshold frames and assemble first-pass candidate ROI detections."""
+
 from __future__ import annotations
 
 import time
@@ -19,6 +21,7 @@ from .frame_threshold import calculate_threshold_mask
 from .mask_augmentation import as_binary_mask, augment_mask
 from .roi_assembly import assemble_candidate_rois
 from .roi_filter import filter_candidate_rois, should_store_roi_payload
+from .timing import measure_phase
 
 
 ThresholdFn = Callable[[np.ndarray], np.ndarray]
@@ -405,6 +408,8 @@ def threshold_frame(
     resolved_sobel_threshold = thresholding_defaults.sobel_threshold if sobel_threshold is None else sobel_threshold
     resolved_sobel_kernel_size = thresholding_defaults.sobel_kernel_size if sobel_kernel_size is None else sobel_kernel_size
 
+    # Preserve per-frame timings in detection metadata while the shared collector
+    # aggregates the same leaf operations across the complete worker job.
     stage_durations_ms: dict[str, float] = {}
     source_frame = frame
     if apply_preprocessing:
@@ -434,34 +439,36 @@ def threshold_frame(
         stage_durations_ms["preprocessing"] = 0.0
 
     stage_started = time.perf_counter()
-    gray = _as_grayscale_array(frame)
+    with measure_phase("segmentation.grayscale"):
+        gray = _as_grayscale_array(frame)
     stage_durations_ms["grayscale"] = (time.perf_counter() - stage_started) * 1000
     stage_started = time.perf_counter()
-    threshold_mask = as_binary_mask(
-        calculate_threshold_mask(
-            gray,
-            threshold=threshold,
-            method=resolved_threshold_method,
-            manual_threshold=resolved_manual_threshold,
-            thresholding_maximum_value=resolved_thresholding_maximum_value,
-            bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
-            bounded_otsu_max_foreground_fraction=resolved_bounded_otsu_max_foreground_fraction,
-            canny_enabled=resolved_canny_enabled,
-            canny_low_threshold=resolved_canny_low_threshold,
-            canny_high_threshold=resolved_canny_high_threshold,
-            canny_blur_kernel=resolved_canny_blur_kernel,
-            adaptive_block_size=resolved_adaptive_block_size,
-            adaptive_c=resolved_adaptive_c,
-            percentile_background_percentile=resolved_percentile_background_percentile,
-            percentile_min_contrast=resolved_percentile_min_contrast,
-            hysteresis_low_threshold=resolved_hysteresis_low_threshold,
-            hysteresis_high_threshold=resolved_hysteresis_high_threshold,
-            hysteresis_connectivity=resolved_hysteresis_connectivity,
-            sobel_percentile=resolved_sobel_percentile,
-            sobel_threshold=resolved_sobel_threshold,
-            sobel_kernel_size=resolved_sobel_kernel_size,
+    with measure_phase("segmentation.thresholding"):
+        threshold_mask = as_binary_mask(
+            calculate_threshold_mask(
+                gray,
+                threshold=threshold,
+                method=resolved_threshold_method,
+                manual_threshold=resolved_manual_threshold,
+                thresholding_maximum_value=resolved_thresholding_maximum_value,
+                bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
+                bounded_otsu_max_foreground_fraction=resolved_bounded_otsu_max_foreground_fraction,
+                canny_enabled=resolved_canny_enabled,
+                canny_low_threshold=resolved_canny_low_threshold,
+                canny_high_threshold=resolved_canny_high_threshold,
+                canny_blur_kernel=resolved_canny_blur_kernel,
+                adaptive_block_size=resolved_adaptive_block_size,
+                adaptive_c=resolved_adaptive_c,
+                percentile_background_percentile=resolved_percentile_background_percentile,
+                percentile_min_contrast=resolved_percentile_min_contrast,
+                hysteresis_low_threshold=resolved_hysteresis_low_threshold,
+                hysteresis_high_threshold=resolved_hysteresis_high_threshold,
+                hysteresis_connectivity=resolved_hysteresis_connectivity,
+                sobel_percentile=resolved_sobel_percentile,
+                sobel_threshold=resolved_sobel_threshold,
+                sobel_kernel_size=resolved_sobel_kernel_size,
+            )
         )
-    )
     stage_durations_ms["thresholding"] = (time.perf_counter() - stage_started) * 1000
 
     metadata = {
@@ -882,45 +889,48 @@ def segment_frame(
         threshold_mask = threshold_result.threshold_mask
         stage_durations_ms = dict(threshold_result.stage_durations_ms)
         stage_started = time.perf_counter()
-        augmented_mask = augment_mask(
-            threshold_mask,
-            enabled=bool(resolved_mask_augmentation_enabled),
-            steps=resolved_mask_augmentation_steps,
-            dilate_kernel_size=(int(resolved_dilate_kernel_w), int(resolved_dilate_kernel_h)),
-            dilate_iterations=resolved_dilate_iterations,
-            erode_kernel_size=(int(resolved_erode_kernel_w), int(resolved_erode_kernel_h)),
-            erode_iterations=resolved_erode_iterations,
-            open_kernel_size=(int(resolved_open_kernel_w), int(resolved_open_kernel_h)),
-            open_iterations=resolved_open_iterations,
-            close_kernel_size=(int(resolved_close_kernel_w), int(resolved_close_kernel_h)),
-            close_iterations=resolved_close_iterations,
-            fill_holes=resolved_fill_holes,
-            remove_small_components=resolved_remove_small_components,
-            min_component_area=resolved_min_component_area,
-            clear_border=resolved_clear_border,
-        )
+        with measure_phase("segmentation.mask_augmentation"):
+            augmented_mask = augment_mask(
+                threshold_mask,
+                enabled=bool(resolved_mask_augmentation_enabled),
+                steps=resolved_mask_augmentation_steps,
+                dilate_kernel_size=(int(resolved_dilate_kernel_w), int(resolved_dilate_kernel_h)),
+                dilate_iterations=resolved_dilate_iterations,
+                erode_kernel_size=(int(resolved_erode_kernel_w), int(resolved_erode_kernel_h)),
+                erode_iterations=resolved_erode_iterations,
+                open_kernel_size=(int(resolved_open_kernel_w), int(resolved_open_kernel_h)),
+                open_iterations=resolved_open_iterations,
+                close_kernel_size=(int(resolved_close_kernel_w), int(resolved_close_kernel_h)),
+                close_iterations=resolved_close_iterations,
+                fill_holes=resolved_fill_holes,
+                remove_small_components=resolved_remove_small_components,
+                min_component_area=resolved_min_component_area,
+                clear_border=resolved_clear_border,
+            )
         stage_durations_ms["mask_augmentation"] = (time.perf_counter() - stage_started) * 1000
         stage_started = time.perf_counter()
-        assembled_candidates = assemble_candidate_rois(
-            augmented_mask,
-            method=str(resolved_roi_assembly_method),
-            connectivity=int(resolved_roi_assembly_connectivity),
-        )
+        with measure_phase("segmentation.roi_assembly"):
+            assembled_candidates = assemble_candidate_rois(
+                augmented_mask,
+                method=str(resolved_roi_assembly_method),
+                connectivity=int(resolved_roi_assembly_connectivity),
+            )
         stage_durations_ms["roi_assembly"] = (time.perf_counter() - stage_started) * 1000
         stage_started = time.perf_counter()
-        candidates = filter_candidate_rois(
-            assembled_candidates,
-            min_area=resolved_min_area,
-            max_area=resolved_max_area,
-            min_perimeter=resolved_min_perimeter,
-            max_perimeter=resolved_max_perimeter,
-            min_width=resolved_min_width,
-            max_width=resolved_max_width,
-            min_height=resolved_min_height,
-            max_height=resolved_max_height,
-            min_width_plus_height=resolved_min_width_plus_height,
-            max_width_plus_height=resolved_max_width_plus_height,
-        )
+        with measure_phase("segmentation.roi_filter"):
+            candidates = filter_candidate_rois(
+                assembled_candidates,
+                min_area=resolved_min_area,
+                max_area=resolved_max_area,
+                min_perimeter=resolved_min_perimeter,
+                max_perimeter=resolved_max_perimeter,
+                min_width=resolved_min_width,
+                max_width=resolved_max_width,
+                min_height=resolved_min_height,
+                max_height=resolved_max_height,
+                min_width_plus_height=resolved_min_width_plus_height,
+                max_width_plus_height=resolved_max_width_plus_height,
+            )
         filtered_candidate_count = len(candidates)
         if max_detections is not None:
             candidates = candidates[:max(0, int(max_detections))]

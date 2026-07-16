@@ -1,3 +1,5 @@
+"""Classification-stage interfaces and placeholder behavior."""
+
 from __future__ import annotations
 
 from ..domain import ClassificationResultRecord

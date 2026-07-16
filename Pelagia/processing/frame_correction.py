@@ -1,3 +1,5 @@
+"""Apply flatfield/background correction and generate reusable backgrounds."""
+
 import numpy as np
 
 from ..domain import FrameRecord
@@ -6,6 +8,7 @@ from ..utils.serialization import json_ready
 from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
+from .timing import measure_phase
 
 
 def _flatfield_profile(array: np.ndarray, *, q: float, axis: int) -> np.ndarray:
@@ -246,31 +249,42 @@ def build_background_payload_for_frames(
     frame_shape: tuple[int, ...] | None = None
     for frame_id in resolved_frame_ids:
         frame = retrieve_frame(frame_id, context=ctx, payload_kind=payload_kind)
-        data = frame.read()
-        if data is None:
-            raise ValueError(f"Frame {frame_id!r} has no image data.")
-        array = np.asarray(data, dtype=np.float32)
-        if array.ndim < 2:
-            raise ValueError(f"Frame {frame_id!r} data must have at least two dimensions.")
-        if frame_shape is None:
-            frame_shape = tuple(array.shape)
-            accumulator = np.zeros(frame_shape, dtype=np.float64)
-        elif tuple(array.shape) != frame_shape:
-            raise ValueError(
-                f"Frame {frame_id!r} shape {tuple(array.shape)} does not match {frame_shape}."
-            )
-        accumulator += array
+        with measure_phase("background.accumulate"):
+            data = frame.read()
+            if data is None:
+                raise ValueError(f"Frame {frame_id!r} has no image data.")
+            array = np.asarray(data, dtype=np.float32)
+            if array.ndim < 2:
+                raise ValueError(f"Frame {frame_id!r} data must have at least two dimensions.")
+            if frame_shape is None:
+                frame_shape = tuple(array.shape)
+                # Float64 accumulation avoids drift when wide windows contain many frames.
+                accumulator = np.zeros(frame_shape, dtype=np.float64)
+            elif tuple(array.shape) != frame_shape:
+                raise ValueError(
+                    f"Frame {frame_id!r} shape {tuple(array.shape)} does not match {frame_shape}."
+                )
+            accumulator += array
 
     if accumulator is None:
         raise ValueError("No frame data was loaded.")
-    background = np.ascontiguousarray((accumulator / len(resolved_frame_ids)).astype(np.float32))
+    with measure_phase("background.finalize"):
+        background = np.ascontiguousarray(
+            np.clip(
+                np.rint(accumulator / len(resolved_frame_ids)),
+                0,
+                np.iinfo(np.uint8).max,
+            ).astype(np.uint8)
+        )
     resolved_quality = ctx.config.processing.frame_storage.image_quality if quality is None else int(quality)
-    payload, payload_encoding, payload_format = encode_array_payload(
-        background,
-        encoding,
-        quality=resolved_quality,
-    )
-    kvstore_key = ctx.kvstore.put_store(payload)
+    with measure_phase("background.encode"):
+        payload, payload_encoding, payload_format = encode_array_payload(
+            background,
+            encoding,
+            quality=resolved_quality,
+        )
+    with measure_phase("background.kvstore_write"):
+        kvstore_key = ctx.kvstore.put_store(payload)
     metadata = {
         "frame_variant": "background",
         "background_method": "mean",
@@ -329,17 +343,18 @@ def generate_background_for_frames(
 
         ctx = default_context()
     background_metadata = {**dict(result["background_metadata"] or {}), **dict(metadata or {})}
-    rows = ctx.repository.update_frame_background_payloads(
-        resolved_frame_ids,
-        project_id=getattr(ctx, "active_project_id", None),
-        kvstore_hash=str(result["background_payload_ref"]),
-        payload_ref=str(result["background_payload_ref"]),
-        payload_encoding=str(result["background_payload_encoding"]),
-        payload_format=str(result["background_payload_format"]),
-        payload_dtype=str(result["background_payload_dtype"]),
-        payload_shape=list(result["background_payload_shape"] or []),
-        metadata=background_metadata,
-    )
+    with measure_phase("background.database_update"):
+        rows = ctx.repository.update_frame_background_payloads(
+            resolved_frame_ids,
+            project_id=getattr(ctx, "active_project_id", None),
+            kvstore_hash=str(result["background_payload_ref"]),
+            payload_ref=str(result["background_payload_ref"]),
+            payload_encoding=str(result["background_payload_encoding"]),
+            payload_format=str(result["background_payload_format"]),
+            payload_dtype=str(result["background_payload_dtype"]),
+            payload_shape=list(result["background_payload_shape"] or []),
+            metadata=background_metadata,
+        )
     return {
         **result,
         "updated_frame_count": len(rows),
@@ -367,7 +382,11 @@ def ensure_asset_background_windows(
 
     targets_by_asset: dict[str, list[FrameRecord]] = {}
     for frame_id in dict.fromkeys(str(value) for value in frame_ids):
-        record = context.repository.get_frame_record(frame_id, project_id=context.active_project_id)
+        with measure_phase("selection.frame_metadata_lookup"):
+            record = context.repository.get_frame_record(
+                frame_id,
+                project_id=context.active_project_id,
+            )
         if record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         targets_by_asset.setdefault(record.asset_id, []).append(record)
@@ -376,10 +395,16 @@ def ensure_asset_background_windows(
     application_half_width = stride // 2
     source_half_width = width // 2
     for asset_id, targets in targets_by_asset.items():
-        rows = context.repository.list_frames(asset_id, project_id=context.active_project_id, limit=None)
+        with measure_phase("background.asset_frame_lookup"):
+            rows = context.repository.list_frames(
+                asset_id,
+                project_id=context.active_project_id,
+                limit=None,
+            )
         frames = [FrameRecord.from_row(row) for row in rows]
         by_center: dict[int, list[FrameRecord]] = {}
         for target in targets:
+            # Fixed boundaries let neighboring jobs reuse the same background payload.
             center = ((target.frame_index + application_half_width) // stride) * stride
             by_center.setdefault(center, []).append(target)
         for center, window_targets in by_center.items():

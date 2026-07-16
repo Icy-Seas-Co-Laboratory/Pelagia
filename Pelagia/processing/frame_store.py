@@ -1,3 +1,5 @@
+"""Persist and retrieve frame payloads across the KVStore and PostgreSQL."""
+
 import json
 import time
 from datetime import datetime
@@ -7,13 +9,14 @@ import numpy as np
 
 from ..domain import FrameRecord
 from ..services.context import AppContext
+from ..services.project_settings import resolve_project_storage_settings
 from ..storage.blob_store import initialize_kvstore
 from ..utils.serialization import json_ready
 from ._logging import log_processing_event, processing_core_logger
 from .frame_codec import decode_array_payload, encode_array_payload
 from .frame_model import FrameData
-from ..services.project_settings import resolve_project_storage_settings
 from .thumbhash import compute_thumbhash
+from .timing import measure_phase
 
 
 _DEFAULT_CONTEXT: AppContext | None = None
@@ -67,7 +70,8 @@ def _frame_project_id(ctx: AppContext, frame_id: str, *, fallback: str | None = 
 
 def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str, Any]:
     started = time.perf_counter()
-    data = frame.read()
+    with measure_phase("storage.frame_read"):
+        data = frame.read()
     if data is None:
         raise ValueError("Frame has no numpy data to store.")
 
@@ -80,44 +84,58 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
     if frame_index is None:
         frame_index = frame.tileNumber if frame.tileNumber is not None else frame.frameNumber
     try:
-        array = np.ascontiguousarray(data)
+        with measure_phase("storage.contiguous_array"):
+            array = np.ascontiguousarray(data)
         if array.ndim < 2:
             raise ValueError("Frame data must have at least two dimensions.")
         frame.validate_geometry(array)
 
-        project_id = _asset_project_id(ctx, str(asset_id) if asset_id else None, fallback=project_id)
+        with measure_phase("storage.project_resolution"):
+            project_id = _asset_project_id(
+                ctx,
+                str(asset_id) if asset_id else None,
+                fallback=project_id,
+            )
         kvstore = _kvstore_for_project(ctx, project_id)
         if kvstore is None:
             raise RuntimeError("A KVStore is required to store frame data.")
         if ctx.repository is None:
             raise RuntimeError("A PostgresRepository is required to record frame metadata.")
 
-        storage_settings = resolve_project_storage_settings(ctx, project_id)
-        requested_encoding = (
-            metadata.get("kvstore_encoding")
-            or metadata.get("array_encoding")
-            or metadata.get("kvstore_format")
-            or storage_settings.frame_encoding
-        )
-        requested_quality = next(
-            (
-                value
-                for value in (
-                    metadata.get("kvstore_quality"),
-                    metadata.get("array_quality"),
-                    metadata.get("image_quality"),
-                )
-                if value is not None
-            ),
-            storage_settings.frame_quality,
-        )
-        payload, kvstore_encoding, kvstore_format = encode_array_payload(
-            array,
-            requested_encoding,
-            quality=int(requested_quality),
-        )
-        kvstore_key = kvstore.put_store(payload)
-        preview_thumbhash = compute_thumbhash(array, max_dim=ctx.config.processing.thumbhash.max_dim)
+        with measure_phase("storage.settings_resolution"):
+            storage_settings = resolve_project_storage_settings(ctx, project_id)
+            requested_encoding = (
+                metadata.get("kvstore_encoding")
+                or metadata.get("array_encoding")
+                or metadata.get("kvstore_format")
+                or storage_settings.frame_encoding
+            )
+            requested_quality = next(
+                (
+                    value
+                    for value in (
+                        metadata.get("kvstore_quality"),
+                        metadata.get("array_quality"),
+                        metadata.get("image_quality"),
+                    )
+                    if value is not None
+                ),
+                storage_settings.frame_quality,
+            )
+        with measure_phase("storage.encode"):
+            payload, kvstore_encoding, kvstore_format = encode_array_payload(
+                array,
+                requested_encoding,
+                quality=int(requested_quality),
+            )
+        # Store content first so committed rows never reference a missing blob.
+        with measure_phase("storage.kvstore_write"):
+            kvstore_key = kvstore.put_store(payload)
+        with measure_phase("storage.thumbhash"):
+            preview_thumbhash = compute_thumbhash(
+                array,
+                max_dim=ctx.config.processing.thumbhash.max_dim,
+            )
         width, height = frame.get_size()
         source_frame_start, source_frame_end = frame.get_source_frame_range()
         captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None
@@ -172,56 +190,57 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
             metadata=metadata,
         )
 
-        with ctx.repository.connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {ctx.repository.schema}.frames
-                    (run_id, asset_id, frame_index, captured_at, width, height,
-                     bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
-                     payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
-                    ON CONFLICT (asset_id, frame_index) DO UPDATE SET
-                        captured_at = EXCLUDED.captured_at,
-                        width = EXCLUDED.width,
-                        height = EXCLUDED.height,
-                        bbox_x = EXCLUDED.bbox_x,
-                        bbox_y = EXCLUDED.bbox_y,
-                        parent_frame_id = EXCLUDED.parent_frame_id,
-                        source_ref = EXCLUDED.source_ref,
-                        kvstore_hash = EXCLUDED.kvstore_hash,
-                        preview_thumbhash = EXCLUDED.preview_thumbhash,
-                        payload_ref = EXCLUDED.payload_ref,
-                        payload_encoding = EXCLUDED.payload_encoding,
-                        payload_format = EXCLUDED.payload_format,
-                        payload_dtype = EXCLUDED.payload_dtype,
-                        payload_shape = EXCLUDED.payload_shape,
-                        metadata = EXCLUDED.metadata
-                    RETURNING *;
-                    """,
-                    (
-                        frame_record.run_id,
-                        frame_record.asset_id,
-                        frame_record.frame_index,
-                        frame_record.captured_at,
-                        frame_record.width,
-                        frame_record.height,
-                        frame_record.bbox_x,
-                        frame_record.bbox_y,
-                        frame_record.parent_frame_id,
-                        frame_record.source_ref,
-                        frame_record.kvstore_hash,
-                        frame_record.preview_thumbhash,
-                        frame_record.payload_ref,
-                        frame_record.payload_encoding,
-                        frame_record.payload_format,
-                        frame_record.payload_dtype,
-                        json.dumps(json_ready(frame_record.payload_shape)),
-                        json.dumps(json_ready(frame_record.metadata)),
-                    ),
-                )
-                row = cursor.fetchone()
-            connection.commit()
+        with measure_phase("storage.database_update"):
+            with ctx.repository.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {ctx.repository.schema}.frames
+                        (run_id, asset_id, frame_index, captured_at, width, height,
+                         bbox_x, bbox_y, parent_frame_id, source_ref, kvstore_hash, preview_thumbhash,
+                         payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                        ON CONFLICT (asset_id, frame_index) DO UPDATE SET
+                            captured_at = EXCLUDED.captured_at,
+                            width = EXCLUDED.width,
+                            height = EXCLUDED.height,
+                            bbox_x = EXCLUDED.bbox_x,
+                            bbox_y = EXCLUDED.bbox_y,
+                            parent_frame_id = EXCLUDED.parent_frame_id,
+                            source_ref = EXCLUDED.source_ref,
+                            kvstore_hash = EXCLUDED.kvstore_hash,
+                            preview_thumbhash = EXCLUDED.preview_thumbhash,
+                            payload_ref = EXCLUDED.payload_ref,
+                            payload_encoding = EXCLUDED.payload_encoding,
+                            payload_format = EXCLUDED.payload_format,
+                            payload_dtype = EXCLUDED.payload_dtype,
+                            payload_shape = EXCLUDED.payload_shape,
+                            metadata = EXCLUDED.metadata
+                        RETURNING *;
+                        """,
+                        (
+                            frame_record.run_id,
+                            frame_record.asset_id,
+                            frame_record.frame_index,
+                            frame_record.captured_at,
+                            frame_record.width,
+                            frame_record.height,
+                            frame_record.bbox_x,
+                            frame_record.bbox_y,
+                            frame_record.parent_frame_id,
+                            frame_record.source_ref,
+                            frame_record.kvstore_hash,
+                            frame_record.preview_thumbhash,
+                            frame_record.payload_ref,
+                            frame_record.payload_encoding,
+                            frame_record.payload_format,
+                            frame_record.payload_dtype,
+                            json.dumps(json_ready(frame_record.payload_shape)),
+                            json.dumps(json_ready(frame_record.metadata)),
+                        ),
+                    )
+                    row = cursor.fetchone()
+                connection.commit()
         _CORE_LOGGER.debug(
             "Stored frame run_id=%s asset_id=%s frame_index=%s shape=%s encoding=%s duration_ms=%.2f",
             run_id,
@@ -305,6 +324,7 @@ def store_preprocessed_frames(
     resolved_project_id = project_id
     if resolved_project_id is None:
         resolved_project_id = _frame_project_id(ctx, frames[0][0], fallback=_active_project_id(ctx))
+    # Blob writes happen first; metadata is then committed as one database batch.
     prepared = [
         _prepare_preprocessed_payload(
             frame_id,
@@ -318,15 +338,17 @@ def store_preprocessed_frames(
     ]
     updater = getattr(ctx.repository, "update_frame_preprocessed_payloads", None)
     if callable(updater):
-        return updater(prepared, project_id=resolved_project_id)
-    return [
-        ctx.repository.update_frame_preprocessed_payload(
-            item["frame_id"],
-            project_id=resolved_project_id,
-            **{key: value for key, value in item.items() if key != "frame_id"},
-        )
-        for item in prepared
-    ]
+        with measure_phase("storage.database_update"):
+            return updater(prepared, project_id=resolved_project_id)
+    with measure_phase("storage.database_update"):
+        return [
+            ctx.repository.update_frame_preprocessed_payload(
+                item["frame_id"],
+                project_id=resolved_project_id,
+                **{key: value for key, value in item.items() if key != "frame_id"},
+            )
+            for item in prepared
+        ]
 
 
 def _prepare_preprocessed_payload(
@@ -338,29 +360,39 @@ def _prepare_preprocessed_payload(
     encoding: str | None,
     quality: int | None,
 ) -> dict[str, Any]:
-    data = frame.read()
+    with measure_phase("storage.frame_read"):
+        data = frame.read()
     if data is None:
         raise ValueError("Preprocessed frame has no numpy data to store.")
     kvstore = _kvstore_for_project(context, project_id)
     if kvstore is None:
         raise RuntimeError("A KVStore is required to store preprocessed frame data.")
-    array = np.ascontiguousarray(data)
-    storage_settings = resolve_project_storage_settings(
-        context,
-        project_id,
-        frame_encoding=encoding,
-        frame_quality=quality,
-    )
-    payload, kvstore_encoding, kvstore_format = encode_array_payload(
-        array,
-        storage_settings.frame_encoding,
-        quality=storage_settings.frame_quality,
-    )
-    kvstore_key = kvstore.put_store(payload)
+    with measure_phase("storage.contiguous_array"):
+        array = np.ascontiguousarray(data)
+    with measure_phase("storage.settings_resolution"):
+        storage_settings = resolve_project_storage_settings(
+            context,
+            project_id,
+            frame_encoding=encoding,
+            frame_quality=quality,
+        )
+    with measure_phase("storage.encode"):
+        payload, kvstore_encoding, kvstore_format = encode_array_payload(
+            array,
+            storage_settings.frame_encoding,
+            quality=storage_settings.frame_quality,
+        )
+    with measure_phase("storage.kvstore_write"):
+        kvstore_key = kvstore.put_store(payload)
+    with measure_phase("storage.thumbhash"):
+        preview_thumbhash = compute_thumbhash(
+            array,
+            max_dim=context.config.processing.thumbhash.max_dim,
+        )
     return {
         "frame_id": frame_id,
         "kvstore_hash": kvstore_key,
-        "preview_thumbhash": compute_thumbhash(array, max_dim=context.config.processing.thumbhash.max_dim),
+        "preview_thumbhash": preview_thumbhash,
         "payload_ref": kvstore_key,
         "payload_encoding": kvstore_encoding,
         "payload_format": kvstore_format,
@@ -396,29 +428,30 @@ def retrieve_frame(
     if ctx.repository is None:
         raise RuntimeError("A PostgresRepository is required to load frame metadata.")
 
-    with ctx.repository.connect() as connection:
-        with connection.cursor() as cursor:
-            if project_id:
-                cursor.execute(
-                    f"""
-                    SELECT frames.*, assets.project_id AS project_id
-                    FROM {ctx.repository.schema}.frames frames
-                    JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE frames.id = %s AND assets.project_id = %s
-                    """,
-                    (id, project_id),
-                )
-            else:
-                cursor.execute(
-                    f"""
-                    SELECT frames.*, assets.project_id AS project_id
-                    FROM {ctx.repository.schema}.frames frames
-                    JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE frames.id = %s
-                    """,
-                    (id,),
-                )
-            row = cursor.fetchone()
+    with measure_phase("load.database_query"):
+        with ctx.repository.connect() as connection:
+            with connection.cursor() as cursor:
+                if project_id:
+                    cursor.execute(
+                        f"""
+                        SELECT frames.*, assets.project_id AS project_id
+                        FROM {ctx.repository.schema}.frames frames
+                        JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE frames.id = %s AND assets.project_id = %s
+                        """,
+                        (id, project_id),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT frames.*, assets.project_id AS project_id
+                        FROM {ctx.repository.schema}.frames frames
+                        JOIN {ctx.repository.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE frames.id = %s
+                        """,
+                        (id,),
+                    )
+                row = cursor.fetchone()
     if row is None:
         raise KeyError(id)
 
@@ -450,7 +483,10 @@ def retrieve_frame(
         raise ValueError(f"Frame {id} does not include a {requested_kind} kvstore key.")
 
     frame_data = FrameData.from_record(record, metadata=metadata)
-    array = decode_array_payload(kvstore.get_store(kvstore_key), frame_data.metadata)
+    with measure_phase("load.kvstore_read"):
+        payload = kvstore.get_store(kvstore_key)
+    with measure_phase("load.decode"):
+        array = decode_array_payload(payload, frame_data.metadata)
     frame_data.update(array)
     background_key = record.background_payload_ref or record.background_kvstore_hash
     if background_key:
@@ -466,9 +502,11 @@ def retrieve_frame(
             background_metadata["dtype"] = record.background_payload_dtype
         if record.background_payload_shape:
             background_metadata["shape"] = list(record.background_payload_shape)
-        frame_data.update_background(
-            decode_array_payload(kvstore.get_store(background_key), background_metadata)
-        )
+        with measure_phase("load.background_kvstore_read"):
+            background_payload = kvstore.get_store(background_key)
+        with measure_phase("load.background_decode"):
+            decoded_background = decode_array_payload(background_payload, background_metadata)
+        frame_data.update_background(decoded_background)
         frame_data.metadata["background_payload_ref"] = background_key
         frame_data.metadata["background_payload_encoding"] = record.background_payload_encoding
         frame_data.metadata["background_payload_format"] = record.background_payload_format

@@ -18,6 +18,7 @@ from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_store import retrieve_frame, store_preprocessed_frames
 from ..processing.oracle_unet_refiner import resolve_refinement_model
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
+from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
 from ..services.project_settings import resolve_project_storage_settings
 from ..services.pipeline import PipelineService
@@ -154,6 +155,7 @@ def mark_job_frame_stage_failed(job: dict[str, Any], context: AppContext) -> Non
         return
 
 
+@collect_result_timings()
 def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for extracting and storing frames from a registered asset."""
     if context.repository is None:
@@ -365,6 +367,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     return result
 
 
+@collect_result_timings()
 def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for creating and storing preprocessed frame payloads."""
     if context.repository is None:
@@ -471,7 +474,8 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
 
     missing_background_frame_ids = []
     for frame_id in frame_ids:
-        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
+        with measure_phase("selection.frame_metadata_lookup"):
+            frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
@@ -603,6 +607,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     return result
 
 
+@collect_result_timings()
 def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for generating and assigning mean background fields."""
     if context.repository is None:
@@ -647,7 +652,8 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     progress.start(f"Generating background from {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
     for frame_id in frame_ids:
-        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
+        with measure_phase("selection.frame_metadata_lookup"):
+            frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if resolved_asset_id is None:
@@ -680,6 +686,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     return result
 
 
+@collect_result_timings()
 def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for segmenting stored frames into ROI detections."""
     if context.repository is None:
@@ -747,7 +754,8 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     )
 
     for index, frame_id in enumerate(frame_ids, start=1):
-        frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
+        with measure_phase("selection.frame_metadata_lookup"):
+            frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
             raise KeyError(f"Frame {frame_id!r} was not found.")
         if not frame_record.run_id:
@@ -781,14 +789,15 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
 
     inserted = []
     for resolved_frame_run_id, run_frame_ids in frame_ids_by_run.items():
-        inserted.extend(
-            context.repository.replace_frame_detections(
-                resolved_frame_run_id,
-                run_frame_ids,
-                detections_by_run[resolved_frame_run_id],
-                project_id=project_id,
+        with measure_phase("segmentation.database_update"):
+            inserted.extend(
+                context.repository.replace_frame_detections(
+                    resolved_frame_run_id,
+                    run_frame_ids,
+                    detections_by_run[resolved_frame_run_id],
+                    project_id=project_id,
+                )
             )
-        )
     _mark_frame_stage_status(
         context,
         project_id=project_id,
@@ -887,6 +896,7 @@ def _resolved_roi_refinement_encoding(value: Any) -> str | None:
     return None if normalized in {"", "auto", "default", "none", "null"} else normalized
 
 
+@collect_result_timings(unit_count_key="detection_count")
 def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     """Worker handler for refining candidate ROI masks into detections_refined rows."""
     if context.repository is None:
@@ -911,7 +921,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     missing_ids = []
     candidate_rows = []
     for detection_id in detection_ids:
-        row = context.repository.get_detection(detection_id, project_id=project_id)
+        with measure_phase("selection.detection_metadata_lookup"):
+            row = context.repository.get_detection(detection_id, project_id=project_id)
         if row is None:
             missing_ids.append(detection_id)
         else:
@@ -936,23 +947,26 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
 
     defaults = context.config.processing.roi_refinement
-    model = resolve_refinement_model(
-        context.config,
-        model_kind=payload.get("model_kind"),
-        model_ref=payload.get("model_ref"),
-        model_run_dir=payload.get("model_run_dir"),
-        model_artifact=payload.get("model_artifact", defaults.model_artifact),
-    )
+    with measure_phase("refinement.model_resolution"):
+        model = resolve_refinement_model(
+            context.config,
+            model_kind=payload.get("model_kind"),
+            model_ref=payload.get("model_ref"),
+            model_run_dir=payload.get("model_run_dir"),
+            model_artifact=payload.get("model_artifact", defaults.model_artifact),
+        )
     method = "identity" if model.__class__.__name__ == "IdentityRoiRefinementModel" else (
         getattr(model, "method_name", None) or model.__class__.__name__
     )
-    options = _roi_refinement_options_from_payload(payload, context)
-    if payload.get("encoding") is None:
-        options.encoding = resolve_project_storage_settings(context, project_id).roi_encoding
+    with measure_phase("refinement.options_resolution"):
+        options = _roi_refinement_options_from_payload(payload, context)
+        if payload.get("encoding") is None:
+            options.encoding = resolve_project_storage_settings(context, project_id).roi_encoding
     allow_frame_expansion = bool(payload.get("allow_frame_expansion", True))
     expansion_payload_kind = str(payload.get("expansion_frame_payload_kind", "preprocessed"))
     frame_loader = None
     if allow_frame_expansion:
+        # Expansion can revisit one frame for many ROIs, so retain one decoded frame per job.
         frame_cache: dict[str, Any] = {}
 
         def frame_loader(frame_id: str):
@@ -965,7 +979,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 ).read()
             return frame_cache[resolved_frame_id]
 
-    detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
+    with measure_phase("refinement.record_construction"):
+        detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
     results = refine_detections(
         detection_records,
         model=model,
@@ -974,14 +989,15 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         method=method,
     )
     refined_records = [result.as_detection_record(encoding=options.encoding) for result in results]
-    stored = context.repository.upsert_refined_detections(
-        [
-            (refined_storage_candidate_detection_id(result), refined)
-            for result, refined in zip(results, refined_records)
-        ],
-        job_id=job.get("id"),
-        project_id=project_id,
-    )
+    with measure_phase("refinement.database_update"):
+        stored = context.repository.upsert_refined_detections(
+            [
+                (refined_storage_candidate_detection_id(result), refined)
+                for result, refined in zip(results, refined_records)
+            ],
+            job_id=job.get("id"),
+            project_id=project_id,
+        )
     run_ids = sorted({record.run_id for record in detection_records})
     frame_ids = sorted({record.frame_id for record in detection_records})
     _mark_frame_stage_status(

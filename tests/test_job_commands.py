@@ -49,6 +49,26 @@ def test_codec_registry_normalizes_aliases_and_encodes_png():
     assert payload.startswith(b"\x89PNG")
 
 
+def test_codec_registry_routes_jpg_responses_through_frame_codec(monkeypatch):
+    calls = []
+
+    def fake_encode(array, encoding, *, quality=None):
+        calls.append((array.copy(), encoding, quality))
+        return b"jpg", "jpg", "jpg"
+
+    monkeypatch.setattr("Pelagia.processing.frame_codec.encode_array_payload", fake_encode)
+
+    payload, media_type = encode_image_response(
+        np.array([[0, 255]], dtype=np.uint8),
+        "jpg",
+        quality=88,
+    )
+
+    assert payload == b"jpg"
+    assert media_type == "image/jpeg"
+    assert calls[0][1:] == ("jpg", 88)
+
+
 def test_segment_command_serializes_explicit_selection():
     payload = SegmentFramesCommand(
         selection=FrameSelection(frame_ids=("frame-1",), asset_id="asset-1"),

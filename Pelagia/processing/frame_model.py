@@ -1,3 +1,5 @@
+"""Runtime frame container bridging stored records and numpy image data."""
+
 import os
 from dataclasses import dataclass, field
 from typing import Any
