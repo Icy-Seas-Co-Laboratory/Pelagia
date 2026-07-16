@@ -249,6 +249,8 @@ class VideoIngestProcessingConfig:
 
     n_tile: int = 4
     prefer_software_decode: bool = True
+    opencv_threads: int = 1
+    decoder_threads: int = 1
 
 
 @dataclass(slots=True)
@@ -551,6 +553,20 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
         "prefer_software_decode",
         "PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE",
         _env_bool,
+    )
+    _set_from_env(
+        settings,
+        "processing.video_ingest",
+        "opencv_threads",
+        "PELAGIA_VIDEO_INGEST_OPENCV_THREADS",
+        int,
+    )
+    _set_from_env(
+        settings,
+        "processing.video_ingest",
+        "decoder_threads",
+        "PELAGIA_VIDEO_INGEST_DECODER_THREADS",
+        int,
     )
 
     _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
@@ -1004,6 +1020,24 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                         "prefer_software_decode",
                         VideoIngestProcessingConfig.prefer_software_decode,
                     )
+                ),
+                opencv_threads=max(
+                    1,
+                    int(
+                        video_ingest.get(
+                            "opencv_threads",
+                            VideoIngestProcessingConfig.opencv_threads,
+                        )
+                    ),
+                ),
+                decoder_threads=max(
+                    1,
+                    int(
+                        video_ingest.get(
+                            "decoder_threads",
+                            VideoIngestProcessingConfig.decoder_threads,
+                        )
+                    ),
                 ),
             ),
             flatfield=FlatfieldProcessingConfig(

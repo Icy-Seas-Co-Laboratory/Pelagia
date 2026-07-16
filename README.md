@@ -467,6 +467,21 @@ Pelagia/default.config.toml < ./config.toml < environment variables < explicit C
 
 The packaged [default.config.toml](Pelagia/default.config.toml) contains development-friendly defaults. Create a local `config.toml` in the repository root for machine-specific overrides; it is ignored by git.
 
+Video ingest defaults to one OpenCV thread and one decoder thread per worker to
+avoid CPU oversubscription when worker count tracks CPU core count. Benchmark
+larger values with:
+
+```toml
+[processing.video_ingest]
+opencv_threads = 1
+decoder_threads = 1
+```
+
+The equivalent environment variables are
+`PELAGIA_VIDEO_INGEST_OPENCV_THREADS` and
+`PELAGIA_VIDEO_INGEST_DECODER_THREADS`. The decoder setting applies to both
+OpenCV's FFmpeg backend and the FFmpeg CLI fallback.
+
 Model and plugin artifacts are split between packaged assets under
 `Pelagia/assets/` and a local runtime library under `./.pelagia/`. See
 [docs/artifacts.md](docs/artifacts.md) for the manifest layout and discovery

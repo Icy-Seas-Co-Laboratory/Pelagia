@@ -72,6 +72,20 @@ def test_core_config_load_applies_kvstore_backend_env(monkeypatch):
     assert config.kvstore.max_blob_bytes == 123456
 
 
+def test_video_ingest_thread_defaults_and_env_overrides(monkeypatch):
+    defaults = CoreConfig.load(local_config_path=None, use_env=False)
+
+    assert defaults.processing.video_ingest.opencv_threads == 1
+    assert defaults.processing.video_ingest.decoder_threads == 1
+
+    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_OPENCV_THREADS", "2")
+    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_DECODER_THREADS", "3")
+    overridden = CoreConfig.load(local_config_path=None)
+
+    assert overridden.processing.video_ingest.opencv_threads == 2
+    assert overridden.processing.video_ingest.decoder_threads == 3
+
+
 def test_logging_config_defaults_to_core_file_logger():
     config = LoggingConfig()
 
@@ -107,6 +121,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.artifacts.plugins.metadata_filename == "metadata.toml"
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.video_ingest.prefer_software_decode is True
+    assert config.processing.video_ingest.opencv_threads == 1
+    assert config.processing.video_ingest.decoder_threads == 1
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
@@ -209,6 +225,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         [processing.video_ingest]
         n_tile = 4
         prefer_software_decode = false
+        opencv_threads = 2
+        decoder_threads = 3
 
         [processing.flatfield]
         flatfield_correction = false
@@ -318,6 +336,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.artifacts.plugins.metadata_filename == "plugin.toml"
     assert config.processing.video_ingest.n_tile == 4
     assert config.processing.video_ingest.prefer_software_decode is False
+    assert config.processing.video_ingest.opencv_threads == 2
+    assert config.processing.video_ingest.decoder_threads == 3
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.8
     assert config.processing.flatfield.flatfield_axis == 1
@@ -406,6 +426,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_ROI_FILTER_MIN_PERIMETER", "9")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_N_TILE", "5")
     monkeypatch.setenv("PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE", "false")
+    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_OPENCV_THREADS", "6")
+    monkeypatch.setenv("PELAGIA_VIDEO_INGEST_DECODER_THREADS", "7")
     monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
     monkeypatch.setenv("PELAGIA_FLATFIELD_AXIS", "1")
@@ -451,6 +473,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.processing.roi_filter.min_perimeter == 9.0
     assert config.processing.video_ingest.n_tile == 5
     assert config.processing.video_ingest.prefer_software_decode is False
+    assert config.processing.video_ingest.opencv_threads == 6
+    assert config.processing.video_ingest.decoder_threads == 7
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.7
     assert config.processing.flatfield.flatfield_axis == 1

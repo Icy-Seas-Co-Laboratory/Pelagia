@@ -104,11 +104,24 @@ def _estimated_tile_count(source_frame_count: int, n_tile: int) -> int | None:
     return (source_frame_count + n_tile - 1) // n_tile
 
 
-def _open_ffmpeg_capture_with_options(input_path: str, options: str):
+def _open_ffmpeg_capture_with_options(
+    input_path: str,
+    options: str,
+    *,
+    decoder_threads: int,
+):
     existing_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
     try:
-        return cv2.VideoCapture(input_path, getattr(cv2, "CAP_FFMPEG", 0))
+        api_preference = getattr(cv2, "CAP_FFMPEG", 0)
+        thread_property = getattr(cv2, "CAP_PROP_N_THREADS", None)
+        if thread_property is not None:
+            return cv2.VideoCapture(
+                input_path,
+                api_preference,
+                [int(thread_property), int(decoder_threads)],
+            )
+        return cv2.VideoCapture(input_path, api_preference)
     finally:
         if existing_options is None:
             os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
@@ -116,15 +129,27 @@ def _open_ffmpeg_capture_with_options(input_path: str, options: str):
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = existing_options
 
 
-def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
+def _open_video_capture(
+    input_path: str,
+    *,
+    prefer_software_decode: bool,
+    decoder_threads: int,
+):
+    decoder_threads = max(1, int(decoder_threads))
+    existing_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+    capture_options = existing_options
+    if "threads;" not in capture_options.lower():
+        capture_options = f"{capture_options}|threads;{decoder_threads}" if capture_options else f"threads;{decoder_threads}"
     if prefer_software_decode:
-        existing_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
-        if "hwaccel" not in existing_options.lower():
-            software_options = "hwaccel;none"
-            if existing_options:
-                software_options = f"{existing_options}|{software_options}"
+        software_options = capture_options
+        if "hwaccel" not in software_options.lower():
+            software_options = f"{software_options}|hwaccel;none"
             try:
-                capture = _open_ffmpeg_capture_with_options(input_path, software_options)
+                capture = _open_ffmpeg_capture_with_options(
+                    input_path,
+                    software_options,
+                    decoder_threads=decoder_threads,
+                )
             except (TypeError, cv2.error):
                 capture = None
             if capture is not None:
@@ -136,11 +161,15 @@ def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
         software_value = getattr(cv2, "VIDEO_ACCELERATION_NONE", None)
         api_preference = getattr(cv2, "CAP_FFMPEG", 0)
         if hw_prop is not None and software_value is not None:
+            params = [int(hw_prop), int(software_value)]
+            thread_property = getattr(cv2, "CAP_PROP_N_THREADS", None)
+            if thread_property is not None:
+                params.extend([int(thread_property), decoder_threads])
             try:
                 capture = cv2.VideoCapture(
                     input_path,
                     api_preference,
-                    [int(hw_prop), int(software_value)],
+                    params,
                 )
             except (TypeError, cv2.error):
                 capture = None
@@ -150,7 +179,17 @@ def _open_video_capture(input_path: str, *, prefer_software_decode: bool):
                 capture.release()
 
     decode_mode = "default_after_software_attempts" if prefer_software_decode else "default"
-    return cv2.VideoCapture(input_path), decode_mode
+    try:
+        return (
+            _open_ffmpeg_capture_with_options(
+                input_path,
+                capture_options,
+                decoder_threads=decoder_threads,
+            ),
+            decode_mode,
+        )
+    except (TypeError, cv2.error):
+        return cv2.VideoCapture(input_path), decode_mode
 
 
 def _video_dimensions(video, input_path: str) -> tuple[int, int]:
@@ -196,6 +235,7 @@ def _decode_with_ffmpeg_cli(
     width: int,
     height: int,
     frame_callback: Callable[[np.ndarray], None],
+    decoder_threads: int,
 ) -> tuple[int, str]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -209,8 +249,12 @@ def _decode_with_ffmpeg_cli(
         "-loglevel",
         "error",
         "-nostdin",
+        "-filter_threads",
+        str(max(1, int(decoder_threads))),
         "-hwaccel",
         "none",
+        "-threads:v",
+        str(max(1, int(decoder_threads))),
         "-i",
         input_path,
         "-map",
@@ -631,6 +675,8 @@ def ingest_video_file(
     adaptive_background_period: int | None = None,
     apply_mask: bool | None = None,
     mask_path: str | None = None,
+    opencv_threads: int | None = None,
+    decoder_threads: int | None = None,
     progress_callback: IngestProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     started = time.perf_counter()
@@ -646,6 +692,15 @@ def ingest_video_file(
     )
     n_tile = ingest_defaults.n_tile if n_tile is None else n_tile
     prefer_software_decode = bool(ingest_defaults.prefer_software_decode)
+    opencv_threads = max(
+        1,
+        int(ingest_defaults.opencv_threads if opencv_threads is None else opencv_threads),
+    )
+    decoder_threads = max(
+        1,
+        int(ingest_defaults.decoder_threads if decoder_threads is None else decoder_threads),
+    )
+    cv2.setNumThreads(opencv_threads)
     adaptive_background_subtraction = (
         preprocessing_defaults.adaptive_background_subtraction
         if adaptive_background_subtraction is None
@@ -673,6 +728,8 @@ def ingest_video_file(
         "filename": filename,
         "n_tile": int(n_tile),
         "prefer_software_decode": prefer_software_decode,
+        "opencv_threads": opencv_threads,
+        "decoder_threads": decoder_threads,
         "adaptive_background_subtraction": bool(adaptive_background_subtraction),
         "adaptive_background_period": int(adaptive_background_period),
         "apply_mask": bool(apply_mask),
@@ -713,6 +770,7 @@ def ingest_video_file(
         video, video_decode_mode = _open_video_capture(
             input_path,
             prefer_software_decode=prefer_software_decode,
+            decoder_threads=decoder_threads,
         )
     ingest_payload["video_decode_mode"] = video_decode_mode
     if not video.isOpened():
@@ -907,6 +965,7 @@ def ingest_video_file(
                 width=width,
                 height=height,
                 frame_callback=store_source_frame,
+                decoder_threads=decoder_threads,
             )
             flush_partial_tile()
             fallback_completed_payload = {

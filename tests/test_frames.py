@@ -1364,6 +1364,7 @@ def test_ingest_video_file_emits_progress_callback(monkeypatch):
 
 def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
     calls = []
+    thread_calls = []
 
     class FakeVideoCapture:
         def __init__(self, *args):
@@ -1392,9 +1393,11 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
             pass
 
     monkeypatch.setattr(ingest_module.cv2, "CAP_FFMPEG", 1900, raising=False)
+    monkeypatch.setattr(ingest_module.cv2, "CAP_PROP_N_THREADS", 998, raising=False)
     monkeypatch.setattr(ingest_module.cv2, "CAP_PROP_HW_ACCELERATION", 999, raising=False)
     monkeypatch.setattr(ingest_module.cv2, "VIDEO_ACCELERATION_NONE", 0, raising=False)
     monkeypatch.setattr(ingest_module.cv2, "VideoCapture", FakeVideoCapture)
+    monkeypatch.setattr(ingest_module.cv2, "setNumThreads", thread_calls.append)
     monkeypatch.delenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", raising=False)
     ctx = FakeContext()
     ctx.logger = FakeDatabaseLogger()
@@ -1410,12 +1413,15 @@ def test_ingest_video_file_prefers_software_decode_when_configured(monkeypatch):
     )
 
     assert calls[0] == (
-        ("/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv", 1900),
-        "hwaccel;none",
+        ("/tmp/Camera-00002-2025-11-10 02-21-32.482.mkv", 1900, [998, 1]),
+        "threads;1|hwaccel;none",
     )
     assert "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ
+    assert thread_calls == [1]
     opened = [event for event in ctx.logger.events if event["event_type"] == "video_ingest.video_opened"][0]
     assert opened["payload"]["video_decode_mode"] == "software_ffmpeg_options"
+    assert opened["payload"]["opencv_threads"] == 1
+    assert opened["payload"]["decoder_threads"] == 1
 
 
 def test_ingest_video_file_uses_ffmpeg_fallback_when_opencv_decodes_zero_frames(monkeypatch):
@@ -1475,7 +1481,18 @@ def test_ingest_video_file_uses_ffmpeg_fallback_when_opencv_decodes_zero_frames(
     )
 
     assert len(rows) == 1
-    assert popen_calls[0][:6] == ["/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-hwaccel"]
+    assert popen_calls[0][:9] == [
+        "/usr/bin/ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-filter_threads",
+        "1",
+        "-hwaccel",
+        "none",
+    ]
+    assert popen_calls[0][9:11] == ["-threads:v", "1"]
     assert "none" in popen_calls[0]
     metadata = json.loads(ctx.repository.cursor_obj.params_history[0][17])
     decoded = decode_array_payload(ctx.kvstore.payload, metadata)

@@ -33,6 +33,8 @@ PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR=""
 PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS=""
 PELAGIA_VIDEO_INGEST_N_TILE=""
 PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE=""
+PELAGIA_VIDEO_INGEST_OPENCV_THREADS=""
+PELAGIA_VIDEO_INGEST_DECODER_THREADS=""
 PELAGIA_INIT_ON_START=""
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS=""
 PELAGIA_CONTROL_PYTHON="python"
@@ -270,6 +272,14 @@ config_rows = {
             os.environ.get("PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE", "true"),
         )
     ),
+    "video_ingest_opencv_threads": scalar(
+        video_ingest.get("opencv_threads"),
+        os.environ.get("PELAGIA_VIDEO_INGEST_OPENCV_THREADS", "1"),
+    ),
+    "video_ingest_decoder_threads": scalar(
+        video_ingest.get("decoder_threads"),
+        os.environ.get("PELAGIA_VIDEO_INGEST_DECODER_THREADS", "1"),
+    ),
     "api_enabled": bool_text(api.get("enabled", True)),
     "api_host": scalar(api.get("host"), os.environ.get("PELAGIA_API_HOST", "127.0.0.1")),
     "api_port": scalar(api.get("port"), os.environ.get("PELAGIA_API_PORT", "8000")),
@@ -387,6 +397,8 @@ PY
                     file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
                     video_ingest_n_tile) PELAGIA_VIDEO_INGEST_N_TILE="$value" ;;
                     video_ingest_prefer_software_decode) PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE="$value" ;;
+                    video_ingest_opencv_threads) PELAGIA_VIDEO_INGEST_OPENCV_THREADS="$value" ;;
+                    video_ingest_decoder_threads) PELAGIA_VIDEO_INGEST_DECODER_THREADS="$value" ;;
                     api_enabled) PELAGIA_API_ENABLED="$value" ;;
                     api_host) PELAGIA_API_HOST="$value" ;;
                     api_port) PELAGIA_API_PORT="$value" ;;
@@ -553,6 +565,8 @@ start_stack() {
     export PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS
     export PELAGIA_VIDEO_INGEST_N_TILE
     export PELAGIA_VIDEO_INGEST_PREFER_SOFTWARE_DECODE
+    export PELAGIA_VIDEO_INGEST_OPENCV_THREADS
+    export PELAGIA_VIDEO_INGEST_DECODER_THREADS
     if [[ -n "$PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX" ]]; then
         export PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX
     fi

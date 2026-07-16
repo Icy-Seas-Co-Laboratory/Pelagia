@@ -29,6 +29,9 @@ allowed_root_paths = []
 n_tile = 4
 # Ask OpenCV/FFmpeg to avoid hardware decode paths for formats like AV1.
 prefer_software_decode = true
+# Keep each worker single-threaded; increase after benchmarking worker concurrency.
+opencv_threads = 1
+decoder_threads = 1
 
 [api]
 enabled = true

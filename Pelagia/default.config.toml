@@ -127,6 +127,10 @@ n_tile = 4
 # Prefer CPU/software decode for reliability with codecs such as AV1 on systems
 # where hardware acceleration is unavailable or misreported.
 prefer_software_decode = true
+# Limit OpenCV image operations within each ingest worker.
+opencv_threads = 1
+# Limit FFmpeg decoding in both VideoCapture and the CLI fallback.
+decoder_threads = 1
 
 [processing.flatfield]
 # Flatfield correction defaults used during segmentation. Must be > 0 and < 1.
