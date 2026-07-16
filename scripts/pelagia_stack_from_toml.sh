@@ -563,7 +563,7 @@ start_stack() {
             --factory \
             --host "$PELAGIA_API_HOST" \
             --port "$PELAGIA_API_PORT" \
-            --workers 4
+            --workers 1
     else
         echo "api disabled by config"
     fi
