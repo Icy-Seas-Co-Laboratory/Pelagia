@@ -733,82 +733,21 @@ def test_roi_detection_handler_accepts_frame_ids_from_multiple_assets(monkeypatc
     ]
 
 
-def test_preprocess_frames_handler_generates_missing_background(monkeypatch):
+def test_preprocess_frames_handler_requires_ingestion_generated_background(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
-    background_generated = False
-    calls = []
 
-    def fake_ensure_asset_background_windows(frame_ids, **kwargs):
-        nonlocal background_generated
-        background_generated = True
-        calls.append((frame_ids, kwargs))
-        repo.frames_with_background.update(frame_ids)
-        return {
-            "background_payload_ref": "background-key",
-            "frame_ids": list(frame_ids),
-            "frame_count": len(frame_ids),
-            "updated_frame_count": len(frame_ids),
-        }
-
-    def fake_retrieve_frame(frame_id, context=None, payload_kind="original", frame_record=None):
-        return FrameData(
-            sourcePath="/tmp",
-            filename="frame.png",
-            frameNumber=1,
-            data=np.zeros((4, 4), dtype=np.uint8),
-            bkg=(
-                np.ones((4, 4), dtype=np.float32)
-                if background_generated
-                else None
-            ),
-            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
-        )
-
-    def fake_preprocess_frame(frame, **kwargs):
-        assert kwargs["background_correction"] is True
-        assert frame.bkg is not None
-        return frame
-
-    monkeypatch.setattr(
-            "Pelagia.workers.handlers.ensure_asset_background_windows",
-            fake_ensure_asset_background_windows,
-    )
-    monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
-    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", fake_preprocess_frame)
-    monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frames",
-        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
-    )
-
-    result = preprocess_frames_handler(
-        {
-            "id": "job-preprocess",
-            "stage": PipelineStage.PREPROCESS_FRAMES.value,
-            "run_id": "run-1",
-            "asset_id": "asset-1",
-            "payload": {
-                "frame_ids": ["frame-1"],
-                "background_correction": True,
-                "background_payload_kind": "original",
-                "background_encoding": "raw",
+    with pytest.raises(ValueError, match="ingestion-generated backgrounds"):
+        preprocess_frames_handler(
+            {
+                "id": "job-preprocess",
+                "stage": PipelineStage.PREPROCESS_FRAMES.value,
+                "run_id": "run-1",
+                "asset_id": "asset-1",
+                "payload": {"frame_ids": ["frame-1"], "background_correction": True},
             },
-        },
-        context,
-    )
-
-    assert calls == [
-        (
-            ["frame-1"],
-            {"context": context, "payload_kind": "original", "encoding": "raw"},
+            context,
         )
-    ]
-    assert result["background_generation"]["background_payload_ref"] == "background-key"
-    progress_payloads = [update["progress"] for update in repo.progress_updates]
-    assert any(
-        payload["secondary"].get("background_generation") == "completed"
-        for payload in progress_payloads
-    )
 
 
 def test_preprocess_frames_handler_skips_background_generation_when_present(monkeypatch):
@@ -856,69 +795,26 @@ def test_preprocess_frames_handler_skips_background_generation_when_present(monk
     assert "background_generation" not in result
 
 
-def test_preprocess_frames_handler_regenerates_stale_background_reference(monkeypatch):
+def test_preprocess_frames_handler_does_not_regenerate_stale_background_reference(monkeypatch):
     repo = FakeRepository()
     repo.frames_with_background.add("frame-1")
     context = make_context(repo)
-    calls = []
-    retrieve_calls = 0
-
-    def fake_generate_background_for_frames(frame_ids, **kwargs):
-        calls.append((frame_ids, kwargs))
-        return {
-            "background_payload_ref": "fresh-background-key",
-            "frame_ids": list(frame_ids),
-            "frame_count": len(frame_ids),
-            "updated_frame_count": len(frame_ids),
-        }
-
     def fake_retrieve_frame(frame_id, context=None, payload_kind="original", frame_record=None):
-        nonlocal retrieve_calls
-        retrieve_calls += 1
-        if retrieve_calls == 1:
-            raise KeyError("stale-background-key")
-        return FrameData(
-            sourcePath="/tmp",
-            filename="frame.png",
-            frameNumber=1,
-            data=np.zeros((4, 4), dtype=np.uint8),
-            bkg=np.ones((4, 4), dtype=np.float32),
-            metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
-        )
+        raise KeyError("stale-background-key")
 
-    monkeypatch.setattr(
-        "Pelagia.workers.handlers.ensure_asset_background_windows",
-        fake_generate_background_for_frames,
-    )
     monkeypatch.setattr("Pelagia.workers.handlers.retrieve_frame", fake_retrieve_frame)
-    monkeypatch.setattr("Pelagia.workers.handlers.preprocess_frame_for_segmentation", lambda frame, **kwargs: frame)
-    monkeypatch.setattr(
-        "Pelagia.workers.handlers.store_preprocessed_frames",
-        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
-    )
 
-    result = preprocess_frames_handler(
-        {
-            "id": "job-preprocess",
-            "stage": PipelineStage.PREPROCESS_FRAMES.value,
-            "run_id": "run-1",
-            "asset_id": "asset-1",
-            "payload": {
-                "frame_ids": ["frame-1"],
-                "background_correction": True,
+    with pytest.raises(KeyError, match="stale-background-key"):
+        preprocess_frames_handler(
+            {
+                "id": "job-preprocess",
+                "stage": PipelineStage.PREPROCESS_FRAMES.value,
+                "run_id": "run-1",
+                "asset_id": "asset-1",
+                "payload": {"frame_ids": ["frame-1"], "background_correction": True},
             },
-        },
-        context,
-    )
-
-    assert len(calls) == 1
-    assert retrieve_calls == 2
-    assert result["background_generation"]["background_payload_ref"] == "fresh-background-key"
-    progress_payloads = [update["progress"] for update in repo.progress_updates]
-    assert any(
-        payload["secondary"].get("reason") == "background_retrieve_failed"
-        for payload in progress_payloads
-    )
+            context,
+        )
 
 
 def test_preprocess_frames_handler_uses_project_context(monkeypatch):
@@ -989,7 +885,7 @@ def test_background_frames_handler_generates_background_for_frame_batch(monkeypa
         }
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.generate_background_for_frames",
+        "Pelagia.workers.handlers.ensure_asset_background_windows",
         fake_generate_background_for_frames,
     )
 
@@ -1386,7 +1282,7 @@ def test_default_registry_includes_background_frames_handler(monkeypatch):
     ]
 
     monkeypatch.setattr(
-        "Pelagia.workers.handlers.generate_background_for_frames",
+        "Pelagia.workers.handlers.ensure_asset_background_windows",
         lambda frame_ids, **kwargs: {
             "background_payload_ref": "background-key",
             "frame_ids": frame_ids,

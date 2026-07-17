@@ -38,6 +38,8 @@ class FakeRepository:
         self.delete_job_calls = []
         self.logs = []
         self.preprocessed_payload_ref = None
+        self.flatfield_profile = []
+        self.flatfield_metadata = {}
         self.sandbox_frames = {}
         self.deleted_sandbox_frames = []
         self.deleted_assets = []
@@ -185,6 +187,8 @@ class FakeRepository:
             "background_payload_dtype": None,
             "background_payload_shape": [],
             "background_metadata": {},
+            "flatfield_profile": list(self.flatfield_profile),
+            "flatfield_metadata": dict(self.flatfield_metadata),
             "width": 10,
             "height": 10,
             "metadata": {"frame_id": frame_id},
@@ -213,6 +217,8 @@ class FakeRepository:
             preprocessed_kvstore_hash=self.preprocessed_payload_ref,
             background_payload_ref=None,
             background_kvstore_hash=None,
+            flatfield_profile=list(self.flatfield_profile),
+            flatfield_metadata=dict(self.flatfield_metadata),
             metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": frame_id},
         )
 
@@ -2807,6 +2813,8 @@ def test_api_can_queue_frame_background_job():
             "frame_ids": ["frame-1"],
             "payload_kind": "original",
             "encoding": "zstd",
+            "window_stride": 25,
+            "window_width": 125,
             "priority": 7,
             "depends_on": ["job-1"],
         },
@@ -2823,6 +2831,23 @@ def test_api_can_queue_frame_background_job():
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
     assert repository.created_jobs[-1]["payload"]["payload_kind"] == "original"
     assert repository.created_jobs[-1]["payload"]["encoding"] == "zstd"
+    assert repository.created_jobs[-1]["payload"]["window_stride"] == 25
+    assert repository.created_jobs[-1]["payload"]["window_width"] == 125
+
+
+def test_api_returns_stored_flatfield_profile():
+    client, repository, _ = make_client()
+    repository.flatfield_profile = [10.0, 20.0, 30.0]
+    repository.flatfield_metadata = {"flatfield_method": "column_mean", "window_center": 25}
+
+    response = client.get("/frames/frame-1/flatfield-profile")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "frame_id": "frame-1",
+        "profile": [10.0, 20.0, 30.0],
+        "metadata": {"flatfield_method": "column_mean", "window_center": 25},
+    }
 
 
 def test_api_queue_frame_background_job_dry_run_does_not_create_job():
@@ -3885,12 +3910,16 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
     assert "flatfield_correction" not in repository.created_jobs[0]["payload"]
     assert "flatfield_q" not in repository.created_jobs[0]["payload"]
-    assert "flatfield_axis" not in repository.created_jobs[0]["payload"]
+    assert repository.created_jobs[0]["payload"]["flatfield_axis"] == 0
+    assert repository.created_jobs[0]["payload"]["background_window_stride"] == 25
+    assert repository.created_jobs[0]["payload"]["background_window_width"] == 25
+    assert repository.created_jobs[0]["payload"]["flatfield_window_stride"] == 1
+    assert repository.created_jobs[0]["payload"]["flatfield_window_width"] == 1
     assert "flatfield_maximum_value" not in repository.created_jobs[0]["payload"]
     assert repository.created_jobs[0]["payload"]["adaptive_background_subtraction"] is False
     assert repository.created_jobs[0]["payload"]["adaptive_background_period"] == 50
     assert repository.created_jobs[0]["payload"]["apply_mask"] is False
-    assert repository.created_jobs[0]["payload"]["mask_path"] is None
+    assert repository.created_jobs[0]["payload"].get("mask_path") is None
     assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_encoding"] == "jpg"
     assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 90
     assert repository.created_jobs[0]["project_id"] == "project-1"
@@ -3976,6 +4005,10 @@ def test_api_analyzes_image_sequence_before_ingestion(tmp_path):
             "kind": "image_sequence",
             "collections": ["survey-a"],
             "metadata": {"operator": "ada"},
+            "generate_backgrounds": True,
+            "flatfield_axis": 1,
+            "background_window_stride": 25,
+            "background_window_width": 125,
         },
     )
 
@@ -3992,6 +4025,13 @@ def test_api_analyzes_image_sequence_before_ingestion(tmp_path):
     assert asset["metadata"]["width"] == 4
     assert asset["metadata"]["height"] == 3
     assert body["suggested_ingestion_request"]["assets"][0]["asset_id"] == asset["asset_id"]
+    assert body["suggested_ingestion_request"]["generate_backgrounds"] is True
+    assert body["suggested_ingestion_request"]["generate_flatfield_profiles"] is False
+    assert body["suggested_ingestion_request"]["flatfield_axis"] == 1
+    assert body["suggested_ingestion_request"]["background_window_stride"] == 25
+    assert body["suggested_ingestion_request"]["background_window_width"] == 125
+    assert body["suggested_ingestion_request"]["flatfield_window_stride"] == 1
+    assert body["suggested_ingestion_request"]["flatfield_window_width"] == 1
 
 
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):

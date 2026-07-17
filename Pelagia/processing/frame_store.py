@@ -521,6 +521,9 @@ def retrieve_frame(
         raise ValueError(f"Frame {id} does not include a {requested_kind} kvstore key.")
 
     frame_data = FrameData.from_record(record, metadata=metadata)
+    if record.flatfield_profile:
+        frame_data.metadata["flatfield_profile"] = list(record.flatfield_profile)
+        frame_data.metadata["flatfield_metadata"] = dict(record.flatfield_metadata or {})
     with measure_phase("load.kvstore_read"):
         payload = kvstore.get_store(kvstore_key)
     with measure_phase("load.decode"):

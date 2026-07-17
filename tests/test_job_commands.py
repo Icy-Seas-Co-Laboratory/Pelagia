@@ -12,9 +12,51 @@ from Pelagia.services.job_commands import (
     COMMAND_TYPE_KEY,
     COMMAND_VERSION_KEY,
     FrameSelection,
+    ExtractFramesCommand,
     SegmentFramesCommand,
     command_from_payload,
 )
+
+
+def test_extract_frames_command_serializes_ingestion_background_options():
+    payload = ExtractFramesCommand.from_payload(
+        {
+            "source_path": "/data/asset.mkv",
+            "generate_backgrounds": True,
+            "generate_flatfield_profiles": False,
+            "flatfield_axis": 1,
+            "background_window_stride": 25,
+            "background_window_width": 125,
+            "flatfield_window_stride": 1,
+            "flatfield_window_width": 3,
+            "background_encoding": "zstd",
+            "background_quality": 90,
+        }
+    ).to_payload()
+
+    assert payload["generate_backgrounds"] is True
+    assert payload["generate_flatfield_profiles"] is False
+    assert payload["flatfield_axis"] == 1
+    assert payload["background_window_stride"] == 25
+    assert payload["background_window_width"] == 125
+    assert payload["flatfield_window_stride"] == 1
+    assert payload["flatfield_window_width"] == 3
+    assert payload["background_encoding"] == "zstd"
+    assert payload["background_quality"] == 90
+
+
+def test_background_command_serializes_window_settings():
+    command = command_from_payload(
+        PipelineStage.BACKGROUND_FRAMES,
+        {
+            "asset_id": "asset-1",
+            "window_stride": 25,
+            "window_width": 125,
+        },
+    )
+
+    assert command.to_payload()["window_stride"] == 25
+    assert command.to_payload()["window_width"] == 125
 
 
 def test_segment_command_upgrades_a_legacy_flat_payload():

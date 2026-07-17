@@ -120,9 +120,9 @@ backend = "kvstore" # Options: kvstore, kvstore2
 root_path = "./data/kvstore"
 hash_algorithm = "blake3"
 prefix_length = 2
-max_db_bytes = 42949672960   # Used by kvstore.
-max_rows = 1000000           # Used by kvstore.
-max_blob_bytes = 67108864    # Used by kvstore2.
+max_db_bytes = 42_949_672_960   # Used by kvstore.
+max_rows = 1_000_000           # Used by kvstore.
+max_blob_bytes = 67_108_864    # Used by kvstore2.
 
 [api]
 host = "0.0.0.0"
@@ -131,7 +131,7 @@ cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|10(?:\\.\\d{1,3})
 
 [auth]
 enabled = true
-session_ttl_seconds = 604800
+session_ttl_seconds = 604_800
 dev_project_key = "default"
 ```
 
@@ -445,6 +445,26 @@ Useful endpoint groups:
 - `GET /io/export/options`
 - `GET /io/export/table/{table_name}`, `GET /io/export/tables`
 - `GET /io/export/datasets/frame-metadata`, `/roi-metadata`
+
+Ingestion requests can generate aligned fields while decoded frames are already
+in memory. Area-scan ingestion normally uses `generate_backgrounds=true`, while
+line-scan ingestion normally uses `generate_flatfield_profiles=true`; callers
+may explicitly enable both. Area-scan means use `background_window_stride` and
+`background_window_width`, which default to `25/25`. Line-scan profiles use
+`flatfield_window_stride` and `flatfield_window_width`, which default to `1/1`.
+The schedules are independent when both products are enabled. Mean background
+images are written to the project KV
+store, while column-mean flatfield profiles are stored directly as PostgreSQL
+`real[]` values and can be read from
+`GET /frames/{frame_id}/flatfield-profile`. Non-nominal partial frames receive
+the applicable field references. They are excluded from full-frame background
+means, but can still contribute to flatfield profiles. `flatfield_axis=0` is the
+default: frames are effectively stacked vertically, their widths must match, and
+column means are stored. With `flatfield_axis=1`, frames are effectively stacked
+horizontally, their heights must match, and row means are stored. The stacking is
+accumulated without allocating a concatenated image.
+When neither switch is supplied, effective correction settings choose one mode,
+with background generation taking precedence over flatfield profiles.
 
 General list endpoints are intentionally shaped as limited searches. For example,
 `GET /assets` does not require a run id and can be narrowed with filters such as

@@ -2194,7 +2194,7 @@ class PostgresRepository:
                      payload_ref, payload_encoding, payload_format, payload_dtype, payload_shape,
                      background_kvstore_hash, background_payload_ref, background_payload_encoding,
                      background_payload_format, background_payload_dtype, background_payload_shape,
-                     background_metadata, metadata)
+                     background_metadata, flatfield_profile, flatfield_metadata, metadata)
                     SELECT
                         source.run_id,
                         source.asset_id,
@@ -2220,6 +2220,8 @@ class PostgresRepository:
                         source.background_payload_dtype,
                         source.background_payload_shape,
                         source.background_metadata,
+                        source.flatfield_profile,
+                        source.flatfield_metadata,
                         COALESCE(source.metadata, '{{}}'::jsonb) || %s::jsonb
                     FROM source, next_index
                     RETURNING *;
@@ -2530,6 +2532,80 @@ class PostgresRepository:
         if len(rows) != len(resolved_frame_ids):
             found_ids = {str(row["id"]) for row in rows}
             missing = [frame_id for frame_id in resolved_frame_ids if frame_id not in found_ids]
+            raise KeyError(f"Frame(s) not found: {', '.join(missing)}")
+        return rows
+
+    def update_frame_background_payload_assignments(
+        self,
+        assignments: Sequence[dict[str, Any]],
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Assign independently generated background payloads in one transaction."""
+        if not assignments:
+            return []
+        frame_ids = [str(assignment["frame_id"]) for assignment in assignments]
+        payload = [
+            {
+                **assignment,
+                "frame_id": str(assignment["frame_id"]),
+                "payload_shape": (
+                    json_ready(list(assignment.get("payload_shape") or []))
+                    if "payload_shape" in assignment
+                    else None
+                ),
+                "metadata": (
+                    json_ready(dict(assignment.get("metadata") or {}))
+                    if "metadata" in assignment
+                    else None
+                ),
+                "flatfield_profile": json_ready(assignment.get("flatfield_profile")),
+                "flatfield_metadata": (
+                    json_ready(dict(assignment.get("flatfield_metadata") or {}))
+                    if "flatfield_metadata" in assignment
+                    else None
+                ),
+            }
+            for assignment in assignments
+        ]
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                self._ensure_project_scope(cursor, project_id, frame_ids=frame_ids)
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.frames AS frames
+                    SET
+                        background_kvstore_hash = COALESCE(assignment.kvstore_hash, frames.background_kvstore_hash),
+                        background_payload_ref = COALESCE(assignment.payload_ref, frames.background_payload_ref),
+                        background_payload_encoding = COALESCE(assignment.payload_encoding, frames.background_payload_encoding),
+                        background_payload_format = COALESCE(assignment.payload_format, frames.background_payload_format),
+                        background_payload_dtype = COALESCE(assignment.payload_dtype, frames.background_payload_dtype),
+                        background_payload_shape = COALESCE(assignment.payload_shape, frames.background_payload_shape),
+                        background_metadata = COALESCE(assignment.metadata, frames.background_metadata),
+                        flatfield_profile = COALESCE(assignment.flatfield_profile, frames.flatfield_profile),
+                        flatfield_metadata = COALESCE(assignment.flatfield_metadata, frames.flatfield_metadata)
+                    FROM jsonb_to_recordset(%s::jsonb) AS assignment(
+                        frame_id uuid,
+                        kvstore_hash text,
+                        payload_ref text,
+                        payload_encoding text,
+                        payload_format text,
+                        payload_dtype text,
+                        payload_shape jsonb,
+                        metadata jsonb,
+                        flatfield_profile real[],
+                        flatfield_metadata jsonb
+                    )
+                    WHERE frames.id = assignment.frame_id
+                    RETURNING frames.*;
+                    """,
+                    (json.dumps(payload),),
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        if len(rows) != len(frame_ids):
+            found_ids = {str(row["id"]) for row in rows}
+            missing = [frame_id for frame_id in frame_ids if frame_id not in found_ids]
             raise KeyError(f"Frame(s) not found: {', '.join(missing)}")
         return rows
 

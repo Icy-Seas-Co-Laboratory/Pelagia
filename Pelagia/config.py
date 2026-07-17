@@ -260,6 +260,8 @@ class FlatfieldProcessingConfig:
     flatfield_correction: bool = True
     flatfield_q: float = 0.9
     flatfield_axis: int = 0
+    background_window_stride: int = 1
+    background_window_width: int = 1
     flatfield_min_field_value: float = 1.0
     flatfield_max_field_value: float | None = None
 
@@ -297,8 +299,8 @@ class PreprocessingConfig:
     mask_path: str | None = None
     adaptive_background_subtraction: bool = False
     adaptive_background_period: int = 50
-    background_window_stride: int = 51
-    background_window_width: int = 51
+    background_window_stride: int = 25
+    background_window_width: int = 25
     background_correction: bool = False
     background_min_field_value: float = 1.0
     background_max_field_value: float | None = None
@@ -572,6 +574,8 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.flatfield", "flatfield_correction", "PELAGIA_FLATFIELD_CORRECTION", _env_bool)
     _set_from_env(settings, "processing.flatfield", "flatfield_q", "PELAGIA_FLATFIELD_Q", float)
     _set_from_env(settings, "processing.flatfield", "flatfield_axis", "PELAGIA_FLATFIELD_AXIS", int)
+    _set_from_env(settings, "processing.flatfield", "background_window_stride", "PELAGIA_FLATFIELD_BACKGROUND_WINDOW_STRIDE", int)
+    _set_from_env(settings, "processing.flatfield", "background_window_width", "PELAGIA_FLATFIELD_BACKGROUND_WINDOW_WIDTH", int)
     _set_from_env(settings, "processing.flatfield", "flatfield_min_field_value", "PELAGIA_FLATFIELD_MIN_FIELD_VALUE", float)
     _set_from_env(settings, "processing.flatfield", "flatfield_max_field_value", "PELAGIA_FLATFIELD_MAX_FIELD_VALUE", float)
 
@@ -1046,6 +1050,18 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 ),
                 flatfield_q=float(flatfield.get("flatfield_q", FlatfieldProcessingConfig.flatfield_q)),
                 flatfield_axis=int(flatfield.get("flatfield_axis", FlatfieldProcessingConfig.flatfield_axis)),
+                background_window_stride=int(
+                    flatfield.get(
+                        "background_window_stride",
+                        FlatfieldProcessingConfig.background_window_stride,
+                    )
+                ),
+                background_window_width=int(
+                    flatfield.get(
+                        "background_window_width",
+                        FlatfieldProcessingConfig.background_window_width,
+                    )
+                ),
                 flatfield_min_field_value=float(
                     flatfield.get(
                         "flatfield_min_field_value",

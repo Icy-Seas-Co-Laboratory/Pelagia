@@ -45,6 +45,7 @@ VIDEO_FRAME_EXTENSIONS = {
     ".wmv",
 }
 IngestProgressCallback = Callable[[dict[str, Any]], None]
+IngestFrameStoredCallback = Callable[[dict[str, Any], np.ndarray], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +422,7 @@ def ingest(
     apply_mask: bool | None = None,
     mask_path: str | None = None,
     progress_callback: IngestProgressCallback | None = None,
+    frame_stored_callback: IngestFrameStoredCallback | None = None,
 ) -> list[dict[str, Any]]:
     """Generic direct-ingest dispatcher for a single registered source."""
     sources = discover_ingest_sources(input_path, recursive=recursive)
@@ -442,6 +444,7 @@ def ingest(
             asset_id=asset_id,
             metadata=metadata,
             progress_callback=progress_callback,
+            frame_stored_callback=frame_stored_callback,
         )
     if source.kind == "video":
         return ingest_video_file(
@@ -456,6 +459,7 @@ def ingest(
             apply_mask=apply_mask,
             mask_path=mask_path,
             progress_callback=progress_callback,
+            frame_stored_callback=frame_stored_callback,
         )
     raise ValueError(f"Unsupported ingest source kind: {source.kind!r}")
 
@@ -469,6 +473,7 @@ def ingest_image_folder(
     asset_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     progress_callback: IngestProgressCallback | None = None,
+    frame_stored_callback: IngestFrameStoredCallback | None = None,
 ) -> list[dict[str, Any]]:
     """Ingest a folder of image files as one stored frame per image."""
     started = time.perf_counter()
@@ -550,22 +555,23 @@ def ingest_image_folder(
                     "image_extension": image_path.suffix.lower(),
                 }
             )
-            stored_frames.append(
-                store_frame(
-                    FrameData(
-                        sourcePath=str(image_path.parent),
-                        filename=image_path.name,
-                        frameNumber=frame_index,
-                        data=image,
-                        tileNumber=frame_index,
-                        sourceFrameStart=frame_index,
-                        sourceFrameEnd=frame_index,
-                        frameType="image",
-                        metadata=metadata_for_frame,
-                    ),
-                    context=context,
-                )
+            stored_row = store_frame(
+                FrameData(
+                    sourcePath=str(image_path.parent),
+                    filename=image_path.name,
+                    frameNumber=frame_index,
+                    data=image,
+                    tileNumber=frame_index,
+                    sourceFrameStart=frame_index,
+                    sourceFrameEnd=frame_index,
+                    frameType="image",
+                    metadata=metadata_for_frame,
+                ),
+                context=context,
             )
+            stored_frames.append(stored_row)
+            if frame_stored_callback is not None:
+                frame_stored_callback(stored_row, image)
             if frame_index == 1 or frame_index % _PROGRESS_LOG_TILE_INTERVAL == 0:
                 _log_database_event(
                     context,
@@ -678,6 +684,7 @@ def ingest_video_file(
     opencv_threads: int | None = None,
     decoder_threads: int | None = None,
     progress_callback: IngestProgressCallback | None = None,
+    frame_stored_callback: IngestFrameStoredCallback | None = None,
 ) -> list[dict[str, Any]]:
     started = time.perf_counter()
     ingest_defaults = (
@@ -846,23 +853,24 @@ def ingest_video_file(
 
     def store_tile(tile: np.ndarray, source_start: int, source_end: int, *, partial_tile: bool = False) -> None:
         nonlocal tile_number
-        stored_frames.append(
-            store_frame(
-                FrameData(
-                    sourcePath=source_path,
-                    filename=filename,
-                    frameNumber=source_end,
-                    data=tile,
-                    tileNumber=tile_number,
-                    sourceFrameStart=source_start,
-                    sourceFrameEnd=source_end,
-                    frameType="line",
-                    timestamp=timestamp_for_frame(start_timestamp, fps, source_end),
-                    metadata=frame_metadata.copy(),
-                ),
-                context=context,
-            )
+        stored_row = store_frame(
+            FrameData(
+                sourcePath=source_path,
+                filename=filename,
+                frameNumber=source_end,
+                data=tile,
+                tileNumber=tile_number,
+                sourceFrameStart=source_start,
+                sourceFrameEnd=source_end,
+                frameType="line",
+                timestamp=timestamp_for_frame(start_timestamp, fps, source_end),
+                metadata=frame_metadata.copy(),
+            ),
+            context=context,
         )
+        stored_frames.append(stored_row)
+        if frame_stored_callback is not None:
+            frame_stored_callback(stored_row, tile)
         event_payload = {
             "filename": filename,
             "tile_number": tile_number,

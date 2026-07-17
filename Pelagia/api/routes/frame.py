@@ -109,6 +109,8 @@ if APIRouter is not None:
         quality: int | None = None
 
     class QueueFrameBackgroundRequest(FrameBackgroundRequest):
+        window_stride: int | None = None
+        window_width: int | None = None
         priority: int | None = None
         depends_on: list[str] | None = None
         dry_run: bool = False
@@ -325,6 +327,22 @@ if APIRouter is not None:
             {
                 **stats,
                 "page": page_metadata(limit=limit, offset=offset, count=len(stats.get("frames", []))),
+            }
+        )
+
+    @frames_router.get("/{frame_id}/flatfield-profile")
+    def get_frame_flatfield_profile(request: Request, frame_id: str) -> dict:
+        record = get_repository(request).get_frame_record(
+            frame_id,
+            project_id=scoped_project_id(request),
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Frame {frame_id!r} was not found.")
+        return as_response(
+            {
+                "frame_id": frame_id,
+                "profile": list(record.flatfield_profile),
+                "metadata": dict(record.flatfield_metadata),
             }
         )
 
@@ -726,6 +744,12 @@ if APIRouter is not None:
     def queue_frame_background_job(request: Request, body: QueueFrameBackgroundRequest) -> dict:
         repository = get_repository(request)
         auth = require_project_write(request)
+        for name, value in {
+            "window_stride": body.window_stride,
+            "window_width": body.window_width,
+        }.items():
+            if value is not None and (value < 1 or value % 2 == 0):
+                raise HTTPException(status_code=422, detail=f"{name} must be a positive odd integer.")
         run_id, asset_id, frame_ids = _resolve_background_target(request, body)
         payload = {
             "frame_ids": frame_ids,
@@ -735,6 +759,8 @@ if APIRouter is not None:
             "payload_kind": body.payload_kind,
             "encoding": body.encoding,
             "quality": body.quality,
+            "window_stride": body.window_stride,
+            "window_width": body.window_width,
         }
         payload = {key: value for key, value in payload.items() if value is not None}
         payload = FrameBackgroundCommand.from_payload(payload).to_payload()

@@ -19,9 +19,11 @@ from Pelagia.processing.frame_correction import (
     divide_background,
     ensure_asset_background_windows,
     flatfield_correction,
+    flatfield_profile_correction,
     generate_background_for_frames,
 )
 from Pelagia.processing.frame_model import FrameData
+from Pelagia.processing.frame_preprocess import preprocess_frame_for_segmentation
 from Pelagia.processing.frame_store import _fit_background_to_frame, retrieve_frame, store_frame
 from Pelagia.processing.frame_time import parse_filename_timestamp_utc
 from Pelagia.processing.thumbhash import compute_thumbhash
@@ -268,6 +270,82 @@ def test_flatfield_correction_uses_column_profile_for_grayscale_data():
 
     np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
     np.testing.assert_array_equal(row_corrected, np.array([[170, 255], [139, 255]], dtype=np.uint8))
+
+
+def test_stored_flatfield_profile_correction_uses_column_mean_vector():
+    corrected = flatfield_profile_correction(
+        np.array([[10, 20], [30, 40]], dtype=np.uint8),
+        [20.0, 30.0],
+    )
+
+    np.testing.assert_array_equal(
+        corrected,
+        np.array([[127, 170], [255, 255]], dtype=np.uint8),
+    )
+
+
+def test_stored_flatfield_profile_correction_uses_row_mean_vector():
+    corrected = flatfield_profile_correction(
+        np.array([[10, 20], [30, 40]], dtype=np.uint8),
+        [15.0, 35.0],
+        axis=1,
+    )
+
+    np.testing.assert_array_equal(
+        corrected,
+        np.array([[170, 255], [218, 255]], dtype=np.uint8),
+    )
+
+def test_preprocessing_prefers_stored_flatfield_profile():
+    frame = FrameData(
+        sourcePath="/tmp",
+        filename="frame.png",
+        frameNumber=1,
+        data=np.array([[10, 20], [30, 40]], dtype=np.uint8),
+        metadata={"flatfield_profile": [20.0, 30.0]},
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        flatfield_correction=True,
+        flatfield_min_field_value=1,
+        background_correction=False,
+        invert_intensity=False,
+    )
+
+    np.testing.assert_array_equal(
+        processed.read(),
+        np.array([[127, 170], [255, 255]], dtype=np.uint8),
+    )
+    assert processed.metadata["flatfield_profile_method"] == "window_column_mean"
+
+
+def test_preprocessing_uses_stored_row_profile_for_axis_one():
+    frame = FrameData(
+        sourcePath="/tmp",
+        filename="frame.png",
+        frameNumber=1,
+        data=np.array([[10, 20], [30, 40]], dtype=np.uint8),
+        metadata={
+            "flatfield_profile": [15.0, 35.0],
+            "flatfield_metadata": {"flatfield_axis": 1},
+        },
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        flatfield_correction=True,
+        flatfield_min_field_value=1,
+        background_correction=False,
+        invert_intensity=False,
+    )
+
+    np.testing.assert_array_equal(
+        processed.read(),
+        np.array([[170, 255], [218, 255]], dtype=np.uint8),
+    )
+    assert processed.metadata["flatfield_profile_method"] == "window_row_mean"
+    assert processed.metadata["flatfield_axis"] == 1
 
 
 def test_bounded_field_marks_out_of_range_values_with_sentinel_divisors():

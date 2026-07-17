@@ -8,7 +8,11 @@ import cv2
 import numpy as np
 
 from .defaults import default_processing_config
-from .frame_correction import divide_background, flatfield_correction as correct_flatfield
+from .frame_correction import (
+    divide_background,
+    flatfield_correction as correct_flatfield,
+    flatfield_profile_correction,
+)
 from .frame_model import FrameData
 from .timing import measure_phase
 
@@ -141,6 +145,7 @@ def preprocess_frame_for_segmentation(
     flatfield_correction: bool | None = None,
     flatfield_q: float | None = None,
     flatfield_axis: int | None = None,
+    flatfield_profile: np.ndarray | list[float] | tuple[float, ...] | None = None,
     flatfield_min_field_value: int | float | None = None,
     flatfield_max_field_value: int | float | None = None,
     background_correction: bool | None = None,
@@ -202,6 +207,20 @@ def preprocess_frame_for_segmentation(
 
     source_mask = mask if mask is not None else frame.mask
     source_background = background if background is not None else frame.bkg
+    source_flatfield_profile = (
+        flatfield_profile
+        if flatfield_profile is not None
+        else (frame.metadata or {}).get("flatfield_profile")
+    )
+    source_flatfield_metadata = dict((frame.metadata or {}).get("flatfield_metadata") or {})
+    source_flatfield_axis = int(
+        source_flatfield_metadata.get(
+            "flatfield_axis",
+            flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis,
+        )
+    )
+    if source_flatfield_axis not in {0, 1}:
+        raise ValueError("Stored flatfield profile axis must be 0 or 1.")
     with measure_phase("processing.crop"):
         crop_bounds = _resolve_crop_bounds(
             image.shape,
@@ -214,6 +233,9 @@ def preprocess_frame_for_segmentation(
         if crop_bounds is not None:
             x0, y0, x1, y1 = crop_bounds
             image = np.ascontiguousarray(image[y0:y1, x0:x1])
+            if source_flatfield_profile is not None:
+                profile_slice = slice(x0, x1) if source_flatfield_axis == 0 else slice(y0, y1)
+                source_flatfield_profile = np.asarray(source_flatfield_profile)[profile_slice]
             if source_mask is not None:
                 source_mask = crop_frame_data(
                     source_mask,
@@ -244,7 +266,11 @@ def preprocess_frame_for_segmentation(
         flatfield_defaults.flatfield_correction if flatfield_correction is None else flatfield_correction
     )
     resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
-    resolved_flatfield_axis = flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    resolved_flatfield_axis = (
+        source_flatfield_axis
+        if flatfield_axis is None and source_flatfield_profile is not None
+        else flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
+    )
     resolved_flatfield_min_field_value = (
         flatfield_defaults.flatfield_min_field_value
         if flatfield_min_field_value is None
@@ -256,15 +282,29 @@ def preprocess_frame_for_segmentation(
         else flatfield_max_field_value
     )
 
+    uses_stored_flatfield_profile = False
     if resolved_flatfield_correction:
+        uses_stored_flatfield_profile = (
+            source_flatfield_profile is not None
+            and source_flatfield_axis == resolved_flatfield_axis
+        )
         with measure_phase("processing.flatfield"):
-            image = correct_flatfield(
-                image,
-                q=resolved_flatfield_q,
-                axis=resolved_flatfield_axis,
-                min_field_value=resolved_flatfield_min_field_value,
-                max_field_value=resolved_flatfield_max_field_value,
-            )
+            if uses_stored_flatfield_profile:
+                image = flatfield_profile_correction(
+                    image,
+                    source_flatfield_profile,
+                    axis=resolved_flatfield_axis,
+                    min_field_value=resolved_flatfield_min_field_value,
+                    max_field_value=resolved_flatfield_max_field_value,
+                )
+            else:
+                image = correct_flatfield(
+                    image,
+                    q=resolved_flatfield_q,
+                    axis=resolved_flatfield_axis,
+                    min_field_value=resolved_flatfield_min_field_value,
+                    max_field_value=resolved_flatfield_max_field_value,
+                )
 
     if resolved_background_correction:
         if source_background is None:
@@ -284,6 +324,7 @@ def preprocess_frame_for_segmentation(
             image = invert_image_intensity(image)
 
     metadata = dict(frame.metadata or {})
+    metadata.pop("flatfield_profile", None)
     preprocessing_steps = list(metadata.get("preprocessing_steps") or [])
     preprocessing_steps.extend(
         step
@@ -308,6 +349,11 @@ def preprocess_frame_for_segmentation(
             "candidate_image_kind": "preprocessed",
             "foreground_polarity": "bright",
             "frame_mask_applied": bool(resolved_apply_mask and source_mask is not None),
+            "flatfield_profile_method": (
+                ("window_column_mean" if resolved_flatfield_axis == 0 else "window_row_mean")
+                if resolved_flatfield_correction and uses_stored_flatfield_profile
+                else "frame_quantile"
+            ),
             "crop_enabled": bool(crop_bounds is not None),
             "crop_bbox": crop_bbox,
             "flatfield_correction": bool(resolved_flatfield_correction),

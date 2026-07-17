@@ -38,6 +38,15 @@ if APIRouter is not None:
         n_tile: int | None = None
         image_encoding: str | None = None
         image_quality: int | None = None
+        generate_backgrounds: bool | None = None
+        generate_flatfield_profiles: bool | None = None
+        flatfield_axis: int | None = None
+        background_window_stride: int | None = None
+        background_window_width: int | None = None
+        flatfield_window_stride: int | None = None
+        flatfield_window_width: int | None = None
+        background_encoding: str | None = None
+        background_quality: int | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -62,6 +71,15 @@ if APIRouter is not None:
         n_tile: int | None = None
         image_encoding: str | None = None
         image_quality: int | None = None
+        generate_backgrounds: bool | None = None
+        generate_flatfield_profiles: bool | None = None
+        flatfield_axis: int | None = None
+        background_window_stride: int | None = None
+        background_window_width: int | None = None
+        flatfield_window_stride: int | None = None
+        flatfield_window_width: int | None = None
+        background_encoding: str | None = None
+        background_quality: int | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     class IngestionAssetRequest(BaseModel):
@@ -78,6 +96,15 @@ if APIRouter is not None:
         n_tile: int | None = None
         image_encoding: str | None = None
         image_quality: int | None = None
+        generate_backgrounds: bool | None = None
+        generate_flatfield_profiles: bool | None = None
+        flatfield_axis: int | None = None
+        background_window_stride: int | None = None
+        background_window_width: int | None = None
+        flatfield_window_stride: int | None = None
+        flatfield_window_width: int | None = None
+        background_encoding: str | None = None
+        background_quality: int | None = None
         recursive: bool | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
@@ -106,6 +133,15 @@ if APIRouter is not None:
         n_tile: int | None = None
         image_encoding: str | None = None
         image_quality: int | None = None
+        generate_backgrounds: bool | None = None
+        generate_flatfield_profiles: bool | None = None
+        flatfield_axis: int | None = None
+        background_window_stride: int | None = None
+        background_window_width: int | None = None
+        flatfield_window_stride: int | None = None
+        flatfield_window_width: int | None = None
+        background_encoding: str | None = None
+        background_quality: int | None = None
         adaptive_background_subtraction: bool | None = None
         adaptive_background_period: int | None = None
         apply_mask: bool | None = None
@@ -173,6 +209,19 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail="image_quality must be between 0 and 100.")
         return quality
 
+    def _validate_background_windows(stride: int, width: int) -> None:
+        if stride < 1 or width < 1 or stride % 2 == 0 or width % 2 == 0:
+            raise HTTPException(
+                status_code=422,
+                detail="background_window_stride and background_window_width must be positive odd integers.",
+            )
+
+    def _validate_flatfield_axis(value: int) -> int:
+        axis = int(value)
+        if axis not in {0, 1}:
+            raise HTTPException(status_code=422, detail="flatfield_axis must be 0 or 1.")
+        return axis
+
     def _resolved_ingest_defaults(
         request: Request,
         *,
@@ -184,6 +233,7 @@ if APIRouter is not None:
         defaults = request.app.state.context.config.processing
         ingest_defaults = defaults.video_ingest
         preprocessing_defaults = defaults.preprocessing
+        flatfield_defaults = defaults.flatfield
         roi_recording_defaults = defaults.roi_recording
         storage_settings = resolve_project_storage_settings(
             request.app.state.context,
@@ -201,6 +251,18 @@ if APIRouter is not None:
             "mask_path": preprocessing_defaults.mask_path,
             "roi_padding": roi_recording_defaults.padding,
             "roi_encoding": storage_settings.roi_encoding,
+            "generate_backgrounds": preprocessing_defaults.background_correction,
+            "generate_flatfield_profiles": (
+                flatfield_defaults.flatfield_correction
+                and not preprocessing_defaults.background_correction
+            ),
+            "flatfield_axis": flatfield_defaults.flatfield_axis,
+            "background_window_stride": preprocessing_defaults.background_window_stride,
+            "background_window_width": preprocessing_defaults.background_window_width,
+            "flatfield_window_stride": flatfield_defaults.background_window_stride,
+            "flatfield_window_width": flatfield_defaults.background_window_width,
+            "background_encoding": "zstd",
+            "background_quality": storage_settings.frame_quality,
         }
 
     def _job_payload_for_asset(
@@ -222,6 +284,17 @@ if APIRouter is not None:
         n_tile = defaults["n_tile"] if asset.n_tile is None else asset.n_tile
         image_encoding = _normalize_image_encoding(asset.image_encoding) or defaults["image_encoding"]
         image_quality = _normalize_image_quality(asset.image_quality, defaults["image_quality"])
+        background_encoding = _normalize_image_encoding(
+            asset.background_encoding
+            if asset.background_encoding is not None
+            else getattr(global_body, "background_encoding", None)
+        ) or defaults["background_encoding"]
+        background_quality = _normalize_image_quality(
+            asset.background_quality
+            if asset.background_quality is not None
+            else getattr(global_body, "background_quality", None),
+            defaults["background_quality"],
+        )
         adaptive_background_period = (
             asset.adaptive_background_period
             if asset.adaptive_background_period is not None
@@ -244,6 +317,54 @@ if APIRouter is not None:
                 return body_value
             return defaults[default_name]
 
+        generate_backgrounds = bool(
+            resolve_option(asset.generate_backgrounds, "generate_backgrounds", "generate_backgrounds")
+        )
+        requested_flatfield_profiles = (
+            asset.generate_flatfield_profiles
+            if asset.generate_flatfield_profiles is not None
+            else getattr(global_body, "generate_flatfield_profiles", None)
+        )
+        generate_flatfield_profiles = (
+            bool(requested_flatfield_profiles)
+            if requested_flatfield_profiles is not None
+            else bool(defaults["generate_flatfield_profiles"] and not generate_backgrounds)
+        )
+        flatfield_axis = _validate_flatfield_axis(
+            resolve_option(asset.flatfield_axis, "flatfield_axis", "flatfield_axis")
+        )
+
+        background_window_stride = int(
+            resolve_option(
+                asset.background_window_stride,
+                "background_window_stride",
+                "background_window_stride",
+            )
+        )
+        background_window_width = int(
+            resolve_option(
+                asset.background_window_width,
+                "background_window_width",
+                "background_window_width",
+            )
+        )
+        flatfield_window_stride = int(
+            resolve_option(
+                asset.flatfield_window_stride,
+                "flatfield_window_stride",
+                "flatfield_window_stride",
+            )
+        )
+        flatfield_window_width = int(
+            resolve_option(
+                asset.flatfield_window_width,
+                "flatfield_window_width",
+                "flatfield_window_width",
+            )
+        )
+        _validate_background_windows(background_window_stride, background_window_width)
+        _validate_background_windows(flatfield_window_stride, flatfield_window_width)
+
         return ExtractFramesCommand.from_payload({
             "source_path": str(Path(asset.path).expanduser().resolve()),
             "kind": asset.kind,
@@ -264,6 +385,15 @@ if APIRouter is not None:
             ),
             "padding": resolve_option(asset.roi_padding, "roi_padding", "roi_padding"),
             "roi_encoding": resolve_option(asset.roi_encoding, "roi_encoding", "roi_encoding"),
+            "generate_backgrounds": generate_backgrounds,
+            "generate_flatfield_profiles": generate_flatfield_profiles,
+            "flatfield_axis": flatfield_axis,
+            "background_window_stride": background_window_stride,
+            "background_window_width": background_window_width,
+            "flatfield_window_stride": flatfield_window_stride,
+            "flatfield_window_width": flatfield_window_width,
+            "background_encoding": background_encoding,
+            "background_quality": background_quality,
             "collections": collections,
             "checksum_status": checksum_status,
             "metadata": {
@@ -300,6 +430,63 @@ if APIRouter is not None:
             image_encoding=body.image_encoding,
             image_quality=body.image_quality,
         )
+        generate_backgrounds = (
+            defaults["generate_backgrounds"]
+            if body.generate_backgrounds is None
+            else bool(body.generate_backgrounds)
+        )
+        generate_flatfield_profiles = (
+            bool(body.generate_flatfield_profiles)
+            if body.generate_flatfield_profiles is not None
+            else bool(defaults["generate_flatfield_profiles"] and not generate_backgrounds)
+        )
+        defaults.update(
+            {
+                "generate_backgrounds": generate_backgrounds,
+                "generate_flatfield_profiles": generate_flatfield_profiles,
+                "flatfield_axis": (
+                    defaults["flatfield_axis"]
+                    if body.flatfield_axis is None
+                    else _validate_flatfield_axis(body.flatfield_axis)
+                ),
+                "background_window_stride": (
+                    defaults["background_window_stride"]
+                    if body.background_window_stride is None
+                    else body.background_window_stride
+                ),
+                "background_window_width": (
+                    defaults["background_window_width"]
+                    if body.background_window_width is None
+                    else body.background_window_width
+                ),
+                "flatfield_window_stride": (
+                    defaults["flatfield_window_stride"]
+                    if body.flatfield_window_stride is None
+                    else body.flatfield_window_stride
+                ),
+                "flatfield_window_width": (
+                    defaults["flatfield_window_width"]
+                    if body.flatfield_window_width is None
+                    else body.flatfield_window_width
+                ),
+                "background_encoding": (
+                    _normalize_image_encoding(body.background_encoding)
+                    or defaults["background_encoding"]
+                ),
+                "background_quality": _normalize_image_quality(
+                    body.background_quality,
+                    defaults["background_quality"],
+                ),
+            }
+        )
+        _validate_background_windows(
+            int(defaults["background_window_stride"]),
+            int(defaults["background_window_width"]),
+        )
+        _validate_background_windows(
+            int(defaults["flatfield_window_stride"]),
+            int(defaults["flatfield_window_width"]),
+        )
         asset_payloads = [asset.as_dict() for asset in assets]
         return as_response(
             {
@@ -321,6 +508,15 @@ if APIRouter is not None:
                     "mask_path": defaults["mask_path"],
                     "roi_padding": defaults["roi_padding"],
                     "roi_encoding": defaults["roi_encoding"],
+                    "generate_backgrounds": defaults["generate_backgrounds"],
+                    "generate_flatfield_profiles": defaults["generate_flatfield_profiles"],
+                    "flatfield_axis": defaults["flatfield_axis"],
+                    "background_window_stride": defaults["background_window_stride"],
+                    "background_window_width": defaults["background_window_width"],
+                    "flatfield_window_stride": defaults["flatfield_window_stride"],
+                    "flatfield_window_width": defaults["flatfield_window_width"],
+                    "background_encoding": defaults["background_encoding"],
+                    "background_quality": defaults["background_quality"],
                 },
             }
         )
@@ -443,6 +639,55 @@ if APIRouter is not None:
         n_tile = defaults["n_tile"]
         image_encoding = defaults["image_encoding"]
         image_quality = defaults["image_quality"]
+        generate_backgrounds = (
+            defaults["generate_backgrounds"]
+            if body.generate_backgrounds is None
+            else body.generate_backgrounds
+        )
+        generate_flatfield_profiles = (
+            bool(body.generate_flatfield_profiles)
+            if body.generate_flatfield_profiles is not None
+            else bool(defaults["generate_flatfield_profiles"] and not generate_backgrounds)
+        )
+        flatfield_axis = _validate_flatfield_axis(
+            defaults["flatfield_axis"] if body.flatfield_axis is None else body.flatfield_axis
+        )
+        background_window_stride = (
+            defaults["background_window_stride"]
+            if body.background_window_stride is None
+            else body.background_window_stride
+        )
+        background_window_width = (
+            defaults["background_window_width"]
+            if body.background_window_width is None
+            else body.background_window_width
+        )
+        flatfield_window_stride = (
+            defaults["flatfield_window_stride"]
+            if body.flatfield_window_stride is None
+            else body.flatfield_window_stride
+        )
+        flatfield_window_width = (
+            defaults["flatfield_window_width"]
+            if body.flatfield_window_width is None
+            else body.flatfield_window_width
+        )
+        background_encoding = (
+            _normalize_image_encoding(body.background_encoding)
+            or defaults["background_encoding"]
+        )
+        background_quality = _normalize_image_quality(
+            body.background_quality,
+            defaults["background_quality"],
+        )
+        _validate_background_windows(
+            int(background_window_stride),
+            int(background_window_width),
+        )
+        _validate_background_windows(
+            int(flatfield_window_stride),
+            int(flatfield_window_width),
+        )
         adaptive_background_subtraction = (
             preprocessing_defaults.adaptive_background_subtraction
             if body.adaptive_background_subtraction is None
@@ -544,6 +789,15 @@ if APIRouter is not None:
                 },
                 "padding": roi_padding,
                 "roi_encoding": roi_encoding,
+                "generate_backgrounds": generate_backgrounds,
+                "generate_flatfield_profiles": generate_flatfield_profiles,
+                "flatfield_axis": flatfield_axis,
+                "background_window_stride": background_window_stride,
+                "background_window_width": background_window_width,
+                "flatfield_window_stride": flatfield_window_stride,
+                "flatfield_window_width": flatfield_window_width,
+                "background_encoding": background_encoding,
+                "background_quality": background_quality,
                 "collections": collections,
                 "checksum_status": checksum_status,
             }).to_payload(),

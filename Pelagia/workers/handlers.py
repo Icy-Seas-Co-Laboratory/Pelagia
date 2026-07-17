@@ -12,7 +12,8 @@ from ..processing.detection_refinement import (
     refine_detections,
     refined_storage_candidate_detection_id,
 )
-from ..processing.frame_correction import ensure_asset_background_windows, generate_background_for_frames
+from ..processing.frame_correction import ensure_asset_background_windows
+from ..processing.ingest_background import MeanFieldIngestAddon
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
 from ..processing.oracle_unet_refiner import resolve_refinement_model
@@ -178,6 +179,51 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
     ingest_defaults = context.config.processing.video_ingest
     preprocessing_defaults = context.config.processing.preprocessing
+    flatfield_defaults = context.config.processing.flatfield
+    generate_backgrounds = bool(
+        payload.get("generate_backgrounds", preprocessing_defaults.background_correction)
+    )
+    generate_flatfield_profiles = bool(
+        payload.get(
+            "generate_flatfield_profiles",
+            flatfield_defaults.flatfield_correction and not generate_backgrounds,
+        )
+    )
+    background_addon = None
+    if generate_backgrounds or generate_flatfield_profiles:
+        background_addon = MeanFieldIngestAddon(
+            context=context,
+            project_id=project_id,
+            window_stride=int(
+                payload.get(
+                    "background_window_stride",
+                    preprocessing_defaults.background_window_stride,
+                )
+            ),
+            window_width=int(
+                payload.get(
+                    "background_window_width",
+                    preprocessing_defaults.background_window_width,
+                )
+            ),
+            flatfield_window_stride=int(
+                payload.get(
+                    "flatfield_window_stride",
+                    flatfield_defaults.background_window_stride,
+                )
+            ),
+            flatfield_window_width=int(
+                payload.get(
+                    "flatfield_window_width",
+                    flatfield_defaults.background_window_width,
+                )
+            ),
+            encoding=str(payload.get("background_encoding", "zstd")),
+            quality=payload.get("background_quality"),
+            generate_backgrounds=generate_backgrounds,
+            generate_flatfield_profiles=generate_flatfield_profiles,
+            flatfield_axis=int(payload.get("flatfield_axis", flatfield_defaults.flatfield_axis)),
+        )
     progress = JobProgressReporter(
         job,
         context,
@@ -273,6 +319,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             asset_id=asset_id,
             metadata=metadata,
             progress_callback=report_ingest_progress,
+            frame_stored_callback=None if background_addon is None else background_addon.consume,
         )
     else:
         frame_rows = ingest_module.ingest_video_file(
@@ -299,6 +346,33 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             ),
             mask_path=payload.get("mask_path", preprocessing_defaults.mask_path),
             progress_callback=report_ingest_progress,
+            frame_stored_callback=None if background_addon is None else background_addon.consume,
+        )
+
+    background_result = None
+    if background_addon is not None:
+        background_progress_completed = max(
+            len(frame_rows),
+            int(ingest_progress_state["source_frames_read"]),
+        )
+        progress.update(
+            background_progress_completed,
+            secondary={"field_generation": "started"},
+            message=f"Finalizing ingestion fields for {len(frame_rows)} frames",
+            force=True,
+        )
+        background_result = background_addon.finalize()
+        progress.update(
+            background_progress_completed,
+            secondary={
+                "field_generation": "completed",
+                "background_window_count": background_result["window_count"],
+                "flatfield_profiles_generated": background_result[
+                    "flatfield_profiles_generated"
+                ],
+            },
+            message=f"Generated {background_result['window_count']} aligned field windows",
+            force=True,
         )
 
     result: dict[str, Any] = {
@@ -310,6 +384,10 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_count": len(frame_rows),
         "frame_ids": [row.get("id") for row in frame_rows],
     }
+    if background_result is not None and background_result["updated_frame_count"]:
+        result["field_generation"] = background_result
+        if background_result["backgrounds_generated"]:
+            result["background_generation"] = background_result
     status_frame_ids = [str(row.get("id")) for row in frame_rows if row.get("id")]
     _ensure_frame_status_rows(
         context,
@@ -478,88 +556,23 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
                 missing_background_frame_ids.append(frame_id)
 
-    background_generation_result = None
-
-    def generate_preprocess_background(reason: str) -> dict[str, Any]:
-        progress.update(
-            0,
-            secondary={
-                "background_generation": "started",
-                "missing_background_frames": len(missing_background_frame_ids),
-                "reason": reason,
-            },
-            message=(
-                "Generating background for "
-                f"{len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}"
-            ),
-            force=True,
-        )
-        background_kwargs = {
-            "context": context,
-            "payload_kind": str(payload.get("background_payload_kind", "original")),
-            "encoding": str(payload.get("background_encoding", "zstd")),
-        }
-        if payload.get("background_quality") is not None:
-            background_kwargs["quality"] = payload.get("background_quality")
-        if payload.get("background_window_stride") is not None:
-            background_kwargs["window_stride"] = payload["background_window_stride"]
-        if payload.get("background_window_width") is not None:
-            background_kwargs["window_width"] = payload["background_window_width"]
-        result = ensure_asset_background_windows(frame_ids, **background_kwargs)
-        progress.update(
-            0,
-            secondary={
-                "background_generation": "completed",
-                "background_window_count": len(result.get("windows") or []),
-                "reason": reason,
-            },
-            message=(
-                "Generated background for "
-                f"{len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}"
-            ),
-            force=True,
-        )
-        return result
-
     if background_correction and missing_background_frame_ids:
-        background_generation_result = generate_preprocess_background("missing_background_payload")
+        raise ValueError(
+            "Background correction requires ingestion-generated backgrounds. "
+            f"{len(missing_background_frame_ids)} selected frame(s) are missing background payloads; "
+            "reingest with generate_backgrounds enabled or run a background backfill job."
+        )
 
     completed_count = 0
     for work_frame_ids in frame_id_work_units(frame_ids):
-        if background_generation_result is not None:
-            with measure_phase("selection.frame_metadata_lookup"):
-                refreshed_records = context.repository.get_frame_records(
-                    work_frame_ids,
-                    project_id=project_id,
-                )
-            frame_records.update({str(record.id): record for record in refreshed_records})
         processed_frames = []
         for frame_id in work_frame_ids:
-            try:
-                frame = retrieve_frame(
-                    frame_id,
-                    context=context,
-                    payload_kind="original",
-                    frame_record=frame_records[frame_id],
-                )
-            except KeyError:
-                if not background_correction or background_generation_result is not None:
-                    raise
-                background_generation_result = generate_preprocess_background("background_retrieve_failed")
-                refreshed = context.repository.get_frame_records(
-                    work_frame_ids,
-                    project_id=project_id,
-                )
-                refreshed_by_id = {str(record.id): record for record in refreshed}
-                if frame_id not in refreshed_by_id:
-                    raise KeyError(f"Frame {frame_id!r} was not found.")
-                frame_records.update(refreshed_by_id)
-                frame = retrieve_frame(
-                    frame_id,
-                    context=context,
-                    payload_kind="original",
-                    frame_record=refreshed_by_id[frame_id],
-                )
+            frame = retrieve_frame(
+                frame_id,
+                context=context,
+                payload_kind="original",
+                frame_record=frame_records[frame_id],
+            )
             processed = preprocess_frame_for_segmentation(
                 frame,
                 flatfield_correction=flatfield_correction,
@@ -617,8 +630,6 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         "frame_ids": frame_ids,
         "preprocessed_frame_ids": [str(row.get("id")) for row in stored_rows],
     }
-    if background_generation_result is not None:
-        result["background_generation"] = background_generation_result
     _mark_frame_stage_status(
         context,
         project_id=project_id,
@@ -694,13 +705,19 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     }
     if payload.get("quality") is not None:
         background_kwargs["quality"] = payload.get("quality")
-    result = generate_background_for_frames(frame_ids, **background_kwargs)
+    if payload.get("window_stride") is not None:
+        background_kwargs["window_stride"] = payload.get("window_stride")
+    if payload.get("window_width") is not None:
+        background_kwargs["window_width"] = payload.get("window_width")
+    result = ensure_asset_background_windows(frame_ids, **background_kwargs)
     result.update(
         {
             "stage": PipelineStage.BACKGROUND_FRAMES.value,
             "project_id": project_id,
             "run_id": resolved_run_id,
             "asset_id": resolved_asset_id,
+            "frame_count": len(frame_ids),
+            "frame_ids": frame_ids,
         }
     )
     progress.finish(

@@ -133,12 +133,16 @@ opencv_threads = 1
 decoder_threads = 1
 
 [processing.flatfield]
-# Flatfield correction defaults used during segmentation. Must be > 0 and < 1.
+# Flatfield correction defaults used during ingestion and segmentation.
 flatfield_correction = true
-# Quantile used to estimate the flatfield profile.
+# Fallback quantile for older frames without an ingestion-generated mean profile.
 flatfield_q = 0.5
-# Axis used by global flatfield correction. Options: 0, 1.
+# Profile reduction/stacking axis: 0 stacks frames vertically and produces
+# column means; 1 stacks horizontally and produces row means.
 flatfield_axis = 0
+# Line-scan profile generation defaults to one profile per frame.
+background_window_stride = 1
+background_window_width = 1
 # Bound the estimated field before division: values below min become 0, values above max become 255.
 flatfield_min_field_value = 25
 flatfield_max_field_value = 255
@@ -205,6 +209,10 @@ mask_path = null
 # Future adaptive background-subtraction controls.
 adaptive_background_subtraction = false
 adaptive_background_period = 50
+# Mean backgrounds generated during ingestion use fixed application groups and
+# may use a wider source window for natural temporal smoothing.
+background_window_stride = 25
+background_window_width = 25
 # Divide by a generated mean background field before inversion and thresholding.
 background_correction = false
 # Clamp the background field before division. Min must be > 0; max may be null.

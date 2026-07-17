@@ -98,6 +98,15 @@ class ExtractFramesCommand(JobCommand):
     enqueue_segment: bool = False
     padding: int | None = None
     roi_encoding: str | None = None
+    generate_backgrounds: bool | None = None
+    generate_flatfield_profiles: bool | None = None
+    flatfield_axis: int | None = None
+    background_window_stride: int | None = None
+    background_window_width: int | None = None
+    flatfield_window_stride: int | None = None
+    flatfield_window_width: int | None = None
+    background_encoding: str | None = None
+    background_quality: int | None = None
     collections: tuple[str, ...] = ()
     checksum_status: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -109,7 +118,12 @@ class ExtractFramesCommand(JobCommand):
         known = {
             "source_path", "kind", "recursive", "n_tile", "adaptive_background_subtraction",
             "adaptive_background_period", "apply_mask", "mask_path", "enqueue_segment",
-            "padding", "roi_encoding", "collections", "checksum_status", "metadata",
+            "padding", "roi_encoding", "generate_backgrounds", "generate_flatfield_profiles",
+            "flatfield_axis",
+            "background_window_stride",
+            "background_window_width", "flatfield_window_stride", "flatfield_window_width",
+            "background_encoding", "background_quality",
+            "collections", "checksum_status", "metadata",
         }
         return cls(
             source_path=payload.get("source_path"),
@@ -123,6 +137,15 @@ class ExtractFramesCommand(JobCommand):
             enqueue_segment=bool(payload.get("enqueue_segment", False)),
             padding=payload.get("padding"),
             roi_encoding=payload.get("roi_encoding"),
+            generate_backgrounds=payload.get("generate_backgrounds"),
+            generate_flatfield_profiles=payload.get("generate_flatfield_profiles"),
+            flatfield_axis=payload.get("flatfield_axis"),
+            background_window_stride=payload.get("background_window_stride"),
+            background_window_width=payload.get("background_window_width"),
+            flatfield_window_stride=payload.get("flatfield_window_stride"),
+            flatfield_window_width=payload.get("flatfield_window_width"),
+            background_encoding=payload.get("background_encoding"),
+            background_quality=payload.get("background_quality"),
             collections=tuple(str(value) for value in payload.get("collections") or ()),
             checksum_status=payload.get("checksum_status"),
             metadata=dict(payload.get("metadata") or {}),
@@ -146,6 +169,15 @@ class ExtractFramesCommand(JobCommand):
                     "enqueue_segment": self.enqueue_segment,
                     "padding": self.padding,
                     "roi_encoding": self.roi_encoding,
+                    "generate_backgrounds": self.generate_backgrounds,
+                    "generate_flatfield_profiles": self.generate_flatfield_profiles,
+                    "flatfield_axis": self.flatfield_axis,
+                    "background_window_stride": self.background_window_stride,
+                    "background_window_width": self.background_window_width,
+                    "flatfield_window_stride": self.flatfield_window_stride,
+                    "flatfield_window_width": self.flatfield_window_width,
+                    "background_encoding": self.background_encoding,
+                    "background_quality": self.background_quality,
                     "collections": list(self.collections),
                     "checksum_status": self.checksum_status,
                     "metadata": self.metadata,
@@ -205,6 +237,8 @@ class FrameBackgroundCommand(JobCommand):
     payload_kind: str = "original"
     encoding: str = "zstd"
     quality: int | None = None
+    window_stride: int | None = None
+    window_width: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -216,9 +250,18 @@ class FrameBackgroundCommand(JobCommand):
             payload_kind=str(payload.get("payload_kind", "original")),
             encoding=str(payload.get("encoding", "zstd")),
             quality=payload.get("quality"),
+            window_stride=payload.get("window_stride"),
+            window_width=payload.get("window_width"),
             extra=_payload_values(
                 payload,
-                {*selection.to_payload(), "payload_kind", "encoding", "quality"},
+                {
+                    *selection.to_payload(),
+                    "payload_kind",
+                    "encoding",
+                    "quality",
+                    "window_stride",
+                    "window_width",
+                },
             ),
         )
 
@@ -227,7 +270,15 @@ class FrameBackgroundCommand(JobCommand):
             **self._payload_header(),
             **self.selection.to_payload(),
             **_compact(self.extra),
-            **_compact({"payload_kind": self.payload_kind, "encoding": self.encoding, "quality": self.quality}),
+            **_compact(
+                {
+                    "payload_kind": self.payload_kind,
+                    "encoding": self.encoding,
+                    "quality": self.quality,
+                    "window_stride": self.window_stride,
+                    "window_width": self.window_width,
+                }
+            ),
         }
 
 

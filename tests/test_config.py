@@ -126,6 +126,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.flatfield.flatfield_correction is True
     assert config.processing.flatfield.flatfield_q == 0.5
     assert config.processing.flatfield.flatfield_axis == 0
+    assert config.processing.flatfield.background_window_stride == 1
+    assert config.processing.flatfield.background_window_width == 1
     assert config.processing.flatfield.flatfield_min_field_value == 25.0
     assert config.processing.flatfield.flatfield_max_field_value == 255.0
     assert config.processing.thresholding.method == "manual"
@@ -147,6 +149,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.preprocessing.mask_path is None
     assert config.processing.preprocessing.adaptive_background_subtraction is False
     assert config.processing.preprocessing.adaptive_background_period == 50
+    assert config.processing.preprocessing.background_window_stride == 25
+    assert config.processing.preprocessing.background_window_width == 25
     assert config.processing.preprocessing.background_correction is False
     assert config.processing.preprocessing.background_min_field_value == 50.0
     assert config.processing.preprocessing.background_max_field_value == 255.0
@@ -232,6 +236,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         flatfield_correction = false
         flatfield_q = 0.8
         flatfield_axis = 1
+        background_window_stride = 3
+        background_window_width = 5
         flatfield_min_field_value = 2
         flatfield_max_field_value = 200
 
@@ -341,6 +347,8 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.8
     assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.flatfield.background_window_stride == 3
+    assert config.processing.flatfield.background_window_width == 5
     assert config.processing.flatfield.flatfield_min_field_value == 2.0
     assert config.processing.flatfield.flatfield_max_field_value == 200.0
     assert config.processing.thresholding.method == "bounded_otsu_canny"
@@ -431,6 +439,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_FLATFIELD_CORRECTION", "false")
     monkeypatch.setenv("PELAGIA_FLATFIELD_Q", "0.7")
     monkeypatch.setenv("PELAGIA_FLATFIELD_AXIS", "1")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_BACKGROUND_WINDOW_STRIDE", "7")
+    monkeypatch.setenv("PELAGIA_FLATFIELD_BACKGROUND_WINDOW_WIDTH", "9")
     monkeypatch.setenv("PELAGIA_FLATFIELD_MIN_FIELD_VALUE", "4")
     monkeypatch.setenv("PELAGIA_FLATFIELD_MAX_FIELD_VALUE", "210")
     monkeypatch.setenv("PELAGIA_THRESHOLDING_METHOD", "adaptive_mean")
@@ -478,6 +488,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.processing.flatfield.flatfield_correction is False
     assert config.processing.flatfield.flatfield_q == 0.7
     assert config.processing.flatfield.flatfield_axis == 1
+    assert config.processing.flatfield.background_window_stride == 7
+    assert config.processing.flatfield.background_window_width == 9
     assert config.processing.flatfield.flatfield_min_field_value == 4.0
     assert config.processing.flatfield.flatfield_max_field_value == 210.0
     assert config.processing.thresholding.method == "adaptive_mean"

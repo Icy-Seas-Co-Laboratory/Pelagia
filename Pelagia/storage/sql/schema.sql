@@ -347,6 +347,8 @@ CREATE TABLE IF NOT EXISTS {schema}.frames (
     background_payload_dtype text,
     background_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
     background_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    flatfield_profile real[],
+    flatfield_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     UNIQUE (asset_id, frame_index)
@@ -377,7 +379,9 @@ ALTER TABLE {schema}.frames
     ADD COLUMN IF NOT EXISTS background_payload_format text,
     ADD COLUMN IF NOT EXISTS background_payload_dtype text,
     ADD COLUMN IF NOT EXISTS background_payload_shape jsonb NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS background_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+    ADD COLUMN IF NOT EXISTS background_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS flatfield_profile real[],
+    ADD COLUMN IF NOT EXISTS flatfield_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 UPDATE {schema}.frames
 SET

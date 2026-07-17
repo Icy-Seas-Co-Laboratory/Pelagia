@@ -1,16 +1,21 @@
 """Apply flatfield/background correction and generate reusable backgrounds."""
 
+from __future__ import annotations
+
 from collections import Counter
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..domain import FrameRecord
-from ..services.context import AppContext
 from ..utils.serialization import json_ready
 from .defaults import default_processing_config
 from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 from .timing import measure_phase
+
+if TYPE_CHECKING:
+    from ..services.context import AppContext
 
 
 def _nominal_frame_geometry(frames: list[FrameRecord]) -> tuple[int, int]:
@@ -79,6 +84,40 @@ def flatfield_correction(
         axis=resolved_axis,
         min_field_value=resolved_min_field_value,
         max_field_value=resolved_max_field_value,
+    )
+
+
+def flatfield_profile_correction(
+    data: np.ndarray,
+    profile: np.ndarray | list[float] | tuple[float, ...],
+    *,
+    axis: int = 0,
+    min_field_value: float = 1.0,
+    max_field_value: float | None = None,
+) -> np.ndarray:
+    """Apply a stored row- or column-mean flatfield profile to a grayscale image."""
+    array = np.asarray(data)
+    if array.ndim != 2:
+        raise ValueError("Stored flatfield profiles require two-dimensional grayscale data.")
+    resolved_axis = int(axis)
+    if resolved_axis not in {0, 1}:
+        raise ValueError("flatfield_axis must be 0 or 1.")
+    field = np.asarray(profile, dtype=np.float32)
+    expected_length = array.shape[1 - resolved_axis]
+    if field.ndim != 1 or field.shape[0] != expected_length:
+        raise ValueError(
+            f"Flatfield profile length {field.shape} does not match image axis "
+            f"{1 - resolved_axis} length {expected_length}."
+        )
+    if resolved_axis == 1:
+        field = field[:, np.newaxis]
+    return _divide_by_field(
+        array,
+        _bounded_field(
+            field,
+            min_field_value=min_field_value,
+            max_field_value=max_field_value,
+        ),
     )
 
 

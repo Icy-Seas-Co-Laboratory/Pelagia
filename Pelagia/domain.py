@@ -151,6 +151,8 @@ class FrameRecord:
     background_payload_dtype: str | None = None
     background_payload_shape: list[int] = field(default_factory=list)
     background_metadata: dict[str, Any] = field(default_factory=dict)
+    flatfield_profile: list[float] = field(default_factory=list)
+    flatfield_metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
 
     @classmethod
@@ -200,6 +202,8 @@ class FrameRecord:
             background_payload_dtype=data.get("background_payload_dtype"),
             background_payload_shape=list(data.get("background_payload_shape") or []),
             background_metadata=dict(data.get("background_metadata") or {}),
+            flatfield_profile=[float(value) for value in data.get("flatfield_profile") or []],
+            flatfield_metadata=dict(data.get("flatfield_metadata") or {}),
             metadata=metadata,
             created_at=data.get("created_at"),
         )

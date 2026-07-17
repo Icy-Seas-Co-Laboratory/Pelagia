@@ -129,6 +129,9 @@ def touch_processing_status_snapshot(repository, *, project_id: str | None) -> N
 
 def frame_summary(row: Any) -> dict[str, Any]:
     item = _as_dict(row)
+    flatfield_profile = item.pop("flatfield_profile", None)
+    item["has_flatfield_profile"] = bool(flatfield_profile)
+    item["flatfield_profile_length"] = len(flatfield_profile or [])
     preview_thumbhash = item.pop("preview_thumbhash", item.pop("frame_png", None))
     if preview_thumbhash is not None:
         item["preview_thumbhash_bytes"] = len(preview_thumbhash)
