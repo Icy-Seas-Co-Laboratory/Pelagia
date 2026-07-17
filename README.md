@@ -28,7 +28,7 @@ For large-frame filtering and project processing summaries, see the
 
 ### Prerequisites
 
-- Python 3.10 or newer. Python 3.11+ is preferred.
+- [uv](https://docs.astral.sh/uv/) for Python and dependency management.
 - PostgreSQL reachable from the Pelagia machine.
 - A writable runtime directory for logs, pid files, and cold frame storage.
 - Node.js 18+ and npm if you will run PelagiaView.
@@ -38,55 +38,59 @@ Python environment:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip postgresql postgresql-client libgl1 libglib2.0-0
+sudo apt install -y curl ca-certificates postgresql postgresql-client libgl1 libglib2.0-0
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Debian 13 ships Python 3.13 rather than Python 3.12. This is supported: uv
+downloads Pelagia's pinned Python 3.12 runtime independently and does not modify
+the system Python.
 
 ### Install The Backend
 
-From the Pelagia repository root:
+From the Pelagia repository root, create the API/CPU-worker environment:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+./scripts/pelagia_env sync cpu
 ```
 
-Use Python 3.12 for the current CPU codec and ML worker profiles.
+This uses `uv.lock`, installs a uv-managed Python 3.12 when necessary, and
+synchronizes `.venv` exactly. Activation is optional; Pelagia's stack scripts
+select the managed environment automatically.
 
 For development and tests, install the dev target instead:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+./scripts/pelagia_env sync dev
 ```
 
 For CPU/API/ingest/preprocess/segment workers, create and synchronize the CPU
 profile:
 
 ```bash
-./scripts/pelagia_env.py sync cpu
+./scripts/pelagia_env sync cpu
 ```
 
 For machines that will run learned ROI refinement models, install the optional
 ML profile in its separate environment:
 
 ```bash
-./scripts/pelagia_env.py sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env.py sync ml-cuda
+./scripts/pelagia_env sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env sync ml-cuda
 ```
 
-Apple Metal users should use `requirements-ml-apple-metal.txt` instead of
-`requirements-ml.txt`. The CPU profile pins `imagecodecs 2026.6.26` with
-NumPy 2.1+, while the Apple Metal profile uses `imagecodecs 2026.3.6` with
-NumPy 2.0 because TensorFlow 2.18 requires `numpy<2.1`.
+The CPU and CUDA profiles pin `imagecodecs 2026.6.26` with NumPy 2.1+. The
+Apple Metal profile uses `imagecodecs 2026.3.6` with NumPy 2.0 because
+TensorFlow 2.18 requires `numpy<2.1`; uv records these profiles as mutually
+exclusive dependency sets in the shared lockfile.
 
 For dedicated GPU/ML workers, create a second environment rather than adding
 TensorFlow to the API and CPU-worker environment:
 
 ```bash
-./scripts/pelagia_env.py doctor all
-./scripts/pelagia_env.py doctor gpu-ml --require-gpu
-./scripts/pelagia_env.py doctor cpu --require-jpegxs
+./scripts/pelagia_env doctor all
+./scripts/pelagia_env doctor gpu-ml --require-gpu
+./scripts/pelagia_env doctor cpu --require-jpegxs
 ```
 
 `pelagia env sync ...` and `pelagia env doctor ...` provide the same commands
@@ -496,21 +500,17 @@ For storage maintenance, migration, and recovery procedures, use:
 
 ## Python Environment
 
-Pelagia provides requirements files for common backend environments:
+Pelagia uses a cross-platform `uv.lock` and separate runtime profiles:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+./scripts/pelagia_env sync cpu       # API and non-ML workers
+./scripts/pelagia_env sync dev       # CPU profile plus tests
+./scripts/pelagia_env sync ml-cuda   # dedicated Linux GPU/ML workers
 ```
 
-Use `requirements-dev.txt` for test/development tools and `requirements-ml.txt`
-for optional TensorFlow/Keras U-Net refinement support. On Linux x86_64,
-`requirements-ml.txt` prefers TensorFlow's CUDA-enabled pip extra. For Apple
-Metal acceleration on macOS, use `requirements-ml-apple-metal.txt`. See
-[docs/python-environment.md](docs/python-environment.md) for the full setup
-walkthrough.
+The legacy requirements files remain available as compatibility inputs, but
+new installations should use uv profiles. See
+[docs/python-environment.md](docs/python-environment.md) for details.
 
 ## Storage Strategy
 

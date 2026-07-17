@@ -1,28 +1,31 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-MINIMUM_PROFILE_PYTHON = (3, 12)
+PROFILE_PYTHON = "3.12"
+RUNTIME_EXTRAS = ("api", "cli", "postgres", "kvstore-blake3")
 
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentProfile:
     name: str
     venv_name: str
-    requirements_file: str | None
+    extras: tuple[str, ...]
     requires_tensorflow: bool = False
 
 
 SYNC_PROFILES = {
-    "cpu": EnvironmentProfile("cpu", ".venv", "requirements-worker-cpu.txt"),
-    "ml-metal": EnvironmentProfile("ml-metal", ".venv-ml", "requirements-ml-apple-metal.txt", True),
-    "ml-cuda": EnvironmentProfile("ml-cuda", ".venv-ml", "requirements-ml.txt", True),
+    "cpu": EnvironmentProfile("cpu", ".venv", (*RUNTIME_EXTRAS, "worker-cpu")),
+    "dev": EnvironmentProfile("dev", ".venv", (*RUNTIME_EXTRAS, "worker-cpu", "test")),
+    "ml-metal": EnvironmentProfile("ml-metal", ".venv-ml", (*RUNTIME_EXTRAS, "ml-apple-metal"), True),
+    "ml-cuda": EnvironmentProfile("ml-cuda", ".venv-ml", (*RUNTIME_EXTRAS, "ml"), True),
 }
 DOCTOR_PROFILES = {
     "cpu": (".venv", False),
@@ -37,7 +40,7 @@ def resolve_root(root: Path | None = None) -> Path:
 def profile_venv_path(profile: str, *, root: Path | None = None) -> Path:
     resolved_root = resolve_root(root)
     normalized = profile.strip().lower().replace("_", "-")
-    if normalized in {"cpu", "default"}:
+    if normalized in {"cpu", "default", "dev"}:
         return resolved_root / ".venv"
     if normalized in {"gpu-ml", "ml-metal", "ml-cuda"}:
         return resolved_root / ".venv-ml"
@@ -53,7 +56,8 @@ def sync_profile(
     profile_name: str,
     *,
     root: Path | None = None,
-    python: Path | None = None,
+    python: str | Path | None = None,
+    uv: Path | None = None,
     imagecodecs_wheel: Path | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -64,35 +68,36 @@ def sync_profile(
         raise ValueError(f"sync profile must be one of: {valid}.")
 
     resolved_root = resolve_root(root)
-    source_python = (python or Path(sys.executable)).expanduser().resolve()
-    if not source_python.is_file():
-        raise ValueError(f"Python executable was not found: {source_python}")
-    source_version = _python_version(source_python)
-    if source_version < MINIMUM_PROFILE_PYTHON:
-        required = ".".join(map(str, MINIMUM_PROFILE_PYTHON))
-        raise ValueError(f"The {profile.name} profile requires Python {required}+.")
+    if not (resolved_root / "pyproject.toml").is_file():
+        raise ValueError(f"Pelagia pyproject.toml was not found under: {resolved_root}")
+    uv_executable = _resolve_uv(uv)
+    python_request = str(python or PROFILE_PYTHON)
+    if isinstance(python, Path):
+        python_request = str(python.expanduser().resolve())
 
     venv_path = resolved_root / profile.venv_name
-    requirement_path = resolved_root / str(profile.requirements_file)
-    if not requirement_path.is_file():
-        raise ValueError(f"Requirements file was not found: {requirement_path}")
     if imagecodecs_wheel is not None:
         imagecodecs_wheel = imagecodecs_wheel.expanduser().resolve()
         if not imagecodecs_wheel.is_file():
             raise ValueError(f"imagecodecs wheel was not found: {imagecodecs_wheel}")
 
-    commands = [
-        [str(source_python), "-m", "venv", str(venv_path)],
-        [str(venv_path / "bin" / "python"), "-m", "pip", "install", "--upgrade", "pip"],
-        [str(venv_path / "bin" / "python"), "-m", "pip", "install", "-r", str(requirement_path)],
-    ]
+    commands = [[
+        str(uv_executable),
+        "sync",
+        "--locked",
+        "--python",
+        python_request,
+        "--no-dev",
+        *(item for extra in profile.extras for item in ("--extra", extra)),
+    ]]
     if imagecodecs_wheel is not None:
         commands.append(
             [
-                str(venv_path / "bin" / "python"),
-                "-m",
+                str(uv_executable),
                 "pip",
                 "install",
+                "--python",
+                str(venv_path / "bin" / "python"),
                 "--force-reinstall",
                 "--no-deps",
                 str(imagecodecs_wheel),
@@ -100,14 +105,18 @@ def sync_profile(
         )
 
     if not dry_run:
+        command_environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv_path)}
         for command in commands:
-            subprocess.run(command, check=True)
+            subprocess.run(command, check=True, cwd=resolved_root, env=command_environment)
         manifest_path = venv_path / ".pelagia-environment.json"
         manifest_path.write_text(
             json.dumps(
                 {
                     "profile": profile.name,
-                    "requirements_file": str(requirement_path),
+                    "manager": "uv",
+                    "python_request": python_request,
+                    "extras": list(profile.extras),
+                    "lockfile": str(resolved_root / "uv.lock"),
                     "imagecodecs_wheel": None if imagecodecs_wheel is None else str(imagecodecs_wheel),
                     "python": str(venv_path / "bin" / "python"),
                 },
@@ -122,11 +131,29 @@ def sync_profile(
         "profile": profile.name,
         "venv": str(venv_path),
         "python": str(venv_path / "bin" / "python"),
-        "requirements_file": str(requirement_path),
+        "manager": "uv",
+        "python_request": python_request,
+        "extras": list(profile.extras),
+        "lockfile": str(resolved_root / "uv.lock"),
         "imagecodecs_wheel": None if imagecodecs_wheel is None else str(imagecodecs_wheel),
         "dry_run": dry_run,
         "commands": commands,
     }
+
+
+def _resolve_uv(executable: Path | None) -> Path:
+    if executable is not None:
+        resolved = executable.expanduser().resolve()
+        if not resolved.is_file():
+            raise ValueError(f"uv executable was not found: {resolved}")
+        return resolved
+    discovered = shutil.which("uv")
+    if discovered:
+        return Path(discovered).resolve()
+    raise ValueError(
+        "uv is required to synchronize Pelagia environments. Install it from "
+        "https://docs.astral.sh/uv/getting-started/installation/."
+    )
 
 
 def doctor_profiles(
@@ -236,19 +263,3 @@ print(json.dumps(result))
             "warnings": [],
         }
     return json.loads(result.stdout)
-
-
-def _python_version(executable: Path) -> tuple[int, int]:
-    result = subprocess.run(
-        [str(executable), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise ValueError(result.stderr.strip() or f"Could not inspect Python executable: {executable}")
-    try:
-        major, minor = result.stdout.strip().split(".", maxsplit=1)
-        return int(major), int(minor)
-    except ValueError as exc:
-        raise ValueError(f"Could not parse Python version from {executable}: {result.stdout!r}") from exc

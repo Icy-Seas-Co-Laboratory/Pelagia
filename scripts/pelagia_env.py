@@ -18,9 +18,10 @@ def main() -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     sync = subcommands.add_parser("sync", help="Create and install a named environment.")
-    sync.add_argument("profile", choices=["cpu", "ml-metal", "ml-cuda"])
+    sync.add_argument("profile", choices=["cpu", "dev", "ml-metal", "ml-cuda"])
     sync.add_argument("--root", type=Path, default=ROOT_DIR)
-    sync.add_argument("--python", type=Path)
+    sync.add_argument("--python", help="Python version request or interpreter path (default: 3.12).")
+    sync.add_argument("--uv", type=Path, help="Path to the uv executable.")
     sync.add_argument("--imagecodecs-wheel", type=Path)
     sync.add_argument("--dry-run", action="store_true")
 
@@ -37,6 +38,7 @@ def main() -> int:
                 args.profile,
                 root=args.root,
                 python=args.python,
+                uv=args.uv,
                 imagecodecs_wheel=args.imagecodecs_wheel,
                 dry_run=args.dry_run,
             )

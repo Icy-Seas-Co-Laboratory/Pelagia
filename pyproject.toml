@@ -6,31 +6,30 @@ build-backend = "setuptools.build_meta"
 name = "pelagia"
 version = "0.0.1"
 description = "Integrated image processing, storage, API, CLI, and worker tools."
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy",
-    "opencv-python",
-    "psutil>=5.9",
-    "tomli; python_version < '3.11'",
+    "opencv-python>=4.10,<5",
+    "psutil>=5.9,<8",
     "thumbhash>=0.1.2",
     "zstandard",
 ]
 
 [project.optional-dependencies]
-api = ["fastapi", "uvicorn"]
-cli = ["typer"]
-postgres = ["psycopg[binary]"]
+api = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+cli = ["typer>=0.12,<1"]
+postgres = ["psycopg[binary]>=3.2,<4"]
 kvstore-blake3 = ["blake3"]
 worker-cpu = [
     "imagecodecs==2026.6.26",
-    "numpy>=2.1,<2.6",
+    "numpy>=2.1,<2.5",
 ]
 ml = [
     "tensorflow[and-cuda]>=2.21,<2.22; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "tensorflow>=2.21,<2.22; platform_system != 'Linux' or platform_machine != 'x86_64'",
     "keras>=3.12,<3.15",
     "imagecodecs==2026.6.26",
-    "numpy>=2.1,<2.6",
+    "numpy>=2.1,<2.5",
 ]
 ml-apple-metal = [
     "tensorflow>=2.18,<2.19; platform_system == 'Darwin'",
@@ -43,6 +42,18 @@ test = ["pytest"]
 
 [project.scripts]
 pelagia = "Pelagia.cli.app:main"
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "worker-cpu" },
+        { extra = "ml-apple-metal" },
+    ],
+    [
+        { extra = "ml" },
+        { extra = "ml-apple-metal" },
+    ],
+]
 
 [tool.setuptools.packages.find]
 include = ["Pelagia*"]

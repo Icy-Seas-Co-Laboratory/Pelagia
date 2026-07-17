@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo "uv is required. Install it from https://docs.astral.sh/uv/getting-started/installation/" >&2
+    exit 1
+fi
+
+if PYTHON=$(uv python find --no-managed-python --no-project 3.12 2>/dev/null); then
+    :
+else
+    uv python install 3.12 >/dev/null
+    PYTHON=$(uv python find --managed-python --no-project 3.12)
+fi
+
+if [ "${1:-}" = "sync" ] && [ -n "${2:-}" ]; then
+    PROFILE=$2
+    shift 2
+    exec "$PYTHON" "$ROOT_DIR/scripts/pelagia_env.py" sync "$PROFILE" --python "$PYTHON" "$@"
+fi
+
+exec "$PYTHON" "$ROOT_DIR/scripts/pelagia_env.py" "$@"

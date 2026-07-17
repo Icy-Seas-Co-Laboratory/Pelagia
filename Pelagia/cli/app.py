@@ -106,7 +106,8 @@ if typer is not None:
     def environment_sync(
         profile: str,
         root: Path = Path("."),
-        python: Optional[Path] = None,
+        python: Optional[str] = None,
+        uv: Optional[Path] = None,
         imagecodecs_wheel: Optional[Path] = None,
         dry_run: bool = False,
     ) -> None:
@@ -118,6 +119,7 @@ if typer is not None:
                 profile,
                 root=root,
                 python=python,
+                uv=uv,
                 imagecodecs_wheel=imagecodecs_wheel,
                 dry_run=dry_run,
             )

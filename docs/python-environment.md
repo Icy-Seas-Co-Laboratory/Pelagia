@@ -1,46 +1,45 @@
 # Python Environment Setup
 
-Pelagia is packaged with `pyproject.toml`, and the requirements files are thin
-install targets for common environments.
+Pelagia uses uv to install Python, resolve dependencies from `pyproject.toml`,
+and synchronize environments from the committed `uv.lock`. The requirements
+files remain only for compatibility with older deployments.
 
-## 1. Create A Virtual Environment
+## 1. Install uv
 
-Use Python 3.10 or newer for the base backend. The current CPU codec and ML
-profiles require Python 3.12 because current `imagecodecs` does.
+Install uv using its standalone installer or your platform package manager:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+No system Python 3.12 package is required. Pelagia pins Python 3.12 in
+`.python-version`, and uv downloads a managed interpreter when it is absent.
+This avoids modifying Debian's externally managed system Python. Debian 13's
+default Python 3.13 can remain installed unchanged.
 
 ## 2. Install Pelagia
 
-For a normal local backend environment with API, CLI, PostgreSQL, and cold frame
-storage support:
+For a normal local backend environment with API, CLI, PostgreSQL, codecs, and
+cold frame storage support:
 
 ```bash
-python -m pip install -r requirements.txt
+./scripts/pelagia_env sync cpu
 ```
 
-For the API and CPU workers, synchronize the managed CPU profile instead:
+The shell entrypoint first ensures a uv-managed Python 3.12 exists, so it also
+works on hosts where `python3.12` is unavailable. It then synchronizes `.venv`
+from the lockfile. For development and tests:
 
 ```bash
-./scripts/pelagia_env.py sync cpu
-```
-
-For development and tests:
-
-```bash
-python -m pip install -r requirements-dev.txt
+./scripts/pelagia_env sync dev
 ```
 
 For machines that will run learned ROI refinement models such as the
 oracle-builder U-Net adapter, synchronize one of the managed ML profiles:
 
 ```bash
-./scripts/pelagia_env.py sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env.py sync ml-cuda
+./scripts/pelagia_env sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env sync ml-cuda
 ```
 
 The ML install includes TensorFlow/Keras and is intentionally separate because
@@ -50,20 +49,20 @@ support is preferred when the driver/runtime can use it.
 
 The `ml-metal` profile installs the TensorFlow 2.18 / `tensorflow-metal` 1.2
 combination; `ml-cuda` installs the current TensorFlow CUDA target. Use
-`pelagia_env.py doctor gpu-ml --require-gpu` after synchronization to verify
-hardware visibility.
+`./scripts/pelagia_env doctor gpu-ml --require-gpu` after synchronization to
+verify hardware visibility.
 
 ## 2.1 Separate CPU And GPU/ML Workers
 
 Keep the API plus ingest, background, preprocess, and segment workers in the
 managed `cpu` profile (`.venv`). Use the managed ML profile (`.venv-ml`) for
-`roi_refinement` workers. The bootstrap script creates each environment,
-installs the appropriate requirements, and records its profile:
+`roi_refinement` workers. The bootstrap script synchronizes each environment
+from `uv.lock` and records its profile:
 
 ```bash
-./scripts/pelagia_env.py sync cpu
-./scripts/pelagia_env.py sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env.py sync ml-cuda
+./scripts/pelagia_env sync cpu
+./scripts/pelagia_env sync ml-metal  # Apple Metal
+# or: ./scripts/pelagia_env sync ml-cuda
 ```
 
 Configure the TOML worker stack to select managed environments by capability:
@@ -79,7 +78,7 @@ the stack rejects a worker that mixes it with CPU pipeline capabilities. Confirm
 the environment and resolved interpreters with:
 
 ```bash
-./scripts/pelagia_env.py doctor all
+./scripts/pelagia_env doctor all
 ./scripts/pelagia_stack_from_toml.sh validate scripts/pelagia_workers.toml
 ```
 
@@ -87,8 +86,8 @@ The public `imagecodecs` wheel does not include JPEG XS. Install the internally
 built wheel while synchronizing the CPU profile, then require it in the doctor:
 
 ```bash
-./scripts/pelagia_env.py sync cpu --imagecodecs-wheel /path/to/imagecodecs-*.whl
-./scripts/pelagia_env.py doctor cpu --require-jpegxs
+./scripts/pelagia_env sync cpu --imagecodecs-wheel /path/to/imagecodecs-*.whl
+./scripts/pelagia_env doctor cpu --require-jpegxs
 ```
 
 On a GPU-only worker host, disable the API and set `control = "gpu-ml"` in
@@ -156,6 +155,13 @@ Stop it when finished:
 
 ```bash
 python -m pytest
+```
+
+You can also run these without activation:
+
+```bash
+.venv/bin/pelagia init-system
+.venv/bin/python -m pytest
 ```
 
 The oracle-builder U-Net artifact tests validate artifact metadata without

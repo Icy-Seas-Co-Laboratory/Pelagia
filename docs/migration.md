@@ -28,32 +28,30 @@ Use this for routine code updates on the same machine.
 
 See [Backup And Restore](backup.md).
 
-3. Update the checkout and Python environment.
+3. Update the checkout and synchronize the Python environments.
 
 ```bash
 git pull
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+./scripts/pelagia_env sync cpu
 ```
 
 For development installs:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+./scripts/pelagia_env sync dev
 ```
 
 For learned ROI refinement:
 
 ```bash
-python -m pip install -r requirements-ml.txt
+./scripts/pelagia_env sync ml-cuda
 ```
 
 4. Apply database migrations and verify storage.
 
 ```bash
-python -m Pelagia.cli.app migrate-db
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia migrate-db
+.venv/bin/pelagia check-system
 ```
 
 5. Start the stack.
