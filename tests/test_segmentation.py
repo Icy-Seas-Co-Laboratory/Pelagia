@@ -230,15 +230,12 @@ def test_preprocess_frame_for_segmentation_applies_ordered_steps():
         frameNumber=1,
         data=data,
         mask=mask,
+        bkg=10,
     )
 
     processed = preprocess_frame_for_segmentation(
         frame,
-        flatfield_correction=False,
         apply_mask=True,
-        background_correction=True,
-        background=10,
-        invert_intensity=True,
     )
 
     assert processed.metadata["preprocessing_steps"] == [
@@ -248,8 +245,8 @@ def test_preprocess_frame_for_segmentation_applies_ordered_steps():
     ]
     assert processed.metadata["foreground_polarity"] == "bright"
     assert processed.metadata["background_method"] == "divide"
-    assert processed.metadata["background_min_field_value"] == 50.0
-    assert processed.metadata["background_max_field_value"] == 255.0
+    assert processed.metadata["min_field_value"] == 50.0
+    assert processed.metadata["max_field_value"] == 255.0
     assert processed.read().shape == data.shape
     assert processed.read()[0, 0] == 0
     assert processed.read()[1, 1] == 0
@@ -269,20 +266,15 @@ def test_preprocess_frame_for_segmentation_applies_flatfield_when_enabled():
         filename="frame.png",
         frameNumber=1,
         data=data,
+        metadata={"flatfield_profile": [20.0, 40.0, 80.0]},
     )
 
     processed = preprocess_frame_for_segmentation(
         frame,
-        flatfield_correction=True,
-        flatfield_q=0.5,
-        flatfield_axis=0,
-        flatfield_min_field_value=1,
-        flatfield_max_field_value=None,
-        background_correction=False,
-        invert_intensity=False,
+        min_field_value=1,
     )
 
-    assert processed.metadata["preprocessing_steps"] == ["flatfield"]
+    assert processed.metadata["preprocessing_steps"] == ["flatfield", "invert_intensity"]
     assert processed.metadata["flatfield_correction"] is True
     assert processed.read().shape == data.shape
 
@@ -305,9 +297,7 @@ def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
 
     processed = preprocess_frame_for_segmentation(
         frame,
-        flatfield_correction=False,
         apply_mask=False,
-        invert_intensity=False,
         crop_enabled=True,
         crop_x=1,
         crop_y=2,
@@ -315,13 +305,13 @@ def test_preprocess_frame_for_segmentation_crops_geometry_and_mask():
         crop_h=2,
     )
 
-    np.testing.assert_array_equal(processed.read(), data[2:4, 1:4])
+    np.testing.assert_array_equal(processed.read(), 255 - data[2:4, 1:4])
     np.testing.assert_array_equal(processed.mask, mask[2:4, 1:4])
     assert processed.width == 3
     assert processed.height == 2
     assert processed.bbox_x == 101
     assert processed.bbox_y == 202
-    assert processed.metadata["preprocessing_steps"] == ["crop"]
+    assert processed.metadata["preprocessing_steps"] == ["crop", "invert_intensity"]
     assert processed.metadata["crop_bbox"] == (101, 202, 3, 2)
 
 
@@ -856,8 +846,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     detections = segment_frame(
         frame,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=0,
         min_width=0,
         min_height=0,
@@ -922,8 +911,7 @@ def test_segment_frame_writes_structured_log_events():
     detections = segment_frame(
         frame,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=0,
         min_width=0,
         min_height=0,
@@ -990,8 +978,7 @@ def test_live_detection_candidate_wrapper_returns_transient_detection_records(mo
     detections = live_detection_candidate_wrapper(
         FRAME_ID,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=0,
         min_width=0,
         min_height=0,
@@ -1008,8 +995,7 @@ def test_live_detection_candidate_wrapper_returns_transient_detection_records(mo
     assert live_segment_wrapper(
         FRAME_ID,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=0,
         min_width=0,
         min_height=0,
@@ -1039,8 +1025,7 @@ def test_segment_frame_stores_padded_roi_context_and_mask():
     detections = segment_frame(
         frame,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=0,
         min_width=0,
         min_height=0,
@@ -1103,8 +1088,7 @@ def test_segment_frame_filters_by_bbox_perimeter():
     assert segment_frame(
         frame,
         threshold=1,
-        flatfield_correction=False,
-        invert_intensity=False,
+        apply_preprocessing=False,
         min_perimeter=15,
         roi_encoding="raw",
     ) == []

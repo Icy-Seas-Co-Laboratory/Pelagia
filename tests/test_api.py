@@ -2075,8 +2075,7 @@ def test_api_preprocessing_options_are_ui_ready():
         "source",
         "crop",
         "mask",
-        "flatfield",
-        "background_correction",
+        "stored_field_correction",
         "inversion",
         "recording",
     ]
@@ -2084,29 +2083,11 @@ def test_api_preprocessing_options_are_ui_ready():
     assert "jxl" in body["supported"]["image_encodings"]
     assert "jxs" in body["supported"]["image_encodings"]
     assert body["defaults"]["preprocessing"]["invert_intensity"] is True
-    assert body["defaults"]["flatfield"]["flatfield_q"] == 0.9
-    flatfield_fields = {field["key"]: field for field in body["fields"]["flatfield"]}
-    assert flatfield_fields["flatfield_q"]["min"] == 0
-    assert flatfield_fields["flatfield_q"]["max"] == 1
-    assert flatfield_fields["flatfield_axis"]["options"] == [0, 1]
-    assert flatfield_fields["flatfield_min_field_value"]["min"] == 0
-    assert flatfield_fields["flatfield_max_field_value"]["type"] == "nullable-number"
-    background_fields = {field["key"]: field for field in body["fields"]["background_correction"]}
-    assert background_fields["background_asset_id"]["type"] == "nullable-string"
-    assert background_fields["background_frame_ids"]["type"] == "string-list"
-    assert background_fields["background_start_frame"]["min"] == 0
-    assert background_fields["background_end_frame"]["min"] == 0
-    assert background_fields["background_limit"]["min"] == 1
-    assert sorted(background_fields["background_payload_kind"]["options"]) == [
-        "corrected",
-        "original",
-        "preprocessed",
-        "processed",
-        "raw",
-    ]
-    assert background_fields["background_encoding"]["default"] == "zstd"
-    assert background_fields["background_min_field_value"]["min"] == 0
-    assert background_fields["background_max_field_value"]["type"] == "nullable-number"
+    correction_fields = {
+        field["key"]: field for field in body["fields"]["stored_field_correction"]
+    }
+    assert correction_fields["min_field_value"]["min"] == 0
+    assert correction_fields["max_field_value"]["type"] == "nullable-number"
     recording_fields = {field["key"]: field for field in body["fields"]["recording"]}
     assert recording_fields["encoding"]["options"] == ["jpg", "jxl", "jxs", "png", "raw", "zstd"]
 
@@ -2388,12 +2369,11 @@ def test_api_segmentation_options_are_ui_ready():
     assert "connected_components" in body["supported"]["roi_assembly_methods"]
     assert body["defaults"]["roi_filter"]["min_perimeter"] is None
     assert body["defaults"]["roi_recording"]["roi_encoding"] == "zstd"
-    assert body["defaults"]["preprocessing"]["flatfield_min_field_value"] == 1.0
-    assert body["defaults"]["preprocessing"]["background_min_field_value"] == 1.0
-    assert body["config_defaults"]["flatfield"]["flatfield_min_field_value"] == 1.0
+    assert body["defaults"]["preprocessing"]["min_field_value"] is None
+    assert body["defaults"]["preprocessing"]["max_field_value"] is None
     preprocessing_fields = {field["key"]: field for field in body["fields"]["preprocessing"]}
-    assert preprocessing_fields["flatfield_max_field_value"]["type"] == "nullable-number"
-    assert preprocessing_fields["background_max_field_value"]["type"] == "nullable-number"
+    assert preprocessing_fields["min_field_value"]["type"] == "nullable-number"
+    assert preprocessing_fields["max_field_value"]["type"] == "nullable-number"
     threshold_fields = {field["key"]: field for field in body["fields"]["thresholding"]}
     assert threshold_fields["canny_low_threshold"]["threshold_methods"] == [
         "canny",
@@ -2639,6 +2619,8 @@ def test_api_can_queue_segmentation_job():
             "min_width": 2,
             "store_roi_payload_min_area": 20,
             "always_store_mask": False,
+            "min_field_value": 2,
+            "max_field_value": 200,
         },
     )
 
@@ -2658,11 +2640,8 @@ def test_api_can_queue_segmentation_job():
     assert repository.created_jobs[-1]["payload"]["min_width"] == 2
     assert repository.created_jobs[-1]["payload"]["store_roi_payload_min_area"] == 20
     assert repository.created_jobs[-1]["payload"]["always_store_mask"] is False
-    assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is True
-    assert repository.created_jobs[-1]["payload"]["flatfield_q"] == 0.9
-    assert repository.created_jobs[-1]["payload"]["flatfield_axis"] == 0
-    assert repository.created_jobs[-1]["payload"]["flatfield_min_field_value"] == 1.0
-    assert repository.created_jobs[-1]["payload"]["background_min_field_value"] == 1.0
+    assert repository.created_jobs[-1]["payload"]["min_field_value"] == 2
+    assert repository.created_jobs[-1]["payload"]["max_field_value"] == 200
 
 
 def test_api_rejects_preprocessed_segmentation_job_for_unprocessed_frames():
@@ -2748,8 +2727,8 @@ def test_api_can_queue_frame_preprocess_job():
         headers=headers,
         json={
             "frame_ids": ["frame-1"],
-            "flatfield_correction": False,
-            "background_correction": True,
+            "min_field_value": 2,
+            "max_field_value": 200,
             "encoding": "jpg",
         },
     )
@@ -2760,9 +2739,29 @@ def test_api_can_queue_frame_preprocess_job():
     assert repository.created_jobs[-1]["run_id"] == "run-1"
     assert repository.created_jobs[-1]["asset_id"] == "asset-1"
     assert repository.created_jobs[-1]["payload"]["frame_ids"] == ["frame-1"]
-    assert repository.created_jobs[-1]["payload"]["flatfield_correction"] is False
-    assert repository.created_jobs[-1]["payload"]["background_correction"] is True
+    assert repository.created_jobs[-1]["payload"]["min_field_value"] == 2
+    assert repository.created_jobs[-1]["payload"]["max_field_value"] == 200
     assert repository.created_jobs[-1]["payload"]["encoding"] == "jpg"
+
+
+def test_api_rejects_removed_preprocessing_field_parameters():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    preprocess_response = client.post(
+        "/frame/preprocess/jobs",
+        headers=headers,
+        json={"frame_ids": ["frame-1"], "flatfield_q": 0.5},
+    )
+    segmentation_response = client.post(
+        "/segmentation/jobs",
+        headers=headers,
+        json={"frame_ids": ["frame-1"], "background_correction": True},
+    )
+
+    assert preprocess_response.status_code == 422
+    assert segmentation_response.status_code == 422
+    assert repository.created_jobs == []
 
 
 def test_api_can_generate_frame_background(monkeypatch):
@@ -4179,7 +4178,7 @@ def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):
     assert repository.deleted_sandbox_frames == ["live-frame-1"]
 
 
-def test_live_preprocess_can_generate_background_for_sandbox(monkeypatch):
+def test_live_preprocess_uses_stored_field_without_generating_background(monkeypatch):
     client, repository, _ = make_client()
     calls = []
 
@@ -4193,21 +4192,8 @@ def test_live_preprocess_can_generate_background_for_sandbox(monkeypatch):
             metadata={"frame_id": frame_id, "run_id": "run-1", "asset_id": "asset-1"},
         )
 
-    def fake_build_background_payload_for_frames(frame_ids, **kwargs):
-        calls.append(("background", frame_ids, kwargs.get("payload_kind"), kwargs.get("encoding")))
-        return {
-            "background_payload_ref": "background-key",
-            "background_payload_encoding": "raw",
-            "background_payload_format": "raw_ndarray_c_order",
-            "background_payload_dtype": "float32",
-            "background_payload_shape": [2, 2],
-            "frame_ids": frame_ids,
-            "frame_count": len(frame_ids),
-            "updated_frame_count": len(frame_ids),
-        }
-
     def fake_preprocess_frame(frame, **kwargs):
-        calls.append(("preprocess", kwargs.get("background_correction"), kwargs.get("background_min_field_value")))
+        calls.append(("preprocess", kwargs.get("min_field_value"), kwargs.get("max_field_value")))
         return frame
 
     def fake_store_preprocessed_frame(frame_id, frame, **kwargs):
@@ -4223,27 +4209,18 @@ def test_live_preprocess_can_generate_background_for_sandbox(monkeypatch):
         }
 
     monkeypatch.setattr("Pelagia.api.routes.live.retrieve_frame", fake_retrieve_frame)
-    monkeypatch.setattr("Pelagia.api.routes.live.build_background_payload_for_frames", fake_build_background_payload_for_frames)
     monkeypatch.setattr("Pelagia.api.routes.live.preprocess_frame_for_segmentation", fake_preprocess_frame)
     monkeypatch.setattr("Pelagia.api.routes.live.store_preprocessed_frame", fake_store_preprocessed_frame)
 
     response = client.post(
         "/live/preprocess"
-        "?frame_id=frame-1&asset_id=asset-1&start_frame=2&end_frame=5&limit=1"
-        "&background_encoding=raw&background_min_field_value=2"
+        "?frame_id=frame-1&min_field_value=2&max_field_value=200"
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["background_generation"]["background_payload_ref"] == "background-key"
-    assert body["background_generation"]["asset_id"] == "asset-1"
-    assert body["background_generation"]["start_frame"] == 2
-    assert body["background_generation"]["end_frame"] == 5
-    assert body["background_generation"]["limit"] == 1
-    assert repository.sandbox_frames["live-frame-1"]["background_payload_ref"] == "background-key"
-    assert repository.sandbox_frames["live-frame-1"]["background_payload_shape"] == [2, 2]
-    assert calls[0] == ("background", ["frame-1"], "original", "raw")
-    assert calls[2] == ("preprocess", True, 2.0)
+    assert "background_generation" not in body
+    assert calls[1] == ("preprocess", 2.0, 200.0)
 
 
 def test_live_preprocess_uuid_frame_requires_auth_with_cors(monkeypatch):
@@ -4253,10 +4230,9 @@ def test_live_preprocess_uuid_frame_requires_auth_with_cors(monkeypatch):
     frame_id = str(uuid.uuid4())
 
     response = client.post(
-        f"/live/preprocess?frame_id={frame_id}&encoding=png&background_correction=false"
-        "&flatfield_correction=true&flatfield_q=0.95&flatfield_axis=0"
-        "&flatfield_min_field_value=1&flatfield_max_field_value=255"
-        "&apply_mask=false&crop_enabled=false&invert_intensity=true",
+        f"/live/preprocess?frame_id={frame_id}&encoding=png"
+        "&min_field_value=1&max_field_value=255"
+        "&apply_mask=false&crop_enabled=false",
         headers={"Origin": "http://127.0.0.1:5173"},
     )
 

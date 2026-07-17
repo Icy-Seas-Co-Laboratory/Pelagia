@@ -463,6 +463,15 @@ default: frames are effectively stacked vertically, their widths must match, and
 column means are stored. With `flatfield_axis=1`, frames are effectively stacked
 horizontally, their heights must match, and row means are stored. The stacking is
 accumulated without allocating a concatenated image.
+
+Preprocessing no longer estimates correction fields. It automatically applies
+an ingestion-generated mean background when one is attached to the frame;
+otherwise it applies the stored flatfield profile. If neither field exists,
+preprocessing continues with crop, mask, and configured intensity inversion
+without correction. Preprocessing and segmentation requests now expose only
+`min_field_value`, `max_field_value`, `apply_mask`, and the `crop_*` controls for
+this stage. Quantile, axis, correction-toggle, ad-hoc background-selection, and
+inversion request parameters have been removed.
 When neither switch is supplied, effective correction settings choose one mode,
 with background generation taking precedence over flatfield profiles.
 

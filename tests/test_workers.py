@@ -511,8 +511,8 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
             "asset_id": "asset-1",
             "payload": {
                 "frame_ids": ["frame-1"],
-                "flatfield_correction": False,
-                "background_correction": True,
+                "min_field_value": 2,
+                "max_field_value": 200,
                 "encoding": "jpg",
             },
         },
@@ -526,8 +526,8 @@ def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     assert result["timings"]["unit_count"] == 1
     assert result["timings"]["phase_counts"]["selection.frame_metadata_lookup"] == 1
     assert retrieved == [("frame-1", context, "original")]
-    assert preprocessed[0][1]["flatfield_correction"] is False
-    assert preprocessed[0][1]["background_correction"] is True
+    assert preprocessed[0][1]["min_field_value"] == 2
+    assert preprocessed[0][1]["max_field_value"] == 200
     assert stored[0][1]["encoding"] == "jpg"
     assert stored[0][0][0][0] == "frame-1"
 
@@ -733,21 +733,35 @@ def test_roi_detection_handler_accepts_frame_ids_from_multiple_assets(monkeypatc
     ]
 
 
-def test_preprocess_frames_handler_requires_ingestion_generated_background(monkeypatch):
+def test_preprocess_frames_handler_allows_frames_without_correction_fields(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.retrieve_frame",
+        lambda frame_id, **kwargs: FrameData(
+            sourcePath="/tmp",
+            filename="frame.png",
+            frameNumber=1,
+            data=np.zeros((4, 4), dtype=np.uint8),
+        ),
+    )
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.store_preprocessed_frames",
+        lambda frames, **kwargs: [{"id": frame_id} for frame_id, _ in frames],
+    )
 
-    with pytest.raises(ValueError, match="ingestion-generated backgrounds"):
-        preprocess_frames_handler(
-            {
-                "id": "job-preprocess",
-                "stage": PipelineStage.PREPROCESS_FRAMES.value,
-                "run_id": "run-1",
-                "asset_id": "asset-1",
-                "payload": {"frame_ids": ["frame-1"], "background_correction": True},
-            },
-            context,
-        )
+    result = preprocess_frames_handler(
+        {
+            "id": "job-preprocess",
+            "stage": PipelineStage.PREPROCESS_FRAMES.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {"frame_ids": ["frame-1"]},
+        },
+        context,
+    )
+
+    assert result["frame_count"] == 1
 
 
 def test_preprocess_frames_handler_skips_background_generation_when_present(monkeypatch):

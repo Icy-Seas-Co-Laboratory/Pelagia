@@ -174,17 +174,14 @@ if typer is not None:
         threshold: Optional[float],
         frame_payload_kind: Optional[str],
         apply_preprocessing: Optional[bool],
-        flatfield_correction: Optional[bool],
-        flatfield_q: Optional[float],
-        flatfield_axis: Optional[int],
+        min_field_value: Optional[float],
+        max_field_value: Optional[float],
         apply_mask: Optional[bool],
         crop_enabled: Optional[bool],
         crop_x: Optional[int],
         crop_y: Optional[int],
         crop_w: Optional[int],
         crop_h: Optional[int],
-        background_correction: Optional[bool],
-        invert_intensity: Optional[bool],
         min_perimeter: Optional[float],
         max_perimeter: Optional[float],
         padding: Optional[int],
@@ -194,7 +191,6 @@ if typer is not None:
     ) -> dict:
         roi_filter_defaults = processing_defaults.roi_filter
         roi_recording_defaults = processing_defaults.roi_recording
-        flatfield_defaults = processing_defaults.flatfield
         preprocessing_defaults = processing_defaults.preprocessing
         return {
             "frame_ids": _split_csv(frame_ids),
@@ -208,13 +204,8 @@ if typer is not None:
                 if apply_preprocessing is None
                 else apply_preprocessing
             ),
-            "flatfield_correction": (
-                flatfield_defaults.flatfield_correction
-                if flatfield_correction is None
-                else flatfield_correction
-            ),
-            "flatfield_q": flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q,
-            "flatfield_axis": flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis,
+            "min_field_value": min_field_value,
+            "max_field_value": max_field_value,
             "apply_mask": preprocessing_defaults.apply_mask if apply_mask is None else apply_mask,
             "crop_enabled": (
                 preprocessing_defaults.crop_enabled
@@ -225,16 +216,6 @@ if typer is not None:
             "crop_y": preprocessing_defaults.crop_y if crop_y is None else crop_y,
             "crop_w": preprocessing_defaults.crop_w if crop_w is None else crop_w,
             "crop_h": preprocessing_defaults.crop_h if crop_h is None else crop_h,
-            "background_correction": (
-                preprocessing_defaults.background_correction
-                if background_correction is None
-                else background_correction
-            ),
-            "invert_intensity": (
-                preprocessing_defaults.invert_intensity
-                if invert_intensity is None
-                else invert_intensity
-            ),
             "min_perimeter": roi_filter_defaults.min_perimeter if min_perimeter is None else min_perimeter,
             "max_perimeter": roi_filter_defaults.max_perimeter if max_perimeter is None else max_perimeter,
             "padding": roi_recording_defaults.padding if padding is None else padding,
@@ -247,34 +228,25 @@ if typer is not None:
         start_frame: Optional[int],
         end_frame: Optional[int],
         limit: Optional[int],
-        flatfield_correction: Optional[bool],
-        flatfield_q: Optional[float],
-        flatfield_axis: Optional[int],
+        min_field_value: Optional[float],
+        max_field_value: Optional[float],
         apply_mask: Optional[bool],
         crop_enabled: Optional[bool],
         crop_x: Optional[int],
         crop_y: Optional[int],
         crop_w: Optional[int],
         crop_h: Optional[int],
-        background_correction: Optional[bool],
-        invert_intensity: Optional[bool],
         encoding: Optional[str],
         processing_defaults,
     ) -> dict:
-        flatfield_defaults = processing_defaults.flatfield
         preprocessing_defaults = processing_defaults.preprocessing
         return {
             "frame_ids": _split_csv(frame_ids),
             "start_frame": start_frame,
             "end_frame": end_frame,
             "limit": limit,
-            "flatfield_correction": (
-                flatfield_defaults.flatfield_correction
-                if flatfield_correction is None
-                else flatfield_correction
-            ),
-            "flatfield_q": flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q,
-            "flatfield_axis": flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis,
+            "min_field_value": min_field_value,
+            "max_field_value": max_field_value,
             "apply_mask": preprocessing_defaults.apply_mask if apply_mask is None else apply_mask,
             "crop_enabled": (
                 preprocessing_defaults.crop_enabled
@@ -285,16 +257,6 @@ if typer is not None:
             "crop_y": preprocessing_defaults.crop_y if crop_y is None else crop_y,
             "crop_w": preprocessing_defaults.crop_w if crop_w is None else crop_w,
             "crop_h": preprocessing_defaults.crop_h if crop_h is None else crop_h,
-            "background_correction": (
-                preprocessing_defaults.background_correction
-                if background_correction is None
-                else background_correction
-            ),
-            "invert_intensity": (
-                preprocessing_defaults.invert_intensity
-                if invert_intensity is None
-                else invert_intensity
-            ),
             "encoding": encoding,
         }
 
@@ -911,17 +873,14 @@ if typer is not None:
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         limit: Optional[int] = None,
-        flatfield_correction: Optional[bool] = None,
-        flatfield_q: Optional[float] = None,
-        flatfield_axis: Optional[int] = None,
+        min_field_value: Optional[float] = None,
+        max_field_value: Optional[float] = None,
         apply_mask: Optional[bool] = None,
         crop_enabled: Optional[bool] = None,
         crop_x: Optional[int] = None,
         crop_y: Optional[int] = None,
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
-        background_correction: Optional[bool] = None,
-        invert_intensity: Optional[bool] = None,
         encoding: Optional[str] = None,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -940,17 +899,14 @@ if typer is not None:
             start_frame,
             end_frame,
             limit,
-            flatfield_correction,
-            flatfield_q,
-            flatfield_axis,
+            min_field_value,
+            max_field_value,
             apply_mask,
             crop_enabled,
             crop_x,
             crop_y,
             crop_w,
             crop_h,
-            background_correction,
-            invert_intensity,
             encoding,
             context.config.processing,
         )
@@ -983,17 +939,14 @@ if typer is not None:
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         limit: Optional[int] = None,
-        flatfield_correction: Optional[bool] = None,
-        flatfield_q: Optional[float] = None,
-        flatfield_axis: Optional[int] = None,
+        min_field_value: Optional[float] = None,
+        max_field_value: Optional[float] = None,
         apply_mask: Optional[bool] = None,
         crop_enabled: Optional[bool] = None,
         crop_x: Optional[int] = None,
         crop_y: Optional[int] = None,
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
-        background_correction: Optional[bool] = None,
-        invert_intensity: Optional[bool] = None,
         encoding: Optional[str] = None,
         priority: Optional[int] = None,
         depends_on: Optional[str] = None,
@@ -1012,17 +965,14 @@ if typer is not None:
             start_frame,
             end_frame,
             limit,
-            flatfield_correction,
-            flatfield_q,
-            flatfield_axis,
+            min_field_value,
+            max_field_value,
             apply_mask,
             crop_enabled,
             crop_x,
             crop_y,
             crop_w,
             crop_h,
-            background_correction,
-            invert_intensity,
             encoding,
             context.config.processing,
         )
@@ -1057,17 +1007,14 @@ if typer is not None:
         threshold: Optional[float] = None,
         frame_payload_kind: Optional[str] = None,
         apply_preprocessing: Optional[bool] = None,
-        flatfield_correction: Optional[bool] = None,
-        flatfield_q: Optional[float] = None,
-        flatfield_axis: Optional[int] = None,
+        min_field_value: Optional[float] = None,
+        max_field_value: Optional[float] = None,
         apply_mask: Optional[bool] = None,
         crop_enabled: Optional[bool] = None,
         crop_x: Optional[int] = None,
         crop_y: Optional[int] = None,
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
-        background_correction: Optional[bool] = None,
-        invert_intensity: Optional[bool] = None,
         min_perimeter: Optional[float] = None,
         max_perimeter: Optional[float] = None,
         padding: Optional[int] = None,
@@ -1093,17 +1040,14 @@ if typer is not None:
             threshold,
             frame_payload_kind,
             apply_preprocessing,
-            flatfield_correction,
-            flatfield_q,
-            flatfield_axis,
+            min_field_value,
+            max_field_value,
             apply_mask,
             crop_enabled,
             crop_x,
             crop_y,
             crop_w,
             crop_h,
-            background_correction,
-            invert_intensity,
             min_perimeter,
             max_perimeter,
             padding,
@@ -1143,17 +1087,14 @@ if typer is not None:
         threshold: Optional[float] = None,
         frame_payload_kind: Optional[str] = None,
         apply_preprocessing: Optional[bool] = None,
-        flatfield_correction: Optional[bool] = None,
-        flatfield_q: Optional[float] = None,
-        flatfield_axis: Optional[int] = None,
+        min_field_value: Optional[float] = None,
+        max_field_value: Optional[float] = None,
         apply_mask: Optional[bool] = None,
         crop_enabled: Optional[bool] = None,
         crop_x: Optional[int] = None,
         crop_y: Optional[int] = None,
         crop_w: Optional[int] = None,
         crop_h: Optional[int] = None,
-        background_correction: Optional[bool] = None,
-        invert_intensity: Optional[bool] = None,
         min_perimeter: Optional[float] = None,
         max_perimeter: Optional[float] = None,
         padding: Optional[int] = None,
@@ -1179,17 +1120,14 @@ if typer is not None:
             threshold,
             frame_payload_kind,
             apply_preprocessing,
-            flatfield_correction,
-            flatfield_q,
-            flatfield_axis,
+            min_field_value,
+            max_field_value,
             apply_mask,
             crop_enabled,
             crop_x,
             crop_y,
             crop_w,
             crop_h,
-            background_correction,
-            invert_intensity,
             min_perimeter,
             max_perimeter,
             padding,

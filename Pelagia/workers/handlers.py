@@ -479,38 +479,15 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     resolved_run_id = None if job.get("run_id") is None else str(job["run_id"])
     resolved_asset_ids: set[str] = set()
     resolved_run_ids: set[str] = set()
-    flatfield_defaults = context.config.processing.flatfield
     preprocessing_defaults = context.config.processing.preprocessing
-    flatfield_correction = payload.get("flatfield_correction", flatfield_defaults.flatfield_correction)
-    flatfield_q = payload.get("flatfield_q", flatfield_defaults.flatfield_q)
-    flatfield_axis = payload.get("flatfield_axis", flatfield_defaults.flatfield_axis)
-    flatfield_min_field_value = payload.get(
-        "flatfield_min_field_value",
-        flatfield_defaults.flatfield_min_field_value,
-    )
-    flatfield_max_field_value = payload.get(
-        "flatfield_max_field_value",
-        flatfield_defaults.flatfield_max_field_value,
-    )
+    min_field_value = payload.get("min_field_value")
+    max_field_value = payload.get("max_field_value")
     apply_mask = payload.get("apply_mask", preprocessing_defaults.apply_mask)
     crop_enabled = payload.get("crop_enabled", preprocessing_defaults.crop_enabled)
     crop_x = payload.get("crop_x", preprocessing_defaults.crop_x)
     crop_y = payload.get("crop_y", preprocessing_defaults.crop_y)
     crop_w = payload.get("crop_w", preprocessing_defaults.crop_w)
     crop_h = payload.get("crop_h", preprocessing_defaults.crop_h)
-    background_correction = payload.get(
-        "background_correction",
-        preprocessing_defaults.background_correction,
-    )
-    background_min_field_value = payload.get(
-        "background_min_field_value",
-        preprocessing_defaults.background_min_field_value,
-    )
-    background_max_field_value = payload.get(
-        "background_max_field_value",
-        preprocessing_defaults.background_max_field_value,
-    )
-    invert_intensity = payload.get("invert_intensity", preprocessing_defaults.invert_intensity)
     encoding = payload.get("encoding")
     quality = payload.get("quality")
     stored_rows = []
@@ -532,7 +509,6 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
 
     frame_records: dict[str, FrameRecord] = {}
-    missing_background_frame_ids = []
     for work_frame_ids in frame_id_work_units(frame_ids):
         with measure_phase("selection.frame_metadata_lookup"):
             work_records = context.repository.get_frame_records(
@@ -553,15 +529,6 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
                 resolved_run_id = frame_record.run_id
             if frame_record.run_id is not None:
                 resolved_run_ids.add(frame_record.run_id)
-            if not (frame_record.background_payload_ref or frame_record.background_kvstore_hash):
-                missing_background_frame_ids.append(frame_id)
-
-    if background_correction and missing_background_frame_ids:
-        raise ValueError(
-            "Background correction requires ingestion-generated backgrounds. "
-            f"{len(missing_background_frame_ids)} selected frame(s) are missing background payloads; "
-            "reingest with generate_backgrounds enabled or run a background backfill job."
-        )
 
     completed_count = 0
     for work_frame_ids in frame_id_work_units(frame_ids):
@@ -575,21 +542,14 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
             )
             processed = preprocess_frame_for_segmentation(
                 frame,
-                flatfield_correction=flatfield_correction,
-                flatfield_q=flatfield_q,
-                flatfield_axis=flatfield_axis,
-                flatfield_min_field_value=flatfield_min_field_value,
-                flatfield_max_field_value=flatfield_max_field_value,
+                min_field_value=min_field_value,
+                max_field_value=max_field_value,
                 apply_mask=apply_mask,
                 crop_enabled=crop_enabled,
                 crop_x=crop_x,
                 crop_y=crop_y,
                 crop_w=crop_w,
                 crop_h=crop_h,
-                background_correction=background_correction,
-                background_min_field_value=background_min_field_value,
-                background_max_field_value=background_max_field_value,
-                invert_intensity=invert_intensity,
                 context=context,
             )
             processed_frames.append((frame_id, processed))

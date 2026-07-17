@@ -10,7 +10,6 @@ import numpy as np
 from .defaults import default_processing_config
 from .frame_correction import (
     divide_background,
-    flatfield_correction as correct_flatfield,
     flatfield_profile_correction,
 )
 from .frame_model import FrameData
@@ -142,17 +141,8 @@ def preprocess_frame_for_segmentation(
     crop_y: int | None = None,
     crop_w: int | None = None,
     crop_h: int | None = None,
-    flatfield_correction: bool | None = None,
-    flatfield_q: float | None = None,
-    flatfield_axis: int | None = None,
-    flatfield_profile: np.ndarray | list[float] | tuple[float, ...] | None = None,
-    flatfield_min_field_value: int | float | None = None,
-    flatfield_max_field_value: int | float | None = None,
-    background_correction: bool | None = None,
-    background: np.ndarray | int | float | None = None,
-    background_min_field_value: int | float | None = None,
-    background_max_field_value: int | float | None = None,
-    invert_intensity: bool | None = None,
+    min_field_value: int | float | None = None,
+    max_field_value: int | float | None = None,
     context: Any = None,
 ) -> FrameData:
     """
@@ -186,37 +176,16 @@ def preprocess_frame_for_segmentation(
     resolved_crop_y = processing_defaults.crop_y if crop_y is None else crop_y
     resolved_crop_w = processing_defaults.crop_w if crop_w is None else crop_w
     resolved_crop_h = processing_defaults.crop_h if crop_h is None else crop_h
-    resolved_background_correction = (
-        processing_defaults.background_correction
-        if background_correction is None
-        else background_correction
-    )
-    resolved_background_min_field_value = (
-        processing_defaults.background_min_field_value
-        if background_min_field_value is None
-        else background_min_field_value
-    )
-    resolved_background_max_field_value = (
-        processing_defaults.background_max_field_value
-        if background_max_field_value is None
-        else background_max_field_value
-    )
-    resolved_invert_intensity = (
-        processing_defaults.invert_intensity if invert_intensity is None else invert_intensity
-    )
+    resolved_invert_intensity = processing_defaults.invert_intensity
 
     source_mask = mask if mask is not None else frame.mask
-    source_background = background if background is not None else frame.bkg
-    source_flatfield_profile = (
-        flatfield_profile
-        if flatfield_profile is not None
-        else (frame.metadata or {}).get("flatfield_profile")
-    )
+    source_background = frame.bkg
+    source_flatfield_profile = (frame.metadata or {}).get("flatfield_profile")
     source_flatfield_metadata = dict((frame.metadata or {}).get("flatfield_metadata") or {})
     source_flatfield_axis = int(
         source_flatfield_metadata.get(
             "flatfield_axis",
-            flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis,
+            flatfield_defaults.flatfield_axis,
         )
     )
     if source_flatfield_axis not in {0, 1}:
@@ -262,61 +231,35 @@ def preprocess_frame_for_segmentation(
         with measure_phase("processing.mask"):
             image = apply_frame_mask(image, source_mask)
 
-    resolved_flatfield_correction = (
-        flatfield_defaults.flatfield_correction if flatfield_correction is None else flatfield_correction
-    )
-    resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
-    resolved_flatfield_axis = (
-        source_flatfield_axis
-        if flatfield_axis is None and source_flatfield_profile is not None
-        else flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
-    )
-    resolved_flatfield_min_field_value = (
-        flatfield_defaults.flatfield_min_field_value
-        if flatfield_min_field_value is None
-        else flatfield_min_field_value
-    )
-    resolved_flatfield_max_field_value = (
-        flatfield_defaults.flatfield_max_field_value
-        if flatfield_max_field_value is None
-        else flatfield_max_field_value
-    )
-
-    uses_stored_flatfield_profile = False
-    if resolved_flatfield_correction:
-        uses_stored_flatfield_profile = (
-            source_flatfield_profile is not None
-            and source_flatfield_axis == resolved_flatfield_axis
-        )
-        with measure_phase("processing.flatfield"):
-            if uses_stored_flatfield_profile:
-                image = flatfield_profile_correction(
-                    image,
-                    source_flatfield_profile,
-                    axis=resolved_flatfield_axis,
-                    min_field_value=resolved_flatfield_min_field_value,
-                    max_field_value=resolved_flatfield_max_field_value,
-                )
-            else:
-                image = correct_flatfield(
-                    image,
-                    q=resolved_flatfield_q,
-                    axis=resolved_flatfield_axis,
-                    min_field_value=resolved_flatfield_min_field_value,
-                    max_field_value=resolved_flatfield_max_field_value,
-                )
-
-    if resolved_background_correction:
-        if source_background is None:
-            raise ValueError(
-                "background_correction requires a generated background field on the frame."
-            )
+    correction_kind = "none"
+    resolved_min_field_value = min_field_value
+    resolved_max_field_value = max_field_value
+    if source_background is not None:
+        correction_kind = "background"
+        if resolved_min_field_value is None:
+            resolved_min_field_value = processing_defaults.background_min_field_value
+        if resolved_max_field_value is None:
+            resolved_max_field_value = processing_defaults.background_max_field_value
         with measure_phase("processing.background_correction"):
             image = divide_background(
                 image,
                 background=source_background,
-                min_field_value=resolved_background_min_field_value,
-                max_field_value=resolved_background_max_field_value,
+                min_field_value=resolved_min_field_value,
+                max_field_value=resolved_max_field_value,
+            )
+    elif source_flatfield_profile is not None:
+        correction_kind = "flatfield_profile"
+        if resolved_min_field_value is None:
+            resolved_min_field_value = flatfield_defaults.flatfield_min_field_value
+        if resolved_max_field_value is None:
+            resolved_max_field_value = flatfield_defaults.flatfield_max_field_value
+        with measure_phase("processing.flatfield"):
+            image = flatfield_profile_correction(
+                image,
+                source_flatfield_profile,
+                axis=source_flatfield_axis,
+                min_field_value=resolved_min_field_value,
+                max_field_value=resolved_max_field_value,
             )
 
     if resolved_invert_intensity:
@@ -331,8 +274,8 @@ def preprocess_frame_for_segmentation(
         for step, enabled in (
             ("crop", crop_bounds is not None),
             ("mask", bool(resolved_apply_mask and source_mask is not None)),
-            ("flatfield", bool(resolved_flatfield_correction)),
-            ("background_correction", bool(resolved_background_correction)),
+            ("flatfield", correction_kind == "flatfield_profile"),
+            ("background_correction", correction_kind == "background"),
             ("invert_intensity", bool(resolved_invert_intensity)),
         )
         if enabled
@@ -350,21 +293,19 @@ def preprocess_frame_for_segmentation(
             "foreground_polarity": "bright",
             "frame_mask_applied": bool(resolved_apply_mask and source_mask is not None),
             "flatfield_profile_method": (
-                ("window_column_mean" if resolved_flatfield_axis == 0 else "window_row_mean")
-                if resolved_flatfield_correction and uses_stored_flatfield_profile
-                else "frame_quantile"
+                ("window_column_mean" if source_flatfield_axis == 0 else "window_row_mean")
+                if correction_kind == "flatfield_profile"
+                else None
             ),
             "crop_enabled": bool(crop_bounds is not None),
             "crop_bbox": crop_bbox,
-            "flatfield_correction": bool(resolved_flatfield_correction),
-            "flatfield_q": resolved_flatfield_q,
-            "flatfield_axis": resolved_flatfield_axis,
-            "flatfield_min_field_value": resolved_flatfield_min_field_value,
-            "flatfield_max_field_value": resolved_flatfield_max_field_value,
-            "background_correction": bool(resolved_background_correction),
+            "correction_kind": correction_kind,
+            "flatfield_correction": correction_kind == "flatfield_profile",
+            "flatfield_axis": source_flatfield_axis if correction_kind == "flatfield_profile" else None,
+            "background_correction": correction_kind == "background",
             "background_method": "divide",
-            "background_min_field_value": resolved_background_min_field_value,
-            "background_max_field_value": resolved_background_max_field_value,
+            "min_field_value": resolved_min_field_value,
+            "max_field_value": resolved_max_field_value,
             "intensity_inverted": bool(resolved_invert_intensity),
         }
     )

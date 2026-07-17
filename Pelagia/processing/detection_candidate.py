@@ -98,15 +98,8 @@ def live_detection_candidate_wrapper(
     crop_y: int | None = None,
     crop_w: int | None = None,
     crop_h: int | None = None,
-    flatfield_correction: bool | None = None,
-    flatfield_q: float | None = None,
-    flatfield_axis: int | None = None,
-    flatfield_min_field_value: int | float | None = None,
-    flatfield_max_field_value: int | float | None = None,
-    background_correction: bool | None = None,
-    background_min_field_value: int | float | None = None,
-    background_max_field_value: int | float | None = None,
-    invert_intensity: bool | None = None,
+    min_field_value: int | float | None = None,
+    max_field_value: int | float | None = None,
     mask_augmentation_enabled: bool | None = None,
     mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
     roi_assembly_method: str | None = None,
@@ -200,21 +193,14 @@ def live_detection_candidate_wrapper(
                 if apply_preprocessing is None
                 else apply_preprocessing
             ),
-            flatfield_correction=flatfield_correction,
-            flatfield_q=flatfield_q,
-            flatfield_axis=flatfield_axis,
-            flatfield_min_field_value=flatfield_min_field_value,
-            flatfield_max_field_value=flatfield_max_field_value,
+            min_field_value=min_field_value,
+            max_field_value=max_field_value,
             apply_mask=apply_mask,
             crop_enabled=crop_enabled,
             crop_x=crop_x,
             crop_y=crop_y,
             crop_w=crop_w,
             crop_h=crop_h,
-            background_correction=background_correction,
-            background_min_field_value=background_min_field_value,
-            background_max_field_value=background_max_field_value,
-            invert_intensity=invert_intensity,
             mask_augmentation_enabled=mask_augmentation_enabled,
             mask_augmentation_steps=mask_augmentation_steps,
             roi_assembly_method=roi_assembly_method,
@@ -312,63 +298,20 @@ def threshold_frame(
     crop_y: int | None = None,
     crop_w: int | None = None,
     crop_h: int | None = None,
-    flatfield_correction: bool | None = None,
-    flatfield_q: float | None = None,
-    flatfield_axis: int | None = None,
-    flatfield_min_field_value: int | float | None = None,
-    flatfield_max_field_value: int | float | None = None,
-    background_correction: bool | None = None,
-    background: np.ndarray | int | float | None = None,
-    background_min_field_value: int | float | None = None,
-    background_max_field_value: int | float | None = None,
-    invert_intensity: bool | None = None,
+    min_field_value: int | float | None = None,
+    max_field_value: int | float | None = None,
     context: Any = None,
 ) -> ThresholdFrameResult:
     """Preprocess one frame and generate its first-pass binary threshold mask."""
     config = context.config.processing if context is not None and getattr(context, "config", None) is not None else default_processing_config()
     preprocessing_defaults = config.preprocessing
     thresholding_defaults = config.thresholding
-    flatfield_defaults = config.flatfield
-
-    resolved_flatfield_correction = (
-        flatfield_defaults.flatfield_correction
-        if flatfield_correction is None
-        else flatfield_correction
-    )
-    resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
-    resolved_flatfield_axis = flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
-    resolved_flatfield_min_field_value = (
-        flatfield_defaults.flatfield_min_field_value
-        if flatfield_min_field_value is None
-        else flatfield_min_field_value
-    )
-    resolved_flatfield_max_field_value = (
-        flatfield_defaults.flatfield_max_field_value
-        if flatfield_max_field_value is None
-        else flatfield_max_field_value
-    )
     resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
     resolved_crop_enabled = preprocessing_defaults.crop_enabled if crop_enabled is None else crop_enabled
     resolved_crop_x = preprocessing_defaults.crop_x if crop_x is None else crop_x
     resolved_crop_y = preprocessing_defaults.crop_y if crop_y is None else crop_y
     resolved_crop_w = preprocessing_defaults.crop_w if crop_w is None else crop_w
     resolved_crop_h = preprocessing_defaults.crop_h if crop_h is None else crop_h
-    resolved_background_correction = (
-        preprocessing_defaults.background_correction
-        if background_correction is None
-        else background_correction
-    )
-    resolved_background_min_field_value = (
-        preprocessing_defaults.background_min_field_value
-        if background_min_field_value is None
-        else background_min_field_value
-    )
-    resolved_background_max_field_value = (
-        preprocessing_defaults.background_max_field_value
-        if background_max_field_value is None
-        else background_max_field_value
-    )
-    resolved_invert_intensity = preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
     explicit_manual_threshold = threshold is not None and threshold_method is None
     resolved_threshold_method = str(
         threshold_method or ("manual" if explicit_manual_threshold else thresholding_defaults.method)
@@ -416,22 +359,14 @@ def threshold_frame(
         stage_started = time.perf_counter()
         frame = preprocess_frame_for_segmentation(
             frame,
-            flatfield_correction=resolved_flatfield_correction,
-            flatfield_q=resolved_flatfield_q,
-            flatfield_axis=resolved_flatfield_axis,
-            flatfield_min_field_value=resolved_flatfield_min_field_value,
-            flatfield_max_field_value=resolved_flatfield_max_field_value,
+            min_field_value=min_field_value,
+            max_field_value=max_field_value,
             apply_mask=resolved_apply_mask,
             crop_enabled=resolved_crop_enabled,
             crop_x=resolved_crop_x,
             crop_y=resolved_crop_y,
             crop_w=resolved_crop_w,
             crop_h=resolved_crop_h,
-            background_correction=resolved_background_correction,
-            background=background,
-            background_min_field_value=resolved_background_min_field_value,
-            background_max_field_value=resolved_background_max_field_value,
-            invert_intensity=resolved_invert_intensity,
             context=context,
         )
         stage_durations_ms["preprocessing"] = (time.perf_counter() - stage_started) * 1000
@@ -538,16 +473,8 @@ def segment_frame(
     crop_y: int | None = None,
     crop_w: int | None = None,
     crop_h: int | None = None,
-    flatfield_correction: bool | None = None,
-    flatfield_q: float | None = None,
-    flatfield_axis: int | None = None,
-    flatfield_min_field_value: int | float | None = None,
-    flatfield_max_field_value: int | float | None = None,
-    background_correction: bool | None = None,
-    background: np.ndarray | int | float | None = None,
-    background_min_field_value: int | float | None = None,
-    background_max_field_value: int | float | None = None,
-    invert_intensity: bool | None = None,
+    min_field_value: int | float | None = None,
+    max_field_value: int | float | None = None,
     mask_augmentation_enabled: bool | None = None,
     mask_augmentation_steps: list[str] | tuple[str, ...] | None = None,
     roi_assembly_method: str | None = None,
@@ -587,28 +514,6 @@ def segment_frame(
     thresholding_defaults = (
         config.thresholding
     )
-    flatfield_defaults = (
-        config.flatfield
-    )
-    resolved_flatfield_correction = (
-        flatfield_defaults.flatfield_correction
-        if flatfield_correction is None
-        else flatfield_correction
-    )
-    resolved_flatfield_q = flatfield_defaults.flatfield_q if flatfield_q is None else flatfield_q
-    resolved_flatfield_axis = (
-        flatfield_defaults.flatfield_axis if flatfield_axis is None else flatfield_axis
-    )
-    resolved_flatfield_min_field_value = (
-        flatfield_defaults.flatfield_min_field_value
-        if flatfield_min_field_value is None
-        else flatfield_min_field_value
-    )
-    resolved_flatfield_max_field_value = (
-        flatfield_defaults.flatfield_max_field_value
-        if flatfield_max_field_value is None
-        else flatfield_max_field_value
-    )
     resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
     resolved_crop_enabled = (
         preprocessing_defaults.crop_enabled if crop_enabled is None else crop_enabled
@@ -617,24 +522,6 @@ def segment_frame(
     resolved_crop_y = preprocessing_defaults.crop_y if crop_y is None else crop_y
     resolved_crop_w = preprocessing_defaults.crop_w if crop_w is None else crop_w
     resolved_crop_h = preprocessing_defaults.crop_h if crop_h is None else crop_h
-    resolved_background_correction = (
-        preprocessing_defaults.background_correction
-        if background_correction is None
-        else background_correction
-    )
-    resolved_background_min_field_value = (
-        preprocessing_defaults.background_min_field_value
-        if background_min_field_value is None
-        else background_min_field_value
-    )
-    resolved_background_max_field_value = (
-        preprocessing_defaults.background_max_field_value
-        if background_max_field_value is None
-        else background_max_field_value
-    )
-    resolved_invert_intensity = (
-        preprocessing_defaults.invert_intensity if invert_intensity is None else invert_intensity
-    )
     resolved_mask_augmentation_enabled = (
         mask_defaults.enabled if mask_augmentation_enabled is None else mask_augmentation_enabled
     )
@@ -776,16 +663,9 @@ def segment_frame(
         "filename": frame.filename,
         "frame_number": frame.frameNumber,
         "tile_number": frame.tileNumber,
-        "flatfield_correction": bool(resolved_flatfield_correction),
         "apply_preprocessing": bool(apply_preprocessing),
-        "flatfield_q": resolved_flatfield_q,
-        "flatfield_axis": resolved_flatfield_axis,
-        "flatfield_min_field_value": resolved_flatfield_min_field_value,
-        "flatfield_max_field_value": resolved_flatfield_max_field_value,
-        "background_correction": bool(resolved_background_correction),
-        "background_min_field_value": resolved_background_min_field_value,
-        "background_max_field_value": resolved_background_max_field_value,
-        "intensity_inverted": bool(resolved_invert_intensity),
+        "min_field_value": min_field_value,
+        "max_field_value": max_field_value,
         "apply_mask": bool(resolved_apply_mask),
         "crop_enabled": bool(resolved_crop_enabled),
         "crop_x": resolved_crop_x,
@@ -865,22 +745,14 @@ def segment_frame(
             sobel_threshold=resolved_sobel_threshold,
             sobel_kernel_size=resolved_sobel_kernel_size,
             apply_preprocessing=apply_preprocessing,
-            flatfield_correction=resolved_flatfield_correction,
-            flatfield_q=resolved_flatfield_q,
-            flatfield_axis=resolved_flatfield_axis,
-            flatfield_min_field_value=resolved_flatfield_min_field_value,
-            flatfield_max_field_value=resolved_flatfield_max_field_value,
+            min_field_value=min_field_value,
+            max_field_value=max_field_value,
             apply_mask=resolved_apply_mask,
             crop_enabled=resolved_crop_enabled,
             crop_x=resolved_crop_x,
             crop_y=resolved_crop_y,
             crop_w=resolved_crop_w,
             crop_h=resolved_crop_h,
-            background_correction=resolved_background_correction,
-            background=background,
-            background_min_field_value=resolved_background_min_field_value,
-            background_max_field_value=resolved_background_max_field_value,
-            invert_intensity=resolved_invert_intensity,
             context=context,
         )
         source_frame = threshold_result.source_frame

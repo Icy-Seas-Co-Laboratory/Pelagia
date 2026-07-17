@@ -53,7 +53,6 @@ def resolve_segmentation_options(
     """Resolve flat request/payload fields into grouped segmentation options."""
     values = {key: value for key, value in (overrides or {}).items() if value is not None}
     preprocessing = config.preprocessing
-    flatfield = config.flatfield
     thresholding = config.thresholding
     mask = config.mask_augmentation
     assembly = config.roi_assembly
@@ -93,43 +92,14 @@ def resolve_segmentation_options(
             "apply_preprocessing": bool(apply_preprocessing),
         },
         "preprocessing": {
-            "flatfield_correction": bool(
-                _get(values, "flatfield_correction", flatfield.flatfield_correction)
-            ),
-            "flatfield_q": float(_get(values, "flatfield_q", flatfield.flatfield_q)),
-            "flatfield_axis": int(_get(values, "flatfield_axis", flatfield.flatfield_axis)),
-            "flatfield_min_field_value": float(
-                _get(values, "flatfield_min_field_value", flatfield.flatfield_min_field_value)
-            ),
-            "flatfield_max_field_value": _get(
-                values,
-                "flatfield_max_field_value",
-                flatfield.flatfield_max_field_value,
-            ),
+            "min_field_value": _get(values, "min_field_value", None),
+            "max_field_value": _get(values, "max_field_value", None),
             "apply_mask": bool(_get(values, "apply_mask", preprocessing.apply_mask)),
             "crop_enabled": bool(_get(values, "crop_enabled", preprocessing.crop_enabled)),
             "crop_x": _get(values, "crop_x", preprocessing.crop_x),
             "crop_y": _get(values, "crop_y", preprocessing.crop_y),
             "crop_w": _get(values, "crop_w", preprocessing.crop_w),
             "crop_h": _get(values, "crop_h", preprocessing.crop_h),
-            "background_correction": bool(
-                _get(values, "background_correction", preprocessing.background_correction)
-            ),
-            "background_min_field_value": float(
-                _get(
-                    values,
-                    "background_min_field_value",
-                    preprocessing.background_min_field_value,
-                )
-            ),
-            "background_max_field_value": _get(
-                values,
-                "background_max_field_value",
-                preprocessing.background_max_field_value,
-            ),
-            "invert_intensity": bool(
-                _get(values, "invert_intensity", preprocessing.invert_intensity)
-            ),
         },
         "thresholding": {
             "threshold": threshold,
@@ -396,21 +366,14 @@ def _field_groups() -> dict[str, list[dict[str, Any]]]:
             _field("apply_preprocessing", "Apply Preprocessing", "boolean"),
         ],
         "preprocessing": [
-            _field("flatfield_correction", "Flatfield Correction", "boolean"),
-            _field("flatfield_q", "Flatfield Quantile", "number", minimum=0, maximum=1, step=0.01),
-            _field("flatfield_axis", "Flatfield Axis", "integer", minimum=0, maximum=1, step=1),
-            _field("flatfield_min_field_value", "Flatfield Min Field Value", "number", minimum=0, step=1),
-            _field("flatfield_max_field_value", "Flatfield Max Field Value", "nullable-number", minimum=0, step=1),
+            _field("min_field_value", "Minimum Field Value", "nullable-number", minimum=0, step=1),
+            _field("max_field_value", "Maximum Field Value", "nullable-number", minimum=0, step=1),
             _field("apply_mask", "Apply Mask", "boolean"),
             _field("crop_enabled", "Crop", "boolean"),
             _field("crop_x", "Crop X", "nullable-number", minimum=0, step=1),
             _field("crop_y", "Crop Y", "nullable-number", minimum=0, step=1),
             _field("crop_w", "Crop Width", "nullable-number", minimum=1, step=1),
             _field("crop_h", "Crop Height", "nullable-number", minimum=1, step=1),
-            _field("background_correction", "Background Correction", "boolean"),
-            _field("background_min_field_value", "Background Min Field Value", "number", minimum=0, step=1),
-            _field("background_max_field_value", "Background Max Field Value", "nullable-number", minimum=0, step=1),
-            _field("invert_intensity", "Invert Intensity", "boolean"),
         ],
         "thresholding": [
             _field("threshold_method", "Threshold Method", "enum", options=THRESHOLD_METHODS),
@@ -519,21 +482,14 @@ def _group_for_key(key: str) -> str:
     for group, fields in {
         "source": ["frame_payload_kind", "apply_preprocessing"],
         "preprocessing": [
-            "flatfield_correction",
-            "flatfield_q",
-            "flatfield_axis",
-            "flatfield_min_field_value",
-            "flatfield_max_field_value",
+            "min_field_value",
+            "max_field_value",
             "apply_mask",
             "crop_enabled",
             "crop_x",
             "crop_y",
             "crop_w",
             "crop_h",
-            "background_correction",
-            "background_min_field_value",
-            "background_max_field_value",
-            "invert_intensity",
         ],
         "thresholding": [
             "threshold",

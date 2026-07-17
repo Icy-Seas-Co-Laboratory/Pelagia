@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 try:
     from fastapi import APIRouter, HTTPException, Request
-    from pydantic import BaseModel
+    from pydantic import BaseModel, ConfigDict
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -65,6 +65,8 @@ if APIRouter is not None:
     RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
 
     class SegmentFrameRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         threshold: int | float | None = None
         threshold_method: ThresholdMethod | None = None
         manual_threshold: int | float | None = None
@@ -103,21 +105,14 @@ if APIRouter is not None:
         sobel_kernel_size: int | None = None
         frame_payload_kind: Literal["original", "raw", "preprocessed", "processed", "corrected"] = "original"
         apply_preprocessing: bool | None = None
-        flatfield_correction: bool | None = None
-        flatfield_q: float | None = None
-        flatfield_axis: int | None = None
-        flatfield_min_field_value: int | float | None = None
-        flatfield_max_field_value: int | float | None = None
+        min_field_value: int | float | None = None
+        max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
         crop_y: int | None = None
         crop_w: int | None = None
         crop_h: int | None = None
-        background_correction: bool | None = None
-        background_min_field_value: int | float | None = None
-        background_max_field_value: int | float | None = None
-        invert_intensity: bool | None = None
         mask_augmentation_enabled: bool | None = None
         mask_augmentation_steps: list[MaskAugmentationStep] | None = None
         roi_assembly_method: RoiAssemblyMethod | None = None

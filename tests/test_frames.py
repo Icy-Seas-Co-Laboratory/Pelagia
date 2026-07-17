@@ -297,6 +297,8 @@ def test_stored_flatfield_profile_correction_uses_row_mean_vector():
     )
 
 def test_preprocessing_prefers_stored_flatfield_profile():
+    config = CoreConfig()
+    config.processing.preprocessing.invert_intensity = False
     frame = FrameData(
         sourcePath="/tmp",
         filename="frame.png",
@@ -307,10 +309,8 @@ def test_preprocessing_prefers_stored_flatfield_profile():
 
     processed = preprocess_frame_for_segmentation(
         frame,
-        flatfield_correction=True,
-        flatfield_min_field_value=1,
-        background_correction=False,
-        invert_intensity=False,
+        min_field_value=1,
+        context=SimpleNamespace(config=config),
     )
 
     np.testing.assert_array_equal(
@@ -321,6 +321,8 @@ def test_preprocessing_prefers_stored_flatfield_profile():
 
 
 def test_preprocessing_uses_stored_row_profile_for_axis_one():
+    config = CoreConfig()
+    config.processing.preprocessing.invert_intensity = False
     frame = FrameData(
         sourcePath="/tmp",
         filename="frame.png",
@@ -334,10 +336,8 @@ def test_preprocessing_uses_stored_row_profile_for_axis_one():
 
     processed = preprocess_frame_for_segmentation(
         frame,
-        flatfield_correction=True,
-        flatfield_min_field_value=1,
-        background_correction=False,
-        invert_intensity=False,
+        min_field_value=1,
+        context=SimpleNamespace(config=config),
     )
 
     np.testing.assert_array_equal(

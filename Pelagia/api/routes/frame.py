@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 
 try:
     from fastapi import APIRouter, HTTPException, Request, Response
-    from pydantic import BaseModel
+    from pydantic import BaseModel, ConfigDict
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -39,6 +39,8 @@ if APIRouter is not None:
     routers = [frames_router]
 
     class FramePreprocessRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         frame_id: str | None = None
         frame_ids: list[str] | None = None
         asset_id: str | None = None
@@ -46,27 +48,22 @@ if APIRouter is not None:
         start_frame: int | None = None
         end_frame: int | None = None
         limit: int | None = None
-        flatfield_correction: bool | None = None
-        flatfield_q: float | None = None
-        flatfield_axis: int | None = None
-        flatfield_min_field_value: int | float | None = None
-        flatfield_max_field_value: int | float | None = None
+        min_field_value: int | float | None = None
+        max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
         crop_y: int | None = None
         crop_w: int | None = None
         crop_h: int | None = None
-        background_correction: bool | None = None
-        background_min_field_value: int | float | None = None
-        background_max_field_value: int | float | None = None
-        invert_intensity: bool | None = None
         store: bool = True
         encoding: Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"] | None = None
         quality: int | None = None
         response_format: Literal["metadata", "matrix"] = "metadata"
 
     class QueueFramePreprocessRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         run_id: str | None = None
         asset_id: str | None = None
         frame_id: str | None = None
@@ -74,23 +71,14 @@ if APIRouter is not None:
         start_frame: int | None = None
         end_frame: int | None = None
         limit: int | None = None
-        flatfield_correction: bool | None = None
-        flatfield_q: float | None = None
-        flatfield_axis: int | None = None
-        flatfield_min_field_value: int | float | None = None
-        flatfield_max_field_value: int | float | None = None
+        min_field_value: int | float | None = None
+        max_field_value: int | float | None = None
         apply_mask: bool | None = None
         crop_enabled: bool | None = None
         crop_x: int | None = None
         crop_y: int | None = None
         crop_w: int | None = None
         crop_h: int | None = None
-        background_correction: bool | None = None
-        background_window_stride: int | None = None
-        background_window_width: int | None = None
-        background_min_field_value: int | float | None = None
-        background_max_field_value: int | float | None = None
-        invert_intensity: bool | None = None
         encoding: Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"] | None = None
         quality: int | None = None
         priority: int | None = None
@@ -479,21 +467,14 @@ if APIRouter is not None:
         source_frame = retrieve_frame(str(row["id"]), context=context, payload_kind="original")
         processed = preprocess_frame_for_segmentation(
             source_frame,
-            flatfield_correction=body.flatfield_correction,
-            flatfield_q=body.flatfield_q,
-            flatfield_axis=body.flatfield_axis,
-            flatfield_min_field_value=body.flatfield_min_field_value,
-            flatfield_max_field_value=body.flatfield_max_field_value,
+            min_field_value=body.min_field_value,
+            max_field_value=body.max_field_value,
             apply_mask=body.apply_mask,
             crop_enabled=body.crop_enabled,
             crop_x=body.crop_x,
             crop_y=body.crop_y,
             crop_w=body.crop_w,
             crop_h=body.crop_h,
-            background_correction=body.background_correction,
-            background_min_field_value=body.background_min_field_value,
-            background_max_field_value=body.background_max_field_value,
-            invert_intensity=body.invert_intensity,
             context=context,
         )
         array = processed.read()
@@ -601,7 +582,6 @@ if APIRouter is not None:
         repository = get_repository(request)
         auth = require_project_write(request)
         processing_defaults = get_context(request).config.processing
-        flatfield_defaults = processing_defaults.flatfield
         preprocessing_defaults = processing_defaults.preprocessing
         frame_ids = list(body.frame_ids or [])
         if body.frame_id is not None:
@@ -641,23 +621,8 @@ if APIRouter is not None:
             "start_frame": body.start_frame,
             "end_frame": body.end_frame,
             "limit": body.limit,
-            "flatfield_correction": (
-                flatfield_defaults.flatfield_correction
-                if body.flatfield_correction is None
-                else body.flatfield_correction
-            ),
-            "flatfield_q": flatfield_defaults.flatfield_q if body.flatfield_q is None else body.flatfield_q,
-            "flatfield_axis": flatfield_defaults.flatfield_axis if body.flatfield_axis is None else body.flatfield_axis,
-            "flatfield_min_field_value": (
-                flatfield_defaults.flatfield_min_field_value
-                if body.flatfield_min_field_value is None
-                else body.flatfield_min_field_value
-            ),
-            "flatfield_max_field_value": (
-                flatfield_defaults.flatfield_max_field_value
-                if body.flatfield_max_field_value is None
-                else body.flatfield_max_field_value
-            ),
+            "min_field_value": body.min_field_value,
+            "max_field_value": body.max_field_value,
             "apply_mask": preprocessing_defaults.apply_mask if body.apply_mask is None else body.apply_mask,
             "crop_enabled": (
                 preprocessing_defaults.crop_enabled
@@ -668,28 +633,6 @@ if APIRouter is not None:
             "crop_y": preprocessing_defaults.crop_y if body.crop_y is None else body.crop_y,
             "crop_w": preprocessing_defaults.crop_w if body.crop_w is None else body.crop_w,
             "crop_h": preprocessing_defaults.crop_h if body.crop_h is None else body.crop_h,
-            "background_correction": (
-                preprocessing_defaults.background_correction
-                if body.background_correction is None
-                else body.background_correction
-            ),
-            "background_window_stride": body.background_window_stride,
-            "background_window_width": body.background_window_width,
-            "background_min_field_value": (
-                preprocessing_defaults.background_min_field_value
-                if body.background_min_field_value is None
-                else body.background_min_field_value
-            ),
-            "background_max_field_value": (
-                preprocessing_defaults.background_max_field_value
-                if body.background_max_field_value is None
-                else body.background_max_field_value
-            ),
-            "invert_intensity": (
-                preprocessing_defaults.invert_intensity
-                if body.invert_intensity is None
-                else body.invert_intensity
-            ),
             "encoding": body.encoding,
             "quality": body.quality,
         }
