@@ -193,6 +193,11 @@ def test_ingest_background_addon_supports_independent_output_windows():
     assert result["background"]["window_width"] == 3
     assert result["flatfield"]["window_stride"] == 1
     assert result["flatfield"]["window_width"] == 1
+    assert result["window_count"] == (
+        result["background"]["window_count"] + result["flatfield"]["window_count"]
+    )
+    assert result["background_window_count"] == result["background"]["window_count"]
+    assert result["flatfield_window_count"] == result["flatfield"]["window_count"]
     assert len(repository.calls) == 1
     assert "payload_ref" in repository.calls[0][0][0]
     assert "flatfield_profile" in repository.calls[0][0][0]

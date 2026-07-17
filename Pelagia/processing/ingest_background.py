@@ -270,6 +270,16 @@ class MeanFieldIngestAddon:
                 "backgrounds_generated": True,
                 "flatfield_profiles_generated": True,
                 "updated_frame_count": len(rows),
+                "window_count": (
+                    int(background_result["window_count"])
+                    + int(flatfield_result["window_count"])
+                ),
+                "stored_window_count": (
+                    int(background_result["stored_window_count"])
+                    + int(flatfield_result["stored_window_count"])
+                ),
+                "background_window_count": int(background_result["window_count"]),
+                "flatfield_window_count": int(flatfield_result["window_count"]),
                 "background": background_result,
                 "flatfield": flatfield_result,
             }

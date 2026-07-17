@@ -55,6 +55,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0001_processing_status",
         "0002_projectless_admin_sessions",
         "0003_processing_status_summary_indexes",
+        "0004_frame_flatfield_profiles",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -65,6 +66,10 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     summary_indexes = postgres.render_migration(migrations[2], "pelagia_unit")
     assert "frame_processing_status_has_candidates" in summary_indexes
     assert "{schema}" not in summary_indexes
+    flatfield_columns = postgres.render_migration(migrations[3], "pelagia_unit")
+    assert "ADD COLUMN IF NOT EXISTS flatfield_profile real[]" in flatfield_columns
+    assert "ADD COLUMN IF NOT EXISTS flatfield_metadata jsonb" in flatfield_columns
+    assert "{schema}" not in flatfield_columns
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -96,8 +101,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 3
-    assert status["migrations"]["applied_count"] == 3
+    assert status["migrations"]["available_count"] == 4
+    assert status["migrations"]["applied_count"] == 4
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 

@@ -139,6 +139,14 @@ def mark_job_frame_stage_failed(job: dict[str, Any], context: AppContext) -> Non
     try:
         payload = _job_payload(job)
         project_id = _job_project_id(job, context)
+        if str(job.get("stage")) == PipelineStage.EXTRACT_FRAMES.value:
+            asset_id = job.get("asset_id") or payload.get("asset_id")
+            _ensure_frame_status_rows(
+                context,
+                project_id=project_id,
+                frame_ids=[],
+                asset_id=None if asset_id is None else str(asset_id),
+            )
         _mark_frame_stage_status(
             context,
             project_id=project_id,
@@ -349,6 +357,17 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             frame_stored_callback=None if background_addon is None else background_addon.consume,
         )
 
+    # Publish newly inserted frames before optional field finalization so a late
+    # encoding/KVStore failure cannot leave the queue projection stale.
+    status_frame_ids = [str(row.get("id")) for row in frame_rows if row.get("id")]
+    _ensure_frame_status_rows(
+        context,
+        project_id=project_id,
+        frame_ids=status_frame_ids,
+        asset_id=asset_id,
+    )
+    _touch_processing_status_snapshot(context, project_id=project_id)
+
     background_result = None
     if background_addon is not None:
         background_progress_completed = max(
@@ -366,7 +385,14 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             background_progress_completed,
             secondary={
                 "field_generation": "completed",
-                "background_window_count": background_result["window_count"],
+                "background_window_count": background_result.get(
+                    "background_window_count",
+                    background_result["window_count"],
+                ),
+                "flatfield_window_count": background_result.get(
+                    "flatfield_window_count",
+                    background_result["window_count"],
+                ),
                 "flatfield_profiles_generated": background_result[
                     "flatfield_profiles_generated"
                 ],
@@ -388,14 +414,6 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         result["field_generation"] = background_result
         if background_result["backgrounds_generated"]:
             result["background_generation"] = background_result
-    status_frame_ids = [str(row.get("id")) for row in frame_rows if row.get("id")]
-    _ensure_frame_status_rows(
-        context,
-        project_id=project_id,
-        frame_ids=status_frame_ids,
-        asset_id=asset_id,
-    )
-    _touch_processing_status_snapshot(context, project_id=project_id)
     final_completed = max(
         len(frame_rows),
         int(ingest_progress_state["source_frames_read"]),

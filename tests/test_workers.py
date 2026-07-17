@@ -434,6 +434,49 @@ def test_extract_frames_handler_preserves_project_when_enqueuing_segment(monkeyp
     assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
+def test_extract_frames_handler_publishes_status_before_field_finalization(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo).for_project("project-1")
+
+    class FailingFieldAddon:
+        def __init__(self, **kwargs):
+            pass
+
+        def consume(self, frame_row, array):
+            pass
+
+        def finalize(self):
+            raise RuntimeError("field finalization failed")
+
+    monkeypatch.setattr("Pelagia.workers.handlers.MeanFieldIngestAddon", FailingFieldAddon)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.ingest_module.ingest_video_file",
+        lambda *args, **kwargs: [{"id": "frame-1"}],
+    )
+
+    with pytest.raises(RuntimeError, match="field finalization failed"):
+        extract_frames_handler(
+            {
+                "id": "job-1",
+                "project_id": "project-1",
+                "stage": PipelineStage.EXTRACT_FRAMES.value,
+                "run_id": "run-1",
+                "asset_id": "asset-1",
+                "payload": {},
+            },
+            context,
+        )
+
+    assert repo.frame_status_rows == [
+        {
+            "project_id": "project-1",
+            "frame_ids": ["frame-1"],
+            "asset_id": "asset-1",
+        }
+    ]
+    assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
+
+
 def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_path):
     repo = FakeRepository()
     image_dir = tmp_path / "frames"
