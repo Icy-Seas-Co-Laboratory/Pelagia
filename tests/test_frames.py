@@ -387,6 +387,34 @@ def test_divide_background_promotes_uint8_field_for_calculation():
     np.testing.assert_array_equal(corrected, np.full((1, 3), 255, dtype=np.uint8))
 
 
+def test_area_scan_preprocessing_divides_source_by_background_then_inverts():
+    config = CoreConfig()
+    config.processing.preprocessing.invert_intensity = True
+    source = np.array([[50, 100], [75, 200]], dtype=np.uint8)
+    background = np.array([[100, 100], [150, 100]], dtype=np.uint8)
+    frame = FrameData(
+        sourcePath="/tmp",
+        filename="frame.png",
+        frameNumber=1,
+        data=source,
+        bkg=background,
+    )
+
+    processed = preprocess_frame_for_segmentation(
+        frame,
+        min_field_value=1,
+        context=SimpleNamespace(config=config),
+    )
+
+    # Ratios below one remain as bright foreground; ratios at or above one clip to black.
+    np.testing.assert_array_equal(
+        processed.read(),
+        np.array([[128, 0], [128, 0]], dtype=np.uint8),
+    )
+    assert processed.metadata["correction_kind"] == "background"
+    assert processed.metadata["intensity_inverted"] is True
+
+
 def test_generate_background_for_frames_stores_mean_field(monkeypatch):
     class BackgroundKVStore:
         def __init__(self):
