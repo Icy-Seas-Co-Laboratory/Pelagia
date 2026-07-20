@@ -1,4 +1,4 @@
-.pelagia
+.pelagia/
 data/
 reports/
 
@@ -56,11 +56,29 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Python tooling caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Python build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
 # Virtual environments
 .venv/
-.venv-ml/
+.venv-*/
 venv/
 env/
+.tox/
+.nox/
 .ipynb_checkpoints/
 
 # Temporary or scratch data
@@ -91,6 +109,8 @@ packrat/src/
 
 .env
 .env.*
+!.env.example
+!.env.*.example
 *.key
 *.pem
 
