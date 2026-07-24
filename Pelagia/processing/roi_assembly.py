@@ -66,7 +66,8 @@ def assemble_connected_components(mask: np.ndarray, *, connectivity: int = 8) ->
         y = int(stats[label, cv2.CC_STAT_TOP])
         width = int(stats[label, cv2.CC_STAT_WIDTH])
         height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        area = float(stats[label, cv2.CC_STAT_AREA])
+        #area = float(stats[label, cv2.CC_STAT_AREA])
+        area = float(width * height) # area is bbox area.
         # Candidate masks are bbox-local even though bbox coordinates are frame-relative.
         component_mask = np.ascontiguousarray(
             (labels[y:y + height, x:x + width] == label).astype(np.uint8) * 255
