@@ -65,6 +65,46 @@ PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
+def _initial_job_progress(
+    stage: str,
+    status: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Seed queued jobs with known work-unit totals for aggregate progress."""
+    total = 0
+    unit = "units"
+    if stage in {
+        PipelineStage.PREPROCESS_FRAMES.value,
+        PipelineStage.SEGMENT.value,
+        PipelineStage.BACKGROUND_FRAMES.value,
+    }:
+        frame_ids = [value for value in payload.get("frame_ids") or [] if value]
+        if payload.get("frame_id"):
+            frame_ids.append(payload["frame_id"])
+        total = len(dict.fromkeys(str(frame_id) for frame_id in frame_ids))
+        unit = "frames"
+    elif stage == PipelineStage.ROI_REFINEMENT.value:
+        total = len(dict.fromkeys(str(value) for value in payload.get("detection_ids") or [] if value))
+        unit = "rois"
+
+    if total <= 0:
+        return {}
+    return {
+        "schema_version": 1,
+        "stage": stage,
+        "unit": unit,
+        "total": total,
+        "completed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "percent": 0.0,
+        "current": {},
+        "secondary": {},
+        "rates": {"units_per_second": None},
+        "message": f"{status} for {total} {unit}",
+    }
+
+
 def render_schema(schema: str = "seasight") -> str:
     schema = validate_schema_name(schema)
     template = files(__package__).joinpath("sql", "schema.sql").read_text(encoding="utf-8")
@@ -4552,6 +4592,7 @@ class PostgresRepository:
         payload: dict[str, Any] | None = None,
         depends_on: Sequence[str] | None = None,
         summary: str | None = None,
+        progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         stage_value = stage.value if isinstance(stage, PipelineStage) else stage
         status_value = status.value if isinstance(status, JobStatus) else status
@@ -4571,6 +4612,11 @@ class PostgresRepository:
                     for detection_id in (resolved_payload.get("detection_ids") or [])
                     if detection_id
                 ]
+                resolved_progress = progress or _initial_job_progress(
+                    stage_value,
+                    status_value,
+                    resolved_payload,
+                )
                 self._ensure_project_scope(
                     cursor,
                     resolved_project_id,
@@ -4583,8 +4629,8 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.processing_jobs
-                    (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, summary)
-                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s)
+                    (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary)
+                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s)
                     RETURNING *;
                     """,
                     (
@@ -4596,6 +4642,7 @@ class PostgresRepository:
                         priority if priority is not None else self.config.queue.default_priority,
                         max_attempts if max_attempts is not None else self.config.queue.max_attempts,
                         json.dumps(json_ready(resolved_payload)),
+                        json.dumps(json_ready(resolved_progress)),
                         summary,
                     ),
                 )
@@ -4776,12 +4823,17 @@ class PostgresRepository:
                         "Some frames are no longer eligible for preprocessing: " + ", ".join(missing[:10])
                     )
                 for job in jobs:
+                    progress = job.get("progress") or _initial_job_progress(
+                        PipelineStage.PREPROCESS_FRAMES.value,
+                        JobStatus.QUEUED.value,
+                        dict(job.get("payload") or {}),
+                    )
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.processing_jobs
-                            (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, summary)
+                            (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary)
                         VALUES (%s, %s, %s, 'preprocess_frames'::{self.schema}.stage_name,
-                                'queued'::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s)
+                                'queued'::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s)
                         RETURNING *
                         """,
                         (
@@ -4791,6 +4843,7 @@ class PostgresRepository:
                             priority if priority is not None else self.config.queue.default_priority,
                             self.config.queue.max_attempts,
                             json.dumps(json_ready(job["payload"])),
+                            json.dumps(json_ready(progress)),
                             job["summary"],
                         ),
                     )

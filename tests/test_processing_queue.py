@@ -9,7 +9,7 @@ from Pelagia.services.processing_queue import (
     PreprocessQueueRequest,
     ProcessingQueueService,
 )
-from Pelagia.storage.postgres import PostgresRepository
+from Pelagia.storage.postgres import PostgresRepository, _initial_job_progress
 
 
 class QueueRepository:
@@ -191,3 +191,23 @@ def test_queue_stage_batch_limits_are_controlled_by_the_backend():
     assert preprocess["batch_sizes"] == [PREPROCESS_FRAMES_PER_JOB, 1]
     assert segment["batch_sizes"] == [SEGMENT_FRAMES_PER_JOB, 1]
     assert refinement["batch_sizes"] == [ROI_REFINEMENT_DETECTIONS_PER_JOB, 1]
+
+
+def test_initial_job_progress_counts_queued_frame_and_roi_units():
+    frame_progress = _initial_job_progress(
+        "segment",
+        "queued",
+        {"frame_ids": ["frame-1", "frame-2", "frame-1"]},
+    )
+    roi_progress = _initial_job_progress(
+        "roi_refinement",
+        "queued",
+        {"detection_ids": ["roi-1", "roi-2", "roi-2"]},
+    )
+
+    assert frame_progress["unit"] == "frames"
+    assert frame_progress["total"] == 2
+    assert frame_progress["completed"] == 0
+    assert roi_progress["unit"] == "rois"
+    assert roi_progress["total"] == 2
+    assert roi_progress["completed"] == 0
