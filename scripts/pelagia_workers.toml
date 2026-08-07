@@ -40,7 +40,7 @@ requeue_interval_seconds = 30.0
 
 [worker_profiles]
 default = "cpu"
-roi_refinement = "gpu-ml"
+roi_refinement = "cpu"
 
 [[worker]]
 name = "fio-1"
@@ -91,9 +91,9 @@ name = "cpu-6"
 capabilities = ["segment"]
 
 [[worker]]
-name = "gpu-1"
+name = "refine-1"
 capabilities = ["roi_refinement"]
 
 [[worker]]
-name = "gpu-2"
+name = "refine-2"
 capabilities = ["roi_refinement"]

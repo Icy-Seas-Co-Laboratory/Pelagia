@@ -34,48 +34,17 @@ from the lockfile. For development and tests:
 ./scripts/pelagia_env sync dev
 ```
 
-For machines that will run learned ROI refinement models such as the
-oracle-builder U-Net adapter, synchronize one of the managed ML profiles:
-
-```bash
-./scripts/pelagia_env sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env sync ml-cuda
-```
-
-The ML install includes TensorFlow/Keras and is intentionally separate because
-it is much heavier than the normal backend runtime. On Linux x86_64,
-`requirements-ml.txt` uses TensorFlow's `and-cuda` pip extra so NVIDIA GPU
-support is preferred when the driver/runtime can use it.
-
-The `ml-metal` profile installs the TensorFlow 2.18 / `tensorflow-metal` 1.2
-combination; `ml-cuda` installs the current TensorFlow CUDA target. Use
-`./scripts/pelagia_env doctor gpu-ml --require-gpu` after synchronization to
-verify hardware visibility.
-
-## 2.1 Separate CPU And GPU/ML Workers
-
-Keep the API plus ingest, background, preprocess, and segment workers in the
-managed `cpu` profile (`.venv`). Use the managed ML profile (`.venv-ml`) for
-`roi_refinement` workers. The bootstrap script synchronizes each environment
-from `uv.lock` and records its profile:
-
-```bash
-./scripts/pelagia_env sync cpu
-./scripts/pelagia_env sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env sync ml-cuda
-```
-
-Configure the TOML worker stack to select managed environments by capability:
+Pelagia has no TensorFlow/Keras dependency. Oracle Builder owns model execution
+and GPU isolation. All Pelagia workers, including ROI refinement orchestration,
+use `.venv`:
 
 ```toml
 [worker_profiles]
 default = "cpu"
-roi_refinement = "gpu-ml"
+roi_refinement = "cpu"
 ```
 
-`roi_refinement` is the GPU/ML capability and must have a dedicated worker;
-the stack rejects a worker that mixes it with CPU pipeline capabilities. Confirm
-the environment and resolved interpreters with:
+Confirm the environment and resolved interpreters with:
 
 ```bash
 ./scripts/pelagia_env doctor all
@@ -89,10 +58,6 @@ built wheel while synchronizing the CPU profile, then require it in the doctor:
 ./scripts/pelagia_env sync cpu --imagecodecs-wheel /path/to/imagecodecs-*.whl
 ./scripts/pelagia_env doctor cpu --require-jpegxs
 ```
-
-On a GPU-only worker host, disable the API and set `control = "gpu-ml"` in
-`[worker_profiles]`; this uses the ML environment for stack lifecycle commands
-without starting CPU workers.
 
 ## 3. Configure Local Settings
 
@@ -120,14 +85,12 @@ host = "127.0.0.1"
 port = 8000
 ```
 
-For learned ROI refinement with the current oracle-builder test run:
+Configure the Oracle Builder service used for learned refinement:
 
 ```toml
-[processing.roi_refinement]
-enabled = true
-model_kind = "oracle_builder_unet"
-model_run_dir = "../oracle-builder/runs/unet-test"
-model_artifact = "auto"
+[oracle]
+base_url = "http://127.0.0.1:8100"
+default_mask_model = "pelagia-refiner"
 ```
 
 ## 4. Initialize And Run
@@ -164,6 +127,6 @@ You can also run these without activation:
 .venv/bin/python -m pytest
 ```
 
-The oracle-builder U-Net artifact tests validate artifact metadata without
-TensorFlow. Actual SavedModel inference tests require the ML environment and are
-skipped when TensorFlow is not installed.
+The Oracle transport and whole-crop orchestration tests use dependency-injected
+fake services, so Pelagia's test suite does not require TensorFlow or a running
+Oracle process.

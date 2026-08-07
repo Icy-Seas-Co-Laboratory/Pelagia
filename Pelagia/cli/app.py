@@ -131,7 +131,6 @@ if typer is not None:
     def environment_doctor(
         profile: str = "all",
         root: Path = Path("."),
-        require_gpu: bool = False,
         require_jpegxs: bool = False,
     ) -> None:
         """Report whether named worker environments are ready to run."""
@@ -141,7 +140,6 @@ if typer is not None:
             result = doctor_profiles(
                 profile,
                 root=root,
-                require_gpu=require_gpu,
                 require_jpegxs=require_jpegxs,
             )
         except ValueError as exc:

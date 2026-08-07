@@ -13,7 +13,6 @@ from .segmentation_options import (
     ROI_ENCODINGS,
     segmentation_capabilities,
 )
-from ..services.models import ModelService
 from .codec_registry import image_codec_available
 
 
@@ -138,48 +137,47 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
     }
 
 
-def roi_refinement_capabilities(config: CoreConfig) -> dict[str, Any]:
+def roi_refinement_capabilities(
+    config: CoreConfig,
+    *,
+    oracle_models: list[dict[str, Any]] | None = None,
+    oracle_health: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return GUI-facing ROI refinement defaults, valid options, and model refs."""
-    models = ModelService.from_config(config).list_model_artifacts()
-    roi_models = [model for model in models if model.get("kind") == "roi_refinement"]
     defaults = config.processing.roi_refinement
+    models = list(oracle_models or [])
+    model_refs = [str(model["alias"]) for model in models if model.get("alias")]
+    if config.oracle.default_mask_model not in model_refs:
+        model_refs.insert(0, config.oracle.default_mask_model)
     return {
         "pipeline_stage_order": [
             "source",
             "model_selection",
-            "tiling",
-            "prediction",
+            "oracle_inference",
             "expansion",
             "residual_discovery",
             "reconciliation",
             "recording",
         ],
         "supported": {
-            "model_kinds": ["identity", "keras_artifact", "oracle_builder_unet"],
-            "model_refs": [model["ref"] for model in roi_models],
-            "model_artifacts": roi_models,
+            "inference_backend": "oracle_builder",
+            "model_refs": model_refs,
+            "models": models,
+            "oracle": oracle_health or {"enabled": config.oracle.enabled, "status": "unknown"},
             "roi_encoding_options": ROI_ENCODINGS,
         },
         "defaults": {
-            "roi_refinement": _dataclass_dict(defaults),
+            "roi_refinement": {
+                **_dataclass_dict(defaults),
+                "model_ref": config.oracle.default_mask_model,
+            },
         },
         "fields": {
             "source": [
                 _field("detection_ids", "Detection IDs", "string-list", request_field_name="detection_ids"),
             ],
             "model_selection": [
-                _field("model_kind", "Model Kind", "enum", options=["identity", "keras_artifact", "oracle_builder_unet"], config_section="processing.roi_refinement"),
-                _field("model_ref", "Model Reference", "enum", options=[model["ref"] for model in roi_models], config_section="processing.roi_refinement"),
-                _field("model_run_dir", "Model Run Directory", "nullable-string", config_section="processing.roi_refinement"),
-                _field("model_artifact", "Model Artifact", "enum", options=["auto", "keras", "savedmodel"], config_section="processing.roi_refinement"),
-            ],
-            "tiling": [
-                _field("tile_size", "Tile Size", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
-                _field("overlap_fraction", "Overlap Fraction", "number", minimum=0, maximum=0.99, step=0.01, config_section="processing.roi_refinement"),
-                _field("batch_size", "Batch Size", "nullable-integer", minimum=1, step=1, config_section="processing.roi_refinement"),
-            ],
-            "prediction": [
-                _field("output_threshold", "Output Threshold", "number", minimum=0, maximum=1, step=0.01, config_section="processing.roi_refinement"),
+                _field("model_ref", "Oracle Model", "enum", options=model_refs, config_section="oracle"),
             ],
             "expansion": [
                 _field("allow_frame_expansion", "Allow Frame Expansion", "boolean", default=True),

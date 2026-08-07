@@ -157,5 +157,5 @@ Before any non-disposable reset:
 - Copy the configured KVStore root.
 - Copy any explicit project KVStore roots.
 - Copy `config.toml`.
-- Copy `.pelagia/` if it contains local models or plugin manifests.
+- Copy `.pelagia/` if it contains local plugin manifests.
 - Confirm where raw source files live if you need to reproduce ingestion.

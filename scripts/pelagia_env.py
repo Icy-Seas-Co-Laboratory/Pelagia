@@ -18,7 +18,7 @@ def main() -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     sync = subcommands.add_parser("sync", help="Create and install a named environment.")
-    sync.add_argument("profile", choices=["cpu", "dev", "ml-metal", "ml-cuda"])
+    sync.add_argument("profile", choices=["cpu", "dev"])
     sync.add_argument("--root", type=Path, default=ROOT_DIR)
     sync.add_argument("--python", help="Python version request or interpreter path (default: 3.12).")
     sync.add_argument("--uv", type=Path, help="Path to the uv executable.")
@@ -26,9 +26,8 @@ def main() -> int:
     sync.add_argument("--dry-run", action="store_true")
 
     doctor = subcommands.add_parser("doctor", help="Report whether named environments are ready.")
-    doctor.add_argument("profile", nargs="?", default="all", choices=["all", "cpu", "gpu-ml"])
+    doctor.add_argument("profile", nargs="?", default="all", choices=["all", "cpu"])
     doctor.add_argument("--root", type=Path, default=ROOT_DIR)
-    doctor.add_argument("--require-gpu", action="store_true")
     doctor.add_argument("--require-jpegxs", action="store_true")
 
     args = parser.parse_args()
@@ -47,7 +46,6 @@ def main() -> int:
             result = doctor_profiles(
                 args.profile,
                 root=args.root,
-                require_gpu=args.require_gpu,
                 require_jpegxs=args.require_jpegxs,
             )
             status = 0 if result["healthy"] else 1

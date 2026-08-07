@@ -13,19 +13,16 @@ if APIRouter is not None:
     from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
     from ...domain import DetectionRecord, PipelineStage
-    from ...processing.detection_refinement import (
-        IdentityRoiRefinementModel,
-        RoiRefinementOptions,
-        refine_detections,
-        refined_storage_candidate_detection_id,
-    )
+    from ...processing.detection_refinement import RoiRefinementOptions, refine_detections, refined_storage_candidate_detection_id
     from ...processing.frame_store import retrieve_frame
-    from ...processing.oracle_unet_refiner import (
-        OracleUnetRefinerError,
-        resolve_refinement_model,
+    from ...processing.oracle_client import (
+        OracleInferenceClient,
+        OracleInferenceError,
+        OracleRejectedError,
+        OracleRoiRefinementBackend,
+        OracleUnavailableError,
     )
     from ...processing.capabilities import roi_refinement_capabilities
-    from ...services.models import ModelService
     from ...services.job_commands import RoiRefinementCommand
     from ...services.pipeline import PipelineService
     from ._common import (
@@ -38,24 +35,16 @@ if APIRouter is not None:
         touch_processing_status_snapshot,
     )
 
-    ModelKind = Literal["identity", "keras_artifact", "oracle_builder_unet"]
     RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
 
     class RoiRefinementRequest(BaseModel):
-        model_config = ConfigDict(protected_namespaces=())
+        model_config = ConfigDict(protected_namespaces=(), extra="forbid")
 
         detection_ids: list[str] = Field(default_factory=list)
         model_ref: str | None = None
-        model_kind: ModelKind | None = None
-        model_run_dir: str | None = None
-        model_artifact: str | None = None
-        batch_size: int | None = None
-        tile_size: int | None = None
-        overlap_fraction: float | None = None
         max_iterations: int | None = None
         expansion_pixels: int | None = None
         edge_touch_margin: int | None = None
-        output_threshold: float | None = None
         encoding: RoiEncoding | None = None
         overlap_reconciliation_enabled: bool | None = None
         overlap_iou_threshold: float | None = None
@@ -98,12 +87,6 @@ if APIRouter is not None:
         values = _model_dict(body)
         try:
             return RoiRefinementOptions(
-                tile_size=values.get("tile_size") or defaults.tile_size,
-                overlap_fraction=(
-                    defaults.overlap_fraction
-                    if values.get("overlap_fraction") is None
-                    else values["overlap_fraction"]
-                ),
                 max_iterations=values.get("max_iterations") or defaults.max_iterations,
                 expansion_pixels=(
                     defaults.expansion_pixels
@@ -111,16 +94,6 @@ if APIRouter is not None:
                     else values["expansion_pixels"]
                 ),
                 edge_touch_margin=values.get("edge_touch_margin") or defaults.edge_touch_margin,
-                output_threshold=(
-                    defaults.output_threshold
-                    if values.get("output_threshold") is None
-                    else values["output_threshold"]
-                ),
-                batch_size=(
-                    defaults.batch_size
-                    if values.get("batch_size") is None
-                    else values["batch_size"]
-                ),
                 encoding=_resolved_encoding(values.get("encoding"), defaults.encoding),
                 overlap_reconciliation_enabled=(
                     defaults.overlap_reconciliation_enabled
@@ -188,42 +161,23 @@ if APIRouter is not None:
 
     def _requested_model_metadata(request: Request, body: RoiRefinementRequest) -> dict[str, Any]:
         context = get_context(request)
-        defaults = context.config.processing.roi_refinement
-        using_defaults = body.model_kind is None and body.model_ref is None and body.model_run_dir is None
-        model_ref = body.model_ref or (defaults.model_ref if defaults.enabled and using_defaults else None)
-        model_kind = body.model_kind or (
-            "keras_artifact"
-            if model_ref
-            else (defaults.model_kind if defaults.enabled and using_defaults else "identity")
-        )
-        model_run_dir = body.model_run_dir or defaults.model_run_dir
-        model_artifact = body.model_artifact or defaults.model_artifact
-        model_info = {
-            "model_kind": model_kind,
-            "model_ref": model_ref,
-            "model_run_dir": model_run_dir,
-            "model_artifact": model_artifact,
+        return {
+            "inference_backend": "oracle_builder",
+            "model_ref": body.model_ref or context.config.oracle.default_mask_model,
+            "oracle_base_url": context.config.oracle.base_url,
         }
-        if model_ref:
-            manifest = ModelService.from_config(context.config).find_model_artifact(model_ref)
-            if manifest is None:
-                raise HTTPException(status_code=422, detail=f"ROI refinement model_ref was not found: {model_ref!r}.")
-            model_info["model"] = manifest
-        return model_info
 
-    def _resolve_model(request: Request, body: RoiRefinementRequest):
+    def _resolve_backend(request: Request, body: RoiRefinementRequest):
         context = get_context(request)
-        defaults = context.config.processing.roi_refinement
-        try:
-            return resolve_refinement_model(
-                context.config,
-                model_kind=body.model_kind,
-                model_ref=body.model_ref,
-                model_run_dir=body.model_run_dir,
-                model_artifact=body.model_artifact or defaults.model_artifact,
-            )
-        except (ValueError, OracleUnetRefinerError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not context.config.oracle.enabled:
+            raise HTTPException(status_code=503, detail="Oracle Builder inference is disabled.")
+        if context.oracle is not None:
+            return context.oracle
+        model_ref = body.model_ref or context.config.oracle.default_mask_model
+        return OracleRoiRefinementBackend(
+            OracleInferenceClient(context.config.oracle),
+            model_ref,
+        )
 
     def _missing_roi_payload_ids(rows: list[dict[str, Any]]) -> list[str]:
         return [
@@ -235,7 +189,20 @@ if APIRouter is not None:
     @router.get("/options", response_model=OptionsResponse)
     def get_roi_refinement_options(request: Request) -> dict:
         context = get_context(request)
-        return as_response(roi_refinement_capabilities(context.config))
+        client = context.oracle or OracleInferenceClient(context.config.oracle)
+        try:
+            models = client.list_models(task="segmentation")
+            oracle_health = {"enabled": True, "status": "ready"}
+        except OracleInferenceError:
+            models = []
+            oracle_health = {"enabled": context.config.oracle.enabled, "status": "unavailable"}
+        return as_response(
+            roi_refinement_capabilities(
+                context.config,
+                oracle_models=models,
+                oracle_health=oracle_health,
+            )
+        )
 
     @router.get("")
     def get_roi_refinement_endpoint() -> dict:
@@ -305,12 +272,8 @@ if APIRouter is not None:
                     ),
                 )
 
-        model = _resolve_model(request, body)
-        method = (
-            "identity"
-            if isinstance(model, IdentityRoiRefinementModel)
-            else getattr(model, "method_name", None) or model.__class__.__name__
-        )
+        backend = _resolve_backend(request, body)
+        method = backend.method_name
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
 
         frame_loader = None
@@ -330,7 +293,7 @@ if APIRouter is not None:
         try:
             results = refine_detections(
                 detection_records,
-                model=model,
+                backend=backend,
                 frame_loader=frame_loader,
                 options=options,
                 method=method,
@@ -339,6 +302,12 @@ if APIRouter is not None:
                 result.as_detection_record(encoding=options.encoding)
                 for result in results
             ]
+        except OracleRejectedError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except OracleUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except OracleInferenceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -407,17 +376,10 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Detection {body.detection_ids[0]!r} was not found.")
         payload = {
             "detection_ids": body.detection_ids,
-            "model_ref": body.model_ref,
-            "model_kind": body.model_kind,
-            "model_run_dir": body.model_run_dir,
-            "model_artifact": body.model_artifact,
-            "batch_size": options.batch_size,
-            "tile_size": options.tile_size,
-            "overlap_fraction": options.overlap_fraction,
+            "model_ref": body.model_ref or context.config.oracle.default_mask_model,
             "max_iterations": options.max_iterations,
             "expansion_pixels": options.expansion_pixels,
             "edge_touch_margin": options.edge_touch_margin,
-            "output_threshold": options.output_threshold,
             "encoding": options.encoding,
             "overlap_reconciliation_enabled": options.overlap_reconciliation_enabled,
             "overlap_iou_threshold": options.overlap_iou_threshold,
@@ -467,13 +429,9 @@ if APIRouter is not None:
 
     def _options_dict(options: RoiRefinementOptions) -> dict[str, Any]:
         return {
-            "tile_size": options.tile_size,
-            "overlap_fraction": options.overlap_fraction,
             "max_iterations": options.max_iterations,
             "expansion_pixels": options.expansion_pixels,
             "edge_touch_margin": options.edge_touch_margin,
-            "output_threshold": options.output_threshold,
-            "batch_size": options.batch_size,
             "encoding": options.encoding,
             "overlap_reconciliation_enabled": options.overlap_reconciliation_enabled,
             "overlap_iou_threshold": options.overlap_iou_threshold,

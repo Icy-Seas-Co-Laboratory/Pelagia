@@ -16,7 +16,7 @@ from ..processing.frame_correction import ensure_asset_background_windows
 from ..processing.ingest_background import MeanFieldIngestAddon
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
-from ..processing.oracle_unet_refiner import resolve_refinement_model
+from ..processing.oracle_client import OracleInferenceClient, OracleRoiRefinementBackend
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
@@ -855,13 +855,9 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
 def _roi_refinement_options_from_payload(payload: dict[str, Any], context: AppContext) -> RoiRefinementOptions:
     defaults = context.config.processing.roi_refinement
     return RoiRefinementOptions(
-        tile_size=int(payload.get("tile_size", defaults.tile_size)),
-        overlap_fraction=float(payload.get("overlap_fraction", defaults.overlap_fraction)),
         max_iterations=int(payload.get("max_iterations", defaults.max_iterations)),
         expansion_pixels=payload.get("expansion_pixels", defaults.expansion_pixels),
         edge_touch_margin=int(payload.get("edge_touch_margin", defaults.edge_touch_margin)),
-        output_threshold=float(payload.get("output_threshold", defaults.output_threshold)),
-        batch_size=payload.get("batch_size", defaults.batch_size),
         encoding=_resolved_roi_refinement_encoding(payload.get("encoding", defaults.encoding)),
         overlap_reconciliation_enabled=bool(
             payload.get(
@@ -967,16 +963,11 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     defaults = context.config.processing.roi_refinement
     with measure_phase("refinement.model_resolution"):
-        model = resolve_refinement_model(
-            context.config,
-            model_kind=payload.get("model_kind"),
-            model_ref=payload.get("model_ref"),
-            model_run_dir=payload.get("model_run_dir"),
-            model_artifact=payload.get("model_artifact", defaults.model_artifact),
+        backend = context.oracle or OracleRoiRefinementBackend(
+            OracleInferenceClient(context.config.oracle),
+            payload.get("model_ref") or context.config.oracle.default_mask_model,
         )
-    method = "identity" if model.__class__.__name__ == "IdentityRoiRefinementModel" else (
-        getattr(model, "method_name", None) or model.__class__.__name__
-    )
+    method = backend.method_name
     with measure_phase("refinement.options_resolution"):
         options = _roi_refinement_options_from_payload(payload, context)
         if payload.get("encoding") is None:
@@ -1002,7 +993,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
     results = refine_detections(
         detection_records,
-        model=model,
+        backend=backend,
         frame_loader=frame_loader,
         options=options,
         method=method,
@@ -1058,17 +1049,13 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "detection_ids": detection_ids,
         "refined_detection_ids": [row.get("id") for row in stored],
         "frame_ids": frame_ids,
-        "model_kind": payload.get("model_kind") or defaults.model_kind,
-        "model_ref": payload.get("model_ref"),
+        "inference_backend": "oracle_builder",
+        "model_ref": payload.get("model_ref") or context.config.oracle.default_mask_model,
         "refinement_method": method,
         "resolved_options": {
-            "tile_size": options.tile_size,
-            "overlap_fraction": options.overlap_fraction,
             "max_iterations": options.max_iterations,
             "expansion_pixels": options.expansion_pixels,
             "edge_touch_margin": options.edge_touch_margin,
-            "output_threshold": options.output_threshold,
-            "batch_size": options.batch_size,
             "encoding": options.encoding,
             "overlap_reconciliation_enabled": options.overlap_reconciliation_enabled,
             "overlap_iou_threshold": options.overlap_iou_threshold,

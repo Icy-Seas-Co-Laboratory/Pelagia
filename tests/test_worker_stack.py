@@ -26,7 +26,6 @@ def _write_stack_config(tmp_path: Path, contents: str) -> Path:
 
 def test_stack_validate_selects_venv_by_worker_capability(tmp_path):
     cpu_venv = _venv_path(tmp_path, "cpu")
-    gpu_ml_venv = _venv_path(tmp_path, "gpu-ml")
     config_path = _write_stack_config(
         tmp_path,
         f'''
@@ -59,16 +58,16 @@ capabilities = ["roi_refinement"]
         env={
             **os.environ,
             "PELAGIA_CPU_VENV": str(cpu_venv),
-            "PELAGIA_GPU_ML_VENV": str(gpu_ml_venv),
         },
     )
 
     assert result.returncode == 0, result.stderr
     assert f"worker-ingest profile=cpu stages=extract_frames,preprocess_frames python={cpu_venv}/bin/python" in result.stdout
-    assert f"worker-refine profile=gpu-ml stages=roi_refinement python={gpu_ml_venv}/bin/python" in result.stdout
+    assert f"worker-refine profile=cpu stages=roi_refinement python={cpu_venv}/bin/python" in result.stdout
 
 
-def test_stack_validate_rejects_mixed_gpu_ml_and_cpu_capabilities(tmp_path):
+def test_stack_validate_allows_refinement_with_other_cpu_capabilities(tmp_path):
+    cpu_venv = _venv_path(tmp_path, "cpu")
     config_path = _write_stack_config(
         tmp_path,
         f'''
@@ -77,7 +76,7 @@ name = "pytest-worker-stack"
 run_dir = "{tmp_path / "run"}"
 
 [[worker]]
-name = "invalid"
+name = "combined"
 capabilities = ["ingest", "roi_refinement"]
 ''',
     )
@@ -88,7 +87,8 @@ capabilities = ["ingest", "roi_refinement"]
         text=True,
         capture_output=True,
         check=False,
+        env={**os.environ, "PELAGIA_CPU_VENV": str(cpu_venv)},
     )
 
-    assert result.returncode != 0
-    assert "mixes GPU/ML capabilities with CPU capabilities" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert f"profile=cpu stages=extract_frames,roi_refinement python={cpu_venv}/bin/python" in result.stdout

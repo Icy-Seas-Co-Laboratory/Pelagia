@@ -22,6 +22,7 @@ from dataclasses import asdict
 from Pelagia.domain import FrameRecord, PipelineStage
 from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
+from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
 from Pelagia.services.io_exports import ExportPayload, _sqlite_bytes, _xlsx_bytes
 
@@ -1109,6 +1110,38 @@ class FakeKVStore2Status:
         return {"healthy": True, "errors": [], "warnings": []}
 
 
+class FakeOracle:
+    method_name = "oracle_builder:test-refiner"
+
+    def list_models(self, *, task="segmentation"):
+        return [
+            {
+                "alias": "test-refiner",
+                "loaded": True,
+                "available": True,
+                "task": task,
+                "model": {
+                    "artifact_id": "artifact-test",
+                    "run_id": "run-test",
+                    "task": task,
+                    "architecture": "unet",
+                },
+            }
+        ]
+
+    def health(self):
+        return {"enabled": True, "status": "ready"}
+
+    def refine_batch(self, inputs):
+        return [
+            RoiRefinementPrediction(
+                mask=np.asarray(item.candidate_mask),
+                metadata={"oracle_model": {"artifact_id": "artifact-test"}},
+            )
+            for item in inputs
+        ]
+
+
 def make_client(*, auth_enabled=False):
     config = CoreConfig()
     config.auth.enabled = auth_enabled
@@ -1118,7 +1151,12 @@ def make_client(*, auth_enabled=False):
     repository = FakeRepository()
     kvstore = FakeKVStore()
     app.state.config = config
-    app.state.context = AppContext(config=config, repository=repository, kvstore=kvstore)
+    app.state.context = AppContext(
+        config=config,
+        repository=repository,
+        kvstore=kvstore,
+        oracle=FakeOracle(),
+    )
     return TestClient(app), repository, kvstore
 
 
@@ -1404,7 +1442,7 @@ def test_api_exposes_system_capabilities():
     assert "roi_refinement" in body["processing"]
     assert "mask_augmentation" in body["processing"]["groups"]
     assert "roi_refinement" in body["processing"]["groups"]
-    assert "builtin:model/roi_refinement/example_model" in body["processing"]["roi_refinement"]["supported"]["model_refs"]
+    assert body["processing"]["roi_refinement"]["supported"]["inference_backend"] == "oracle_builder"
     assert body["storage"]["kvstore"]["hash_algorithm_options"] == ["sha256", "blake3"]
 
 
@@ -1833,20 +1871,15 @@ def test_api_roi_refinement_options_are_ui_ready():
     assert body["pipeline_stage_order"] == [
         "source",
         "model_selection",
-        "tiling",
-        "prediction",
+        "oracle_inference",
         "expansion",
         "residual_discovery",
         "reconciliation",
         "recording",
     ]
-    assert "identity" in body["supported"]["model_kinds"]
-    assert "keras_artifact" in body["supported"]["model_kinds"]
-    assert "builtin:model/roi_refinement/example_model" in body["supported"]["model_refs"]
-    assert body["defaults"]["roi_refinement"]["model_ref"] == "builtin:model/roi_refinement/example_model"
-    fields = {field["key"]: field for field in body["fields"]["tiling"]}
-    assert fields["batch_size"]["type"] == "nullable-integer"
-    assert fields["tile_size"]["min"] == 1
+    assert body["supported"]["inference_backend"] == "oracle_builder"
+    assert "test-refiner" in body["supported"]["model_refs"]
+    assert body["supported"]["oracle"]["status"] == "ready"
     reconciliation_fields = {field["key"]: field for field in body["fields"]["reconciliation"]}
     assert reconciliation_fields["overlap_iou_threshold"]["max"] == 1
     assert body["defaults"]["roi_refinement"]["overlap_reconciliation_enabled"] is True
@@ -1869,14 +1902,14 @@ def test_api_roi_refinement_get_describes_post_contract():
     assert "detection_ids" in body["required_payload"]
 
 
-def test_api_roi_refinement_dry_run_resolves_builtin_model_ref():
+def test_api_roi_refinement_dry_run_resolves_oracle_model_ref():
     client, _, _ = make_client()
 
     response = client.post(
         "/roi-refinement",
         json={
             "detection_ids": ["det-1"],
-            "model_ref": "builtin:model/roi_refinement/example_model",
+            "model_ref": "test-refiner",
             "dry_run": True,
         },
     )
@@ -1885,21 +1918,20 @@ def test_api_roi_refinement_dry_run_resolves_builtin_model_ref():
     body = response.json()
     assert body["dry_run"] is True
     assert body["candidate_count"] == 1
-    assert body["model"]["ref"] == "builtin:model/roi_refinement/example_model"
-    assert body["model"]["artifact_path"].endswith("/model.keras")
+    assert body["inference_backend"] == "oracle_builder"
+    assert body["model_ref"] == "test-refiner"
 
 
-def test_api_roi_refinement_identity_stores_refined_detection():
+def test_api_roi_refinement_oracle_stores_refined_detection():
     client, repository, _ = make_client()
 
     response = client.post(
         "/roi-refinement",
         json={
             "detection_ids": ["det-1"],
-            "model_kind": "identity",
+            "model_ref": "test-refiner",
             "allow_frame_expansion": False,
             "store": True,
-            "batch_size": 1,
             "encoding": "raw",
         },
     )
@@ -1917,7 +1949,8 @@ def test_api_roi_refinement_identity_stores_refined_detection():
     assert refined["refined_roi_url"] == "/refined-detections/refined-det-1/roi"
     assert refined["refined_mask_url"] == "/refined-detections/refined-det-1/mask"
     assert refined["metadata"]["detection_stage"] == "refined"
-    assert refined["metadata"]["refinement_method"] == "identity"
+    assert refined["metadata"]["refinement_method"] == "oracle_builder:test-refiner"
+    assert refined["metadata"]["oracle_model"]["artifact_id"] == "artifact-test"
     assert repository.frame_stage_status_updates == [
         {
             "project_id": "project-1",
@@ -1940,7 +1973,7 @@ def test_api_roi_refinement_rejects_missing_roi_payload():
         "/roi-refinement",
         json={
             "detection_ids": ["det-no-roi"],
-            "model_kind": "identity",
+            "model_ref": "test-refiner",
             "allow_frame_expansion": False,
         },
     )
@@ -1970,9 +2003,8 @@ def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeyp
         "/roi-refinement",
         json={
             "detection_ids": ["det-no-roi"],
-            "model_kind": "identity",
+            "model_ref": "test-refiner",
             "store": True,
-            "batch_size": 1,
             "encoding": "raw",
         },
     )
@@ -1991,10 +2023,9 @@ def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
         "/roi-refinement",
         json={
             "detection_ids": ["det-1"],
-            "model_kind": "identity",
+            "model_ref": "test-refiner",
             "allow_frame_expansion": False,
             "store": True,
-            "batch_size": 1,
             "encoding": "auto",
         },
     )
@@ -2014,9 +2045,8 @@ def test_api_queue_roi_refinement_job():
         headers=headers,
         json={
             "detection_ids": ["det-1"],
-            "model_kind": "identity",
+            "model_ref": "test-refiner",
             "allow_frame_expansion": False,
-            "batch_size": 2,
             "residual_discovery_enabled": True,
             "residual_min_area": 4,
             "residual_roi_assembly_connectivity": 4,
@@ -2034,8 +2064,7 @@ def test_api_queue_roi_refinement_job():
     assert body["job"]["priority"] == 7
     assert body["job"]["depends_on"] == ["job-1"]
     assert body["job"]["payload"]["detection_ids"] == ["det-1"]
-    assert body["job"]["payload"]["model_kind"] == "identity"
-    assert body["job"]["payload"]["batch_size"] == 2
+    assert body["job"]["payload"]["model_ref"] == "test-refiner"
     assert body["job"]["payload"]["residual_discovery_enabled"] is True
     assert body["job"]["payload"]["residual_min_area"] == 4
     assert body["job"]["payload"]["residual_roi_assembly_connectivity"] == 4
@@ -2052,7 +2081,7 @@ def test_api_queue_roi_refinement_job_dry_run():
         headers=headers,
         json={
             "detection_ids": ["det-1"],
-            "model_ref": "builtin:model/roi_refinement/example_model",
+            "model_ref": "test-refiner",
             "dry_run": True,
         },
     )
@@ -2061,7 +2090,7 @@ def test_api_queue_roi_refinement_job_dry_run():
     body = response.json()
     assert body["dry_run"] is True
     assert body["payload"]["detection_ids"] == ["det-1"]
-    assert body["model"]["ref"] == "builtin:model/roi_refinement/example_model"
+    assert body["model_ref"] == "test-refiner"
 
 
 def test_api_preprocessing_options_are_ui_ready():

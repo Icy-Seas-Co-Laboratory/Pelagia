@@ -19,7 +19,6 @@ PELAGIA_REQUEUE_INTERVAL_SECONDS="${PELAGIA_REQUEUE_INTERVAL_SECONDS:-30.0}"
 PELAGIA_INIT_ON_START="${PELAGIA_INIT_ON_START:-auto}"
 PELAGIA_INIT_STATEMENT_TIMEOUT_MS="${PELAGIA_INIT_STATEMENT_TIMEOUT_MS:-0}"
 PELAGIA_CPU_VENV="${PELAGIA_CPU_VENV:-$ROOT_DIR/.venv}"
-PELAGIA_GPU_ML_VENV="${PELAGIA_GPU_ML_VENV:-$ROOT_DIR/.venv-ml}"
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
@@ -38,11 +37,6 @@ venv_python() {
 CPU_PYTHON="$(venv_python "$PELAGIA_CPU_VENV" "CPU")"
 
 worker_runtime_for_stage() {
-    local stage="$1"
-    if [[ "$stage" == "roi_refinement" ]]; then
-        printf 'gpu-ml|%s|%s\n' "$(venv_python "$PELAGIA_GPU_ML_VENV" "GPU/ML")" "$PELAGIA_GPU_ML_VENV"
-        return
-    fi
     printf 'cpu|%s|%s\n' "$CPU_PYTHON" "$PELAGIA_CPU_VENV"
 }
 

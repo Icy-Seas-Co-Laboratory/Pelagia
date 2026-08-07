@@ -4,6 +4,7 @@ import pytest
 from Pelagia.config import CoreConfig
 from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
 from Pelagia.processing.frame_model import FrameData
+from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
 from Pelagia.workers.handlers import (
     HandlerRegistry,
@@ -217,17 +218,29 @@ class FakeRepository:
         return {"queued": 0, "dead_lettered": 0}
 
 
+class FakeOracle:
+    method_name = "oracle_builder:test-refiner"
+
+    def refine_batch(self, inputs):
+        return [
+            RoiRefinementPrediction(
+                mask=np.asarray(item.candidate_mask),
+                metadata={"oracle_model": {"artifact_id": "artifact-test"}},
+            )
+            for item in inputs
+        ]
+
+
 def make_context(repository):
-    return AppContext(config=CoreConfig(), repository=repository, kvstore=None)
+    return AppContext(config=CoreConfig(), repository=repository, kvstore=None, oracle=FakeOracle())
 
 
 def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
     with pytest.raises(ValueError, match="explicit stages"):
         worker_runtime_profile(None)
     assert worker_runtime_profile([PipelineStage.SEGMENT]) == "cpu"
-    assert worker_runtime_profile([PipelineStage.ROI_REFINEMENT]) == "gpu-ml"
-    with pytest.raises(ValueError, match="dedicated worker"):
-        worker_runtime_profile([PipelineStage.SEGMENT, PipelineStage.ROI_REFINEMENT])
+    assert worker_runtime_profile([PipelineStage.ROI_REFINEMENT]) == "cpu"
+    assert worker_runtime_profile([PipelineStage.SEGMENT, PipelineStage.ROI_REFINEMENT]) == "cpu"
 
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
@@ -1129,9 +1142,8 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-1"],
-                "model_kind": "identity",
+                "model_ref": "test-refiner",
                 "allow_frame_expansion": False,
-                "batch_size": 1,
                 "encoding": "raw",
             },
         },
@@ -1145,11 +1157,11 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     assert result["refined_count"] == 1
     assert result["detection_ids"] == ["det-1"]
     assert result["refined_detection_ids"] == ["refined-det-1"]
-    assert result["refinement_method"] == "identity"
+    assert result["refinement_method"] == "oracle_builder:test-refiner"
     assert result["timings"]["unit_count"] == 1
     assert result["timings"]["phase_counts"]["refinement.model_inference"] == 1
     assert result["timings"]["phase_counts"]["refinement.database_update"] == 1
-    assert result["resolved_options"]["batch_size"] == 1
+    assert result["inference_backend"] == "oracle_builder"
     assert result["resolved_options"]["allow_frame_expansion"] is False
     assert repo.refined_detections[0][0][0] == "det-1"
     assert repo.refined_detections[0][0][1].metadata["detection_stage"] == "refined"
@@ -1168,7 +1180,7 @@ def test_roi_refinement_handler_preserves_project_id():
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-1"],
-                "model_kind": "identity",
+                "model_ref": "test-refiner",
                 "allow_frame_expansion": False,
                 "encoding": "raw",
             },
@@ -1213,7 +1225,7 @@ def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-1"],
-                "model_kind": "identity",
+                "model_ref": "test-refiner",
                 "allow_frame_expansion": False,
                 "encoding": "auto",
             },
@@ -1251,7 +1263,7 @@ def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(mon
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-no-roi"],
-                "model_kind": "identity",
+                "model_ref": "test-refiner",
                 "encoding": "raw",
             },
         },
@@ -1309,7 +1321,7 @@ def test_default_registry_includes_roi_refinement_handler():
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-1"],
-                "model_kind": "identity",
+                "model_ref": "test-refiner",
                 "allow_frame_expansion": False,
                 "encoding": "raw",
             },

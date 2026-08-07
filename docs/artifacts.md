@@ -5,23 +5,18 @@ Pelagia distinguishes packaged assets from local runtime artifacts.
 ## Packaged Assets
 
 Files under `Pelagia/assets/` ship with the Python package. Use this location
-for built-in manifests, small schemas, built-in plugin placeholders, and bundled
-model artifacts that should be available immediately after installation.
+for small schemas and built-in plugin placeholders. ML model products are owned
+and served by Oracle Builder and must not be bundled into Pelagia.
 
 ```text
 Pelagia/assets/
-  models/
-    roi_refinement/
-      model_name/
-        metadata.toml
-        model.keras
   plugins/
     plugin_name/
       metadata.toml
   schemas/
 ```
 
-Every model or plugin artifact directory should include `metadata.toml`.
+Every plugin artifact directory should include `metadata.toml`.
 
 ## Local Artifact Library
 
@@ -30,7 +25,6 @@ library. The defaults are:
 
 ```text
 .pelagia/
-  models/
   plugins/
 ```
 
@@ -40,31 +34,8 @@ These paths can be changed in `config.toml`:
 [artifacts]
 local_root = "./.pelagia"
 
-[artifacts.models]
-local_path = "./.pelagia/models"
-
 [artifacts.plugins]
 local_path = "./.pelagia/plugins"
-```
-
-## Model Metadata
-
-Recommended `metadata.toml`:
-
-```toml
-name = "oracle_unet_v1"
-kind = "roi_refinement"
-version = "0.1.0"
-description = "Bundled U-Net ROI mask refinement model."
-
-[artifact]
-framework = "keras"
-format = "keras"
-path = "model.keras"
-
-[io]
-input_shape = [256, 256, 2]
-output_shape = [256, 256, 1]
 ```
 
 ## Plugin Metadata
@@ -86,23 +57,10 @@ capabilities = ["export"]
 The future plugin system can build on this manifest layout without changing
 where files live.
 
-## Model References
+## Model references
 
-Discovered artifacts receive stable references:
-
-```text
-builtin:model/roi_refinement/example_model
-local:model/roi_refinement/my_model
-```
-
-ROI refinement can use these references directly:
-
-```toml
-[processing.roi_refinement]
-enabled = true
-model_kind = "keras_artifact"
-model_ref = "builtin:model/roi_refinement/example_model"
-```
-
-The API exposes available ROI refinement model references through
-`GET /roi-refinement/options` and `GET /system/capabilities`.
+`GET /roi-refinement/options` proxies Oracle Builder's model catalog and exposes
+operational aliases plus immutable artifact identity. Pelagia stores the
+resolved artifact/run IDs and fingerprint on refined detections; it does not
+interpret model directories or framework files. See [Oracle Builder
+inference](oracle-builder.md).

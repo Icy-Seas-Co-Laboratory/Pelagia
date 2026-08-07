@@ -131,6 +131,20 @@ class APIConfig:
 
 
 @dataclass(slots=True)
+class OracleConfig:
+    """Connection and batching policy for Oracle Builder inference."""
+
+    enabled: bool = True
+    base_url: str = "http://127.0.0.1:8100"
+    default_mask_model: str = "pelagia-refiner"
+    api_token: str | None = None
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 120.0
+    max_items_per_request: int = 32
+    max_payload_bytes: int = 256 * 1024 * 1024
+
+
+@dataclass(slots=True)
 class AuthConfig:
     """Authentication and dev bootstrap settings."""
 
@@ -155,15 +169,6 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
-class ArtifactModelsConfig:
-    """Model artifact discovery settings."""
-
-    builtin_enabled: bool = True
-    local_path: Path = Path("./.pelagia/models")
-    metadata_filename: str = "metadata.toml"
-
-
-@dataclass(slots=True)
 class ArtifactPluginsConfig:
     """Plugin artifact discovery settings."""
 
@@ -174,10 +179,9 @@ class ArtifactPluginsConfig:
 
 @dataclass(slots=True)
 class ArtifactsConfig:
-    """Packaged and local model/plugin artifact locations."""
+    """Packaged and local non-ML artifact locations."""
 
     local_root: Path = Path("./.pelagia")
-    models: ArtifactModelsConfig = field(default_factory=ArtifactModelsConfig)
     plugins: ArtifactPluginsConfig = field(default_factory=ArtifactPluginsConfig)
 
 
@@ -339,20 +343,11 @@ class ThumbhashProcessingConfig:
 
 @dataclass(slots=True)
 class RoiRefinementProcessingConfig:
-    """Default ROI-mask refinement parameters."""
+    """Pelagia-owned refinement workflow parameters."""
 
-    enabled: bool = False
-    model_kind: str = "keras_artifact"
-    model_ref: str | None = "builtin:model/roi_refinement/example_model"
-    model_run_dir: str | None = None
-    model_artifact: str = "auto"
-    tile_size: int = 256
-    overlap_fraction: float = 0.25
     max_iterations: int = 3
-    expansion_pixels: int | None = None
+    expansion_pixels: int | None = 256
     edge_touch_margin: int = 1
-    output_threshold: float = 0.5
-    batch_size: int | None = None
     encoding: str | None = None
     overlap_reconciliation_enabled: bool = True
     overlap_iou_threshold: float = 0.5
@@ -395,6 +390,7 @@ class CoreConfig:
     file_browser: FileBrowserConfig = field(default_factory=FileBrowserConfig)
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    oracle: OracleConfig = field(default_factory=OracleConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
@@ -526,6 +522,15 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
     _set_from_env(settings, "api", "cors_allow_origin_regex", "PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX")
 
+    _set_from_env(settings, "oracle", "enabled", "PELAGIA_ORACLE_ENABLED", _env_bool)
+    _set_from_env(settings, "oracle", "base_url", "PELAGIA_ORACLE_BASE_URL")
+    _set_from_env(settings, "oracle", "default_mask_model", "PELAGIA_ORACLE_DEFAULT_MASK_MODEL")
+    _set_from_env(settings, "oracle", "api_token", "PELAGIA_ORACLE_API_TOKEN")
+    _set_from_env(settings, "oracle", "connect_timeout_seconds", "PELAGIA_ORACLE_CONNECT_TIMEOUT_SECONDS", float)
+    _set_from_env(settings, "oracle", "read_timeout_seconds", "PELAGIA_ORACLE_READ_TIMEOUT_SECONDS", float)
+    _set_from_env(settings, "oracle", "max_items_per_request", "PELAGIA_ORACLE_MAX_ITEMS_PER_REQUEST", int)
+    _set_from_env(settings, "oracle", "max_payload_bytes", "PELAGIA_ORACLE_MAX_PAYLOAD_BYTES", int)
+
     _set_from_env(settings, "auth", "enabled", "PELAGIA_AUTH_ENABLED", _env_bool)
     _set_from_env(settings, "auth", "session_ttl_seconds", "PELAGIA_AUTH_SESSION_TTL_SECONDS", int)
     _set_from_env(settings, "auth", "dev_project_key", "PELAGIA_AUTH_DEV_PROJECT_KEY")
@@ -541,9 +546,6 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
 
     _set_from_env(settings, "artifacts", "local_root", "PELAGIA_ARTIFACTS_LOCAL_ROOT", Path)
-    _set_from_env(settings, "artifacts.models", "builtin_enabled", "PELAGIA_ARTIFACT_MODELS_BUILTIN_ENABLED", _env_bool)
-    _set_from_env(settings, "artifacts.models", "local_path", "PELAGIA_ARTIFACT_MODELS_LOCAL_PATH", Path)
-    _set_from_env(settings, "artifacts.models", "metadata_filename", "PELAGIA_ARTIFACT_MODELS_METADATA_FILENAME")
     _set_from_env(settings, "artifacts.plugins", "builtin_enabled", "PELAGIA_ARTIFACT_PLUGINS_BUILTIN_ENABLED", _env_bool)
     _set_from_env(settings, "artifacts.plugins", "local_path", "PELAGIA_ARTIFACT_PLUGINS_LOCAL_PATH", Path)
     _set_from_env(settings, "artifacts.plugins", "metadata_filename", "PELAGIA_ARTIFACT_PLUGINS_METADATA_FILENAME")
@@ -655,18 +657,9 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
 
     _set_from_env(settings, "processing.thumbhash", "max_dim", "PELAGIA_THUMBHASH_MAX_DIM", int)
 
-    _set_from_env(settings, "processing.roi_refinement", "enabled", "PELAGIA_ROI_REFINEMENT_ENABLED", _env_bool)
-    _set_from_env(settings, "processing.roi_refinement", "model_kind", "PELAGIA_ROI_REFINEMENT_MODEL_KIND")
-    _set_from_env(settings, "processing.roi_refinement", "model_ref", "PELAGIA_ROI_REFINEMENT_MODEL_REF")
-    _set_from_env(settings, "processing.roi_refinement", "model_run_dir", "PELAGIA_ROI_REFINEMENT_MODEL_RUN_DIR")
-    _set_from_env(settings, "processing.roi_refinement", "model_artifact", "PELAGIA_ROI_REFINEMENT_MODEL_ARTIFACT")
-    _set_from_env(settings, "processing.roi_refinement", "tile_size", "PELAGIA_ROI_REFINEMENT_TILE_SIZE", int)
-    _set_from_env(settings, "processing.roi_refinement", "overlap_fraction", "PELAGIA_ROI_REFINEMENT_OVERLAP_FRACTION", float)
     _set_from_env(settings, "processing.roi_refinement", "max_iterations", "PELAGIA_ROI_REFINEMENT_MAX_ITERATIONS", int)
     _set_from_env(settings, "processing.roi_refinement", "expansion_pixels", "PELAGIA_ROI_REFINEMENT_EXPANSION_PIXELS", int)
     _set_from_env(settings, "processing.roi_refinement", "edge_touch_margin", "PELAGIA_ROI_REFINEMENT_EDGE_TOUCH_MARGIN", int)
-    _set_from_env(settings, "processing.roi_refinement", "output_threshold", "PELAGIA_ROI_REFINEMENT_OUTPUT_THRESHOLD", float)
-    _set_from_env(settings, "processing.roi_refinement", "batch_size", "PELAGIA_ROI_REFINEMENT_BATCH_SIZE", int)
     _set_from_env(settings, "processing.roi_refinement", "encoding", "PELAGIA_ROI_REFINEMENT_ENCODING")
     _set_from_env(settings, "processing.roi_refinement", "overlap_reconciliation_enabled", "PELAGIA_ROI_REFINEMENT_OVERLAP_RECONCILIATION_ENABLED", _env_bool)
     _set_from_env(settings, "processing.roi_refinement", "overlap_iou_threshold", "PELAGIA_ROI_REFINEMENT_OVERLAP_IOU_THRESHOLD", float)
@@ -704,10 +697,10 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     file_browser = _section(settings, "file_browser")
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
+    oracle = _section(settings, "oracle")
     auth = _section(settings, "auth")
     logging = _section(settings, "logging")
     artifacts = _section(settings, "artifacts")
-    artifact_models = _section(settings, "artifacts.models")
     artifact_plugins = _section(settings, "artifacts.plugins")
     mask_augmentation = _section(settings, "processing.mask_augmentation")
     roi_assembly = _section(settings, "processing.roi_assembly")
@@ -779,6 +772,16 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 api.get("cors_allow_origin_regex", APIConfig.cors_allow_origin_regex)
             ),
         ),
+        oracle=OracleConfig(
+            enabled=bool(oracle.get("enabled", OracleConfig.enabled)),
+            base_url=str(oracle.get("base_url", OracleConfig.base_url)).rstrip("/"),
+            default_mask_model=str(oracle.get("default_mask_model", OracleConfig.default_mask_model)),
+            api_token=None if oracle.get("api_token") in {None, ""} else str(oracle["api_token"]),
+            connect_timeout_seconds=float(oracle.get("connect_timeout_seconds", OracleConfig.connect_timeout_seconds)),
+            read_timeout_seconds=float(oracle.get("read_timeout_seconds", OracleConfig.read_timeout_seconds)),
+            max_items_per_request=int(oracle.get("max_items_per_request", OracleConfig.max_items_per_request)),
+            max_payload_bytes=int(oracle.get("max_payload_bytes", OracleConfig.max_payload_bytes)),
+        ),
         auth=AuthConfig(
             enabled=bool(auth.get("enabled", AuthConfig.enabled)),
             session_ttl_seconds=int(
@@ -812,23 +815,6 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         ),
         artifacts=ArtifactsConfig(
             local_root=Path(artifacts.get("local_root", ArtifactsConfig.local_root)),
-            models=ArtifactModelsConfig(
-                builtin_enabled=bool(
-                    artifact_models.get(
-                        "builtin_enabled",
-                        ArtifactModelsConfig.builtin_enabled,
-                    )
-                ),
-                local_path=Path(
-                    artifact_models.get("local_path", ArtifactModelsConfig.local_path)
-                ),
-                metadata_filename=str(
-                    artifact_models.get(
-                        "metadata_filename",
-                        ArtifactModelsConfig.metadata_filename,
-                    )
-                ),
-            ),
             plugins=ArtifactPluginsConfig(
                 builtin_enabled=bool(
                     artifact_plugins.get(
@@ -1221,33 +1207,6 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 max_dim=int(thumbhash.get("max_dim", ThumbhashProcessingConfig.max_dim)),
             ),
             roi_refinement=RoiRefinementProcessingConfig(
-                enabled=bool(roi_refinement.get("enabled", RoiRefinementProcessingConfig.enabled)),
-                model_kind=str(
-                    roi_refinement.get("model_kind", RoiRefinementProcessingConfig.model_kind)
-                ),
-                model_ref=roi_refinement.get(
-                    "model_ref",
-                    RoiRefinementProcessingConfig.model_ref,
-                ),
-                model_run_dir=roi_refinement.get(
-                    "model_run_dir",
-                    RoiRefinementProcessingConfig.model_run_dir,
-                ),
-                model_artifact=str(
-                    roi_refinement.get(
-                        "model_artifact",
-                        RoiRefinementProcessingConfig.model_artifact,
-                    )
-                ),
-                tile_size=int(
-                    roi_refinement.get("tile_size", RoiRefinementProcessingConfig.tile_size)
-                ),
-                overlap_fraction=float(
-                    roi_refinement.get(
-                        "overlap_fraction",
-                        RoiRefinementProcessingConfig.overlap_fraction,
-                    )
-                ),
                 max_iterations=int(
                     roi_refinement.get(
                         "max_iterations",
@@ -1264,18 +1223,6 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                     roi_refinement.get(
                         "edge_touch_margin",
                         RoiRefinementProcessingConfig.edge_touch_margin,
-                    )
-                ),
-                output_threshold=float(
-                    roi_refinement.get(
-                        "output_threshold",
-                        RoiRefinementProcessingConfig.output_threshold,
-                    )
-                ),
-                batch_size=_optional_int(
-                    roi_refinement.get(
-                        "batch_size",
-                        RoiRefinementProcessingConfig.batch_size,
                     )
                 ),
                 encoding=roi_refinement.get("encoding", RoiRefinementProcessingConfig.encoding),

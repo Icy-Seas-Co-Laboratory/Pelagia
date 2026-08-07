@@ -12,7 +12,7 @@ Back up all of the following:
 - Configured top-level KVStore root, usually `./data/kvstore`.
 - Explicit project KVStore roots from `projects.kvstore_root_path`, if any.
 - `config.toml`.
-- `.pelagia/` if it contains local model or plugin artifacts.
+- `.pelagia/` if it contains local plugin artifacts.
 - Worker stack TOML files or service files.
 - Raw import/source directories when source paths need to remain reproducible.
 

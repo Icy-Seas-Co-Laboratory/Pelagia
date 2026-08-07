@@ -17,6 +17,7 @@ class AppContext:
     repository: PostgresRepository | None = None
     kvstore: BlobStore | None = None
     logger: DatabaseLogger | None = None
+    oracle: Any | None = None
     active_project_id: str | None = None
     _project_kvstores: dict[str, BlobStore] = field(default_factory=dict)
     _project_settings_cache: dict[str, tuple[dict[str, Any], float]] = field(default_factory=dict)

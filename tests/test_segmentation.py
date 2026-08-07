@@ -6,6 +6,7 @@ from Pelagia.processing.frame_codec import decode_array_payload
 from Pelagia.processing.detection_refinement import (
     IdentityRoiRefinementModel,
     RoiRefinementOptions,
+    RoiRefinementPrediction,
     build_roi_tiles,
     merge_refined_tiles,
     predict_refined_tile_masks,
@@ -62,6 +63,23 @@ class SplitOnceRefinementModel:
 class EmptyRefinementModel:
     def predict(self, batch):
         return np.zeros(np.asarray(batch).shape[:3], dtype=np.float32)
+
+
+class RecordingWholeCropBackend:
+    method_name = "oracle_builder:test-refiner"
+
+    def __init__(self):
+        self.batch_sizes = []
+
+    def refine_batch(self, inputs):
+        self.batch_sizes.append(len(inputs))
+        return [
+            RoiRefinementPrediction(
+                mask=np.asarray(item.candidate_mask),
+                metadata={"oracle_model": {"artifact_id": "artifact-1"}},
+            )
+            for item in inputs
+        ]
 
 
 class FakeContext:
@@ -358,6 +376,59 @@ def test_refine_detection_identity_uses_candidate_mask():
     assert refined_record.bbox_y == 0
     assert refined_record.bbox_w == 2
     assert refined_record.bbox_h == 2
+
+
+def test_whole_crop_backend_batches_detections_and_records_oracle_provenance():
+    roi = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1:3, 1:3] = 255
+
+    def detection(identifier: str, roi_index: int) -> DetectionRecord:
+        return DetectionRecord(
+            run_id="00000000-0000-0000-0000-000000000001",
+            frame_id=FRAME_ID,
+            roi_index=roi_index,
+            bbox_x=1,
+            bbox_y=1,
+            bbox_w=2,
+            bbox_h=2,
+            crop_bbox_x=0,
+            crop_bbox_y=0,
+            crop_bbox_w=4,
+            crop_bbox_h=4,
+            area=4,
+            perimeter=8,
+            major_axis_length=2,
+            minor_axis_length=2,
+            min_gray_value=1,
+            mean_gray_value=5,
+            roi_payload=roi.tobytes(order="C"),
+            mask_payload=mask.tobytes(order="C"),
+            roi_encoding="raw",
+            roi_format="raw_ndarray_c_order",
+            roi_dtype=str(roi.dtype),
+            roi_shape=list(roi.shape),
+            mask_encoding="raw",
+            mask_format="raw_ndarray_c_order",
+            mask_dtype=str(mask.dtype),
+            mask_shape=list(mask.shape),
+            id=identifier,
+        )
+
+    backend = RecordingWholeCropBackend()
+    results = refine_detections(
+        [
+            detection("00000000-0000-7000-8000-000000000101", 1),
+            detection("00000000-0000-7000-8000-000000000102", 2),
+        ],
+        backend=backend,
+        options=RoiRefinementOptions(overlap_reconciliation_enabled=False),
+    )
+
+    assert backend.batch_sizes == [2]
+    assert len(results) == 2
+    assert results[0].method == "oracle_builder:test-refiner"
+    assert results[0].metadata["oracle_model"]["artifact_id"] == "artifact-1"
 
 
 def test_refine_detections_drops_empty_refined_masks():

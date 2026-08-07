@@ -18,18 +18,14 @@ class EnvironmentProfile:
     name: str
     venv_name: str
     extras: tuple[str, ...]
-    requires_tensorflow: bool = False
 
 
 SYNC_PROFILES = {
     "cpu": EnvironmentProfile("cpu", ".venv", (*RUNTIME_EXTRAS, "worker-cpu")),
     "dev": EnvironmentProfile("dev", ".venv", (*RUNTIME_EXTRAS, "worker-cpu", "test")),
-    "ml-metal": EnvironmentProfile("ml-metal", ".venv-ml", (*RUNTIME_EXTRAS, "ml-apple-metal"), True),
-    "ml-cuda": EnvironmentProfile("ml-cuda", ".venv-ml", (*RUNTIME_EXTRAS, "ml"), True),
 }
 DOCTOR_PROFILES = {
-    "cpu": (".venv", False),
-    "gpu-ml": (".venv-ml", True),
+    "cpu": ".venv",
 }
 
 
@@ -42,8 +38,6 @@ def profile_venv_path(profile: str, *, root: Path | None = None) -> Path:
     normalized = profile.strip().lower().replace("_", "-")
     if normalized in {"cpu", "default", "dev"}:
         return resolved_root / ".venv"
-    if normalized in {"gpu-ml", "ml-metal", "ml-cuda"}:
-        return resolved_root / ".venv-ml"
     valid = ", ".join(sorted({*SYNC_PROFILES, *DOCTOR_PROFILES}))
     raise ValueError(f"Unknown environment profile {profile!r}. Valid profiles: {valid}.")
 
@@ -160,7 +154,6 @@ def doctor_profiles(
     profile_name: str = "all",
     *,
     root: Path | None = None,
-    require_gpu: bool = False,
     require_jpegxs: bool = False,
 ) -> dict[str, Any]:
     normalized = profile_name.strip().lower().replace("_", "-")
@@ -174,7 +167,7 @@ def doctor_profiles(
     profiles = []
     healthy = True
     for name in names:
-        venv_name, requires_tensorflow = DOCTOR_PROFILES[name]
+        venv_name = DOCTOR_PROFILES[name]
         venv_path = resolved_root / venv_name
         executable = venv_path / "bin" / "python"
         if not executable.is_file():
@@ -189,13 +182,11 @@ def doctor_profiles(
             healthy = False
             continue
 
-        probe = _probe_environment(executable, requires_tensorflow=requires_tensorflow)
+        probe = _probe_environment(executable)
         errors = list(probe.pop("errors"))
         warnings = list(probe.pop("warnings"))
         if require_jpegxs and not probe["jpegxs_available"]:
             errors.append("JPEG XS support is required but unavailable")
-        if require_gpu and requires_tensorflow and not probe["gpu_devices"]:
-            errors.append("GPU support is required but no TensorFlow GPU device was detected")
         profile_healthy = not errors
         healthy = healthy and profile_healthy
         profiles.append(
@@ -211,7 +202,7 @@ def doctor_profiles(
     return {"healthy": healthy, "profiles": profiles}
 
 
-def _probe_environment(executable: Path, *, requires_tensorflow: bool) -> dict[str, Any]:
+def _probe_environment(executable: Path) -> dict[str, Any]:
     probe_script = """
 import importlib.metadata
 import json
@@ -221,11 +212,10 @@ result = {
     'python': sys.version,
     'packages': {},
     'jpegxs_available': False,
-    'gpu_devices': [],
     'errors': [],
     'warnings': [],
 }
-for package in ('numpy', 'imagecodecs', 'tensorflow', 'tensorflow-metal'):
+for package in ('numpy', 'imagecodecs'):
     try:
         result['packages'][package] = importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
@@ -237,16 +227,8 @@ try:
         result['warnings'].append('imagecodecs JPEG XS support is unavailable')
 except Exception as exc:
     result['errors'].append(f'imagecodecs import failed: {exc}')
-if __REQUIRES_TENSORFLOW__:
-    try:
-        import tensorflow as tf
-        result['gpu_devices'] = [device.name for device in tf.config.list_physical_devices('GPU')]
-        if not result['gpu_devices']:
-            result['warnings'].append('TensorFlow did not detect a GPU device')
-    except Exception as exc:
-        result['errors'].append(f'TensorFlow import failed: {exc}')
 print(json.dumps(result))
-""".replace("__REQUIRES_TENSORFLOW__", repr(requires_tensorflow))
+"""
     result = subprocess.run(
         [str(executable), "-c", probe_script],
         text=True,
@@ -258,7 +240,6 @@ print(json.dumps(result))
             "python": None,
             "packages": {},
             "jpegxs_available": False,
-            "gpu_devices": [],
             "errors": [result.stderr.strip() or "environment probe failed"],
             "warnings": [],
         }

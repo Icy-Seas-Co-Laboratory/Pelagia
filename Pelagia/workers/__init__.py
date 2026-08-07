@@ -9,11 +9,10 @@ from .handlers import (
 )
 from .registry import HandlerRegistry, default_handler_registry
 from .worker import Worker
-from .runtime import GPU_ML_STAGES, worker_runtime_profile
+from .runtime import worker_runtime_profile
 
 __all__ = [
     "HandlerRegistry",
-    "GPU_ML_STAGES",
     "Worker",
     "background_frames_handler",
     "default_handler_registry",

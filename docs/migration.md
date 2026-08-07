@@ -41,11 +41,8 @@ For development installs:
 ./scripts/pelagia_env sync dev
 ```
 
-For learned ROI refinement:
-
-```bash
-./scripts/pelagia_env sync ml-cuda
-```
+Learned ROI refinement requires a reachable Oracle Builder service; Pelagia
+itself has no separate ML environment.
 
 4. Apply database migrations and verify storage.
 
@@ -96,7 +93,8 @@ Follow the full backup steps in [Backup And Restore](backup.md).
 - Configured top-level KVStore root.
 - Any explicit project KVStore roots outside the top-level root.
 - `config.toml`.
-- `.pelagia/` model and plugin artifacts.
+- `.pelagia/` plugin artifacts.
+- Oracle Builder service configuration and model runs, when moving that service too.
 - Raw import/source directories if you want source paths to remain usable.
 - Worker TOML files or service files if you use them.
 
@@ -247,7 +245,7 @@ the database and KVStore backup taken before the upgrade.
 - Stop writers before copying storage.
 - Back up PostgreSQL and all KVStore roots together.
 - Preserve `config.toml` and environment overrides.
-- Preserve `.pelagia/` when local models or plugins are used.
+- Preserve `.pelagia/` when local plugins are used.
 - Copy raw source data if source paths need to stay valid.
 - Run `migrate-db` or `init-system` after code upgrades.
 - Run `check-system` before starting workers.

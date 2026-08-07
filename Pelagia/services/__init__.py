@@ -3,7 +3,6 @@
 from .context import AppContext
 from .assets import AssetService
 from .jobs import JobService
-from .models import ModelService
 from .pipeline import PipelineService
 from .processing_queue import ProcessingQueueService
 from .runs import RunService
@@ -13,7 +12,6 @@ __all__ = [
     "AppContext",
     "AssetService",
     "JobService",
-    "ModelService",
     "PipelineService",
     "ProcessingQueueService",
     "RunService",

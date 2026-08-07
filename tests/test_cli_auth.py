@@ -325,9 +325,9 @@ def test_cli_environment_sync_dry_run_reports_profile_commands(tmp_path):
     )
 
     assert result.exit_code == 2
-    assert "Requirements file was not found" in result.output
+    assert "Pelagia pyproject.toml was not found" in result.output
 
-    (tmp_path / "requirements-worker-cpu.txt").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'pelagia-test'\nversion = '0'\n", encoding="utf-8")
     result = runner.invoke(
         cli_module.app,
         [

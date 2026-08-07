@@ -180,9 +180,7 @@ def managed_venv(profile: object, *, label: str) -> str:
     normalized = str(profile).strip().lower().replace("_", "-")
     if normalized in {"cpu", "default"}:
         return os.environ.get("PELAGIA_CPU_VENV", str(root_dir / ".venv"))
-    if normalized in {"gpu-ml", "ml-metal", "ml-cuda"}:
-        return os.environ.get("PELAGIA_GPU_ML_VENV", str(root_dir / ".venv-ml"))
-    raise SystemExit(f"{label} must be one of: cpu, gpu-ml, ml-metal, ml-cuda")
+    raise SystemExit(f"{label} must be: cpu")
 
 
 capability_venvs: dict[str, object] = {}
@@ -219,7 +217,7 @@ else:
 
 capability_venvs.setdefault(
     "roi_refinement",
-    managed_venv("gpu-ml", label="ROI refinement environment"),
+    managed_venv("cpu", label="ROI refinement environment"),
 )
 
 control_python, _ = venv_path(control_venv, label="worker control environment")
@@ -324,8 +322,6 @@ if not workers:
 
 default_idle = worker_defaults.get("idle_sleep_seconds", os.environ.get("PELAGIA_IDLE_SLEEP_SECONDS", "2.0"))
 default_requeue = worker_defaults.get("requeue_interval_seconds", os.environ.get("PELAGIA_REQUEUE_INTERVAL_SECONDS", "30.0"))
-gpu_ml_stages = {"roi_refinement"}
-
 for index, worker in enumerate(workers, start=1):
     if not isinstance(worker, dict):
         raise SystemExit("Each worker entry must be a TOML table")
@@ -348,12 +344,6 @@ for index, worker in enumerate(workers, start=1):
             raise SystemExit(f"Unknown worker capability {raw_stage!r}. Valid aliases: {valid}")
         if stage not in stages:
             stages.append(stage)
-    selected_gpu_ml_stages = set(stages) & gpu_ml_stages
-    if selected_gpu_ml_stages and set(stages) - gpu_ml_stages:
-        raise SystemExit(
-            f"Worker {name!r} mixes GPU/ML capabilities with CPU capabilities. "
-            "Configure GPU/ML stages in a dedicated worker."
-        )
     resolved_venvs = {capability_venvs.get(stage, default_venv) for stage in stages}
     if len(resolved_venvs) != 1:
         raise SystemExit(
@@ -364,7 +354,7 @@ for index, worker in enumerate(workers, start=1):
         resolved_venvs.pop(),
         label=f"Worker {name!r} virtual environment",
     )
-    runtime_profile = "gpu-ml" if selected_gpu_ml_stages else "cpu"
+    runtime_profile = "cpu"
     count = int(worker.get("count", 1))
     if count < 1:
         raise SystemExit(f"Worker {name!r} count must be >= 1")

@@ -30,6 +30,34 @@ class RoiRefinementModel(Protocol):
         """Return a KxHxW refined-mask batch for a KxHxWx2 input batch."""
 
 
+@dataclass(frozen=True, slots=True)
+class RoiRefinementInput:
+    """One whole ROI crop supplied to an external refinement backend."""
+
+    detection_id: str
+    image: np.ndarray
+    candidate_mask: np.ndarray
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RoiRefinementPrediction:
+    """Storage-neutral mask prediction returned by a refinement backend."""
+
+    mask: np.ndarray
+    probability_map: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class RoiRefinementBackend(Protocol):
+    """Whole-crop inference boundary implemented by Oracle Builder clients."""
+
+    @property
+    def method_name(self) -> str: ...
+
+    def refine_batch(self, inputs: list[RoiRefinementInput]) -> list[RoiRefinementPrediction]: ...
+
+
 @dataclass(slots=True)
 class RoiRefinementOptions:
     """Options controlling tiled ROI refinement and optional crop expansion."""
@@ -197,6 +225,21 @@ class DetectionRefinementResult:
             mask_shape=list(self.refined_mask.shape),
             metadata=metadata,
         )
+
+
+@dataclass(slots=True)
+class _BackendRefinementState:
+    detection: DetectionRecord
+    roi: np.ndarray
+    candidate_mask: np.ndarray
+    refined_mask: np.ndarray
+    crop_bbox: tuple[int, int, int, int]
+    full_frame: np.ndarray | None = None
+    frame_loaded: bool = False
+    roi_source: str = "payload"
+    expansion_count: int = 0
+    boundary_expansion_required: bool = False
+    inference_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class IdentityRoiRefinementModel:
@@ -531,10 +574,158 @@ def refine_detection(
     )
 
 
+def _refine_detections_with_backend(
+    detections: list[DetectionRecord],
+    *,
+    backend: RoiRefinementBackend,
+    frame_loader: FrameLoader | None,
+    options: RoiRefinementOptions,
+    method: str | None,
+) -> list[DetectionRefinementResult]:
+    """Refine whole crops in iteration batches while Pelagia owns expansion."""
+    states: list[_BackendRefinementState] = []
+    for detection in detections:
+        full_frame: np.ndarray | None = None
+        frame_loaded = False
+        roi_source = "payload"
+        if detection.roi_payload is None:
+            if frame_loader is None:
+                raise ValueError(
+                    "Detection does not include ROI payload data and no frame_loader was supplied."
+                )
+            with measure_phase("refinement.frame_prepare"):
+                full_frame = as_grayscale_array(frame_loader(detection.frame_id))
+            frame_loaded = True
+            roi_source = "frame"
+            roi = _crop_detection_roi_from_frame(detection, full_frame)
+        else:
+            with measure_phase("refinement.roi_decode"):
+                roi = as_grayscale_array(decode_detection_roi(detection))
+        with measure_phase("refinement.mask_decode"):
+            candidate_mask = decode_detection_candidate_mask(detection, roi=roi)
+        if candidate_mask.shape[:2] != roi.shape[:2]:
+            raise ValueError(
+                f"Candidate mask shape {candidate_mask.shape[:2]} does not match ROI shape {roi.shape[:2]}."
+            )
+        states.append(
+            _BackendRefinementState(
+                detection=detection,
+                roi=roi,
+                candidate_mask=candidate_mask,
+                refined_mask=candidate_mask,
+                crop_bbox=_detection_crop_bbox(detection, roi.shape),
+                full_frame=full_frame,
+                frame_loaded=frame_loaded,
+                roi_source=roi_source,
+            )
+        )
+
+    active = list(range(len(states)))
+    for iteration in range(options.max_iterations):
+        if not active:
+            break
+        request_inputs = [
+            RoiRefinementInput(
+                detection_id=_detection_identifier(states[index].detection),
+                image=np.ascontiguousarray(states[index].roi),
+                candidate_mask=np.ascontiguousarray(states[index].refined_mask),
+                metadata={
+                    "frame_id": states[index].detection.frame_id,
+                    "roi_index": states[index].detection.roi_index,
+                    "crop_bbox": list(states[index].crop_bbox),
+                    "expansion_iteration": iteration,
+                },
+            )
+            for index in active
+        ]
+        with measure_phase("refinement.model_inference"):
+            predictions = backend.refine_batch(request_inputs)
+        if len(predictions) != len(active):
+            raise ValueError("Refinement backend returned an unexpected prediction count.")
+        next_active: list[int] = []
+        for index, prediction in zip(active, predictions):
+            state = states[index]
+            predicted_mask = as_binary_mask(prediction.mask)
+            if predicted_mask.shape[:2] != state.roi.shape[:2]:
+                raise ValueError(
+                    "Refinement backend output shape does not match the submitted ROI crop."
+                )
+            state.refined_mask = predicted_mask
+            state.inference_metadata.update(prediction.metadata)
+            touched = mask_touches_uncovered_edge(
+                state.refined_mask,
+                crop_bbox=state.crop_bbox,
+                frame_shape=None if state.full_frame is None else state.full_frame.shape[:2],
+                margin=options.edge_touch_margin,
+            )
+            if not any(touched.values()):
+                continue
+            state.boundary_expansion_required = True
+            if frame_loader is None:
+                continue
+            if state.full_frame is None:
+                with measure_phase("refinement.frame_prepare"):
+                    state.full_frame = as_grayscale_array(frame_loader(state.detection.frame_id))
+                state.frame_loaded = True
+            new_crop_bbox = _expanded_crop_bbox(
+                state.crop_bbox,
+                touched,
+                frame_shape=state.full_frame.shape[:2],
+                expansion_pixels=options.resolved_expansion_pixels,
+            )
+            if new_crop_bbox == state.crop_bbox:
+                continue
+            with measure_phase("refinement.roi_expansion"):
+                state.roi, state.refined_mask = _expand_roi_and_mask_from_frame(
+                    state.full_frame,
+                    current_roi=state.roi,
+                    current_mask=state.refined_mask,
+                    current_crop_bbox=state.crop_bbox,
+                    new_crop_bbox=new_crop_bbox,
+                )
+            state.crop_bbox = new_crop_bbox
+            state.expansion_count += 1
+            next_active.append(index)
+        active = next_active
+
+    resolved_method = method or backend.method_name
+    results: list[DetectionRefinementResult] = []
+    for state in states:
+        bbox = _mask_bbox_in_frame(state.refined_mask, state.crop_bbox)
+        metadata = {
+            "candidate_mask_kind": "candidate",
+            "refined_mask_kind": "refined",
+            "candidate_shape": list(state.candidate_mask.shape),
+            "refined_shape": list(state.refined_mask.shape),
+            "refined_foreground_pixels": int(np.count_nonzero(state.refined_mask)),
+            "refinement_expansion_count": state.expansion_count,
+            "refinement_frame_loaded": state.frame_loaded,
+            "refinement_initial_roi_source": state.roi_source,
+            "refinement_boundary_expansion_required": state.boundary_expansion_required,
+            "refinement_crop_bbox": state.crop_bbox,
+            "refinement_bbox": bbox,
+            **state.inference_metadata,
+        }
+        results.append(
+            DetectionRefinementResult(
+                candidate_detection=state.detection,
+                roi=state.roi,
+                candidate_mask=state.candidate_mask,
+                refined_mask=state.refined_mask,
+                crop_bbox=state.crop_bbox,
+                bbox=bbox,
+                method=resolved_method,
+                metadata=metadata,
+            )
+        )
+    return results
+
+
 def refine_detections(
     detections: Iterable[DetectionRecord],
     *,
     model: RoiRefinementModel | None = None,
+    backend: RoiRefinementBackend | None = None,
     refiner: RefinementFn | None = None,
     frame_loader: FrameLoader | None = None,
     options: RoiRefinementOptions | None = None,
@@ -542,21 +733,32 @@ def refine_detections(
 ) -> list[DetectionRefinementResult]:
     """Refine a batch of candidate detections and reconcile duplicate overlaps."""
     resolved_options = options or RoiRefinementOptions()
-    results = [
-        refine_detection(
-            detection,
-            model=model,
-            refiner=refiner,
+    resolved_detections = list(detections)
+    if backend is not None:
+        results = _refine_detections_with_backend(
+            resolved_detections,
+            backend=backend,
             frame_loader=frame_loader,
             options=resolved_options,
             method=method,
         )
-        for detection in detections
-    ]
+    else:
+        results = [
+            refine_detection(
+                detection,
+                model=model,
+                refiner=refiner,
+                frame_loader=frame_loader,
+                options=resolved_options,
+                method=method,
+            )
+            for detection in resolved_detections
+        ]
     if resolved_options.residual_discovery_enabled:
         results = discover_residual_refinements(
             results,
             model=model,
+            backend=backend,
             refiner=refiner,
             frame_loader=frame_loader,
             options=resolved_options,
@@ -572,6 +774,7 @@ def discover_residual_refinements(
     results: Iterable[DetectionRefinementResult],
     *,
     model: RoiRefinementModel | None = None,
+    backend: RoiRefinementBackend | None = None,
     refiner: RefinementFn | None = None,
     frame_loader: FrameLoader | None = None,
     options: RoiRefinementOptions | None = None,
@@ -597,21 +800,39 @@ def discover_residual_refinements(
     frontier = list(resolved_results)
     for generation in range(1, resolved_options.residual_max_iterations + 1):
         child_results: list[DetectionRefinementResult] = []
+        child_parents: list[DetectionRefinementResult] = []
+        child_detections: list[DetectionRecord] = []
         for result in frontier:
-            child_detections = _residual_candidate_detections(
+            discovered = _residual_candidate_detections(
                 result,
                 options=resolved_options,
                 generation=generation,
             )
-            for child_detection in child_detections:
-                child_result = refine_detection(
-                    child_detection,
-                    model=model,
-                    refiner=refiner,
-                    frame_loader=None,
-                    options=resolved_options,
-                    method=method,
-                )
+            child_detections.extend(discovered)
+            child_parents.extend([result] * len(discovered))
+        if child_detections:
+            child_options = replace(
+                resolved_options,
+                residual_discovery_enabled=False,
+                overlap_reconciliation_enabled=False,
+            )
+            refined_children = refine_detections(
+                child_detections,
+                model=model,
+                backend=backend,
+                refiner=refiner,
+                frame_loader=None,
+                options=child_options,
+                method=method,
+            )
+            refined_by_id = {
+                _detection_identifier(child_result.candidate_detection): child_result
+                for child_result in refined_children
+            }
+            for result, child_detection in zip(child_parents, child_detections):
+                child_result = refined_by_id.get(_detection_identifier(child_detection))
+                if child_result is None:
+                    continue
                 child_result.metadata.update(
                     {
                         "residual_discovery_enabled": True,

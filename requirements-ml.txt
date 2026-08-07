@@ -1,6 +1,0 @@
-# Optional machine-learning dependencies for U-Net ROI refinement adapters.
-# On Linux x86_64 this installs TensorFlow with the CUDA dependency extra
-# (`tensorflow[and-cuda]`) so NVIDIA GPU support is preferred when available.
-# Install this only on machines that will run learned refinement models.
--r requirements.txt
--e ".[ml]"

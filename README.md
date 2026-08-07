@@ -64,32 +64,17 @@ For development and tests, install the dev target instead:
 ./scripts/pelagia_env sync dev
 ```
 
-For CPU/API/ingest/preprocess/segment workers, create and synchronize the CPU
-profile:
+For the API and all Pelagia workers, create and synchronize the CPU profile:
 
 ```bash
 ./scripts/pelagia_env sync cpu
 ```
 
-For machines that will run learned ROI refinement models, install the optional
-ML profile in its separate environment:
-
-```bash
-./scripts/pelagia_env sync ml-metal  # Apple Metal
-# or: ./scripts/pelagia_env sync ml-cuda
-```
-
-The CPU and CUDA profiles pin `imagecodecs 2026.6.26` with NumPy 2.1+. The
-Apple Metal profile uses `imagecodecs 2026.3.6` with NumPy 2.0 because
-TensorFlow 2.18 requires `numpy<2.1`; uv records these profiles as mutually
-exclusive dependency sets in the shared lockfile.
-
-For dedicated GPU/ML workers, create a second environment rather than adding
-TensorFlow to the API and CPU-worker environment:
+Oracle Builder owns TensorFlow/Keras and GPU isolation. Pelagia only verifies
+its CPU environment:
 
 ```bash
 ./scripts/pelagia_env doctor all
-./scripts/pelagia_env doctor gpu-ml --require-gpu
 ./scripts/pelagia_env doctor cpu --require-jpegxs
 ```
 
@@ -225,15 +210,13 @@ You can also put it in `scripts/pelagia_workers.toml`:
 run_dir = "/scratch/Pelagia/.pelagia/run/dev-workers"
 ```
 
-The TOML stack chooses its Python interpreter from `[worker_profiles]` based on
-each worker's capabilities. `roi_refinement` is the GPU/ML capability and must
-be configured in a dedicated worker; it cannot be combined with ingest,
-preprocess, background, or segmentation stages.
+The TOML stack chooses its Python interpreter from `[worker_profiles]`. All
+Pelagia stages use the CPU environment; ROI refinement calls Oracle Builder.
 
 ```toml
 [worker_profiles]
 default = "cpu"
-roi_refinement = "gpu-ml"
+roi_refinement = "cpu"
 ```
 
 Validate the resolved worker profiles before starting services:
@@ -242,8 +225,8 @@ Validate the resolved worker profiles before starting services:
 ./scripts/pelagia_stack_from_toml.sh validate scripts/pelagia_workers.toml
 ```
 
-For a GPU-only worker host, set `api.enabled = false` and
-`worker_profiles.control = "gpu-ml"` in its stack TOML.
+See [Oracle Builder inference](docs/oracle-builder.md) for service setup and
+failure behavior.
 
 ### Verify The API
 
@@ -437,7 +420,7 @@ Useful endpoint groups:
 - `GET /jobs`, `GET /jobs/summary`, `POST /jobs`, `GET /jobs/events`
 - `POST /jobs/{job_id}/pause`, `/resume`, `/retry`, `/priority`
 - `GET /workers`, `POST /workers/{worker_id}/shutdown`
-- `GET /runs`, `/assets`, `/models`, `/kvstore`
+- `GET /runs`, `/assets`, `/models`, `/kvstore` (`/models` records model provenance; inference discovery lives in Oracle Builder)
 - `GET /collections`, `GET /assets?collection=test`, `GET /runs?collection=test`
 - `GET /frames/{frame_id}/context`
 - `GET /detections`, `/detections/{detection_id}/framedata`, `/mask`, `/refined-roi`, `/refined-mask`
@@ -532,9 +515,8 @@ For storage maintenance, migration, and recovery procedures, use:
 Pelagia uses a cross-platform `uv.lock` and separate runtime profiles:
 
 ```bash
-./scripts/pelagia_env sync cpu       # API and non-ML workers
+./scripts/pelagia_env sync cpu       # API and all workers
 ./scripts/pelagia_env sync dev       # CPU profile plus tests
-./scripts/pelagia_env sync ml-cuda   # dedicated Linux GPU/ML workers
 ```
 
 The legacy requirements files remain available as compatibility inputs, but

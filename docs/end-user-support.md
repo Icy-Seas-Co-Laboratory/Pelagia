@@ -10,7 +10,7 @@ Pelagia stores state in several places:
 - KVStore stores large binary frame payloads and generated frame payloads.
 - `config.toml` and environment variables define where PostgreSQL and KVStore
   live.
-- `.pelagia/` stores local model and plugin artifacts by default.
+- `.pelagia/` stores local plugin artifacts by default.
 - Raw source files may live outside Pelagia and are usually referenced by path
   during ingestion.
 
@@ -29,7 +29,7 @@ when resetting, migrating, or backing up.
   and status tracking for large frame sets.
 - [Python Environment Setup](python-environment.md): Python, dependency, and
   local configuration setup.
-- [Artifact Organization](artifacts.md): model and plugin artifact layout.
+- [Artifact Organization](artifacts.md): plugin artifacts and remote model references.
 
 ## Daily Health Checks
 
@@ -127,7 +127,6 @@ data/
           store_000001.sqlite
   import/
 .pelagia/
-  models/
   plugins/
 logs/
   pelagia.log

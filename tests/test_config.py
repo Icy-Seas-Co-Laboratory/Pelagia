@@ -112,10 +112,11 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.auth.dev_project_key is None
     assert config.auth.bootstrap_admin_username is None
     assert config.auth.bootstrap_admin_password is None
+    assert config.oracle.enabled is True
+    assert config.oracle.base_url == "http://127.0.0.1:8100"
+    assert config.oracle.default_mask_model == "pelagia-refiner"
+    assert config.oracle.max_items_per_request == 32
     assert config.artifacts.local_root.as_posix() == ".pelagia"
-    assert config.artifacts.models.builtin_enabled is True
-    assert config.artifacts.models.local_path.as_posix() == ".pelagia/models"
-    assert config.artifacts.models.metadata_filename == "metadata.toml"
     assert config.artifacts.plugins.builtin_enabled is True
     assert config.artifacts.plugins.local_path.as_posix() == ".pelagia/plugins"
     assert config.artifacts.plugins.metadata_filename == "metadata.toml"
@@ -163,18 +164,9 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.frame_storage.image_encoding == "jpg"
     assert config.processing.frame_storage.image_quality == 90
     assert config.processing.thumbhash.max_dim == 100
-    assert config.processing.roi_refinement.enabled is True
-    assert config.processing.roi_refinement.model_kind == "keras_artifact"
-    assert config.processing.roi_refinement.model_ref == "builtin:model/roi_refinement/example_model"
-    assert config.processing.roi_refinement.model_run_dir is None
-    assert config.processing.roi_refinement.model_artifact == "auto"
-    assert config.processing.roi_refinement.tile_size == 256
-    assert config.processing.roi_refinement.overlap_fraction == 0.25
     assert config.processing.roi_refinement.max_iterations == 5
     assert config.processing.roi_refinement.expansion_pixels == 256
     assert config.processing.roi_refinement.edge_touch_margin == 2
-    assert config.processing.roi_refinement.output_threshold == 0.5
-    assert config.processing.roi_refinement.batch_size is None
     assert config.processing.roi_refinement.encoding is None
     assert config.processing.roi_refinement.overlap_reconciliation_enabled is True
     assert config.processing.roi_refinement.overlap_iou_threshold == 0.5
@@ -215,11 +207,6 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [artifacts]
         local_root = "/tmp/pelagia-artifacts"
-
-        [artifacts.models]
-        builtin_enabled = false
-        local_path = "/tmp/pelagia-artifacts/models"
-        metadata_filename = "model.toml"
 
         [artifacts.plugins]
         builtin_enabled = false
@@ -289,18 +276,9 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         max_dim = 64
 
         [processing.roi_refinement]
-        enabled = true
-        model_kind = "oracle_builder_unet"
-        model_ref = "builtin:model/roi_refinement/example_model"
-        model_run_dir = "../oracle-builder/runs/unet-test"
-        model_artifact = "savedmodel"
-        tile_size = 128
-        overlap_fraction = 0.5
         max_iterations = 4
         expansion_pixels = 32
         edge_touch_margin = 2
-        output_threshold = 0.6
-        batch_size = 6
         encoding = "png"
         overlap_reconciliation_enabled = false
         overlap_iou_threshold = 0.3
@@ -334,9 +312,6 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     ]
     assert config.image_data_storage.encoding == "raw"
     assert config.artifacts.local_root.as_posix() == "/tmp/pelagia-artifacts"
-    assert config.artifacts.models.builtin_enabled is False
-    assert config.artifacts.models.local_path.as_posix() == "/tmp/pelagia-artifacts/models"
-    assert config.artifacts.models.metadata_filename == "model.toml"
     assert config.artifacts.plugins.builtin_enabled is False
     assert config.artifacts.plugins.local_path.as_posix() == "/tmp/pelagia-artifacts/plugins"
     assert config.artifacts.plugins.metadata_filename == "plugin.toml"
@@ -382,18 +357,9 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.preprocessing.crop_h == 400
     assert config.processing.frame_storage.image_encoding == "png"
     assert config.processing.thumbhash.max_dim == 64
-    assert config.processing.roi_refinement.enabled is True
-    assert config.processing.roi_refinement.model_kind == "oracle_builder_unet"
-    assert config.processing.roi_refinement.model_ref == "builtin:model/roi_refinement/example_model"
-    assert config.processing.roi_refinement.model_run_dir == "../oracle-builder/runs/unet-test"
-    assert config.processing.roi_refinement.model_artifact == "savedmodel"
-    assert config.processing.roi_refinement.tile_size == 128
-    assert config.processing.roi_refinement.overlap_fraction == 0.5
     assert config.processing.roi_refinement.max_iterations == 4
     assert config.processing.roi_refinement.expansion_pixels == 32
     assert config.processing.roi_refinement.edge_touch_margin == 2
-    assert config.processing.roi_refinement.output_threshold == 0.6
-    assert config.processing.roi_refinement.batch_size == 6
     assert config.processing.roi_refinement.encoding == "png"
     assert config.processing.roi_refinement.overlap_reconciliation_enabled is False
     assert config.processing.roi_refinement.overlap_iou_threshold == 0.3
@@ -427,8 +393,6 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", "/tmp/env-import")
     monkeypatch.setenv("PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS", "/tmp/env-raw,/mnt/env-cruise")
     monkeypatch.setenv("PELAGIA_ARTIFACTS_LOCAL_ROOT", "/tmp/env-pelagia-artifacts")
-    monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_BUILTIN_ENABLED", "false")
-    monkeypatch.setenv("PELAGIA_ARTIFACT_MODELS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/models")
     monkeypatch.setenv("PELAGIA_ARTIFACT_PLUGINS_BUILTIN_ENABLED", "false")
     monkeypatch.setenv("PELAGIA_ARTIFACT_PLUGINS_LOCAL_PATH", "/tmp/env-pelagia-artifacts/plugins")
     monkeypatch.setenv("PELAGIA_ROI_FILTER_MIN_PERIMETER", "9")
@@ -464,6 +428,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("PELAGIA_LOG_PATH", "/tmp/env-pelagia-logs")
     monkeypatch.setenv("PELAGIA_LOG_LEVEL", "warning")
     monkeypatch.setenv("PELAGIA_LOG_CONSOLE", "false")
+    monkeypatch.setenv("PELAGIA_ORACLE_BASE_URL", "http://oracle.internal:8100/")
+    monkeypatch.setenv("PELAGIA_ORACLE_DEFAULT_MASK_MODEL", "refiner-production")
 
     config = CoreConfig.load(config_path=config_path)
 
@@ -476,8 +442,6 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
         "/mnt/env-cruise",
     ]
     assert config.artifacts.local_root.as_posix() == "/tmp/env-pelagia-artifacts"
-    assert config.artifacts.models.builtin_enabled is False
-    assert config.artifacts.models.local_path.as_posix() == "/tmp/env-pelagia-artifacts/models"
     assert config.artifacts.plugins.builtin_enabled is False
     assert config.artifacts.plugins.local_path.as_posix() == "/tmp/env-pelagia-artifacts/plugins"
     assert config.processing.roi_filter.min_perimeter == 9.0
@@ -513,6 +477,8 @@ def test_core_config_env_overrides_toml(monkeypatch, tmp_path):
     assert config.logging.log_path.as_posix() == "/tmp/env-pelagia-logs"
     assert config.logging.level == "WARNING"
     assert config.logging.console is False
+    assert config.oracle.base_url == "http://oracle.internal:8100"
+    assert config.oracle.default_mask_model == "refiner-production"
 
 
 def test_core_config_uses_pelagia_config_env(monkeypatch, tmp_path):
