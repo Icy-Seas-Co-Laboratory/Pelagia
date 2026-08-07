@@ -10,6 +10,10 @@ import numpy as np
 from ..domain import DetectionRecord, FrameRecord, JobStatus, PipelineStage
 from ..domain import normalize_collections
 from ..processing import ingest as ingest_module
+from ..processing.classification import (
+    CLASSIFICATION_CROP_POLICY,
+    refined_bbox_classification_crop,
+)
 from ..processing.detection_candidate import segment_frame
 from ..processing.detection_refinement import (
     RoiRefinementOptions,
@@ -940,15 +944,10 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
     progress.start(f"Refining {len(detection_ids)} ROI{'s' if len(detection_ids) != 1 else ''}")
 
-    missing_ids = []
-    candidate_rows = []
-    for detection_id in detection_ids:
-        with measure_phase("selection.detection_metadata_lookup"):
-            row = context.repository.get_detection(detection_id, project_id=project_id)
-        if row is None:
-            missing_ids.append(detection_id)
-        else:
-            candidate_rows.append(row)
+    with measure_phase("selection.detection_metadata_lookup"):
+        candidate_rows = context.repository.get_detections(detection_ids, project_id=project_id)
+    loaded_ids = {str(row["id"]) for row in candidate_rows}
+    missing_ids = list(dict.fromkeys(detection_id for detection_id in detection_ids if detection_id not in loaded_ids))
     if missing_ids:
         raise KeyError(f"Detection(s) not found: {', '.join(missing_ids)}")
     candidate_frame_ids = sorted({str(row["frame_id"]) for row in candidate_rows if row.get("frame_id")})
@@ -1103,20 +1102,30 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     project_id = _job_project_id(job, context)
     if project_id is None:
         raise ValueError("Classification jobs require project_id.")
+    target_count = context.repository.count_classification_targets(
+        project_id=project_id,
+        roi_ids=command.roi_ids,
+    )
     inference_run = context.repository.create_classification_inference_run(
         project_id=project_id,
         job_id=None if job.get("id") is None else str(job["id"]),
         model_selector=command.model_ref,
-        parameters={"roi_ids": list(command.roi_ids)},
+        parameters={
+            "roi_ids": list(command.roi_ids),
+            "target_count": target_count,
+            "input_crop_policy": CLASSIFICATION_CROP_POLICY,
+        },
     )
     progress = JobProgressReporter(
         job,
         context,
         stage=PipelineStage.CLASSIFY.value,
         unit="rois",
-        total=len(command.roi_ids),
+        total=target_count,
     )
-    progress.start("Classifying refined ROIs")
+    progress.start(
+        f"Preparing {target_count} refined ROI{'s' if target_count != 1 else ''} for classification"
+    )
     client = context.oracle
     owns_client = not callable(getattr(client, "predict_batch", None))
     if owns_client:
@@ -1124,8 +1133,21 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     completed = 0
     offset = 0
     batch_size = context.config.oracle.max_items_per_request
+    batch_count = (target_count + batch_size - 1) // batch_size if target_count else 0
+    batch_number = 0
     try:
-        while True:
+        while offset < target_count:
+            batch_number += 1
+            progress.update(
+                completed,
+                current={
+                    "phase": "loading_inputs",
+                    "batch": batch_number,
+                    "batch_count": batch_count,
+                },
+                message=f"Loading ROI inputs for batch {batch_number} of {batch_count}",
+                force=True,
+            )
             targets = context.repository.list_classification_targets(
                 project_id=project_id,
                 roi_ids=command.roi_ids,
@@ -1145,17 +1167,46 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                         "shape": row.get("roi_shape"),
                     },
                 )
+                classification_crop = refined_bbox_classification_crop(image, row)
                 oracle_items.append(
                     OracleInferenceItem(
                         resource_type="refined_detection",
                         resource_id=str(row["id"]),
-                        inputs={"image": np.asarray(image)},
-                        metadata={"project_id": project_id},
+                        inputs={"image": classification_crop.image},
+                        metadata={
+                            "project_id": project_id,
+                            "classification_input": classification_crop.metadata,
+                        },
                     )
                 )
+            progress.update(
+                completed,
+                current={
+                    "phase": "oracle_inference",
+                    "batch": batch_number,
+                    "batch_count": batch_count,
+                    "batch_size": len(oracle_items),
+                },
+                message=(
+                    f"Oracle Builder is classifying batch {batch_number} of {batch_count} "
+                    f"({len(oracle_items)} ROIs)"
+                ),
+                force=True,
+            )
             responses = client.predict_batch(command.model_ref, oracle_items)
             if len(responses) != len(targets):
                 raise RuntimeError("Oracle Builder returned an unexpected classification result count")
+            progress.update(
+                completed,
+                current={
+                    "phase": "saving_evidence",
+                    "batch": batch_number,
+                    "batch_count": batch_count,
+                    "batch_size": len(targets),
+                },
+                message=f"Saving evidence from batch {batch_number} of {batch_count}",
+                force=True,
+            )
             for target, response in zip(targets, responses, strict=True):
                 row = response.result
                 output = dict(row.get("output") or {})
@@ -1195,24 +1246,50 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     embedding_sha256=embedding_sha256,
                 )
                 completed += 1
-                progress.update(completed, message=f"Classified {completed} refined ROIs")
+                progress.update(
+                    completed,
+                    current={
+                        "phase": "saving_evidence",
+                        "batch": batch_number,
+                        "batch_count": batch_count,
+                    },
+                    message=f"Saved evidence for {completed} of {target_count} refined ROIs",
+                )
             offset += len(targets)
             if len(targets) < batch_size:
                 break
         context.repository.complete_classification_inference_run(
             str(inference_run["id"]),
             status="complete",
-            metadata={"completed_count": completed},
+            metadata={
+                "completed_count": completed,
+                "input_crop_policy": CLASSIFICATION_CROP_POLICY,
+            },
         )
-        progress.finish(completed=completed, message=f"Classified {completed} refined ROIs")
+        progress.finish(
+            completed=completed,
+            secondary={"phase": "complete", "batch_count": batch_count},
+            message=f"Classification complete: {completed} refined ROIs",
+        )
         return {
             "stage": PipelineStage.CLASSIFY.value,
             "project_id": project_id,
             "inference_run_id": str(inference_run["id"]),
             "model_ref": command.model_ref,
+            "input_crop_policy": CLASSIFICATION_CROP_POLICY,
             "detection_count": completed,
         }
     except Exception as exc:
+        progress.update(
+            completed,
+            current={
+                "phase": "failed",
+                "batch": batch_number,
+                "batch_count": batch_count,
+            },
+            message=f"Classification failed after {completed} of {target_count} ROIs: {exc}",
+            force=True,
+        )
         context.repository.complete_classification_inference_run(
             str(inference_run["id"]),
             status="failed",

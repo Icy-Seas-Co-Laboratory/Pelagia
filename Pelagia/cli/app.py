@@ -1516,12 +1516,15 @@ if typer is not None:
         signal.signal(signal.SIGTERM, stop_worker)
 
         typer.echo(json.dumps({"worker_id": worker.worker_id, "status": "starting"}, sort_keys=True))
-        worker.run_forever(
-            stages=selected_stages,
-            idle_sleep_seconds=idle_sleep_seconds,
-            requeue_interval_seconds=requeue_interval_seconds,
-            stop_event=stop_event,
-        )
+        try:
+            worker.run_forever(
+                stages=selected_stages,
+                idle_sleep_seconds=idle_sleep_seconds,
+                requeue_interval_seconds=requeue_interval_seconds,
+                stop_event=stop_event,
+            )
+        finally:
+            context.close()
         typer.echo(json.dumps({"worker_id": worker.worker_id, "status": "stopped"}, sort_keys=True))
 
     @app.command("worker_shutdown")

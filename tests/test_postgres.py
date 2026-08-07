@@ -21,6 +21,7 @@ from Pelagia.domain import (
 )
 from Pelagia.storage import postgres
 from Pelagia.storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository, hash_session_token
+from Pelagia.services.taxonomy import default_taxonomy_dictionary
 
 
 POSTGRES_TEST_DSN = os.getenv(
@@ -182,6 +183,30 @@ def postgres_repo():
             with connection.cursor() as cursor:
                 cursor.execute(f"DROP SCHEMA IF EXISTS {repo.schema} CASCADE")
             connection.commit()
+        repo.close()
+
+
+def test_postgres_imports_default_curation_labels_idempotently(postgres_repo):
+    project = postgres_repo.create_project(f"taxonomy-{uuid.uuid4().hex}")
+    dictionary = default_taxonomy_dictionary()
+
+    first = postgres_repo.import_curation_label_dictionary(
+        project_id=str(project["id"]),
+        dictionary=dictionary,
+    )
+    second = postgres_repo.import_curation_label_dictionary(
+        project_id=str(project["id"]),
+        dictionary=dictionary,
+    )
+
+    assert first["dictionary_key"] == "pelagia-core@0.1.1"
+    assert first["created_count"] == dictionary["selectable_count"]
+    assert first["updated_count"] == 0
+    assert second["created_count"] == 0
+    assert second["updated_count"] == dictionary["selectable_count"]
+    labels = {label["stable_concept_id"]: label for label in second["labels"]}
+    assert labels["taxon_crustacea"]["parent_label_id"] == labels["taxon_arthropoda"]["id"]
+    assert labels["taxon_copepoda"]["display_name"] == "Copepod"
 
 
 def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
@@ -415,6 +440,17 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert detection_lookup is not None
     assert detection_lookup["roi_payload"] == b"roi-bytes"
     assert str(detection_lookup["asset_id"]) == asset_id
+    bulk_detection_lookup = postgres_repo.get_detections(
+        [
+            str(detections[1]["id"]),
+            str(detections[0]["id"]),
+            str(uuid.uuid4()),
+        ]
+    )
+    assert [str(row["id"]) for row in bulk_detection_lookup] == [
+        str(detections[1]["id"]),
+        str(detections[0]["id"]),
+    ]
     detection_record = DetectionRecord.from_row(filtered_detections[0])
     assert detection_record.id == str(filtered_detections[0]["id"])
     assert detection_record.roi_payload == b"roi-bytes"

@@ -1,0 +1,2394 @@
+# =============================================================================
+# Pelagia Core Vocabulary
+# =============================================================================
+#
+# Three independent controlled vocabularies:
+#
+#   taxonomy
+#       What is the target?
+#
+#   target_tags
+#       What properties does the target itself have?
+#       Examples: life stage, sex, posture, condition.
+#
+#   image_tags
+#       What properties does the image / ROI observation have?
+#       Examples: blur, clipping, overexposure, segmentation failure.
+#
+# Design principles:
+#
+# - `id` is the stable Pelagia identifier.
+# - Display names may change without changing `id`.
+# - External authorities are represented by repeatable `mappings`.
+# - Taxonomy is primarily single-valued.
+# - Target tags and image tags are multi-valued.
+# - Organizational nodes may be non-selectable.
+# - Some child groups may be mutually exclusive.
+#
+# =============================================================================
+
+
+[vocabulary]
+id = "pelagia-core"
+name = "Pelagia Core Vocabulary"
+version = "0.1.1"
+schema_version = "1.0.0"
+
+description = """
+Core controlled vocabulary for Pelagia image datasets and curation tools.
+Defines taxonomy, target-level tags, and image/ROI-level tags.
+"""
+
+created = "2026-08-07"
+language = "en"
+status = "draft"
+
+
+# =============================================================================
+# SOURCE REGISTRY
+# =============================================================================
+#
+# URLs are intentionally not repeated on individual concepts.
+# Applications can associate these source IDs with their canonical resources.
+#
+# `retrieved` records when this vocabulary release was checked against
+# the external authority.
+# =============================================================================
+
+
+[[sources]]
+id = "worms"
+name = "World Register of Marine Species"
+organization = "Flanders Marine Institute / WoRMS"
+authority_type = "taxonomy"
+identifier_scheme = "aphia_id"
+uri_scheme = "urn:lsid:marinespecies.org:taxname:{identifier}"
+retrieved = "2026-08-07"
+
+[[sources]]
+id = "ptwg"
+name = "PTWG namespace for non-conforming ROIs"
+organization = "NASA SeaBASS / OCB Phytoplankton Taxonomy Working Group"
+authority_type = "imaging_vocabulary"
+version = "1"
+identifier_scheme = "ptwg_term"
+retrieved = "2026-08-07"
+
+[[sources]]
+id = "wod_lifestage"
+name = "World Ocean Database Taxon Lifestage Code Table"
+organization = "NOAA National Centers for Environmental Information"
+authority_type = "life_stage_vocabulary"
+identifier_scheme = "wod_code"
+retrieved = "2026-08-07"
+
+[[sources]]
+id = "pelagia"
+name = "Pelagia Core Vocabulary"
+organization = "Icy Seas Co-Laboratory"
+authority_type = "local_controlled_vocabulary"
+identifier_scheme = "pelagia_concept_id"
+version = "0.1.0"
+
+
+# =============================================================================
+# TAXONOMY
+# =============================================================================
+
+[taxonomy]
+name = "Taxonomy"
+description = "Primary identity of the target contained in the ROI."
+allow_multiple = false
+require_selection = false
+
+
+# -----------------------------------------------------------------------------
+# Root
+# -----------------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "identity"
+name = "Identity"
+concept_type = "root"
+selectable = false
+
+
+# -----------------------------------------------------------------------------
+# Biological
+# -----------------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "biological"
+name = "Biological"
+parent_id = "identity"
+concept_type = "biological"
+selectable = true
+
+
+# Animalia --------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_animalia"
+name = "Animalia"
+scientific_name = "Animalia"
+parent_id = "biological"
+concept_type = "taxon"
+rank = "kingdom"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "2"
+uri = "urn:lsid:marinespecies.org:taxname:2"
+relationship = "exact"
+
+
+# Cnidaria --------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_cnidaria"
+name = "Cnidaria"
+scientific_name = "Cnidaria"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1267"
+uri = "urn:lsid:marinespecies.org:taxname:1267"
+relationship = "exact"
+
+
+# Arthropoda ------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_arthropoda"
+name = "Arthropoda"
+scientific_name = "Arthropoda"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1065"
+uri = "urn:lsid:marinespecies.org:taxname:1065"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "taxon_crustacea"
+name = "Crustacea"
+scientific_name = "Crustacea"
+parent_id = "taxon_arthropoda"
+concept_type = "taxon"
+rank = "subphylum"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1066"
+uri = "urn:lsid:marinespecies.org:taxname:1066"
+relationship = "exact"
+
+
+# Copepoda --------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_copepoda"
+name = "Copepoda"
+display_name = "Copepod"
+scientific_name = "Copepoda"
+parent_id = "taxon_crustacea"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1080"
+uri = "urn:lsid:marinespecies.org:taxname:1080"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "taxon_calanoida"
+name = "Calanoida"
+display_name = "Calanoid copepod"
+scientific_name = "Calanoida"
+parent_id = "taxon_copepoda"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+
+# Resolve and verify AphiaID through oracle vocabulary tooling before release.
+taxonomic_authority = "Sars G.O., 1903"
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1100"
+uri = "urn:lsid:marinespecies.org:taxname:1100"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_calanus"
+name = "Calanus"
+display_name = "Calanus"
+scientific_name = "Calanus"
+parent_id = "taxon_calanoida"
+concept_type = "taxon"
+rank = "genus"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "104152"
+uri = "urn:lsid:marinespecies.org:taxname:104152"
+relationship = "exact"
+
+
+# Imaging-operational taxonomic category.
+# Useful when morphology supports a broader classification but not a
+# taxonomically exact identification.
+
+[[taxonomy.nodes]]
+id = "operational_large_calanoid"
+name = "Large calanoid"
+parent_id = "taxon_calanoida"
+concept_type = "operational_taxon"
+match_type = "operational"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "pelagia"
+scheme = "pelagia_concept_id"
+identifier = "operational_large_calanoid"
+relationship = "exact"
+
+
+# Euphausiacea ----------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_euphausiacea"
+name = "Euphausiacea"
+display_name = "Euphausiid / krill"
+scientific_name = "Euphausiacea"
+parent_id = "taxon_crustacea"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1128"
+uri = "urn:lsid:marinespecies.org:taxname:1128"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "taxon_euphausiidae"
+name = "Euphausiidae"
+scientific_name = "Euphausiidae"
+parent_id = "taxon_euphausiacea"
+concept_type = "taxon"
+rank = "family"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "110671"
+uri = "urn:lsid:marinespecies.org:taxname:110671"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "taxon_euphausia_pacifica"
+name = "Euphausia pacifica"
+display_name = "Euphausia pacifica"
+scientific_name = "Euphausia pacifica"
+parent_id = "taxon_euphausiidae"
+concept_type = "taxon"
+rank = "species"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "237851"
+uri = "urn:lsid:marinespecies.org:taxname:237851"
+relationship = "exact"
+
+
+# Mollusca --------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "taxon_mollusca"
+name = "Mollusca"
+scientific_name = "Mollusca"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "51"
+uri = "urn:lsid:marinespecies.org:taxname:51"
+relationship = "exact"
+
+
+# Additional high-value pelagic imaging groups --------------------------------
+#
+# These nodes are included in the Pelagia hierarchy, but their exact WoRMS
+# AphiaIDs should be resolved automatically against WoRMS before the vocabulary
+# is promoted from draft to stable.
+#
+# This is preferable to embedding an unverified external ID.
+
+
+[[taxonomy.nodes]]
+id = "taxon_chaetognatha"
+name = "Chaetognatha"
+display_name = "Chaetognath"
+scientific_name = "Chaetognatha"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "2081"
+uri = "urn:lsid:marinespecies.org:taxname:2081"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_ctenophora"
+name = "Ctenophora"
+display_name = "Ctenophore"
+scientific_name = "Ctenophora"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Eschscholtz, 1829"
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1248"
+uri = "urn:lsid:marinespecies.org:taxname:1248"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_chordata"
+name = "Chordata"
+scientific_name = "Chordata"
+parent_id = "taxon_animalia"
+concept_type = "taxon"
+rank = "phylum"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Haeckel, 1874"
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1821"
+uri = "urn:lsid:marinespecies.org:taxname:1821"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_appendicularia"
+name = "Appendicularia"
+display_name = "Appendicularian"
+parent_id = "taxon_chordata"
+concept_type = "taxon"
+match_type = "exact"
+selectable = true
+scientific_name = "Appendicularia"
+rank = "genus"
+taxonomic_authority = "Fol, 1874"
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "103357"
+uri = "urn:lsid:marinespecies.org:taxname:103357"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_actinopterygii"
+name = "Actinopterygii"
+display_name = "Ray-finned fish"
+parent_id = "taxon_chordata"
+concept_type = "taxon"
+rank = "gigaclass"
+match_type = "exact"
+selectable = true
+scientific_name = "Actinopterygii"
+worms_status = "accepted"
+
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "10194"
+uri = "urn:lsid:marinespecies.org:taxname:10194"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_hydrozoa"
+name = "Hydrozoa"
+scientific_name = "Hydrozoa"
+parent_id = "taxon_cnidaria"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+
+
+
+# -----------------------------------------------------------------------------
+# Non-biological identity
+# -----------------------------------------------------------------------------
+taxonomic_authority = "Owen, 1843"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1337"
+uri = "urn:lsid:marinespecies.org:taxname:1337"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "non_biological"
+name = "Non-biological"
+parent_id = "identity"
+concept_type = "non_biological"
+selectable = true
+
+
+# Detrital material -----------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "particle_detrital_material"
+name = "Detrital material"
+parent_id = "non_biological"
+concept_type = "particle"
+selectable = true
+
+
+[[taxonomy.nodes]]
+id = "particle_detritus"
+name = "Detritus"
+parent_id = "particle_detrital_material"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "detritus"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "particle_aggregate"
+name = "Aggregate"
+parent_id = "particle_detrital_material"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "pelagia"
+scheme = "pelagia_concept_id"
+identifier = "particle_aggregate"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "particle_marine_snow"
+name = "Marine snow"
+parent_id = "particle_aggregate"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "pelagia"
+scheme = "pelagia_concept_id"
+identifier = "particle_marine_snow"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "particle_fiber"
+name = "Fiber"
+parent_id = "particle_detrital_material"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "pelagia"
+scheme = "pelagia_concept_id"
+identifier = "particle_fiber"
+relationship = "exact"
+
+
+[[taxonomy.nodes]]
+id = "particle_fragment"
+name = "Fragment"
+parent_id = "particle_detrital_material"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "pelagia"
+scheme = "pelagia_concept_id"
+identifier = "particle_fragment"
+relationship = "exact"
+
+
+# Fecal material --------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "particle_fecal_material"
+name = "Fecal material"
+parent_id = "non_biological"
+concept_type = "particle"
+selectable = true
+
+
+[[taxonomy.nodes]]
+id = "particle_fecal_pellet"
+name = "Fecal pellet"
+parent_id = "particle_fecal_material"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "fecal_pellet"
+relationship = "exact"
+
+
+# Bubble ----------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "particle_bubble"
+name = "Bubble"
+parent_id = "non_biological"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "bubble"
+relationship = "exact"
+
+
+# Calibration / artificial targets --------------------------------------------
+
+[[taxonomy.nodes]]
+id = "artificial_target"
+name = "Artificial target"
+parent_id = "non_biological"
+concept_type = "artificial"
+selectable = true
+
+
+[[taxonomy.nodes]]
+id = "artificial_bead"
+name = "Calibration bead"
+parent_id = "artificial_target"
+concept_type = "artificial"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "bead"
+relationship = "exact"
+
+
+# Other non-living ------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "particle_other"
+name = "Other non-living particle"
+parent_id = "non_biological"
+concept_type = "particle"
+selectable = true
+
+[[taxonomy.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "other"
+relationship = "exact"
+
+
+# -----------------------------------------------------------------------------
+# Unknown identity
+# -----------------------------------------------------------------------------
+
+[[taxonomy.nodes]]
+id = "unknown"
+name = "Unknown"
+parent_id = "identity"
+concept_type = "unknown"
+selectable = true
+
+
+[[taxonomy.nodes]]
+id = "unknown_biological"
+name = "Unknown biological"
+parent_id = "unknown"
+concept_type = "unknown"
+selectable = true
+
+
+[[taxonomy.nodes]]
+id = "unknown_non_biological"
+name = "Unknown non-biological"
+parent_id = "unknown"
+concept_type = "unknown"
+selectable = true
+
+
+# =============================================================================
+# TARGET TAGS
+# =============================================================================
+
+[[taxonomy.nodes]]
+id = "taxon_copepoda_incertae_sedis_237949"
+name = "Copepoda incertae sedis"
+scientific_name = "Copepoda incertae sedis"
+parent_id = "taxon_copepoda"
+concept_type = "taxon"
+rank = "infraclass"
+match_type = "exact"
+selectable = true
+worms_status = "temporary name"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "237949"
+uri = "urn:lsid:marinespecies.org:taxname:237949"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_neocopepoda_155876"
+name = "Neocopepoda"
+scientific_name = "Neocopepoda"
+parent_id = "taxon_copepoda"
+concept_type = "taxon"
+rank = "infraclass"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Huys & Boxshall, 1991"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "155876"
+uri = "urn:lsid:marinespecies.org:taxname:155876"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_gymnoplea_155877"
+name = "Gymnoplea"
+scientific_name = "Gymnoplea"
+parent_id = "taxon_neocopepoda_155876"
+concept_type = "taxon"
+rank = "superorder"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Giesbrecht, 1882"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "155877"
+uri = "urn:lsid:marinespecies.org:taxname:155877"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_podoplea_155879"
+name = "Podoplea"
+scientific_name = "Podoplea"
+parent_id = "taxon_neocopepoda_155876"
+concept_type = "taxon"
+rank = "superorder"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Giesbrecht, 1882"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "155879"
+uri = "urn:lsid:marinespecies.org:taxname:155879"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_canuelloida_1035042"
+name = "Canuelloida"
+scientific_name = "Canuelloida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Khodami, Vaun MacArthur, Blanco-Bercial & Martinez Arbizu, 2017"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1035042"
+uri = "urn:lsid:marinespecies.org:taxname:1035042"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_cyclopoida_1101"
+name = "Cyclopoida"
+scientific_name = "Cyclopoida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Burmeister, 1834"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1101"
+uri = "urn:lsid:marinespecies.org:taxname:1101"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_harpacticoida_1102"
+name = "Harpacticoida"
+scientific_name = "Harpacticoida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Sars G.O., 1903"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1102"
+uri = "urn:lsid:marinespecies.org:taxname:1102"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_misophrioida_22597"
+name = "Misophrioida"
+scientific_name = "Misophrioida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Gurney, 1933"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "22597"
+uri = "urn:lsid:marinespecies.org:taxname:22597"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_monstrilloida_1106"
+name = "Monstrilloida"
+scientific_name = "Monstrilloida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Sars G.O., 1901"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1106"
+uri = "urn:lsid:marinespecies.org:taxname:1106"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_mormonilloida_22598"
+name = "Mormonilloida"
+scientific_name = "Mormonilloida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Boxshall, 1979"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "22598"
+uri = "urn:lsid:marinespecies.org:taxname:22598"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_siphonostomatoida_1104"
+name = "Siphonostomatoida"
+scientific_name = "Siphonostomatoida"
+parent_id = "taxon_podoplea_155879"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Burmeister, 1835"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1104"
+uri = "urn:lsid:marinespecies.org:taxname:1104"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_progymnoplea_155875"
+name = "Progymnoplea"
+scientific_name = "Progymnoplea"
+parent_id = "taxon_copepoda"
+concept_type = "taxon"
+rank = "infraclass"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Lang, 1948"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "155875"
+uri = "urn:lsid:marinespecies.org:taxname:155875"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_platycopioida_22605"
+name = "Platycopioida"
+scientific_name = "Platycopioida"
+parent_id = "taxon_progymnoplea_155875"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Fosshagen, in Fosshagen & Iliffe, 1985"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "22605"
+uri = "urn:lsid:marinespecies.org:taxname:22605"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_calanidae_104079"
+name = "Calanidae"
+scientific_name = "Calanidae"
+parent_id = "taxon_calanoida"
+concept_type = "taxon"
+rank = "family"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Dana, 1846"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "104079"
+uri = "urn:lsid:marinespecies.org:taxname:104079"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_neocalanus_104155"
+name = "Neocalanus"
+scientific_name = "Neocalanus"
+parent_id = "taxon_calanidae_104079"
+concept_type = "taxon"
+rank = "genus"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Sars G.O., 1925"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "104155"
+uri = "urn:lsid:marinespecies.org:taxname:104155"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_metridinidae_104092"
+name = "Metridinidae"
+scientific_name = "Metridinidae"
+parent_id = "taxon_calanoida"
+concept_type = "taxon"
+rank = "family"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Sars G.O., 1902"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "104092"
+uri = "urn:lsid:marinespecies.org:taxname:104092"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_metridia_104190"
+name = "Metridia"
+scientific_name = "Metridia"
+parent_id = "taxon_metridinidae_104092"
+concept_type = "taxon"
+rank = "genus"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Boeck, 1865"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "104190"
+uri = "urn:lsid:marinespecies.org:taxname:104190"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_oithonida_1381346"
+name = "Oithonida"
+scientific_name = "Oithonida"
+parent_id = "taxon_cyclopoida_1101"
+concept_type = "taxon"
+rank = "suborder"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Khodami, Mercado-Salas, Tang & Matrinez Arbizu, 2019"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1381346"
+uri = "urn:lsid:marinespecies.org:taxname:1381346"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_oithonidae_106422"
+name = "Oithonidae"
+scientific_name = "Oithonidae"
+parent_id = "taxon_oithonida_1381346"
+concept_type = "taxon"
+rank = "family"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Dana, 1853-1855"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "106422"
+uri = "urn:lsid:marinespecies.org:taxname:106422"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_oithona_106485"
+name = "Oithona"
+scientific_name = "Oithona"
+parent_id = "taxon_oithonidae_106422"
+concept_type = "taxon"
+rank = "genus"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Baird, 1843"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "106485"
+uri = "urn:lsid:marinespecies.org:taxname:106485"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_medusozoa_1740301"
+name = "Medusozoa"
+scientific_name = "Medusozoa"
+parent_id = "taxon_cnidaria"
+concept_type = "taxon"
+rank = "subphylum"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Petersen, 1979"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1740301"
+uri = "urn:lsid:marinespecies.org:taxname:1740301"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_scyphozoa_135220"
+name = "Scyphozoa"
+scientific_name = "Scyphozoa"
+parent_id = "taxon_medusozoa_1740301"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Goette, 1887"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "135220"
+uri = "urn:lsid:marinespecies.org:taxname:135220"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_multicrustacea_845959"
+name = "Multicrustacea"
+scientific_name = "Multicrustacea"
+parent_id = "taxon_crustacea"
+concept_type = "taxon"
+rank = "superclass"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Regier, Shultz, Zwick, Hussey, Ball, Wetzer, Martin & Cunningham, 2010"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "845959"
+uri = "urn:lsid:marinespecies.org:taxname:845959"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_malacostraca_1071"
+name = "Malacostraca"
+scientific_name = "Malacostraca"
+parent_id = "taxon_multicrustacea_845959"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Latreille, 1802"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1071"
+uri = "urn:lsid:marinespecies.org:taxname:1071"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_eumalacostraca_1086"
+name = "Eumalacostraca"
+scientific_name = "Eumalacostraca"
+parent_id = "taxon_malacostraca_1071"
+concept_type = "taxon"
+rank = "subclass"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1086"
+uri = "urn:lsid:marinespecies.org:taxname:1086"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_peracarida_1090"
+name = "Peracarida"
+scientific_name = "Peracarida"
+parent_id = "taxon_eumalacostraca_1086"
+concept_type = "taxon"
+rank = "superorder"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Calman, 1904"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1090"
+uri = "urn:lsid:marinespecies.org:taxname:1090"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_amphipoda_1135"
+name = "Amphipoda"
+scientific_name = "Amphipoda"
+parent_id = "taxon_peracarida_1090"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Latreille, 1816"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1135"
+uri = "urn:lsid:marinespecies.org:taxname:1135"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_eucarida_1089"
+name = "Eucarida"
+scientific_name = "Eucarida"
+parent_id = "taxon_eumalacostraca_1086"
+concept_type = "taxon"
+rank = "superorder"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Calman, 1904"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1089"
+uri = "urn:lsid:marinespecies.org:taxname:1089"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_decapoda_1130"
+name = "Decapoda"
+scientific_name = "Decapoda"
+parent_id = "taxon_eucarida_1089"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Latreille, 1802"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1130"
+uri = "urn:lsid:marinespecies.org:taxname:1130"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_mysida_149668"
+name = "Mysida"
+scientific_name = "Mysida"
+parent_id = "taxon_peracarida_1090"
+concept_type = "taxon"
+rank = "order"
+match_type = "exact"
+selectable = true
+taxonomic_authority = "Boas, 1883"
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "149668"
+uri = "urn:lsid:marinespecies.org:taxname:149668"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_actinopteri_843664"
+name = "Actinopteri"
+scientific_name = "Actinopteri"
+parent_id = "taxon_actinopterygii"
+concept_type = "taxon"
+rank = "superclass"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "843664"
+uri = "urn:lsid:marinespecies.org:taxname:843664"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_chondrostei_1517379"
+name = "Chondrostei"
+scientific_name = "Chondrostei"
+parent_id = "taxon_actinopteri_843664"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1517379"
+uri = "urn:lsid:marinespecies.org:taxname:1517379"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_holostei_1517380"
+name = "Holostei"
+scientific_name = "Holostei"
+parent_id = "taxon_actinopteri_843664"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1517380"
+uri = "urn:lsid:marinespecies.org:taxname:1517380"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_teleostei_293496"
+name = "Teleostei"
+scientific_name = "Teleostei"
+parent_id = "taxon_actinopteri_843664"
+concept_type = "taxon"
+rank = "class"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "293496"
+uri = "urn:lsid:marinespecies.org:taxname:293496"
+relationship = "exact"
+[[taxonomy.nodes]]
+id = "taxon_cladistia_1617132"
+name = "Cladistia"
+scientific_name = "Cladistia"
+parent_id = "taxon_actinopterygii"
+concept_type = "taxon"
+rank = "superclass"
+match_type = "exact"
+selectable = true
+worms_status = "accepted"
+
+[[taxonomy.nodes.mappings]]
+authority = "worms"
+scheme = "aphia_id"
+identifier = "1617132"
+uri = "urn:lsid:marinespecies.org:taxname:1617132"
+relationship = "exact"
+[target_tags]
+name = "Target Tags"
+description = """
+Properties of the imaged target itself, independent of the target's primary
+taxonomic or particle identity.
+"""
+allow_multiple = true
+
+
+# -----------------------------------------------------------------------------
+# LIFE STAGE
+# -----------------------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "stage"
+name = "Life stage"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = true
+
+
+[[target_tags.nodes]]
+id = "stage_egg"
+name = "Egg / ova"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "1"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius"
+name = "Nauplius"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "2"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_zoea"
+name = "Zoea"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "3"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_megalopa"
+name = "Megalopa"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "4"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_veliger"
+name = "Veliger"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "5"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_larva"
+name = "Larva"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "6"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_juvenile"
+name = "Juvenile"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "7"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_adult"
+name = "Adult"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "8"
+relationship = "exact"
+
+
+# Copepodite stages -----------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "stage_copepodite"
+name = "Copepodite"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "29"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c1"
+name = "Copepodite C1"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "25"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c2"
+name = "Copepodite C2"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "26"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c3"
+name = "Copepodite C3"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "27"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c4"
+name = "Copepodite C4"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "28"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c5"
+name = "Copepodite C5"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "10"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_copepodite_c6"
+name = "Copepodite C6"
+parent_id = "stage_copepodite"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "52"
+relationship = "exact"
+
+
+# Naupliar stages -------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n1"
+name = "Nauplius N1"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "32"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n2"
+name = "Nauplius N2"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "33"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n3"
+name = "Nauplius N3"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "34"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n4"
+name = "Nauplius N4"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "35"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n5"
+name = "Nauplius N5"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "36"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_nauplius_n6"
+name = "Nauplius N6"
+parent_id = "stage_nauplius"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "48"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_metanauplius"
+name = "Metanauplius"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "37"
+relationship = "exact"
+
+
+# Euphausiid stages -----------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "stage_calyptopis"
+name = "Calyptopis"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "30"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_furcilia"
+name = "Furcilia"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "31"
+relationship = "exact"
+
+
+# Other useful stages ---------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "stage_embryo"
+name = "Embryo"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "19"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_cypris"
+name = "Cypris"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "20"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_trochophore"
+name = "Trochophore"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "16"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_medusa"
+name = "Medusa"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "39"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_polyp"
+name = "Polyp"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "38"
+relationship = "exact"
+
+
+[[target_tags.nodes]]
+id = "stage_indeterminate"
+name = "Indeterminate life stage"
+parent_id = "stage"
+concept_type = "life_stage"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "40"
+relationship = "exact"
+
+
+# -----------------------------------------------------------------------------
+# SEX
+# -----------------------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "sex"
+name = "Sex"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = true
+
+
+[[target_tags.nodes]]
+id = "sex_female"
+name = "Female"
+parent_id = "sex"
+concept_type = "sex"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "sex_male"
+name = "Male"
+parent_id = "sex"
+concept_type = "sex"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "sex_indeterminate"
+name = "Indeterminate"
+parent_id = "sex"
+concept_type = "sex"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# POSTURE
+# -----------------------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "posture"
+name = "Posture"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = true
+
+
+[[target_tags.nodes]]
+id = "posture_extended"
+name = "Extended"
+parent_id = "posture"
+concept_type = "posture"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "posture_curled"
+name = "Curled"
+parent_id = "posture"
+concept_type = "posture"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "posture_folded"
+name = "Folded"
+parent_id = "posture"
+concept_type = "posture"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "posture_contracting"
+name = "Contracting"
+parent_id = "posture"
+concept_type = "posture"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "posture_irregular"
+name = "Irregular"
+parent_id = "posture"
+concept_type = "posture"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# ORIENTATION
+# -----------------------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "orientation"
+name = "Orientation"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = true
+
+
+[[target_tags.nodes]]
+id = "orientation_lateral"
+name = "Lateral"
+parent_id = "orientation"
+concept_type = "orientation"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "orientation_dorsal"
+name = "Dorsal"
+parent_id = "orientation"
+concept_type = "orientation"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "orientation_ventral"
+name = "Ventral"
+parent_id = "orientation"
+concept_type = "orientation"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "orientation_end_on"
+name = "End-on"
+parent_id = "orientation"
+concept_type = "orientation"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "orientation_oblique"
+name = "Oblique"
+parent_id = "orientation"
+concept_type = "orientation"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# TARGET CONDITION
+# -----------------------------------------------------------------------------
+
+[[target_tags.nodes]]
+id = "condition"
+name = "Target condition"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = false
+
+
+[[target_tags.nodes]]
+id = "condition_damaged"
+name = "Damaged"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "condition_fragment"
+name = "Fragment"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "condition_dead"
+name = "Dead / non-viable"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "44"
+relationship = "close"
+
+
+[[target_tags.nodes]]
+id = "condition_living"
+name = "Living / viable"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "45"
+relationship = "close"
+
+
+[[target_tags.nodes]]
+id = "condition_egg_bearing"
+name = "Egg-bearing"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+
+[[target_tags.nodes]]
+id = "condition_exuvia"
+name = "Exuvia / molt"
+parent_id = "condition"
+concept_type = "condition"
+selectable = true
+
+[[target_tags.nodes.mappings]]
+authority = "wod_lifestage"
+scheme = "wod_code"
+identifier = "90"
+relationship = "close"
+
+
+# =============================================================================
+# IMAGE TAGS
+# =============================================================================
+
+[image_tags]
+name = "Image Tags"
+description = """
+Properties of the image, ROI extraction, or observation rather than properties
+of the biological or physical target itself.
+"""
+allow_multiple = true
+
+
+# -----------------------------------------------------------------------------
+# OVERALL IMAGE QUALITY
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "quality"
+name = "Image quality"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = false
+
+
+[[image_tags.nodes]]
+id = "quality_bad_image"
+name = "Bad image"
+parent_id = "quality"
+concept_type = "image_quality"
+selectable = true
+
+[[image_tags.nodes.mappings]]
+authority = "ptwg"
+scheme = "ptwg_term"
+identifier = "bad_image"
+relationship = "exact"
+
+
+# -----------------------------------------------------------------------------
+# FOCUS / SHARPNESS
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "focus"
+name = "Focus"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = false
+
+
+[[image_tags.nodes]]
+id = "focus_blurry"
+name = "Blurry"
+parent_id = "focus"
+concept_type = "image_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "focus_out_of_focus"
+name = "Out of focus"
+parent_id = "focus"
+concept_type = "image_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "focus_motion_blur"
+name = "Motion blur"
+parent_id = "focus"
+concept_type = "image_quality"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# EXPOSURE
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "exposure"
+name = "Exposure"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = false
+
+
+[[image_tags.nodes]]
+id = "exposure_underexposed"
+name = "Underexposed"
+parent_id = "exposure"
+concept_type = "image_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "exposure_overexposed"
+name = "Overexposed"
+parent_id = "exposure"
+concept_type = "image_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "exposure_saturated"
+name = "Saturated"
+parent_id = "exposure"
+concept_type = "image_quality"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# CONTRAST
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "contrast"
+name = "Contrast"
+concept_type = "tag_group"
+selectable = false
+
+
+[[image_tags.nodes]]
+id = "contrast_low"
+name = "Low contrast"
+parent_id = "contrast"
+concept_type = "image_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "contrast_high"
+name = "Excessive contrast"
+parent_id = "contrast"
+concept_type = "image_quality"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# ROI COMPLETENESS
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "completeness"
+name = "ROI completeness"
+concept_type = "tag_group"
+selectable = false
+
+
+[[image_tags.nodes]]
+id = "completeness_cutoff"
+name = "Cut off"
+parent_id = "completeness"
+concept_type = "roi_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "completeness_touching_edge"
+name = "Touching ROI edge"
+parent_id = "completeness"
+concept_type = "roi_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "completeness_partial"
+name = "Partial target"
+parent_id = "completeness"
+concept_type = "roi_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "completeness_occluded"
+name = "Occluded"
+parent_id = "completeness"
+concept_type = "roi_quality"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# SEGMENTATION / ROI GENERATION
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "segmentation"
+name = "Segmentation"
+concept_type = "tag_group"
+selectable = false
+
+
+[[image_tags.nodes]]
+id = "segmentation_multiple_targets"
+name = "Multiple targets"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_overlapping_targets"
+name = "Overlapping targets"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_split_target"
+name = "Target split across ROIs"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_merged_roi"
+name = "Merged ROI"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_background_only"
+name = "Background only"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_bad_crop"
+name = "Bad crop"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "segmentation_excess_background"
+name = "Excess background"
+parent_id = "segmentation"
+concept_type = "segmentation_quality"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# OPTICAL / SENSOR ARTIFACTS
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "artifact"
+name = "Imaging artifact"
+concept_type = "tag_group"
+selectable = false
+
+
+[[image_tags.nodes]]
+id = "artifact_sensor"
+name = "Sensor artifact"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_streak"
+name = "Streak"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_reflection"
+name = "Reflection"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_uneven_illumination"
+name = "Uneven illumination"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_compression"
+name = "Compression artifact"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_hot_pixel"
+name = "Hot / dead pixel"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "artifact_duplicate"
+name = "Duplicate ROI"
+parent_id = "artifact"
+concept_type = "image_artifact"
+selectable = true
+
+
+# -----------------------------------------------------------------------------
+# USABILITY
+# -----------------------------------------------------------------------------
+
+[[image_tags.nodes]]
+id = "usability"
+name = "Usability"
+concept_type = "tag_group"
+selectable = false
+exclusive_within_parent = true
+
+
+[[image_tags.nodes]]
+id = "usability_usable"
+name = "Usable"
+parent_id = "usability"
+concept_type = "usability"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "usability_questionable"
+name = "Questionable"
+parent_id = "usability"
+concept_type = "usability"
+selectable = true
+
+
+[[image_tags.nodes]]
+id = "usability_unusable"
+name = "Unusable"
+parent_id = "usability"
+concept_type = "usability"
+selectable = true
+
+
+# =============================================================================
+# VALIDATION RULES
+# =============================================================================
+
+[validation]
+
+# IDs are immutable once released.
+stable_ids = true
+
+# IDs must be unique across the entire vocabulary, not merely within a branch.
+global_unique_ids = true
+
+# Every parent_id must resolve to a node in the same vocabulary namespace.
+require_valid_parents = true
+
+# Circular hierarchies are invalid.
+forbid_cycles = true
+
+# A node may be selectable even if it has children.
+allow_selectable_parent_nodes = true
+
+# External identifiers need not exist for Pelagia-defined concepts.
+require_external_mapping = false
+
+# An exact external mapping must contain both authority and identifier.
+require_identifier_for_exact_mapping = true
+
+
+# =============================================================================
+# MAPPING RELATIONSHIPS
+# =============================================================================
+#
+# Supported mapping relationships:
+#
+# exact
+#     Pelagia concept and external concept are intended to mean the same thing.
+#
+# close
+#     Concepts substantially overlap but are not semantically identical.
+#
+# broader
+#     Pelagia concept is broader than the mapped concept.
+#
+# narrower
+#     Pelagia concept is narrower than the mapped concept.
+#
+# related
+#     Useful relationship but not hierarchical/equivalent.
+#
+# =============================================================================
+
+
+[mapping_relationships]
+
+exact = "Equivalent concept."
+close = "Substantially equivalent but not strictly identical."
+broader = "Pelagia concept is broader than the external concept."
+narrower = "Pelagia concept is narrower than the external concept."
+related = "Associated concept without equivalence or hierarchy."

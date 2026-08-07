@@ -19,11 +19,13 @@ try:
     import psycopg
     from psycopg import conninfo, sql
     from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
 except ImportError:  # pragma: no cover - exercised only when postgres extras are absent
     psycopg = None
     conninfo = None
     sql = None
     dict_row = None
+    ConnectionPool = None
 
 
 REQUIRED_SCHEMA_TABLES = (
@@ -146,8 +148,8 @@ def render_migration(migration: dict[str, str], schema: str) -> str:
 
 
 def _require_psycopg() -> None:
-    if psycopg is None:
-        raise RuntimeError("psycopg is required for PostgreSQL operations. Install seasight_core[postgres].")
+    if psycopg is None or ConnectionPool is None:
+        raise RuntimeError("psycopg and psycopg-pool are required for PostgreSQL operations. Install Pelagia[postgres].")
 
 
 def _event_level(event_type: str) -> str:
@@ -216,6 +218,24 @@ class PostgresRepository:
         _require_psycopg()
         self.config = config
         self.schema = validate_schema_name(config.database.schema_name)
+        if config.database.pool_min_size < 0:
+            raise ValueError("database.pool_min_size must be non-negative.")
+        if config.database.pool_max_size < 1:
+            raise ValueError("database.pool_max_size must be at least 1.")
+        if config.database.pool_min_size > config.database.pool_max_size:
+            raise ValueError("database.pool_min_size cannot exceed database.pool_max_size.")
+        self._pool = ConnectionPool(
+            conninfo=config.database.dsn,
+            min_size=config.database.pool_min_size,
+            max_size=config.database.pool_max_size,
+            timeout=config.database.pool_timeout_s,
+            kwargs={
+                "connect_timeout": config.database.connect_timeout_s,
+                "row_factory": dict_row,
+                "autocommit": False,
+            },
+            open=True,
+        )
         # Scoped views are the preferred application-facing dependencies.  Keep
         # this facade intact while the underlying SQL moves out incrementally.
         from .scoped import CatalogRepository, FrameRepository, IdentityRepository, JobRepository
@@ -226,12 +246,14 @@ class PostgresRepository:
         self.jobs = JobRepository(self)
 
     def connect(self):
-        return psycopg.connect(
-            self.config.database.dsn,
-            connect_timeout=self.config.database.connect_timeout_s,
-            row_factory=dict_row,
-            autocommit=False,
-        )
+        """Borrow a bounded, reusable connection for one repository operation."""
+
+        return self._pool.connection()
+
+    def close(self) -> None:
+        """Close this process's connection pool."""
+
+        self._pool.close()
 
     def ensure_database_exists(self) -> None:
         dsn_fields = self._dsn_fields()
@@ -2994,11 +3016,22 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def get_detection(self, detection_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+    def get_detections(
+        self,
+        detection_ids: Sequence[str],
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load candidate detections in request order using one query and connection."""
+
+        resolved_ids = [str(detection_id) for detection_id in detection_ids if detection_id]
+        if not resolved_ids:
+            return []
+        unique_ids = list(dict.fromkeys(resolved_ids))
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                clauses = ["detections.id = %s"]
-                params: list[Any] = [detection_id]
+                clauses = ["detections.id = ANY(%s)"]
+                params: list[Any] = [unique_ids]
                 if project_id:
                     clauses.append("assets.project_id = %s")
                     params.append(project_id)
@@ -3025,7 +3058,12 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchone()
+                rows_by_id = {str(row["id"]): row for row in cursor.fetchall()}
+        return [rows_by_id[detection_id] for detection_id in resolved_ids if detection_id in rows_by_id]
+
+    def get_detection(self, detection_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+        rows = self.get_detections([detection_id], project_id=project_id)
+        return rows[0] if rows else None
 
     def get_refined_detection_for_candidate(
         self,
@@ -4516,6 +4554,106 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    def import_curation_label_dictionary(
+        self,
+        *,
+        project_id: str,
+        dictionary: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Materialize selectable taxonomy concepts as idempotent project labels."""
+
+        vocabulary = dictionary.get("vocabulary") or {}
+        nodes = dictionary.get("labels") or []
+        nodes_by_id = {str(node["id"]): node for node in nodes}
+        selectable_nodes = [node for node in nodes if bool(node.get("selectable", True))]
+        created_count = 0
+        updated_count = 0
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.classification_labels WHERE project_id = %s FOR UPDATE",
+                    (project_id,),
+                )
+                existing_rows = list(cursor.fetchall())
+                by_concept = {
+                    str(row["stable_concept_id"]): row
+                    for row in existing_rows
+                    if row.get("stable_concept_id")
+                }
+                by_name = {str(row["name"]).casefold(): row for row in existing_rows}
+                materialized: dict[str, str] = {
+                    concept_id: str(row["id"]) for concept_id, row in by_concept.items()
+                }
+
+                def parent_label_id(node: dict[str, Any]) -> str | None:
+                    parent_id = node.get("parent_id")
+                    while parent_id:
+                        resolved = materialized.get(str(parent_id))
+                        if resolved:
+                            return resolved
+                        parent = nodes_by_id.get(str(parent_id)) or {}
+                        parent_id = parent.get("parent_id")
+                    return None
+
+                for node in selectable_nodes:
+                    concept_id = str(node["id"])
+                    name = str(node["name"])
+                    display_name = str(node.get("display_name") or name)
+                    metadata = {
+                        "label_dictionary": {
+                            "key": dictionary.get("key"),
+                            "filename": dictionary.get("filename"),
+                            "vocabulary": vocabulary,
+                            "concept": node,
+                        }
+                    }
+                    existing = by_concept.get(concept_id) or by_name.get(name.casefold())
+                    if existing is None:
+                        cursor.execute(
+                            f"""
+                            INSERT INTO {self.schema}.classification_labels
+                                (project_id, name, display_name, stable_concept_id,
+                                 parent_label_id, rank, description, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                            RETURNING *
+                            """,
+                            (
+                                project_id, name, display_name, concept_id,
+                                parent_label_id(node), node.get("rank"),
+                                node.get("description"), json.dumps(json_ready(metadata)),
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        created_count += 1
+                    else:
+                        cursor.execute(
+                            f"""
+                            UPDATE {self.schema}.classification_labels
+                            SET display_name = %s, stable_concept_id = %s,
+                                parent_label_id = %s, rank = %s, description = %s,
+                                metadata = metadata || %s::jsonb, deprecated_at = NULL
+                            WHERE id = %s
+                            RETURNING *
+                            """,
+                            (
+                                display_name, concept_id, parent_label_id(node),
+                                node.get("rank"), node.get("description"),
+                                json.dumps(json_ready(metadata)), existing["id"],
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        updated_count += 1
+                    by_concept[concept_id] = row
+                    by_name[name.casefold()] = row
+                    materialized[concept_id] = str(row["id"])
+            connection.commit()
+        return {
+            "dictionary_key": dictionary.get("key"),
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "labels": self.list_curation_labels(project_id=project_id),
+        }
+
     def list_curation_rois(
         self,
         *,
@@ -4883,6 +5021,34 @@ class PostgresRepository:
                     (*params, limit, offset),
                 )
                 return list(cursor.fetchall())
+
+    def count_classification_targets(
+        self,
+        *,
+        project_id: str,
+        roi_ids: Sequence[str] = (),
+    ) -> int:
+        """Count the refined ROIs that can actually be sent for classification."""
+
+        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
+        params: list[Any] = [project_id]
+        if roi_ids:
+            clauses.append("refined.id = ANY(%s::uuid[])")
+            params.append(list(dict.fromkeys(roi_ids)))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT count(*) AS target_count
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    tuple(params),
+                )
+                row = cursor.fetchone()
+        return int((row or {}).get("target_count") or 0)
 
     def create_classification_inference_run(
         self,

@@ -65,7 +65,7 @@ class FrameRepository(RepositoryScope):
             "update_frame_background_payloads", "update_frame_background_payload_assignments",
             "upsert_refined_detections",
             "replace_detections", "replace_frame_detections", "list_detections",
-            "get_detection", "get_refined_detection_for_candidate",
+            "get_detection", "get_detections", "get_refined_detection_for_candidate",
             "get_refined_detection", "list_detection_records",
             "list_asset_detection_stats", "list_asset_processing_state",
             "list_frame_processing_state", "ensure_frame_status_rows",

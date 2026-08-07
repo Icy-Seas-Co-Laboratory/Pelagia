@@ -64,3 +64,9 @@ class AppContext:
             kvstore=self.kvstore_for_project(project_id),
             active_project_id=str(project_id),
         )
+
+    def close(self) -> None:
+        """Release process-owned service resources."""
+
+        if self.repository is not None:
+            self.repository.close()

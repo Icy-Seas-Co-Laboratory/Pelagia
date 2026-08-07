@@ -46,6 +46,7 @@ class FakeRepository:
         self.frames_with_background = set()
         self.shutdown_requested = False
         self.project_calls = []
+        self.heartbeats = []
 
     def get_asset(self, asset_id, **kwargs):
         self.project_calls.append(("get_asset", kwargs.get("project_id")))
@@ -189,6 +190,14 @@ class FakeRepository:
             "metadata": {},
         }
 
+    def get_detections(self, detection_ids, **kwargs):
+        self.project_calls.append(("get_detections", kwargs.get("project_id")))
+        return [
+            row
+            for detection_id in detection_ids
+            if (row := self.get_detection(detection_id, **kwargs)) is not None
+        ]
+
     def upsert_refined_detections(self, refined_detections, *, job_id=None, project_id=None):
         self.project_calls.append(("upsert_refined_detections", project_id))
         rows = []
@@ -217,6 +226,10 @@ class FakeRepository:
     def requeue_expired_jobs(self):
         self.requeued += 1
         return {"queued": 0, "dead_lettered": 0}
+
+    def heartbeat(self, worker_id, job_id):
+        self.heartbeats.append((worker_id, job_id))
+        return {"id": job_id, "worker_id": worker_id, "status": "leased"}
 
 
 class FakeOracle:
@@ -248,16 +261,29 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
     repo = FakeRepository()
     stored_evidence = []
     completed_runs = []
-    repo.create_classification_inference_run = lambda **_: {"id": "inference-run-1"}
+    created_runs = []
+    repo.create_classification_inference_run = lambda **values: created_runs.append(values) or {
+        "id": "inference-run-1"
+    }
+    repo.count_classification_targets = lambda **values: 1
+    padded_roi = np.arange(20, dtype="uint8").reshape(4, 5)
     repo.list_classification_targets = lambda **values: (
         [
             {
                 "id": "refined-1",
-                "roi_payload": np.asarray([[0, 255], [128, 64]], dtype="uint8").tobytes(),
+                "bbox_x": 12,
+                "bbox_y": 21,
+                "bbox_w": 2,
+                "bbox_h": 2,
+                "crop_bbox_x": 10,
+                "crop_bbox_y": 20,
+                "crop_bbox_w": 5,
+                "crop_bbox_h": 4,
+                "roi_payload": padded_roi.tobytes(),
                 "roi_encoding": "raw",
                 "roi_format": "raw_ndarray_c_order",
                 "roi_dtype": "uint8",
-                "roi_shape": [2, 2],
+                "roi_shape": [4, 5],
             }
         ]
         if values["offset"] == 0
@@ -274,6 +300,17 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
         def predict_batch(self, model_ref, items):
             assert model_ref == "classifier"
             assert items[0].resource_type == "refined_detection"
+            np.testing.assert_array_equal(
+                items[0].inputs["image"],
+                np.asarray([[7, 8], [12, 13]], dtype="uint8"),
+            )
+            assert items[0].metadata["classification_input"] == {
+                "policy": "refined_detection_bbox_v1",
+                "frame_bbox": [12, 21, 2, 2],
+                "stored_crop_bbox": [10, 20, 5, 4],
+                "stored_shape": [4, 5],
+                "input_shape": [2, 2],
+            }
             return [
                 type(
                     "Response",
@@ -319,16 +356,22 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
             "id": "job-classify",
             "project_id": "project-1",
             "stage": PipelineStage.CLASSIFY.value,
-            "payload": {"model_ref": "classifier", "roi_ids": ["refined-1"]},
+            "payload": {"model_ref": "classifier", "roi_ids": []},
         },
         context,
     )
 
     assert result["detection_count"] == 1
+    assert result["input_crop_policy"] == "refined_detection_bbox_v1"
+    assert created_runs[0]["parameters"]["input_crop_policy"] == "refined_detection_bbox_v1"
+    assert created_runs[0]["parameters"]["target_count"] == 1
     assert stored_evidence[0]["embedding_payload_ref"] == "embedding-key"
     assert "embedding" not in stored_evidence[0]["output"]
     assert completed_runs[-1][1]["status"] == "complete"
     assert not hasattr(repo, "assign_curation_labels")
+    assert repo.progress_updates[-1]["progress"]["total"] == 1
+    assert repo.progress_updates[-1]["progress"]["percent"] == 100.0
+    assert repo.progress_updates[-1]["progress"]["secondary"]["phase"] == "complete"
 
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
@@ -1292,6 +1335,7 @@ def test_roi_refinement_handler_identity_promotes_without_oracle():
     assert stored.metadata["identity_promotion"] is True
     assert stored.metadata["refinement_bypassed"] is True
     assert result["timings"]["phase_counts"].get("refinement.model_inference", 0) == 0
+    assert sum(operation == "get_detections" for operation, _ in repo.project_calls) == 1
 
 
 def test_roi_refinement_handler_preserves_project_id():
@@ -1316,7 +1360,7 @@ def test_roi_refinement_handler_preserves_project_id():
     )
 
     assert result["project_id"] == "project-1"
-    assert ("get_detection", "project-1") in repo.project_calls
+    assert ("get_detections", "project-1") in repo.project_calls
     assert ("upsert_refined_detections", "project-1") in repo.project_calls
     assert repo.frame_stage_status_updates == [
         {
@@ -1527,6 +1571,7 @@ def test_worker_run_once_uses_default_extract_frames_handler(monkeypatch):
     assert repo.completed[0][0] == "job-1"
     assert repo.completed[0][1]["frame_count"] == 2
     assert repo.failures == []
+    assert repo.heartbeats == [("pytest-worker", "job-1")]
 
 
 def test_worker_run_once_marks_frame_stage_failed_for_project_job():

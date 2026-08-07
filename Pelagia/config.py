@@ -39,6 +39,9 @@ class DatabaseConfig:
     schema_name: str = "pelagia"
     connect_timeout_s: int = 5
     statement_timeout_ms: int = 30_000
+    pool_min_size: int = 0
+    pool_max_size: int = 4
+    pool_timeout_s: float = 10.0
 
 
 @dataclass(slots=True)
@@ -497,6 +500,9 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "database", "schema_name", "PELAGIA_DATABASE_SCHEMA")
     _set_from_env(settings, "database", "connect_timeout_s", "PELAGIA_DB_CONNECT_TIMEOUT_S", int)
     _set_from_env(settings, "database", "statement_timeout_ms", "PELAGIA_DB_STATEMENT_TIMEOUT_MS", int)
+    _set_from_env(settings, "database", "pool_min_size", "PELAGIA_DB_POOL_MIN_SIZE", int)
+    _set_from_env(settings, "database", "pool_max_size", "PELAGIA_DB_POOL_MAX_SIZE", int)
+    _set_from_env(settings, "database", "pool_timeout_s", "PELAGIA_DB_POOL_TIMEOUT_S", float)
 
     _set_from_env(settings, "queue", "default_priority", "PELAGIA_QUEUE_DEFAULT_PRIORITY", int)
     _set_from_env(settings, "queue", "max_attempts", "PELAGIA_QUEUE_MAX_ATTEMPTS", int)
@@ -726,6 +732,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             schema_name=str(database.get("schema_name", DatabaseConfig.schema_name)),
             connect_timeout_s=int(database.get("connect_timeout_s", DatabaseConfig.connect_timeout_s)),
             statement_timeout_ms=int(database.get("statement_timeout_ms", DatabaseConfig.statement_timeout_ms)),
+            pool_min_size=int(database.get("pool_min_size", DatabaseConfig.pool_min_size)),
+            pool_max_size=int(database.get("pool_max_size", DatabaseConfig.pool_max_size)),
+            pool_timeout_s=float(database.get("pool_timeout_s", DatabaseConfig.pool_timeout_s)),
         ),
         queue=QueueConfig(
             default_priority=int(queue.get("default_priority", QueueConfig.default_priority)),

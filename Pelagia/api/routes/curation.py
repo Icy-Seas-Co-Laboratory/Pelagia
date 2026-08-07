@@ -15,6 +15,7 @@ if APIRouter is not None:
     from ...domain import PipelineStage
     from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
     from ...services.pipeline import PipelineService
+    from ...services.taxonomy import default_taxonomy_dictionary
     from ._common import as_response, get_context, get_repository
 
     class LabelCreate(BaseModel):
@@ -77,7 +78,15 @@ if APIRouter is not None:
             client = OracleInferenceClient(context.config.oracle)
         try:
             models = client.list_models(task="classification")
-            oracle = {"enabled": True, "status": "ready"}
+            available_count = sum(model.get("available") is not False for model in models)
+            oracle = {
+                "enabled": True,
+                "status": "ready" if available_count else "unavailable",
+                "registered_model_count": len(models),
+                "available_model_count": available_count,
+            }
+            if models and not available_count:
+                oracle["error"] = "Oracle Builder has no usable classification models."
         except OracleInferenceError as exc:
             models = []
             oracle = {
@@ -94,6 +103,7 @@ if APIRouter is not None:
                 "models": models,
                 "default_model_ref": get_context(request).config.oracle.default_classification_model,
                 "labels": repository.list_curation_labels(project_id=auth.project_id),
+                "default_label_dictionary": default_taxonomy_dictionary(),
                 "ownership": {
                     "human_ground_truth": "pelagia",
                     "model_execution": "oracle_builder",
@@ -129,6 +139,15 @@ if APIRouter is not None:
                 raise HTTPException(status_code=409, detail="A label with that name already exists") from exc
             raise
         return {"label": as_response(row)}
+
+    @router.post("/labels/import-defaults")
+    def import_default_labels(request: Request) -> dict:
+        auth = require_project_write(request)
+        result = get_repository(request).import_curation_label_dictionary(
+            project_id=auth.project_id,
+            dictionary=default_taxonomy_dictionary(),
+        )
+        return as_response(result)
 
     @router.get("/rois")
     def rois(

@@ -15,6 +15,21 @@ A model prediction is never written as human ground truth. Selecting **Accept pr
 3. Open **Curation** in PelagiaView. Choose **Run selected** or **Run all** to enqueue inference.
 4. Filter and sort the queue by human state, review state, evidence availability, confidence, or disagreement. Assign a project label, then verify, reject, or flag the assertion.
 
+The Curation model panel follows active classification jobs and the most recent
+result across page reloads. Pelagia resolves the exact number of eligible ROIs
+before inference and reports input loading, the current Oracle batch, evidence
+storage, completion, and failure through the standard job progress record. The
+worker runtime renews the queue lease while a handler is active, including while
+it is blocked waiting for an Oracle response. Progress advances between batches;
+Oracle Builder's synchronous inference endpoint does not expose per-image
+progress within a submitted batch.
+
+Classification inputs use only the refined detection's `bbox_*` rectangle. The
+worker decodes the stored ROI payload, removes the surrounding `crop_bbox_*`
+padding, and records the `refined_detection_bbox_v1` crop policy and both source
+rectangles in inference provenance. Invalid or inconsistent geometry fails the
+job rather than silently classifying padded pixels.
+
 Useful keyboard actions in the gallery are `1`–`0` for the first ten labels, arrow keys to move, space to verify, `F` to flag, and Escape to clear selection.
 
 ## Evidence storage

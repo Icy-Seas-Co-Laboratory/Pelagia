@@ -1196,8 +1196,15 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     repository.remove_curation_labels = lambda **values: actions.append(("remove", values)) or [
         {"id": "annotation-1", "status": "deprecated"}
     ]
+    repository.import_curation_label_dictionary = lambda **values: {
+        "dictionary_key": values["dictionary"]["key"],
+        "created_count": values["dictionary"]["selectable_count"],
+        "updated_count": 0,
+        "labels": [label],
+    }
 
     options = client.get("/curation/options")
+    imported = client.post("/curation/labels/import-defaults")
     listing = client.get("/curation/rois?evidence_state=available")
     annotation = client.post(
         "/curation/annotations",
@@ -1221,6 +1228,11 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     )
 
     assert options.status_code == 200
+    assert options.json()["oracle"]["available_model_count"] == 1
+    assert options.json()["models"][0]["alias"] == "test-refiner"
+    assert options.json()["default_label_dictionary"]["key"] == "pelagia-core@0.1.1"
+    assert imported.status_code == 200
+    assert imported.json()["dictionary_key"] == "pelagia-core@0.1.1"
     assert options.json()["ownership"] == {
         "human_ground_truth": "pelagia",
         "model_execution": "oracle_builder",

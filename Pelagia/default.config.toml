@@ -8,6 +8,10 @@ dsn = "postgresql://postgres:postgres@localhost:5432/pelagia"
 schema_name = "pelagia"
 connect_timeout_s = 5
 statement_timeout_ms = 30000
+# Connections are opened lazily and reused within each API or worker process.
+pool_min_size = 0
+pool_max_size = 4
+pool_timeout_s = 10.0
 
 [queue]
 # Default job scheduling behavior. Lower priority values run first.

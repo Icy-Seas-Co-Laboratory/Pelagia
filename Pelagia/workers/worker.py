@@ -4,8 +4,10 @@ import os
 import sys
 import socket
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import Event
+from threading import Event, Thread
+from typing import Iterator
 
 from ..domain import PipelineStage
 from ..observability import get_core_logger
@@ -60,6 +62,50 @@ class Worker:
         session = self.context.repository.get_worker_session(self.worker_id)
         return bool(session and session.get("shutdown_requested"))
 
+    @contextmanager
+    def _maintain_job_lease(self, job_id: str) -> Iterator[None]:
+        """Renew a claimed job lease while its handler is running.
+
+        Handlers may block in external services for longer than the queue lease.
+        Lease ownership therefore belongs to the worker runtime, independently of
+        whether a particular handler is currently able to report useful progress.
+        """
+
+        repository = self.context.repository
+        if repository is None:
+            yield
+            return
+        interval = max(1.0, float(self.context.config.queue.heartbeat_interval_seconds))
+        stopped = Event()
+
+        def renew() -> None:
+            try:
+                repository.heartbeat(self.worker_id, job_id)
+            except Exception:
+                get_core_logger("worker").exception(
+                    "Worker %s could not renew the lease for job %s",
+                    self.worker_id,
+                    job_id,
+                )
+
+        def heartbeat() -> None:
+            while not stopped.wait(interval):
+                renew()
+
+        # Renew immediately, then continue independently while the handler runs.
+        renew()
+        thread = Thread(
+            target=heartbeat,
+            name=f"pelagia-heartbeat-{job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            thread.join(timeout=min(interval, 2.0))
+
     def run_once(self, stages: list[PipelineStage] | None = None) -> int:
         """Claim and process currently available jobs once."""
         if self.context.repository is None:
@@ -92,7 +138,8 @@ class Worker:
                     payload={"stage": stage},
                 )
             try:
-                result = self.handlers.handle(job, job_context)
+                with self._maintain_job_lease(job_id):
+                    result = self.handlers.handle(job, job_context)
                 self.context.repository.complete_job(job["id"], result=result)
                 duration_ms = (time.perf_counter() - started) * 1000
                 timings = (result or {}).get("timings")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from ..config import CoreConfig
 from ..observability import configure_core_logging
 from ..services.context import AppContext
@@ -22,7 +24,16 @@ def create_app(config: CoreConfig | None = None):
     resolved_config = config or CoreConfig.load()
     core_logger = configure_core_logging(resolved_config)
     core_logger.info("Starting Pelagia API")
-    app = FastAPI(title="Pelagia", version=__version__)
+    context = AppContext.from_config(resolved_config)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            context.close()
+
+    app = FastAPI(title="Pelagia", version=__version__, lifespan=lifespan)
     exposed_headers = [
         "X-Pelagia-Frame-Id",
         "X-Pelagia-Payload-Kind",
@@ -39,7 +50,7 @@ def create_app(config: CoreConfig | None = None):
         "X-Pelagia-Scale",
     ]
     app.state.config = resolved_config
-    app.state.context = AppContext.from_config(resolved_config)
+    app.state.context = context
     for route_module in (
         health,
         auth,
