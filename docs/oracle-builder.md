@@ -40,3 +40,10 @@ jobs to follow normal Pelagia retry policy. There is no silent identity-model
 fallback. Successful refined detections record Oracle request/result IDs,
 artifact/run identity, fingerprint, input hash, threshold, transforms, and
 execution timing.
+
+The refinement request may instead set `method = "identity"`. Identity is an
+explicit non-ML promotion path: each selected candidate becomes a refined ROI
+with the same crop, mask, geometry, and measurements. It does not contact
+Oracle or run expansion, residual discovery, or overlap reconciliation. If a
+candidate crop was not stored, Pelagia may materialize it from the source frame
+before recording the refined ROI.

@@ -56,6 +56,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0002_projectless_admin_sessions",
         "0003_processing_status_summary_indexes",
         "0004_frame_flatfield_profiles",
+        "0005_roi_curation",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -70,6 +71,10 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "ADD COLUMN IF NOT EXISTS flatfield_profile real[]" in flatfield_columns
     assert "ADD COLUMN IF NOT EXISTS flatfield_metadata jsonb" in flatfield_columns
     assert "{schema}" not in flatfield_columns
+    curation_schema = postgres.render_migration(migrations[4], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.classification_evidence" in curation_schema
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.roi_label_annotations" in curation_schema
+    assert "{schema}" not in curation_schema
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -101,8 +106,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 4
-    assert status["migrations"]["applied_count"] == 4
+    assert status["migrations"]["available_count"] == 5
+    assert status["migrations"]["applied_count"] == 5
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -1282,6 +1287,11 @@ def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
     assert postgres_repo.get_job(str(succeeded_job["id"]))["status"] == JobStatus.SUCCEEDED.value
     assert postgres_repo.get_job(str(other_job["id"]))["status"] == JobStatus.QUEUED.value
     assert postgres_repo.get_job(str(queued_job["id"]))["control_reason"] == "clear test queue"
+
+    assert postgres_repo.complete_job(str(leased_job["id"]), result={"late": True}) is None
+    assert postgres_repo.get_job(str(leased_job["id"]))["status"] == JobStatus.CANCELLED.value
+    assert postgres_repo.record_failure(str(leased_job["id"]), "late failure") is None
+    assert postgres_repo.get_job(str(leased_job["id"]))["status"] == JobStatus.CANCELLED.value
 
     events = postgres_repo.list_job_events(job_id=str(queued_job["id"]))
     assert events[0]["event_type"] == "job.cancelled"

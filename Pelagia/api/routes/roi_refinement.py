@@ -13,7 +13,7 @@ if APIRouter is not None:
     from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
     from ...domain import DetectionRecord, PipelineStage
-    from ...processing.detection_refinement import RoiRefinementOptions, refine_detections, refined_storage_candidate_detection_id
+    from ...processing.detection_refinement import RoiRefinementOptions, identity_refine_detections, refine_detections, refined_storage_candidate_detection_id
     from ...processing.frame_store import retrieve_frame
     from ...processing.oracle_client import (
         OracleInferenceClient,
@@ -41,6 +41,7 @@ if APIRouter is not None:
         model_config = ConfigDict(protected_namespaces=(), extra="forbid")
 
         detection_ids: list[str] = Field(default_factory=list)
+        method: Literal["oracle", "identity"] = "oracle"
         model_ref: str | None = None
         max_iterations: int | None = None
         expansion_pixels: int | None = None
@@ -161,10 +162,18 @@ if APIRouter is not None:
 
     def _requested_model_metadata(request: Request, body: RoiRefinementRequest) -> dict[str, Any]:
         context = get_context(request)
+        if body.method == "identity":
+            return {
+                "inference_backend": "none",
+                "model_ref": None,
+                "method": "identity",
+                "refinement_method": "identity",
+            }
         return {
             "inference_backend": "oracle_builder",
             "model_ref": body.model_ref or context.config.oracle.default_mask_model,
             "oracle_base_url": context.config.oracle.base_url,
+            "method": "oracle",
         }
 
     def _resolve_backend(request: Request, body: RoiRefinementRequest):
@@ -219,6 +228,7 @@ if APIRouter is not None:
                     "detection_ids": ["candidate detection UUID"],
                 },
                 "notes": [
+                    "Set method=identity to promote candidates unchanged without Oracle inference.",
                     "Candidate detections without ROI payloads require frame loading to be enabled.",
                     "Use POST /roi-refinement/jobs to queue longer refinement work.",
                 ],
@@ -272,8 +282,8 @@ if APIRouter is not None:
                     ),
                 )
 
-        backend = _resolve_backend(request, body)
-        method = backend.method_name
+        backend = None if body.method == "identity" else _resolve_backend(request, body)
+        method = "identity" if body.method == "identity" else backend.method_name
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
 
         frame_loader = None
@@ -291,12 +301,16 @@ if APIRouter is not None:
                 return frame_cache[resolved_frame_id]
 
         try:
-            results = refine_detections(
-                detection_records,
-                backend=backend,
-                frame_loader=frame_loader,
-                options=options,
-                method=method,
+            results = (
+                identity_refine_detections(detection_records, frame_loader=frame_loader)
+                if body.method == "identity"
+                else refine_detections(
+                    detection_records,
+                    backend=backend,
+                    frame_loader=frame_loader,
+                    options=options,
+                    method=method,
+                )
             )
             refined_records = [
                 result.as_detection_record(encoding=options.encoding)
@@ -376,7 +390,11 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Detection {body.detection_ids[0]!r} was not found.")
         payload = {
             "detection_ids": body.detection_ids,
-            "model_ref": body.model_ref or context.config.oracle.default_mask_model,
+            "method": body.method,
+            "model_ref": (
+                None if body.method == "identity"
+                else body.model_ref or context.config.oracle.default_mask_model
+            ),
             "max_iterations": options.max_iterations,
             "expansion_pixels": options.expansion_pixels,
             "edge_touch_margin": options.edge_touch_margin,

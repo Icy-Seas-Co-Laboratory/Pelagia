@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/pelagia_stack_runtime.sh"
 RUN_DIR="${PELAGIA_RUN_DIR:-$ROOT_DIR/.pelagia/run}"
 PID_DIR="$RUN_DIR/pids"
 LOG_DIR="$RUN_DIR/logs"
@@ -193,6 +194,9 @@ initialize_system() {
 
 start_stack() {
     cleanup_stale_pid_files
+    if ! is_running "$PID_DIR/api.pid"; then
+        pelagia_require_available_tcp_port "$PELAGIA_API_HOST" "$PELAGIA_API_PORT" "Pelagia API" "$CPU_PYTHON"
+    fi
     initialize_system
 
     export PELAGIA_DATABASE_DSN

@@ -228,6 +228,9 @@ Validate the resolved worker profiles before starting services:
 See [Oracle Builder inference](docs/oracle-builder.md) for service setup and
 failure behavior.
 
+See [ROI curation and classification evidence](docs/curation.md) for the
+human-review workflow, storage boundaries, and classification worker setup.
+
 ### Verify The API
 
 After the stack starts:
@@ -509,6 +512,7 @@ For storage maintenance, migration, and recovery procedures, use:
 - [Resetting Pelagia](docs/reset-system.md)
 - [Migrating Pelagia](docs/migration.md)
 - [Backup And Restore](docs/backup.md)
+- [ROI Curation And Classification Evidence](docs/curation.md)
 
 ## Python Environment
 

@@ -9,6 +9,7 @@ from Pelagia.services.context import AppContext
 from Pelagia.workers.handlers import (
     HandlerRegistry,
     background_frames_handler,
+    classification_handler,
     default_handler_registry,
     extract_frames_handler,
     preprocess_frames_handler,
@@ -241,6 +242,93 @@ def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
     assert worker_runtime_profile([PipelineStage.SEGMENT]) == "cpu"
     assert worker_runtime_profile([PipelineStage.ROI_REFINEMENT]) == "cpu"
     assert worker_runtime_profile([PipelineStage.SEGMENT, PipelineStage.ROI_REFINEMENT]) == "cpu"
+
+
+def test_classification_handler_persists_evidence_without_creating_human_labels():
+    repo = FakeRepository()
+    stored_evidence = []
+    completed_runs = []
+    repo.create_classification_inference_run = lambda **_: {"id": "inference-run-1"}
+    repo.list_classification_targets = lambda **values: (
+        [
+            {
+                "id": "refined-1",
+                "roi_payload": np.asarray([[0, 255], [128, 64]], dtype="uint8").tobytes(),
+                "roi_encoding": "raw",
+                "roi_format": "raw_ndarray_c_order",
+                "roi_dtype": "uint8",
+                "roi_shape": [2, 2],
+            }
+        ]
+        if values["offset"] == 0
+        else []
+    )
+    repo.store_classification_evidence = lambda **values: stored_evidence.append(values) or {
+        "id": "evidence-1"
+    }
+    repo.complete_classification_inference_run = lambda run_id, **values: completed_runs.append(
+        (run_id, values)
+    ) or {"id": run_id, **values}
+
+    class ClassificationOracle:
+        def predict_batch(self, model_ref, items):
+            assert model_ref == "classifier"
+            assert items[0].resource_type == "refined_detection"
+            return [
+                type(
+                    "Response",
+                    (),
+                    {
+                        "transport_request_id": "transport-1",
+                        "result": {
+                            "result_id": "result-1",
+                            "model": {
+                                "artifact_id": "00000000-0000-0000-0000-000000000011",
+                                "run_id": "00000000-0000-0000-0000-000000000012",
+                                "task": "classification",
+                            },
+                            "output": {
+                                "type": "classification",
+                                "decision": {"class_index": 0, "label_name": "copepod"},
+                                "probabilities": [
+                                    {"class_index": 0, "label_name": "copepod", "probability": 0.9},
+                                    {"class_index": 1, "label_name": "other", "probability": 0.1},
+                                ],
+                                "embedding": np.asarray([1.0, 0.0], dtype="float32"),
+                                "evidence": {},
+                            },
+                        },
+                    },
+                )()
+            ]
+
+    class ClassificationKVStore:
+        def __init__(self):
+            self.payloads = []
+
+        def put_store(self, payload):
+            self.payloads.append(payload)
+            return "embedding-key"
+
+    kvstore = ClassificationKVStore()
+    context = AppContext(
+        config=CoreConfig(), repository=repo, kvstore=kvstore, oracle=ClassificationOracle()
+    )
+    result = classification_handler(
+        {
+            "id": "job-classify",
+            "project_id": "project-1",
+            "stage": PipelineStage.CLASSIFY.value,
+            "payload": {"model_ref": "classifier", "roi_ids": ["refined-1"]},
+        },
+        context,
+    )
+
+    assert result["detection_count"] == 1
+    assert stored_evidence[0]["embedding_payload_ref"] == "embedding-key"
+    assert "embedding" not in stored_evidence[0]["output"]
+    assert completed_runs[-1][1]["status"] == "complete"
+    assert not hasattr(repo, "assign_curation_labels")
 
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
@@ -1165,6 +1253,45 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     assert result["resolved_options"]["allow_frame_expansion"] is False
     assert repo.refined_detections[0][0][0] == "det-1"
     assert repo.refined_detections[0][0][1].metadata["detection_stage"] == "refined"
+
+
+def test_roi_refinement_handler_identity_promotes_without_oracle():
+    repo = FakeRepository()
+
+    class FailingOracle:
+        @property
+        def method_name(self):
+            raise AssertionError("Identity refinement must not resolve an Oracle backend")
+
+        def refine_batch(self, _inputs):
+            raise AssertionError("Identity refinement must not call Oracle")
+
+    context = AppContext(
+        config=CoreConfig(), repository=repo, kvstore=None, oracle=FailingOracle()
+    )
+    result = roi_refinement_handler(
+        {
+            "id": "job-identity",
+            "project_id": "project-1",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "payload": {
+                "detection_ids": ["det-1"],
+                "method": "identity",
+                "allow_frame_expansion": False,
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["method"] == "identity"
+    assert result["refinement_method"] == "identity"
+    assert result["inference_backend"] == "none"
+    assert result["model_ref"] is None
+    stored = repo.refined_detections[0][0][1]
+    assert stored.metadata["identity_promotion"] is True
+    assert stored.metadata["refinement_bypassed"] is True
+    assert result["timings"]["phase_counts"].get("refinement.model_inference", 0) == 0
 
 
 def test_roi_refinement_handler_preserves_project_id():

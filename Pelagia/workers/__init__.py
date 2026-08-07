@@ -2,6 +2,7 @@
 
 from .handlers import (
     background_frames_handler,
+    classification_handler,
     extract_frames_handler,
     preprocess_frames_handler,
     roi_detection_handler,
@@ -15,6 +16,7 @@ __all__ = [
     "HandlerRegistry",
     "Worker",
     "background_frames_handler",
+    "classification_handler",
     "default_handler_registry",
     "extract_frames_handler",
     "preprocess_frames_handler",

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import io
 from typing import Any
+
+import numpy as np
 
 from ..domain import DetectionRecord, FrameRecord, JobStatus, PipelineStage
 from ..domain import normalize_collections
@@ -9,14 +13,16 @@ from ..processing import ingest as ingest_module
 from ..processing.detection_candidate import segment_frame
 from ..processing.detection_refinement import (
     RoiRefinementOptions,
+    identity_refine_detections,
     refine_detections,
     refined_storage_candidate_detection_id,
 )
 from ..processing.frame_correction import ensure_asset_background_windows
 from ..processing.ingest_background import MeanFieldIngestAddon
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
+from ..processing.frame_codec import decode_array_payload
 from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
-from ..processing.oracle_client import OracleInferenceClient, OracleRoiRefinementBackend
+from ..processing.oracle_client import OracleInferenceClient, OracleInferenceItem, OracleRoiRefinementBackend
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
@@ -24,6 +30,7 @@ from ..services.project_settings import resolve_project_storage_settings
 from ..services.pipeline import PipelineService
 from ..services.job_commands import (
     ExtractFramesCommand,
+    ClassificationCommand,
     FrameBackgroundCommand,
     FrameSelection,
     PreprocessFramesCommand,
@@ -962,12 +969,18 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
 
     defaults = context.config.processing.roi_refinement
-    with measure_phase("refinement.model_resolution"):
-        backend = context.oracle or OracleRoiRefinementBackend(
-            OracleInferenceClient(context.config.oracle),
-            payload.get("model_ref") or context.config.oracle.default_mask_model,
-        )
-    method = backend.method_name
+    requested_method = str(payload.get("method") or "oracle").strip().lower()
+    if requested_method not in {"oracle", "identity"}:
+        raise ValueError(f"Unsupported ROI refinement method: {requested_method!r}.")
+    backend = None
+    method = "identity"
+    if requested_method == "oracle":
+        with measure_phase("refinement.model_resolution"):
+            backend = context.oracle or OracleRoiRefinementBackend(
+                OracleInferenceClient(context.config.oracle),
+                payload.get("model_ref") or context.config.oracle.default_mask_model,
+            )
+        method = backend.method_name
     with measure_phase("refinement.options_resolution"):
         options = _roi_refinement_options_from_payload(payload, context)
         if payload.get("encoding") is None:
@@ -991,12 +1004,16 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     with measure_phase("refinement.record_construction"):
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
-    results = refine_detections(
-        detection_records,
-        backend=backend,
-        frame_loader=frame_loader,
-        options=options,
-        method=method,
+    results = (
+        identity_refine_detections(detection_records, frame_loader=frame_loader)
+        if requested_method == "identity"
+        else refine_detections(
+            detection_records,
+            backend=backend,
+            frame_loader=frame_loader,
+            options=options,
+            method=method,
+        )
     )
     refined_records = [result.as_detection_record(encoding=options.encoding) for result in results]
     with measure_phase("refinement.database_update"):
@@ -1049,8 +1066,9 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "detection_ids": detection_ids,
         "refined_detection_ids": [row.get("id") for row in stored],
         "frame_ids": frame_ids,
-        "inference_backend": "oracle_builder",
-        "model_ref": payload.get("model_ref") or context.config.oracle.default_mask_model,
+        "inference_backend": "none" if requested_method == "identity" else "oracle_builder",
+        "model_ref": None if requested_method == "identity" else payload.get("model_ref") or context.config.oracle.default_mask_model,
+        "method": requested_method,
         "refinement_method": method,
         "resolved_options": {
             "max_iterations": options.max_iterations,
@@ -1073,6 +1091,137 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             "expansion_frame_payload_kind": expansion_payload_kind,
         },
     }
+
+
+@collect_result_timings(unit_count_key="detection_count")
+def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
+    """Classify refined ROIs through Oracle Builder and persist evidence only."""
+
+    if context.repository is None:
+        raise RuntimeError("Classification handler requires a PostgresRepository.")
+    command = ClassificationCommand.from_payload(_job_payload(job))
+    project_id = _job_project_id(job, context)
+    if project_id is None:
+        raise ValueError("Classification jobs require project_id.")
+    inference_run = context.repository.create_classification_inference_run(
+        project_id=project_id,
+        job_id=None if job.get("id") is None else str(job["id"]),
+        model_selector=command.model_ref,
+        parameters={"roi_ids": list(command.roi_ids)},
+    )
+    progress = JobProgressReporter(
+        job,
+        context,
+        stage=PipelineStage.CLASSIFY.value,
+        unit="rois",
+        total=len(command.roi_ids),
+    )
+    progress.start("Classifying refined ROIs")
+    client = context.oracle
+    owns_client = not callable(getattr(client, "predict_batch", None))
+    if owns_client:
+        client = OracleInferenceClient(context.config.oracle)
+    completed = 0
+    offset = 0
+    batch_size = context.config.oracle.max_items_per_request
+    try:
+        while True:
+            targets = context.repository.list_classification_targets(
+                project_id=project_id,
+                roi_ids=command.roi_ids,
+                limit=batch_size,
+                offset=offset,
+            )
+            if not targets:
+                break
+            oracle_items: list[OracleInferenceItem] = []
+            for row in targets:
+                image = decode_array_payload(
+                    row["roi_payload"],
+                    {
+                        "kvstore_encoding": row.get("roi_encoding"),
+                        "kvstore_format": row.get("roi_format"),
+                        "dtype": row.get("roi_dtype"),
+                        "shape": row.get("roi_shape"),
+                    },
+                )
+                oracle_items.append(
+                    OracleInferenceItem(
+                        resource_type="refined_detection",
+                        resource_id=str(row["id"]),
+                        inputs={"image": np.asarray(image)},
+                        metadata={"project_id": project_id},
+                    )
+                )
+            responses = client.predict_batch(command.model_ref, oracle_items)
+            if len(responses) != len(targets):
+                raise RuntimeError("Oracle Builder returned an unexpected classification result count")
+            for target, response in zip(targets, responses, strict=True):
+                row = response.result
+                output = dict(row.get("output") or {})
+                if output.get("type") != "classification":
+                    raise RuntimeError("Oracle Builder model did not return classification output")
+                embedding = output.pop("embedding", None)
+                embedding_ref = None
+                embedding_dtype = None
+                embedding_shape = None
+                embedding_sha256 = None
+                if isinstance(embedding, np.ndarray):
+                    buffer = io.BytesIO()
+                    np.save(buffer, embedding, allow_pickle=False)
+                    payload = buffer.getvalue()
+                    embedding_sha256 = hashlib.sha256(payload).hexdigest()
+                    embedding_dtype = str(embedding.dtype)
+                    embedding_shape = list(embedding.shape)
+                    kvstore = context.kvstore_for_project(project_id)
+                    if kvstore is not None:
+                        embedding_ref = kvstore.put_store(payload)
+                context.repository.store_classification_evidence(
+                    project_id=project_id,
+                    inference_run_id=str(inference_run["id"]),
+                    refined_detection_id=str(target["id"]),
+                    model=dict(row.get("model") or {}),
+                    output=output,
+                    oracle_result={
+                        "result_id": row.get("result_id"),
+                        "result_set_id": row.get("result_set_id"),
+                        "input_sha256": row.get("input_sha256"),
+                        "execution": row.get("execution"),
+                        "transport_request_id": response.transport_request_id,
+                    },
+                    embedding_payload_ref=embedding_ref,
+                    embedding_dtype=embedding_dtype,
+                    embedding_shape=embedding_shape,
+                    embedding_sha256=embedding_sha256,
+                )
+                completed += 1
+                progress.update(completed, message=f"Classified {completed} refined ROIs")
+            offset += len(targets)
+            if len(targets) < batch_size:
+                break
+        context.repository.complete_classification_inference_run(
+            str(inference_run["id"]),
+            status="complete",
+            metadata={"completed_count": completed},
+        )
+        progress.finish(completed=completed, message=f"Classified {completed} refined ROIs")
+        return {
+            "stage": PipelineStage.CLASSIFY.value,
+            "project_id": project_id,
+            "inference_run_id": str(inference_run["id"]),
+            "model_ref": command.model_ref,
+            "detection_count": completed,
+        }
+    except Exception as exc:
+        context.repository.complete_classification_inference_run(
+            str(inference_run["id"]),
+            status="failed",
+            metadata={"completed_count": completed, "error": str(exc)},
+        )
+        raise
+    finally:
+        if owns_client:
+            client.close()
 
 
 def default_handler_registry() -> HandlerRegistry:

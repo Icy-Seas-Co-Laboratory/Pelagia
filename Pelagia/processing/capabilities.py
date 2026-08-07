@@ -161,6 +161,7 @@ def roi_refinement_capabilities(
         ],
         "supported": {
             "inference_backend": "oracle_builder",
+            "methods": ["oracle", "identity"],
             "model_refs": model_refs,
             "models": models,
             "oracle": oracle_health or {"enabled": config.oracle.enabled, "status": "unknown"},
@@ -169,6 +170,7 @@ def roi_refinement_capabilities(
         "defaults": {
             "roi_refinement": {
                 **_dataclass_dict(defaults),
+                "method": "oracle",
                 "model_ref": config.oracle.default_mask_model,
             },
         },
@@ -177,6 +179,7 @@ def roi_refinement_capabilities(
                 _field("detection_ids", "Detection IDs", "string-list", request_field_name="detection_ids"),
             ],
             "model_selection": [
+                _field("method", "Refinement Method", "enum", options=["oracle", "identity"], default="oracle"),
                 _field("model_ref", "Oracle Model", "enum", options=model_refs, config_section="oracle"),
             ],
             "expansion": [

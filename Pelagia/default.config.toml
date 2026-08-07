@@ -282,6 +282,7 @@ cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\
 enabled = true
 base_url = "http://127.0.0.1:8100"
 default_mask_model = "pelagia-refiner"
+default_classification_model = "pelagia-classifier"
 api_token = null
 connect_timeout_seconds = 5.0
 read_timeout_seconds = 120.0

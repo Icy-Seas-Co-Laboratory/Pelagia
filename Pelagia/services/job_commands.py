@@ -306,6 +306,33 @@ class RoiRefinementCommand(JobCommand):
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ClassificationCommand(JobCommand):
+    command_type = "classification"
+    stage = PipelineStage.CLASSIFY
+
+    roi_ids: tuple[str, ...] = ()
+    model_ref: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ClassificationCommand":
+        cls._validate_payload(payload)
+        model_ref = str(payload.get("model_ref") or "").strip()
+        if not model_ref:
+            raise ValueError("Classification jobs require model_ref.")
+        return cls(
+            roi_ids=tuple(str(value) for value in payload.get("roi_ids") or () if value),
+            model_ref=model_ref,
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            **self._payload_header(),
+            "roi_ids": list(self.roi_ids),
+            "model_ref": self.model_ref,
+        }
+
+
 def command_model(stage: PipelineStage | str) -> type[JobCommand] | None:
     return {
         PipelineStage.EXTRACT_FRAMES: ExtractFramesCommand,
@@ -313,6 +340,7 @@ def command_model(stage: PipelineStage | str) -> type[JobCommand] | None:
         PipelineStage.SEGMENT: SegmentFramesCommand,
         PipelineStage.BACKGROUND_FRAMES: FrameBackgroundCommand,
         PipelineStage.ROI_REFINEMENT: RoiRefinementCommand,
+        PipelineStage.CLASSIFY: ClassificationCommand,
     }.get(PipelineStage(stage))
 
 

@@ -137,6 +137,7 @@ class OracleConfig:
     enabled: bool = True
     base_url: str = "http://127.0.0.1:8100"
     default_mask_model: str = "pelagia-refiner"
+    default_classification_model: str = "pelagia-classifier"
     api_token: str | None = None
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 120.0
@@ -525,6 +526,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "oracle", "enabled", "PELAGIA_ORACLE_ENABLED", _env_bool)
     _set_from_env(settings, "oracle", "base_url", "PELAGIA_ORACLE_BASE_URL")
     _set_from_env(settings, "oracle", "default_mask_model", "PELAGIA_ORACLE_DEFAULT_MASK_MODEL")
+    _set_from_env(settings, "oracle", "default_classification_model", "PELAGIA_ORACLE_DEFAULT_CLASSIFICATION_MODEL")
     _set_from_env(settings, "oracle", "api_token", "PELAGIA_ORACLE_API_TOKEN")
     _set_from_env(settings, "oracle", "connect_timeout_seconds", "PELAGIA_ORACLE_CONNECT_TIMEOUT_SECONDS", float)
     _set_from_env(settings, "oracle", "read_timeout_seconds", "PELAGIA_ORACLE_READ_TIMEOUT_SECONDS", float)
@@ -776,6 +778,12 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             enabled=bool(oracle.get("enabled", OracleConfig.enabled)),
             base_url=str(oracle.get("base_url", OracleConfig.base_url)).rstrip("/"),
             default_mask_model=str(oracle.get("default_mask_model", OracleConfig.default_mask_model)),
+            default_classification_model=str(
+                oracle.get(
+                    "default_classification_model",
+                    OracleConfig.default_classification_model,
+                )
+            ),
             api_token=None if oracle.get("api_token") in {None, ""} else str(oracle["api_token"]),
             connect_timeout_seconds=float(oracle.get("connect_timeout_seconds", OracleConfig.connect_timeout_seconds)),
             read_timeout_seconds=float(oracle.get("read_timeout_seconds", OracleConfig.read_timeout_seconds)),

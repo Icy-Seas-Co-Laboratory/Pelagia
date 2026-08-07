@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/pelagia_stack_runtime.sh"
 ACTION="${1:-start}"
 CONFIG_FILE="${2:-${PELAGIA_STACK_CONFIG:-$ROOT_DIR/scripts/pelagia_workers.example.toml}}"
 
@@ -132,6 +133,8 @@ stage_aliases = {
     "refine": "roi_refinement",
     "refinement": "roi_refinement",
     "roi_refinement": "roi_refinement",
+    "classify": "classify",
+    "classification": "classify",
     "refine_rois": "roi_refinement",
 }
 
@@ -543,6 +546,9 @@ initialize_system() {
 
 start_stack() {
     cleanup_stale_pid_files
+    if [[ "$PELAGIA_API_ENABLED" == "true" ]] && ! is_running "$PID_DIR/api.pid"; then
+        pelagia_require_available_tcp_port "$PELAGIA_API_HOST" "$PELAGIA_API_PORT" "Pelagia API" "$PELAGIA_CONTROL_PYTHON"
+    fi
     initialize_system
 
     export PELAGIA_DATABASE_DSN

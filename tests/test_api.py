@@ -1169,6 +1169,71 @@ def auth_headers(client, *, username="ada", project_key="default"):
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
+    client, repository, _ = make_client()
+    label = {"id": "label-1", "name": "copepod", "display_name": "Copepod"}
+    roi = {
+        "id": "refined-det-1",
+        "predicted_label_id": "label-1",
+        "predicted_label_name": "Copepod",
+        "confidence": 0.91,
+        "total_count": 1,
+    }
+    actions = []
+    repository.list_curation_labels = lambda **_: [label]
+    repository.list_curation_rois = lambda **_: {
+        "items": [dict(roi)], "total": 1, "limit": 120, "offset": 0
+    }
+    repository.get_curation_roi = lambda roi_id, **_: {
+        **roi, "id": roi_id, "annotations": [], "reviews": [], "evidence": []
+    }
+    repository.assign_curation_labels = lambda **values: actions.append(("assign", values)) or [
+        {"id": "annotation-1", "label_id": values["label_id"]}
+    ]
+    repository.review_curation_annotations = lambda **values: actions.append(("review", values)) or [
+        {"id": "review-1", "decision": values["decision"]}
+    ]
+    repository.remove_curation_labels = lambda **values: actions.append(("remove", values)) or [
+        {"id": "annotation-1", "status": "deprecated"}
+    ]
+
+    options = client.get("/curation/options")
+    listing = client.get("/curation/rois?evidence_state=available")
+    annotation = client.post(
+        "/curation/annotations",
+        json={
+            "roi_ids": ["refined-det-1"],
+            "label_id": "label-1",
+            "suggested_by_evidence_id": "evidence-1",
+        },
+    )
+    review = client.post(
+        "/curation/reviews",
+        json={"roi_ids": ["refined-det-1"], "decision": "verified"},
+    )
+    removal = client.post(
+        "/curation/annotations/remove",
+        json={"roi_ids": ["refined-det-1"]},
+    )
+    queued = client.post(
+        "/curation/classification-jobs",
+        json={"roi_ids": ["refined-det-1"], "model_ref": "test-refiner"},
+    )
+
+    assert options.status_code == 200
+    assert options.json()["ownership"] == {
+        "human_ground_truth": "pelagia",
+        "model_execution": "oracle_builder",
+        "review_interface": "pelagiaview",
+    }
+    assert listing.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
+    assert annotation.status_code == review.status_code == removal.status_code == 200
+    assert [action[0] for action in actions] == ["assign", "review", "remove"]
+    assert actions[0][1]["suggested_by_evidence_id"] == "evidence-1"
+    assert queued.status_code == 202
+    assert queued.json()["job"]["stage"] == PipelineStage.CLASSIFY.value
+
+
 def test_io_export_options_are_discoverable():
     client, repository, _ = make_client()
 
@@ -1878,11 +1943,13 @@ def test_api_roi_refinement_options_are_ui_ready():
         "recording",
     ]
     assert body["supported"]["inference_backend"] == "oracle_builder"
+    assert body["supported"]["methods"] == ["oracle", "identity"]
     assert "test-refiner" in body["supported"]["model_refs"]
     assert body["supported"]["oracle"]["status"] == "ready"
     reconciliation_fields = {field["key"]: field for field in body["fields"]["reconciliation"]}
     assert reconciliation_fields["overlap_iou_threshold"]["max"] == 1
     assert body["defaults"]["roi_refinement"]["overlap_reconciliation_enabled"] is True
+    assert body["defaults"]["roi_refinement"]["method"] == "oracle"
     residual_fields = {field["key"]: field for field in body["fields"]["residual_discovery"]}
     assert residual_fields["residual_roi_assembly_connectivity"]["options"] == [4, 8]
     assert body["defaults"]["roi_refinement"]["residual_discovery_enabled"] is False
@@ -1964,6 +2031,42 @@ def test_api_roi_refinement_oracle_stores_refined_detection():
         {"project_id": "project-1", "frame_ids": ["frame-1"], "asset_id": None}
     ]
     assert repository.processing_status_snapshot_touches == [{"project_id": "project-1"}]
+
+
+def test_api_identity_refinement_promotes_candidate_without_oracle():
+    client, _, _ = make_client()
+
+    class FailingOracle:
+        @property
+        def method_name(self):
+            raise AssertionError("Identity refinement must not resolve an Oracle backend")
+
+        def refine_batch(self, _inputs):
+            raise AssertionError("Identity refinement must not call Oracle")
+
+    client.app.state.context.oracle = FailingOracle()
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "method": "identity",
+            "allow_frame_expansion": False,
+            "store": True,
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["inference_backend"] == "none"
+    assert body["model_ref"] is None
+    assert body["refinement_method"] == "identity"
+    refined = body["refined_detections"][0]
+    assert refined["candidate_detection_id"] == "det-1"
+    assert refined["metadata"]["refinement_method"] == "identity"
+    assert refined["metadata"]["identity_promotion"] is True
+    assert refined["metadata"]["refinement_bypassed"] is True
+    assert "oracle_model" not in refined["metadata"]
 
 
 def test_api_roi_refinement_rejects_missing_roi_payload():

@@ -71,5 +71,5 @@ capabilities = ["roi_refinement"]
 
 [[worker]]
 name = "allrounder"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify"]
 enabled = false

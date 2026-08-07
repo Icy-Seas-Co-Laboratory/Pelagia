@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import secrets
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
@@ -38,6 +39,11 @@ REQUIRED_SCHEMA_TABLES = (
     "detections_refined",
     "models",
     "classification_results",
+    "classification_labels",
+    "classification_inference_runs",
+    "classification_evidence",
+    "roi_label_annotations",
+    "roi_annotation_reviews",
     "processing_jobs",
     "processing_job_dependencies",
     "project_processing_status_snapshots",
@@ -85,6 +91,9 @@ def _initial_job_progress(
         unit = "frames"
     elif stage == PipelineStage.ROI_REFINEMENT.value:
         total = len(dict.fromkeys(str(value) for value in payload.get("detection_ids") or [] if value))
+        unit = "rois"
+    elif stage == PipelineStage.CLASSIFY.value:
+        total = len(dict.fromkeys(str(value) for value in payload.get("roi_ids") or [] if value))
         unit = "rois"
 
     if total <= 0:
@@ -4437,6 +4446,709 @@ class PostgresRepository:
             connection.commit()
         return inserted
 
+    def list_curation_labels(
+        self,
+        *,
+        project_id: str,
+        include_deprecated: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT labels.*,
+                           count(DISTINCT annotations.id) FILTER (
+                               WHERE annotations.is_current AND annotations.status <> 'deprecated'
+                           ) AS annotation_count,
+                           count(DISTINCT evidence.id) AS prediction_count
+                    FROM {self.schema}.classification_labels labels
+                    LEFT JOIN {self.schema}.roi_label_annotations annotations
+                      ON annotations.label_id = labels.id
+                    LEFT JOIN {self.schema}.classification_evidence evidence
+                      ON evidence.predicted_label_id = labels.id
+                    WHERE labels.project_id = %s
+                      AND (%s OR labels.deprecated_at IS NULL)
+                    GROUP BY labels.id
+                    ORDER BY labels.deprecated_at NULLS FIRST,
+                             coalesce(labels.display_name, labels.name)
+                    """,
+                    (project_id, include_deprecated),
+                )
+                return list(cursor.fetchall())
+
+    def create_curation_label(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        display_name: str | None = None,
+        stable_concept_id: str | None = None,
+        parent_label_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if parent_label_id is not None:
+                    cursor.execute(
+                        f"SELECT id FROM {self.schema}.classification_labels WHERE id = %s AND project_id = %s",
+                        (parent_label_id, project_id),
+                    )
+                    if cursor.fetchone() is None:
+                        raise KeyError(parent_label_id)
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.classification_labels
+                        (project_id, name, display_name, stable_concept_id,
+                         parent_label_id, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    RETURNING *
+                    """,
+                    (
+                        project_id,
+                        name.strip(),
+                        display_name,
+                        stable_concept_id,
+                        parent_label_id,
+                        json.dumps(json_ready(metadata or {})),
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def list_curation_rois(
+        self,
+        *,
+        project_id: str,
+        annotation_state: str = "all",
+        review_state: str = "all",
+        label_id: str | None = None,
+        evidence_state: str = "all",
+        search: str | None = None,
+        sort_by: str = "oldest",
+        limit: int = 120,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        clauses = ["assets.project_id = %s"]
+        params: list[Any] = [project_id]
+        if annotation_state == "labeled":
+            clauses.append("annotation.id IS NOT NULL AND annotation.status <> 'deprecated'")
+        elif annotation_state == "unlabeled":
+            clauses.append("(annotation.id IS NULL OR annotation.status = 'deprecated')")
+        if review_state == "unreviewed":
+            clauses.append("annotation.id IS NOT NULL AND review.id IS NULL")
+        elif review_state in {"verified", "rejected", "needs_review"}:
+            clauses.append("review.decision = %s")
+            params.append(review_state)
+        if label_id:
+            clauses.append("annotation.label_id = %s")
+            params.append(label_id)
+        if evidence_state == "available":
+            clauses.append("evidence.id IS NOT NULL")
+        elif evidence_state == "missing":
+            clauses.append("evidence.id IS NULL")
+        elif evidence_state == "disagreement":
+            clauses.append(
+                "evidence.id IS NOT NULL AND ((evidence.prototype_class_index IS NOT NULL AND "
+                "evidence.prototype_class_index <> evidence.predicted_class_index) OR "
+                "(evidence.knn_class_index IS NOT NULL AND "
+                "evidence.knn_class_index <> evidence.predicted_class_index))"
+            )
+        if search:
+            clauses.append(
+                "(refined.id::text ILIKE %s OR frames.id::text ILIKE %s "
+                "OR assets.filename ILIKE %s)"
+            )
+            token = f"%{search}%"
+            params.extend([token, token, token])
+        order = {
+            "oldest": "refined.created_at ASC, refined.id ASC",
+            "newest": "refined.created_at DESC, refined.id DESC",
+            "area_asc": "refined.area ASC NULLS LAST, refined.id ASC",
+            "area_desc": "refined.area DESC NULLS LAST, refined.id ASC",
+            "confidence_asc": "evidence.confidence ASC NULLS FIRST, refined.id ASC",
+            "confidence_desc": "evidence.confidence DESC NULLS LAST, refined.id ASC",
+            "disagreement": "(coalesce(evidence.prototype_class_index <> evidence.predicted_class_index, false)::int + coalesce(evidence.knn_class_index <> evidence.predicted_class_index, false)::int) DESC, refined.id ASC",
+        }.get(sort_by, "refined.created_at ASC, refined.id ASC")
+        where = " AND ".join(clauses)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT refined.id, refined.run_id, refined.frame_id,
+                           refined.candidate_detection_id, refined.roi_index,
+                           refined.bbox_x, refined.bbox_y, refined.bbox_w, refined.bbox_h,
+                           refined.crop_bbox_x, refined.crop_bbox_y,
+                           refined.crop_bbox_w, refined.crop_bbox_h,
+                           refined.area, refined.perimeter, refined.roi_shape,
+                           refined.roi_encoding, refined.created_at,
+                           frames.frame_index, assets.id AS asset_id,
+                           assets.filename AS asset_filename,
+                           annotation.id AS annotation_id,
+                           annotation.label_id, annotation.status AS annotation_status,
+                           annotation.actor_username, annotation.created_at AS annotation_created_at,
+                           label.name AS label_name,
+                           coalesce(label.display_name, label.name) AS label_display_name,
+                           review.decision AS review_decision,
+                           evidence.id AS evidence_id,
+                           evidence.predicted_label_id, evidence.predicted_label_name,
+                           evidence.predicted_class_index, evidence.confidence,
+                           evidence.entropy, evidence.probability_margin,
+                           evidence.prototype_class_index, evidence.prototype_similarity,
+                           evidence.prototype_margin, evidence.knn_class_index,
+                           evidence.knn_agreement, evidence.knn_weighted_support,
+                           evidence.knn_margin, evidence.inference_run_id,
+                           count(*) OVER() AS total_count
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_label_annotations current_annotation
+                        WHERE current_annotation.refined_detection_id = refined.id
+                          AND current_annotation.is_current
+                        ORDER BY current_annotation.created_at DESC, current_annotation.id DESC
+                        LIMIT 1
+                    ) annotation ON true
+                    LEFT JOIN {self.schema}.classification_labels label
+                      ON label.id = annotation.label_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_annotation_reviews latest_review
+                        WHERE latest_review.annotation_id = annotation.id
+                        ORDER BY latest_review.created_at DESC, latest_review.id DESC
+                        LIMIT 1
+                    ) review ON true
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.classification_evidence latest_evidence
+                        WHERE latest_evidence.refined_detection_id = refined.id
+                        ORDER BY latest_evidence.created_at DESC, latest_evidence.id DESC
+                        LIMIT 1
+                    ) evidence ON true
+                    WHERE {where}
+                    ORDER BY {order}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*params, limit, offset),
+                )
+                rows = list(cursor.fetchall())
+        return {
+            "items": rows,
+            "total": int(rows[0]["total_count"]) if rows else 0,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_curation_roi(self, roi_id: str, *, project_id: str) -> dict[str, Any] | None:
+        page = self.list_curation_rois(project_id=project_id, search=roi_id, limit=10)
+        row = next((item for item in page["items"] if str(item["id"]) == roi_id), None)
+        if row is None:
+            return None
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT annotations.*, labels.name AS label_name,
+                           coalesce(labels.display_name, labels.name) AS label_display_name
+                    FROM {self.schema}.roi_label_annotations annotations
+                    JOIN {self.schema}.classification_labels labels ON labels.id = annotations.label_id
+                    WHERE annotations.refined_detection_id = %s
+                    ORDER BY annotations.created_at DESC, annotations.id DESC
+                    """,
+                    (roi_id,),
+                )
+                row["annotations"] = list(cursor.fetchall())
+                cursor.execute(
+                    f"""
+                    SELECT reviews.*
+                    FROM {self.schema}.roi_annotation_reviews reviews
+                    JOIN {self.schema}.roi_label_annotations annotations
+                      ON annotations.id = reviews.annotation_id
+                    WHERE annotations.refined_detection_id = %s
+                    ORDER BY reviews.created_at DESC, reviews.id DESC
+                    """,
+                    (roi_id,),
+                )
+                row["reviews"] = list(cursor.fetchall())
+                cursor.execute(
+                    f"""
+                    SELECT evidence.*, runs.model_selector, artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint,
+                           coalesce(json_agg(neighbors ORDER BY neighbors.rank)
+                               FILTER (WHERE neighbors.evidence_id IS NOT NULL), '[]'::json) AS neighbors
+                    FROM {self.schema}.classification_evidence evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = runs.model_artifact_id
+                    LEFT JOIN {self.schema}.classification_evidence_neighbors neighbors
+                      ON neighbors.evidence_id = evidence.id
+                    WHERE evidence.refined_detection_id = %s
+                    GROUP BY evidence.id, runs.model_selector, artifacts.artifact_id,
+                             artifacts.run_id, artifacts.artifact_fingerprint
+                    ORDER BY evidence.created_at DESC, evidence.id DESC
+                    """,
+                    (roi_id,),
+                )
+                row["evidence"] = list(cursor.fetchall())
+        return row
+
+    def assign_curation_labels(
+        self,
+        *,
+        project_id: str,
+        roi_ids: Sequence[str],
+        label_id: str,
+        actor_user_id: str | None,
+        actor_username: str,
+        suggested_by_evidence_id: str | None = None,
+        notes: str | None = None,
+    ) -> list[dict[str, Any]]:
+        created: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT id FROM {self.schema}.classification_labels WHERE id = %s AND project_id = %s AND deprecated_at IS NULL",
+                    (label_id, project_id),
+                )
+                if cursor.fetchone() is None:
+                    raise KeyError(label_id)
+                for roi_id in dict.fromkeys(roi_ids):
+                    cursor.execute(
+                        f"""
+                        SELECT annotations.id
+                        FROM {self.schema}.detections_refined refined
+                        JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        LEFT JOIN {self.schema}.roi_label_annotations annotations
+                          ON annotations.refined_detection_id = refined.id AND annotations.is_current
+                        WHERE refined.id = %s AND assets.project_id = %s
+                        FOR UPDATE OF refined
+                        """,
+                        (roi_id, project_id),
+                    )
+                    current = cursor.fetchone()
+                    if current is None:
+                        raise KeyError(roi_id)
+                    if suggested_by_evidence_id is not None:
+                        cursor.execute(
+                            f"""
+                            SELECT id FROM {self.schema}.classification_evidence
+                            WHERE id = %s AND project_id = %s
+                              AND refined_detection_id = %s
+                            """,
+                            (suggested_by_evidence_id, project_id, roi_id),
+                        )
+                        if cursor.fetchone() is None:
+                            raise KeyError(suggested_by_evidence_id)
+                    parent_id = current.get("id")
+                    if parent_id:
+                        cursor.execute(
+                            f"UPDATE {self.schema}.roi_label_annotations SET is_current = false WHERE id = %s",
+                            (parent_id,),
+                        )
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.roi_label_annotations
+                            (project_id, refined_detection_id, label_id, actor_user_id,
+                             actor_username, parent_annotation_id,
+                             suggested_by_evidence_id, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            project_id, roi_id, label_id, actor_user_id,
+                            actor_username, parent_id, suggested_by_evidence_id, notes,
+                        ),
+                    )
+                    created.append(cursor.fetchone())
+            connection.commit()
+        return created
+
+    def review_curation_annotations(
+        self,
+        *,
+        project_id: str,
+        roi_ids: Sequence[str],
+        decision: str,
+        reviewer_user_id: str | None,
+        reviewer_username: str,
+        notes: str | None = None,
+    ) -> list[dict[str, Any]]:
+        reviews: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                for roi_id in dict.fromkeys(roi_ids):
+                    cursor.execute(
+                        f"""
+                        SELECT annotation.id
+                        FROM {self.schema}.roi_label_annotations annotation
+                        WHERE annotation.project_id = %s
+                          AND annotation.refined_detection_id = %s
+                          AND annotation.is_current
+                          AND annotation.status <> 'deprecated'
+                        """,
+                        (project_id, roi_id),
+                    )
+                    annotation = cursor.fetchone()
+                    if annotation is None:
+                        raise KeyError(roi_id)
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.roi_annotation_reviews
+                            (annotation_id, reviewer_user_id, reviewer_username,
+                             decision, notes)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            annotation["id"], reviewer_user_id, reviewer_username,
+                            decision, notes,
+                        ),
+                    )
+                    reviews.append(cursor.fetchone())
+            connection.commit()
+        return reviews
+
+    def remove_curation_labels(
+        self,
+        *,
+        project_id: str,
+        roi_ids: Sequence[str],
+        actor_username: str,
+        notes: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retire current human assertions without deleting their audit history."""
+
+        retired: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                for roi_id in dict.fromkeys(roi_ids):
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.roi_label_annotations
+                        SET is_current = false,
+                            status = 'deprecated',
+                            metadata = metadata || %s::jsonb
+                        WHERE project_id = %s
+                          AND refined_detection_id = %s
+                          AND is_current
+                        RETURNING *
+                        """,
+                        (
+                            json.dumps(
+                                json_ready(
+                                    {
+                                        "retired_by": actor_username,
+                                        "retired_notes": notes,
+                                        "retired_at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                )
+                            ),
+                            project_id,
+                            roi_id,
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise KeyError(roi_id)
+                    retired.append(row)
+            connection.commit()
+        return retired
+
+    def list_classification_targets(
+        self,
+        *,
+        project_id: str,
+        roi_ids: Sequence[str] = (),
+        limit: int = 128,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
+        params: list[Any] = [project_id]
+        if roi_ids:
+            clauses.append("refined.id = ANY(%s::uuid[])")
+            params.append(list(dict.fromkeys(roi_ids)))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT refined.*
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY refined.created_at, refined.id
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*params, limit, offset),
+                )
+                return list(cursor.fetchall())
+
+    def create_classification_inference_run(
+        self,
+        *,
+        project_id: str,
+        job_id: str | None,
+        model_selector: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.classification_inference_runs
+                        (project_id, job_id, model_selector, parameters)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    RETURNING *
+                    """,
+                    (project_id, job_id, model_selector, json.dumps(json_ready(parameters or {}))),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def _ensure_classification_artifact(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        model: dict[str, Any],
+        probabilities: Sequence[dict[str, Any]],
+    ) -> tuple[str, dict[int, str]]:
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.model_artifacts
+                (project_id, artifact_id, run_id, artifact_fingerprint,
+                 task, architecture, contract_version, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, artifact_id) DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                artifact_fingerprint = EXCLUDED.artifact_fingerprint,
+                architecture = EXCLUDED.architecture,
+                contract_version = EXCLUDED.contract_version
+            RETURNING id
+            """,
+            (
+                project_id,
+                model["artifact_id"],
+                model.get("run_id"),
+                model.get("artifact_fingerprint"),
+                model.get("task", "classification"),
+                model.get("architecture"),
+                model.get("contract_version"),
+                json.dumps(json_ready(model)),
+            ),
+        )
+        artifact_row_id = str(cursor.fetchone()["id"])
+        mappings: dict[int, str] = {}
+        for probability in probabilities:
+            class_index = int(probability["class_index"])
+            oracle_name = str(probability.get("label_name") or f"class-{class_index}")
+            cursor.execute(
+                f"""
+                INSERT INTO {self.schema}.classification_labels
+                    (project_id, name, display_name, metadata)
+                VALUES (%s, %s, %s, %s::jsonb)
+                ON CONFLICT (project_id, name) DO UPDATE SET
+                    display_name = coalesce({self.schema}.classification_labels.display_name, EXCLUDED.display_name)
+                RETURNING id
+                """,
+                (
+                    project_id,
+                    oracle_name,
+                    oracle_name,
+                    json.dumps(
+                        {
+                            "source": "oracle_builder",
+                            "oracle_label_id": probability.get("label_id"),
+                        }
+                    ),
+                ),
+            )
+            project_label_id = str(cursor.fetchone()["id"])
+            mappings[class_index] = project_label_id
+            cursor.execute(
+                f"""
+                INSERT INTO {self.schema}.model_class_mappings
+                    (model_artifact_id, class_index, oracle_label_id,
+                     oracle_label_name, project_label_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (model_artifact_id, class_index) DO UPDATE SET
+                    oracle_label_id = EXCLUDED.oracle_label_id,
+                    oracle_label_name = EXCLUDED.oracle_label_name,
+                    project_label_id = EXCLUDED.project_label_id
+                """,
+                (
+                    artifact_row_id,
+                    class_index,
+                    probability.get("label_id"),
+                    oracle_name,
+                    project_label_id,
+                ),
+            )
+        return artifact_row_id, mappings
+
+    def store_classification_evidence(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        refined_detection_id: str,
+        model: dict[str, Any],
+        output: dict[str, Any],
+        oracle_result: dict[str, Any],
+        embedding_payload_ref: str | None = None,
+        embedding_dtype: str | None = None,
+        embedding_shape: Sequence[int] | None = None,
+        embedding_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        probabilities = list(output.get("probabilities") or [])
+        decision = dict(output.get("decision") or {})
+        packet = dict(output.get("evidence") or {})
+        prototype = dict(packet.get("prototype") or {})
+        knn = dict(packet.get("knn") or {})
+        probability_values = sorted(
+            (float(value.get("probability") or 0.0) for value in probabilities),
+            reverse=True,
+        )
+        entropy = -sum(
+            value * math.log(value)
+            for value in probability_values
+            if value > 0
+        )
+        margin = probability_values[0] - probability_values[1] if len(probability_values) > 1 else (probability_values[0] if probability_values else 0.0)
+        predicted_class_index = decision.get("class_index")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                artifact_row_id, mappings = self._ensure_classification_artifact(
+                    cursor,
+                    project_id=project_id,
+                    model=model,
+                    probabilities=probabilities,
+                )
+                cursor.execute(
+                    f"UPDATE {self.schema}.classification_inference_runs SET model_artifact_id = %s WHERE id = %s",
+                    (artifact_row_id, inference_run_id),
+                )
+                prototype_class = prototype.get("predicted_class")
+                knn_class = knn.get("strongest_label")
+                prototype_similarities = prototype.get("similarities") or {}
+                weighted_support = knn.get("weighted_label_support") or {}
+                cursor.execute(
+                    f"""
+                    INSERT INTO {self.schema}.classification_evidence
+                        (project_id, refined_detection_id, inference_run_id,
+                         predicted_label_id, predicted_class_index, predicted_label_name,
+                         confidence, entropy, probability_margin,
+                         prototype_class_index, prototype_similarity, prototype_margin,
+                         knn_class_index, knn_agreement, knn_weighted_support, knn_margin,
+                         embedding_payload_ref, embedding_dtype, embedding_shape,
+                         embedding_sha256, probabilities, evidence_packet, oracle_result)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+                    ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
+                        predicted_label_id = EXCLUDED.predicted_label_id,
+                        predicted_class_index = EXCLUDED.predicted_class_index,
+                        predicted_label_name = EXCLUDED.predicted_label_name,
+                        confidence = EXCLUDED.confidence,
+                        entropy = EXCLUDED.entropy,
+                        probability_margin = EXCLUDED.probability_margin,
+                        prototype_class_index = EXCLUDED.prototype_class_index,
+                        prototype_similarity = EXCLUDED.prototype_similarity,
+                        prototype_margin = EXCLUDED.prototype_margin,
+                        knn_class_index = EXCLUDED.knn_class_index,
+                        knn_agreement = EXCLUDED.knn_agreement,
+                        knn_weighted_support = EXCLUDED.knn_weighted_support,
+                        knn_margin = EXCLUDED.knn_margin,
+                        embedding_payload_ref = EXCLUDED.embedding_payload_ref,
+                        embedding_dtype = EXCLUDED.embedding_dtype,
+                        embedding_shape = EXCLUDED.embedding_shape,
+                        embedding_sha256 = EXCLUDED.embedding_sha256,
+                        probabilities = EXCLUDED.probabilities,
+                        evidence_packet = EXCLUDED.evidence_packet,
+                        oracle_result = EXCLUDED.oracle_result
+                    RETURNING *
+                    """,
+                    (
+                        project_id,
+                        refined_detection_id,
+                        inference_run_id,
+                        mappings.get(int(predicted_class_index)) if predicted_class_index is not None else None,
+                        predicted_class_index,
+                        decision.get("label_name"),
+                        max(probability_values) if probability_values else None,
+                        entropy,
+                        margin,
+                        prototype_class,
+                        prototype_similarities.get(str(prototype_class)) if prototype_class is not None else None,
+                        prototype.get("similarity_margin"),
+                        knn_class,
+                        knn.get("label_agreement"),
+                        weighted_support.get(str(knn_class)) if knn_class is not None else None,
+                        knn.get("label_support_margin"),
+                        embedding_payload_ref,
+                        embedding_dtype,
+                        json.dumps(list(embedding_shape or [])),
+                        embedding_sha256,
+                        json.dumps(json_ready(probabilities)),
+                        json.dumps(json_ready(packet)),
+                        json.dumps(json_ready(oracle_result)),
+                    ),
+                )
+                evidence = cursor.fetchone()
+                cursor.execute(
+                    f"DELETE FROM {self.schema}.classification_evidence_neighbors WHERE evidence_id = %s",
+                    (evidence["id"],),
+                )
+                for rank, neighbor in enumerate(knn.get("neighbors") or []):
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.classification_evidence_neighbors
+                            (evidence_id, rank, exemplar_id, class_index,
+                             label_name, similarity)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            evidence["id"], rank, str(neighbor["uuid"]),
+                            neighbor.get("label"),
+                            next(
+                                (
+                                    value.get("label_name")
+                                    for value in probabilities
+                                    if value.get("class_index") == neighbor.get("label")
+                                ),
+                                None,
+                            ),
+                            neighbor.get("similarity"),
+                        ),
+                    )
+            connection.commit()
+        return evidence
+
+    def complete_classification_inference_run(
+        self,
+        inference_run_id: str,
+        *,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.classification_inference_runs
+                    SET status = %s, metadata = metadata || %s::jsonb,
+                        completed_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (status, json.dumps(json_ready(metadata or {})), inference_run_id),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
     def _job_frame_status_ids(
         self,
         cursor,
@@ -5668,6 +6380,7 @@ class PostgresRepository:
                         finished_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
+                      AND status IN ('queued', 'leased', 'working')
                     RETURNING *;
                     """,
                     (json.dumps(json_ready(result or {})), job_id),
@@ -5716,6 +6429,7 @@ class PostgresRepository:
                         finished_at = {finished_at_sql},
                         updated_at = NOW()
                     WHERE id = %s
+                      AND status IN ('queued', 'leased', 'working')
                     RETURNING *;
                     """,
                     (

@@ -574,6 +574,65 @@ def refine_detection(
     )
 
 
+def identity_refine_detections(
+    detections: Iterable[DetectionRecord],
+    *,
+    frame_loader: FrameLoader | None = None,
+) -> list[DetectionRefinementResult]:
+    """Promote candidate ROIs unchanged, without model inference or reconciliation."""
+
+    results: list[DetectionRefinementResult] = []
+    for detection in detections:
+        frame_loaded = False
+        roi_source = "payload"
+        if detection.roi_payload is None:
+            if frame_loader is None:
+                raise ValueError(
+                    "Detection does not include ROI payload data and no frame_loader was supplied."
+                )
+            with measure_phase("refinement.frame_prepare"):
+                roi = load_detection_roi_from_frame(detection, frame_loader=frame_loader)
+            frame_loaded = True
+            roi_source = "frame"
+        else:
+            with measure_phase("refinement.roi_decode"):
+                roi = as_grayscale_array(decode_detection_roi(detection))
+        with measure_phase("refinement.mask_decode"):
+            candidate_mask = decode_detection_candidate_mask(detection, roi=roi)
+        if candidate_mask.shape[:2] != roi.shape[:2]:
+            raise ValueError(
+                f"Candidate mask shape {candidate_mask.shape[:2]} does not match ROI shape {roi.shape[:2]}."
+            )
+        crop_bbox = _detection_crop_bbox(detection, roi.shape)
+        results.append(
+            DetectionRefinementResult(
+                candidate_detection=detection,
+                roi=roi,
+                candidate_mask=candidate_mask,
+                refined_mask=candidate_mask,
+                crop_bbox=crop_bbox,
+                bbox=(
+                    detection.bbox_x,
+                    detection.bbox_y,
+                    detection.bbox_w,
+                    detection.bbox_h,
+                ),
+                method="identity",
+                metadata={
+                    "candidate_mask_kind": "candidate",
+                    "refined_mask_kind": "candidate_identity",
+                    "identity_promotion": True,
+                    "refinement_bypassed": True,
+                    "refinement_frame_loaded": frame_loaded,
+                    "refinement_initial_roi_source": roi_source,
+                    "refinement_expansion_count": 0,
+                    "refinement_tile_count": 0,
+                },
+            )
+        )
+    return results
+
+
 def _refine_detections_with_backend(
     detections: list[DetectionRecord],
     *,

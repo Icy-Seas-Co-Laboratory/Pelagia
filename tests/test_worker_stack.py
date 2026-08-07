@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import os
+import socket
 from pathlib import Path
 
 
@@ -92,3 +93,41 @@ capabilities = ["ingest", "roi_refinement"]
 
     assert result.returncode == 0, result.stderr
     assert f"profile=cpu stages=extract_frames,roi_refinement python={cpu_venv}/bin/python" in result.stdout
+
+
+def test_stack_start_refuses_an_api_port_owned_by_another_service(tmp_path):
+    cpu_venv = _venv_path(tmp_path, "cpu")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        config_path = _write_stack_config(
+            tmp_path,
+            f'''
+[stack]
+name = "pytest-port-collision"
+run_dir = "{tmp_path / "run"}"
+init_on_start = "never"
+
+[api]
+host = "127.0.0.1"
+port = {port}
+
+[[worker]]
+name = "cpu"
+capabilities = ["preprocess"]
+''',
+        )
+
+        result = subprocess.run(
+            [str(STACK_SCRIPT), "start", str(config_path)],
+            cwd=ROOT_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "PELAGIA_CPU_VENV": str(cpu_venv)},
+        )
+
+    assert result.returncode != 0
+    assert f"TCP port {port} is already in use" in result.stderr
+    assert not (tmp_path / "run" / "pids" / "api.pid").exists()

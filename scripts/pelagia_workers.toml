@@ -92,8 +92,8 @@ capabilities = ["segment"]
 
 [[worker]]
 name = "refine-1"
-capabilities = ["roi_refinement"]
+capabilities = ["roi_refinement", "classify"]
 
 [[worker]]
 name = "refine-2"
-capabilities = ["roi_refinement"]
+capabilities = ["roi_refinement", "classify"]
