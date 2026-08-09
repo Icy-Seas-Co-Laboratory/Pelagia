@@ -1180,8 +1180,10 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "total_count": 1,
     }
     actions = []
+    listing_calls = []
+    target_calls = []
     repository.list_curation_labels = lambda **_: [label]
-    repository.list_curation_rois = lambda **_: {
+    repository.list_curation_rois = lambda **values: listing_calls.append(values) or {
         "items": [dict(roi)], "total": 1, "limit": 120, "offset": 0
     }
     repository.get_curation_roi = lambda roi_id, **_: {
@@ -1196,6 +1198,7 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     repository.remove_curation_labels = lambda **values: actions.append(("remove", values)) or [
         {"id": "annotation-1", "status": "deprecated"}
     ]
+    repository.count_classification_targets = lambda **values: target_calls.append(values) or 1
     repository.import_curation_label_dictionary = lambda **values: {
         "dictionary_key": values["dictionary"]["key"],
         "created_count": values["dictionary"]["selectable_count"],
@@ -1205,7 +1208,9 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
 
     options = client.get("/curation/options")
     imported = client.post("/curation/labels/import-defaults")
-    listing = client.get("/curation/rois?evidence_state=available")
+    listing = client.get(
+        "/curation/rois?evidence_state=available&label_id=label-1&label_source=prediction"
+    )
     annotation = client.post(
         "/curation/annotations",
         json={
@@ -1226,6 +1231,17 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "/curation/classification-jobs",
         json={"roi_ids": ["refined-det-1"], "model_ref": "test-refiner"},
     )
+    preview = client.post(
+        "/curation/classification-targets/preview",
+        json={
+            "model_ref": "test-refiner",
+            "selection": {
+                "asset_ids": ["asset-1"],
+                "evidence_state": "missing_model",
+                "annotation_state": "unlabeled",
+            },
+        },
+    )
 
     assert options.status_code == 200
     assert options.json()["oracle"]["available_model_count"] == 1
@@ -1239,11 +1255,19 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "review_interface": "pelagiaview",
     }
     assert listing.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
+    assert listing_calls[0]["label_id"] == "label-1"
+    assert listing_calls[0]["label_source"] == "prediction"
     assert annotation.status_code == review.status_code == removal.status_code == 200
     assert [action[0] for action in actions] == ["assign", "review", "remove"]
     assert actions[0][1]["suggested_by_evidence_id"] == "evidence-1"
     assert queued.status_code == 202
     assert queued.json()["job"]["stage"] == PipelineStage.CLASSIFY.value
+    assert queued.json()["target_count"] == 1
+    assert queued.json()["selection"]["evidence_state"] == "all"
+    assert preview.status_code == 200
+    assert preview.json()["target_count"] == 1
+    assert target_calls[-1]["selection"]["evidence_state"] == "missing_model"
+    assert target_calls[-1]["selection"]["asset_ids"] == ["asset-1"]
 
 
 def test_io_export_options_are_discoverable():
@@ -3388,12 +3412,16 @@ def test_api_filters_asset_detections():
 def test_api_lists_global_detections_without_image_payloads():
     client, _, _ = make_client()
 
-    response = client.get("/detections?asset_id=asset-1&collection=test&sort_by=random&limit=100&offset=400")
+    response = client.get(
+        "/detections?asset_id=asset-1&collection=test&has_roi_payload=true"
+        "&sort_by=random&limit=100&offset=400"
+    )
 
     assert response.status_code == 200
     detection = response.json()["detections"][0]
     assert detection["asset_id"] == "asset-1"
     assert detection["collection"] == "test"
+    assert detection["has_roi_payload"] is True
     assert detection["sort_by"] == "random"
     assert detection["limit"] == 100
     assert detection["offset"] == 400

@@ -307,12 +307,61 @@ class RoiRefinementCommand(JobCommand):
 
 
 @dataclass(frozen=True, slots=True)
+class ClassificationTargetSelection:
+    """Stable, serializable query describing refined ROIs eligible for evidence generation."""
+
+    asset_ids: tuple[str, ...] = ()
+    collections: tuple[str, ...] = ()
+    annotation_state: str = "all"
+    review_state: str = "all"
+    evidence_state: str = "missing_model"
+    label_id: str | None = None
+    label_source: str = "any"
+    min_area: float | None = None
+    max_area: float | None = None
+    search: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any] | None) -> "ClassificationTargetSelection":
+        values = payload or {}
+        return cls(
+            asset_ids=tuple(str(value) for value in values.get("asset_ids") or () if value),
+            collections=tuple(str(value) for value in values.get("collections") or () if value),
+            annotation_state=str(values.get("annotation_state") or "all"),
+            review_state=str(values.get("review_state") or "all"),
+            evidence_state=str(values.get("evidence_state") or "missing_model"),
+            label_id=None if not values.get("label_id") else str(values["label_id"]),
+            label_source=str(values.get("label_source") or "any"),
+            min_area=None if values.get("min_area") is None else float(values["min_area"]),
+            max_area=None if values.get("max_area") is None else float(values["max_area"]),
+            search=None if not values.get("search") else str(values["search"]).strip(),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return _compact(
+            {
+                "asset_ids": list(self.asset_ids),
+                "collections": list(self.collections),
+                "annotation_state": self.annotation_state,
+                "review_state": self.review_state,
+                "evidence_state": self.evidence_state,
+                "label_id": self.label_id,
+                "label_source": self.label_source,
+                "min_area": self.min_area,
+                "max_area": self.max_area,
+                "search": self.search,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ClassificationCommand(JobCommand):
     command_type = "classification"
     stage = PipelineStage.CLASSIFY
 
     roi_ids: tuple[str, ...] = ()
     model_ref: str = ""
+    selection: ClassificationTargetSelection = field(default_factory=ClassificationTargetSelection)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ClassificationCommand":
@@ -320,9 +369,14 @@ class ClassificationCommand(JobCommand):
         model_ref = str(payload.get("model_ref") or "").strip()
         if not model_ref:
             raise ValueError("Classification jobs require model_ref.")
+        roi_ids = tuple(str(value) for value in payload.get("roi_ids") or () if value)
+        selection_payload = payload.get("selection")
+        if selection_payload is None and roi_ids:
+            selection_payload = {"evidence_state": "all"}
         return cls(
-            roi_ids=tuple(str(value) for value in payload.get("roi_ids") or () if value),
+            roi_ids=roi_ids,
             model_ref=model_ref,
+            selection=ClassificationTargetSelection.from_payload(selection_payload),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -330,6 +384,7 @@ class ClassificationCommand(JobCommand):
             **self._payload_header(),
             "roi_ids": list(self.roi_ids),
             "model_ref": self.model_ref,
+            "selection": self.selection.to_payload(),
         }
 
 

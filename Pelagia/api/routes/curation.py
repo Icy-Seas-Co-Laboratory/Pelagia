@@ -44,11 +44,40 @@ if APIRouter is not None:
         roi_ids: list[str] = Field(min_length=1)
         notes: str | None = None
 
+    class ClassificationTargetSelectionRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        asset_ids: list[str] = Field(default_factory=list)
+        collections: list[str] = Field(default_factory=list)
+        annotation_state: Literal["all", "labeled", "unlabeled"] = "all"
+        review_state: Literal[
+            "all", "unreviewed", "verified", "rejected", "needs_review"
+        ] = "all"
+        evidence_state: Literal[
+            "all",
+            "missing_model",
+            "available_model",
+            "missing_any",
+            "available_any",
+            "disagreement",
+        ] = "missing_model"
+        label_id: str | None = None
+        label_source: Literal["any", "human", "prediction"] = "any"
+        min_area: float | None = Field(default=None, ge=0)
+        max_area: float | None = Field(default=None, ge=0)
+        search: str | None = Field(default=None, max_length=500)
+
     class ClassificationJobRequest(BaseModel):
         model_config = ConfigDict(extra="forbid", protected_namespaces=())
         roi_ids: list[str] = Field(default_factory=list)
         model_ref: str | None = None
+        selection: ClassificationTargetSelectionRequest | None = None
         priority: int | None = None
+
+    class ClassificationPreviewRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid", protected_namespaces=())
+        roi_ids: list[str] = Field(default_factory=list)
+        model_ref: str | None = None
+        selection: ClassificationTargetSelectionRequest | None = None
 
     router = APIRouter(prefix="/curation", tags=["curation"])
 
@@ -66,6 +95,35 @@ if APIRouter is not None:
             value["thumbnail_url"] = f"/refined-detections/{roi_id}/roi?format=jpg&width=180"
         value.pop("total_count", None)
         return value
+
+    def _classification_request(
+        request: Request,
+        *,
+        model_ref: str | None,
+        roi_ids: list[str],
+        selection: ClassificationTargetSelectionRequest | None,
+    ) -> tuple[str, dict, int]:
+        resolved_model_ref = (
+            model_ref or get_context(request).config.oracle.default_classification_model
+        ).strip()
+        if not resolved_model_ref:
+            raise HTTPException(status_code=422, detail="A classification model is required.")
+        if selection is None:
+            resolved_selection = {"evidence_state": "all" if roi_ids else "missing_model"}
+        else:
+            resolved_selection = selection.model_dump(exclude_none=True)
+        min_area = resolved_selection.get("min_area")
+        max_area = resolved_selection.get("max_area")
+        if min_area is not None and max_area is not None and min_area > max_area:
+            raise HTTPException(status_code=422, detail="Minimum ROI area cannot exceed maximum ROI area.")
+        auth = require_project_read(request)
+        target_count = get_repository(request).count_classification_targets(
+            project_id=auth.project_id,
+            model_ref=resolved_model_ref,
+            roi_ids=roi_ids,
+            selection=resolved_selection,
+        )
+        return resolved_model_ref, resolved_selection, target_count
 
     @router.get("/options")
     def options(request: Request) -> dict:
@@ -155,6 +213,7 @@ if APIRouter is not None:
         annotation_state: Literal["all", "labeled", "unlabeled"] = "all",
         review_state: Literal["all", "unreviewed", "verified", "rejected", "needs_review"] = "all",
         label_id: str | None = None,
+        label_source: Literal["any", "human", "prediction"] = "any",
         evidence_state: Literal["all", "available", "missing", "disagreement"] = "all",
         search: str | None = None,
         sort_by: str = "oldest",
@@ -167,6 +226,7 @@ if APIRouter is not None:
             annotation_state=annotation_state,
             review_state=review_state,
             label_id=label_id,
+            label_source=label_source,
             evidence_state=evidence_state,
             search=search,
             sort_by=sort_by,
@@ -233,17 +293,51 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail=f"Current annotation was not found: {exc.args[0]}") from exc
         return {"annotations": as_response(rows)}
 
+    @router.post("/classification-targets/preview")
+    def preview_classification_targets(
+        request: Request, body: ClassificationPreviewRequest
+    ) -> dict:
+        model_ref, selection, target_count = _classification_request(
+            request,
+            model_ref=body.model_ref,
+            roi_ids=body.roi_ids,
+            selection=body.selection,
+        )
+        return {
+            "model_ref": model_ref,
+            "selection": selection,
+            "target_count": target_count,
+            "explicit_roi_count": len(set(body.roi_ids)),
+        }
+
     @router.post("/classification-jobs", status_code=202)
     def queue_classification(request: Request, body: ClassificationJobRequest) -> dict:
         auth = require_project_write(request)
-        model_ref = body.model_ref or get_context(request).config.oracle.default_classification_model
+        model_ref, selection, target_count = _classification_request(
+            request,
+            model_ref=body.model_ref,
+            roi_ids=body.roi_ids,
+            selection=body.selection,
+        )
+        if target_count < 1:
+            raise HTTPException(status_code=422, detail="No refined ROIs match this evidence query.")
         job = PipelineService(get_context(request)).queue(
             PipelineStage.CLASSIFY,
             project_id=auth.project_id,
-            payload={"roi_ids": body.roi_ids, "model_ref": model_ref},
+            payload={
+                "roi_ids": body.roi_ids,
+                "model_ref": model_ref,
+                "selection": selection,
+            },
             priority=body.priority,
-            summary=f"Classify {'selected' if body.roi_ids else 'all'} refined ROIs with {model_ref}",
+            summary=f"Generate ML evidence for {target_count} refined ROIs with {model_ref}",
         )
-        return {"job": as_response(job), "model_ref": model_ref}
+        return {
+            "job": as_response(job),
+            "model_ref": model_ref,
+            "selection": selection,
+            "target_count": target_count,
+            "explicit_roi_count": len(set(body.roi_ids)),
+        }
 else:
     router = None

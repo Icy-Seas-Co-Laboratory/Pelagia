@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..config import CoreConfig
 from ..domain import ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
@@ -2879,6 +2879,7 @@ class PostgresRepository:
         roi_format: str | None = None,
         mask_encoding: str | None = None,
         mask_format: str | None = None,
+        has_roi_payload: bool | None = None,
         refinement_state: str | None = None,
         sort_by: str = "asset_frame",
         sort_dir: str = "desc",
@@ -2941,6 +2942,11 @@ class PostgresRepository:
             if value:
                 clauses.append(f"{column} = %s")
                 params.append(value)
+
+        if has_roi_payload is True:
+            clauses.append("detections.roi_payload IS NOT NULL AND octet_length(detections.roi_payload) > 0")
+        elif has_roi_payload is False:
+            clauses.append("(detections.roi_payload IS NULL OR octet_length(detections.roi_payload) = 0)")
 
         normalized_refinement_state = str(refinement_state or "").replace("_", "-").lower()
         if normalized_refinement_state in {"refined", "has-refinement", "has-refined"}:
@@ -4494,15 +4500,21 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
+                    WITH latest_evidence AS (
+                        SELECT DISTINCT ON (refined_detection_id)
+                               refined_detection_id, predicted_label_id
+                        FROM {self.schema}.classification_evidence
+                        ORDER BY refined_detection_id, created_at DESC, id DESC
+                    )
                     SELECT labels.*,
                            count(DISTINCT annotations.id) FILTER (
                                WHERE annotations.is_current AND annotations.status <> 'deprecated'
                            ) AS annotation_count,
-                           count(DISTINCT evidence.id) AS prediction_count
+                           count(DISTINCT evidence.refined_detection_id) AS prediction_count
                     FROM {self.schema}.classification_labels labels
                     LEFT JOIN {self.schema}.roi_label_annotations annotations
                       ON annotations.label_id = labels.id
-                    LEFT JOIN {self.schema}.classification_evidence evidence
+                    LEFT JOIN latest_evidence evidence
                       ON evidence.predicted_label_id = labels.id
                     WHERE labels.project_id = %s
                       AND (%s OR labels.deprecated_at IS NULL)
@@ -4661,6 +4673,7 @@ class PostgresRepository:
         annotation_state: str = "all",
         review_state: str = "all",
         label_id: str | None = None,
+        label_source: str = "any",
         evidence_state: str = "all",
         search: str | None = None,
         sort_by: str = "oldest",
@@ -4679,8 +4692,15 @@ class PostgresRepository:
             clauses.append("review.decision = %s")
             params.append(review_state)
         if label_id:
-            clauses.append("annotation.label_id = %s")
-            params.append(label_id)
+            if label_source == "human":
+                clauses.append("annotation.label_id = %s")
+                params.append(label_id)
+            elif label_source == "prediction":
+                clauses.append("evidence.predicted_label_id = %s")
+                params.append(label_id)
+            else:
+                clauses.append("(annotation.label_id = %s OR evidence.predicted_label_id = %s)")
+                params.extend([label_id, label_id])
         if evidence_state == "available":
             clauses.append("evidence.id IS NOT NULL")
         elif evidence_state == "missing":
@@ -4993,19 +5013,146 @@ class PostgresRepository:
             connection.commit()
         return retired
 
+    def _classification_target_query(
+        self,
+        *,
+        project_id: str,
+        model_ref: str,
+        roi_ids: Sequence[str] = (),
+        selection: Mapping[str, Any] | None = None,
+    ) -> tuple[str, str, list[Any]]:
+        """Build the shared target query used by previews, counts, and workers."""
+
+        filters = dict(selection or {})
+        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
+        where_params: list[Any] = [project_id]
+        if roi_ids:
+            clauses.append("refined.id = ANY(%s::uuid[])")
+            where_params.append(list(dict.fromkeys(roi_ids)))
+        asset_ids = [str(value) for value in filters.get("asset_ids") or () if value]
+        if asset_ids:
+            clauses.append("assets.id = ANY(%s::uuid[])")
+            where_params.append(list(dict.fromkeys(asset_ids)))
+        collections = [str(value) for value in filters.get("collections") or () if value]
+        if collections:
+            clauses.append("assets.collections && %s::text[]")
+            where_params.append(list(dict.fromkeys(collections)))
+
+        annotation_state = str(filters.get("annotation_state") or "all")
+        if annotation_state == "labeled":
+            clauses.append("annotation.id IS NOT NULL AND annotation.status <> 'deprecated'")
+        elif annotation_state == "unlabeled":
+            clauses.append("(annotation.id IS NULL OR annotation.status = 'deprecated')")
+
+        review_state = str(filters.get("review_state") or "all")
+        if review_state == "unreviewed":
+            clauses.append("annotation.id IS NOT NULL AND review.id IS NULL")
+        elif review_state in {"verified", "rejected", "needs_review"}:
+            clauses.append("review.decision = %s")
+            where_params.append(review_state)
+
+        label_id = filters.get("label_id")
+        if label_id:
+            label_source = str(filters.get("label_source") or "any")
+            if label_source == "human":
+                clauses.append("annotation.label_id = %s")
+                where_params.append(str(label_id))
+            elif label_source == "prediction":
+                clauses.append("model_evidence.predicted_label_id = %s")
+                where_params.append(str(label_id))
+            else:
+                clauses.append(
+                    "(annotation.label_id = %s OR model_evidence.predicted_label_id = %s)"
+                )
+                where_params.extend([str(label_id), str(label_id)])
+
+        evidence_state = str(filters.get("evidence_state") or "missing_model")
+        if evidence_state == "missing_model":
+            clauses.append("model_evidence.id IS NULL")
+        elif evidence_state == "available_model":
+            clauses.append("model_evidence.id IS NOT NULL")
+        elif evidence_state == "missing_any":
+            clauses.append(
+                f"NOT EXISTS (SELECT 1 FROM {self.schema}.classification_evidence any_evidence "
+                "WHERE any_evidence.refined_detection_id = refined.id)"
+            )
+        elif evidence_state == "available_any":
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM {self.schema}.classification_evidence any_evidence "
+                "WHERE any_evidence.refined_detection_id = refined.id)"
+            )
+        elif evidence_state == "disagreement":
+            clauses.append(
+                "model_evidence.id IS NOT NULL AND ((model_evidence.prototype_class_index IS NOT NULL AND "
+                "model_evidence.prototype_class_index <> model_evidence.predicted_class_index) OR "
+                "(model_evidence.knn_class_index IS NOT NULL AND "
+                "model_evidence.knn_class_index <> model_evidence.predicted_class_index))"
+            )
+
+        min_area = filters.get("min_area")
+        if min_area is not None:
+            clauses.append("refined.area >= %s")
+            where_params.append(float(min_area))
+        max_area = filters.get("max_area")
+        if max_area is not None:
+            clauses.append("refined.area <= %s")
+            where_params.append(float(max_area))
+        search = str(filters.get("search") or "").strip()
+        if search:
+            token = f"%{search}%"
+            clauses.append(
+                "(refined.id::text ILIKE %s OR frames.id::text ILIKE %s OR assets.filename ILIKE %s)"
+            )
+            where_params.extend([token, token, token])
+
+        joins = f"""
+            LEFT JOIN LATERAL (
+                SELECT * FROM {self.schema}.roi_label_annotations current_annotation
+                WHERE current_annotation.refined_detection_id = refined.id
+                  AND current_annotation.is_current
+                ORDER BY current_annotation.created_at DESC, current_annotation.id DESC
+                LIMIT 1
+            ) annotation ON true
+            LEFT JOIN LATERAL (
+                SELECT * FROM {self.schema}.roi_annotation_reviews latest_review
+                WHERE latest_review.annotation_id = annotation.id
+                ORDER BY latest_review.created_at DESC, latest_review.id DESC
+                LIMIT 1
+            ) review ON true
+            LEFT JOIN LATERAL (
+                SELECT evidence.*
+                FROM {self.schema}.classification_evidence evidence
+                JOIN {self.schema}.classification_inference_runs inference_run
+                  ON inference_run.id = evidence.inference_run_id
+                WHERE evidence.refined_detection_id = refined.id
+                  AND inference_run.model_selector = %s
+                ORDER BY evidence.created_at DESC, evidence.id DESC
+                LIMIT 1
+            ) model_evidence ON true
+        """
+        return joins, " AND ".join(clauses), [model_ref, *where_params]
+
     def list_classification_targets(
         self,
         *,
         project_id: str,
+        model_ref: str,
         roi_ids: Sequence[str] = (),
+        selection: Mapping[str, Any] | None = None,
+        after_created_at: datetime | None = None,
+        after_id: str | None = None,
         limit: int = 128,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
-        params: list[Any] = [project_id]
-        if roi_ids:
-            clauses.append("refined.id = ANY(%s::uuid[])")
-            params.append(list(dict.fromkeys(roi_ids)))
+        joins, where, params = self._classification_target_query(
+            project_id=project_id,
+            model_ref=model_ref,
+            roi_ids=roi_ids,
+            selection=selection,
+        )
+        if after_created_at is not None and after_id:
+            where += " AND (refined.created_at, refined.id) > (%s, %s::uuid)"
+            params.extend([after_created_at, after_id])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -5014,7 +5161,8 @@ class PostgresRepository:
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE {' AND '.join(clauses)}
+                    {joins}
+                    WHERE {where}
                     ORDER BY refined.created_at, refined.id
                     LIMIT %s OFFSET %s
                     """,
@@ -5026,15 +5174,18 @@ class PostgresRepository:
         self,
         *,
         project_id: str,
+        model_ref: str,
         roi_ids: Sequence[str] = (),
+        selection: Mapping[str, Any] | None = None,
     ) -> int:
         """Count the refined ROIs that can actually be sent for classification."""
 
-        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
-        params: list[Any] = [project_id]
-        if roi_ids:
-            clauses.append("refined.id = ANY(%s::uuid[])")
-            params.append(list(dict.fromkeys(roi_ids)))
+        joins, where, params = self._classification_target_query(
+            project_id=project_id,
+            model_ref=model_ref,
+            roi_ids=roi_ids,
+            selection=selection,
+        )
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -5043,7 +5194,8 @@ class PostgresRepository:
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
-                    WHERE {' AND '.join(clauses)}
+                    {joins}
+                    WHERE {where}
                     """,
                     tuple(params),
                 )

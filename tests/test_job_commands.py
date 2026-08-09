@@ -11,6 +11,7 @@ from Pelagia.processing.codec_registry import (
 from Pelagia.services.job_commands import (
     COMMAND_TYPE_KEY,
     COMMAND_VERSION_KEY,
+    ClassificationCommand,
     FrameSelection,
     ExtractFramesCommand,
     SegmentFramesCommand,
@@ -78,6 +79,30 @@ def test_segment_command_upgrades_a_legacy_flat_payload():
 def test_command_rejects_a_payload_for_another_stage():
     with pytest.raises(ValueError, match="Expected 'segment_frames' command payload"):
         SegmentFramesCommand.from_payload({COMMAND_TYPE_KEY: "preprocess_frames"})
+
+
+def test_classification_command_preserves_reproducible_target_selection():
+    command = ClassificationCommand.from_payload(
+        {
+            "model_ref": "classifier-v2",
+            "selection": {
+                "asset_ids": ["asset-1"],
+                "collections": ["station-a"],
+                "annotation_state": "unlabeled",
+                "evidence_state": "missing_model",
+                "min_area": 25,
+            },
+        }
+    )
+
+    payload = command.to_payload()
+
+    assert payload["model_ref"] == "classifier-v2"
+    assert payload["selection"]["asset_ids"] == ["asset-1"]
+    assert payload["selection"]["collections"] == ["station-a"]
+    assert payload["selection"]["annotation_state"] == "unlabeled"
+    assert payload["selection"]["evidence_state"] == "missing_model"
+    assert payload["selection"]["min_area"] == 25.0
 
 
 def test_codec_registry_normalizes_aliases_and_encodes_png():

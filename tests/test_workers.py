@@ -271,6 +271,7 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
         [
             {
                 "id": "refined-1",
+                "created_at": "2026-01-01T00:00:00+00:00",
                 "bbox_x": 12,
                 "bbox_y": 21,
                 "bbox_w": 2,
@@ -286,7 +287,7 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
                 "roi_shape": [4, 5],
             }
         ]
-        if values["offset"] == 0
+        if values.get("after_id") is None
         else []
     )
     repo.store_classification_evidence = lambda **values: stored_evidence.append(values) or {

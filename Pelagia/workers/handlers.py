@@ -1104,7 +1104,9 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
         raise ValueError("Classification jobs require project_id.")
     target_count = context.repository.count_classification_targets(
         project_id=project_id,
+        model_ref=command.model_ref,
         roi_ids=command.roi_ids,
+        selection=command.selection.to_payload(),
     )
     inference_run = context.repository.create_classification_inference_run(
         project_id=project_id,
@@ -1112,6 +1114,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
         model_selector=command.model_ref,
         parameters={
             "roi_ids": list(command.roi_ids),
+            "selection": command.selection.to_payload(),
             "target_count": target_count,
             "input_crop_policy": CLASSIFICATION_CROP_POLICY,
         },
@@ -1131,12 +1134,13 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     if owns_client:
         client = OracleInferenceClient(context.config.oracle)
     completed = 0
-    offset = 0
+    after_created_at = None
+    after_id = None
     batch_size = context.config.oracle.max_items_per_request
     batch_count = (target_count + batch_size - 1) // batch_size if target_count else 0
     batch_number = 0
     try:
-        while offset < target_count:
+        while completed < target_count:
             batch_number += 1
             progress.update(
                 completed,
@@ -1150,9 +1154,12 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
             )
             targets = context.repository.list_classification_targets(
                 project_id=project_id,
+                model_ref=command.model_ref,
                 roi_ids=command.roi_ids,
+                selection=command.selection.to_payload(),
                 limit=batch_size,
-                offset=offset,
+                after_created_at=after_created_at,
+                after_id=after_id,
             )
             if not targets:
                 break
@@ -1255,7 +1262,8 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     },
                     message=f"Saved evidence for {completed} of {target_count} refined ROIs",
                 )
-            offset += len(targets)
+            after_created_at = targets[-1]["created_at"]
+            after_id = str(targets[-1]["id"])
             if len(targets) < batch_size:
                 break
         context.repository.complete_classification_inference_run(
@@ -1276,6 +1284,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
             "project_id": project_id,
             "inference_run_id": str(inference_run["id"]),
             "model_ref": command.model_ref,
+            "selection": command.selection.to_payload(),
             "input_crop_policy": CLASSIFICATION_CROP_POLICY,
             "detection_count": completed,
         }
