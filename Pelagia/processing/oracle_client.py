@@ -12,6 +12,7 @@ import httpx
 import numpy as np
 
 from ..config import OracleConfig
+from .timing import measure_phase
 from .detection_refinement import RoiRefinementInput, RoiRefinementPrediction
 
 
@@ -192,16 +193,18 @@ class OracleInferenceClient:
         for start in range(0, len(inputs), self.config.max_items_per_request):
             chunk = inputs[start : start + self.config.max_items_per_request]
             request_id = str(uuid.uuid4())
-            body = _encode_request(request_id, chunk)
+            with measure_phase("oracle_transport.request_encode"):
+                body = _encode_request(request_id, chunk)
             if len(body) > self.config.max_payload_bytes:
                 raise OracleRejectedError("Oracle Builder request exceeds configured payload limit")
             selector = quote(model_ref, safe="")
             try:
-                response = self._http().post(
-                    f"/v1/models/{selector}:predict",
-                    content=body,
-                    headers={"Content-Type": NPZ_MEDIA_TYPE},
-                )
+                with measure_phase("oracle_transport.http_round_trip"):
+                    response = self._http().post(
+                        f"/v1/models/{selector}:predict",
+                        content=body,
+                        headers={"Content-Type": NPZ_MEDIA_TYPE},
+                    )
             except httpx.HTTPError as exc:
                 raise OracleUnavailableError(f"Oracle Builder inference request failed: {exc}") from exc
             if response.status_code in {404, 415, 422}:
@@ -213,9 +216,10 @@ class OracleInferenceClient:
                     f"Oracle Builder inference failed ({response.status_code}): {response.text}"
                 )
             response.raise_for_status()
-            result_set = _decode_result(
-                response.content, max_payload_bytes=self.config.max_payload_bytes
-            )
+            with measure_phase("oracle_transport.response_decode"):
+                result_set = _decode_result(
+                    response.content, max_payload_bytes=self.config.max_payload_bytes
+                )
             rows = result_set.get("results") or []
             if len(rows) != len(chunk):
                 raise OracleInferenceError("Oracle Builder returned an unexpected result count")

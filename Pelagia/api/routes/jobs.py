@@ -87,6 +87,15 @@ if APIRouter is not None:
         mode: str = "cancel"
         dry_run: bool = False
 
+    class ControlJobsRequest(BaseModel):
+        action: str
+        run_id: str | None = None
+        asset_id: str | None = None
+        stage: list[str] = Field(default_factory=list)
+        ids: list[str] = Field(default_factory=list)
+        worker_id: str | None = None
+        reason: str | None = None
+
     router = APIRouter(prefix="/jobs", tags=["jobs"])
 
     @router.get("", response_model=JobsListResponse, response_model_exclude_none=True)
@@ -178,6 +187,8 @@ if APIRouter is not None:
                 payload=body.payload,
                 depends_on=body.depends_on,
                 summary=body.summary,
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -245,6 +256,28 @@ if APIRouter is not None:
             dry_run=body.dry_run,
         )
         return as_response(result)
+
+    @router.post("/control", response_model_exclude_none=True)
+    def control_jobs(request: Request, body: ControlJobsRequest) -> dict:
+        """Apply a cooperative pause or resume to a filtered queue selection."""
+        repository = get_repository(request)
+        auth = require_project_write(request)
+        stages = _enum_values(body.stage, PipelineStage, "stage")
+        job_ids = _uuid_values(body.ids)
+        common = {
+            "project_id": auth.project_id,
+            "run_id": body.run_id,
+            "asset_id": body.asset_id,
+            "stages": stages,
+            "job_ids": job_ids,
+            "worker_id": body.worker_id,
+            "reason": body.reason,
+        }
+        if body.action == "pause":
+            return as_response(repository.pause_jobs(**common))
+        if body.action == "resume":
+            return as_response(repository.resume_jobs(**common))
+        raise HTTPException(status_code=422, detail="action must be one of: pause, resume.")
 
     @router.get("/{job_id}", response_model=JobDetailResponse, response_model_exclude_none=True)
     def get_job(request: Request, job_id: str) -> dict:

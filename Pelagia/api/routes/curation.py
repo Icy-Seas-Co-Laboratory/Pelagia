@@ -331,6 +331,8 @@ if APIRouter is not None:
             },
             priority=body.priority,
             summary=f"Generate ML evidence for {target_count} refined ROIs with {model_ref}",
+            submitted_by_user_id=auth.user_id,
+            submitted_by_username=auth.username,
         )
         return {
             "job": as_response(job),

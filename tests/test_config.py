@@ -115,7 +115,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.oracle.enabled is True
     assert config.oracle.base_url == "http://127.0.0.1:8100"
     assert config.oracle.default_mask_model == "pelagia-refiner"
-    assert config.oracle.max_items_per_request == 32
+    assert config.oracle.max_items_per_request == 256
     assert config.artifacts.local_root.as_posix() == ".pelagia"
     assert config.artifacts.plugins.builtin_enabled is True
     assert config.artifacts.plugins.local_path.as_posix() == ".pelagia/plugins"

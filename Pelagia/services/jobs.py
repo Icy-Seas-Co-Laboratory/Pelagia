@@ -27,6 +27,8 @@ class JobService:
         status: JobStatus = JobStatus.QUEUED,
         max_attempts: int | None = None,
         summary: str | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
     ) -> dict[str, Any]:
         """Create a queued processing job."""
         resolved_payload = dict(payload or {})
@@ -43,6 +45,8 @@ class JobService:
             payload=resolved_payload,
             depends_on=depends_on or [],
             summary=summary,
+            submitted_by_user_id=submitted_by_user_id,
+            submitted_by_username=submitted_by_username,
         )
 
     def claim(self, worker_id: str, stages: Sequence[PipelineStage] | None = None) -> list[dict[str, Any]]:

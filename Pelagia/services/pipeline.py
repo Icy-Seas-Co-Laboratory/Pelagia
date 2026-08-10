@@ -33,6 +33,8 @@ class PipelineService:
         status: JobStatus = JobStatus.QUEUED,
         max_attempts: int | None = None,
         summary: str | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
     ) -> dict[str, Any]:
         """Validate a typed command and submit it to the shared job queue."""
         return self.jobs.enqueue(
@@ -46,6 +48,8 @@ class PipelineService:
             status=status,
             max_attempts=max_attempts,
             summary=summary,
+            submitted_by_user_id=submitted_by_user_id,
+            submitted_by_username=submitted_by_username,
         )
 
     def generate_background(

@@ -20,6 +20,8 @@ class PreprocessQueueRequest:
     options: dict[str, Any]
     priority: int | None = None
     dry_run: bool = False
+    submitted_by_user_id: str | None = None
+    submitted_by_username: str | None = None
 
 
 class ProcessingQueueService:
@@ -56,6 +58,8 @@ class ProcessingQueueService:
             jobs=planned_jobs,
             eligible_statuses=filters["preprocessing_status"],
             priority=request.priority,
+            submitted_by_user_id=request.submitted_by_user_id,
+            submitted_by_username=request.submitted_by_username,
         )
         return {**result, "job_ids": [str(row["id"]) for row in created]}
 
@@ -117,7 +121,19 @@ class ProcessingQueueService:
             frame_ids = [str(row["frame_id"]) for row in batch]
             assets, runs = {str(row["asset_id"]) for row in batch}, {str(row["run_id"]) for row in batch if row.get("run_id")}
             payload = command(selection=FrameSelection(frame_ids=tuple(frame_ids)), options=dict(request.options)).to_payload()
-            jobs.append(self.repository.create_job(stage, project_id=project_id, run_id=next(iter(runs)) if len(runs) == 1 else None, asset_id=next(iter(assets)) if len(assets) == 1 else None, priority=request.priority, payload=payload, summary=f"{stage} queued for {len(frame_ids)} frames"))
+            jobs.append(
+                self.repository.create_job(
+                    stage,
+                    project_id=project_id,
+                    run_id=next(iter(runs)) if len(runs) == 1 else None,
+                    asset_id=next(iter(assets)) if len(assets) == 1 else None,
+                    priority=request.priority,
+                    payload=payload,
+                    summary=f"{stage} queued for {len(frame_ids)} frames",
+                    submitted_by_user_id=request.submitted_by_user_id,
+                    submitted_by_username=request.submitted_by_username,
+                )
+            )
         return {**result, "job_ids": [str(job["id"]) for job in jobs]}
 
     def _queue_detection_stage(
@@ -147,7 +163,19 @@ class ProcessingQueueService:
             detection_ids = [str(row["detection_id"]) for row in batch]
             assets, runs = {str(row["asset_id"]) for row in batch}, {str(row["run_id"]) for row in batch if row.get("run_id")}
             payload = RoiRefinementCommand(detection_ids=tuple(detection_ids), options=dict(request.options)).to_payload()
-            jobs.append(self.repository.create_job("roi_refinement", project_id=project_id, run_id=next(iter(runs)) if len(runs) == 1 else None, asset_id=next(iter(assets)) if len(assets) == 1 else None, priority=request.priority, payload=payload, summary=f"roi refinement queued for {len(detection_ids)} detections"))
+            jobs.append(
+                self.repository.create_job(
+                    "roi_refinement",
+                    project_id=project_id,
+                    run_id=next(iter(runs)) if len(runs) == 1 else None,
+                    asset_id=next(iter(assets)) if len(assets) == 1 else None,
+                    priority=request.priority,
+                    payload=payload,
+                    summary=f"roi refinement queued for {len(detection_ids)} detections",
+                    submitted_by_user_id=request.submitted_by_user_id,
+                    submitted_by_username=request.submitted_by_username,
+                )
+            )
         return {**result, "job_ids": [str(job["id"]) for job in jobs]}
 
     def _plan_by_assets(self, method_name: str, *, project_id: str, filters: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:

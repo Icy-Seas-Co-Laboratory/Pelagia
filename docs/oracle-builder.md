@@ -18,7 +18,7 @@ base_url = "http://127.0.0.1:8100"
 default_mask_model = "pelagia-refiner"
 connect_timeout_seconds = 5
 read_timeout_seconds = 120
-max_items_per_request = 32
+max_items_per_request = 256
 max_payload_bytes = 268435456
 ```
 

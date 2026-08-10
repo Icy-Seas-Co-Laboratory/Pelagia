@@ -290,9 +290,13 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
         if values.get("after_id") is None
         else []
     )
-    repo.store_classification_evidence = lambda **values: stored_evidence.append(values) or {
-        "id": "evidence-1"
+    repo.prepare_classification_evidence_context = lambda **values: {
+        "id": "evidence-context-1",
+        **values,
     }
+    repo.store_classification_evidence_batch = lambda **values: stored_evidence.append(values) or [
+        {"id": "evidence-1"}
+    ]
     repo.complete_classification_inference_run = lambda run_id, **values: completed_runs.append(
         (run_id, values)
     ) or {"id": run_id, **values}
@@ -320,6 +324,7 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
                         "transport_request_id": "transport-1",
                         "result": {
                             "result_id": "result-1",
+                            "execution": {"duration_ms": 12.5},
                             "model": {
                                 "artifact_id": "00000000-0000-0000-0000-000000000011",
                                 "run_id": "00000000-0000-0000-0000-000000000012",
@@ -366,8 +371,20 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
     assert result["input_crop_policy"] == "refined_detection_bbox_v1"
     assert created_runs[0]["parameters"]["input_crop_policy"] == "refined_detection_bbox_v1"
     assert created_runs[0]["parameters"]["target_count"] == 1
-    assert stored_evidence[0]["embedding_payload_ref"] == "embedding-key"
-    assert "embedding" not in stored_evidence[0]["output"]
+    stored_record = stored_evidence[0]["records"][0]
+    assert stored_record["embedding_payload_ref"] == "embedding-key"
+    assert "embedding" not in stored_record["output"]
+    assert result["oracle_execution_ms"] == 12.5
+    assert result["oracle_average_execution_ms"] == 12.5
+    assert {
+        "classification.target_database_read",
+        "classification.roi_decode",
+        "classification.roi_crop",
+        "classification.evidence_context_database_write",
+        "classification.embedding_serialize",
+        "classification.embedding_store",
+        "classification.evidence_database_batch_write",
+    } <= set(result["timings"]["phases_ms"])
     assert completed_runs[-1][1]["status"] == "complete"
     assert not hasattr(repo, "assign_curation_labels")
     assert repo.progress_updates[-1]["progress"]["total"] == 1

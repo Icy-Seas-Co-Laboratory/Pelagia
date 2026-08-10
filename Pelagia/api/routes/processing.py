@@ -50,6 +50,8 @@ if APIRouter is not None:
                 options=body.options,
                 priority=body.priority,
                 dry_run=body.dry_run,
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
             if body.stage == "preprocess_frames":
                 result = service.queue_preprocess(queue_request, project_id=auth.project_id)

@@ -1323,7 +1323,6 @@ def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
     assert postgres_repo.get_job(str(succeeded_job["id"]))["status"] == JobStatus.SUCCEEDED.value
     assert postgres_repo.get_job(str(other_job["id"]))["status"] == JobStatus.QUEUED.value
     assert postgres_repo.get_job(str(queued_job["id"]))["control_reason"] == "clear test queue"
-
     assert postgres_repo.complete_job(str(leased_job["id"]), result={"late": True}) is None
     assert postgres_repo.get_job(str(leased_job["id"]))["status"] == JobStatus.CANCELLED.value
     assert postgres_repo.record_failure(str(leased_job["id"]), "late failure") is None
@@ -1334,6 +1333,56 @@ def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
     assert events[0]["payload"]["bulk"] is True
     assert events[0]["payload"]["previous_status"] == JobStatus.QUEUED.value
 
+
+def test_postgres_repository_bulk_pause_and_resume_are_stage_scoped(postgres_repo):
+    project = postgres_repo.create_project(f"bulk-control-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    queued_job = postgres_repo.create_job(
+        PipelineStage.CLASSIFY,
+        project_id=project_id,
+        status=JobStatus.QUEUED,
+        summary="queued classification",
+    )
+    leased_job = postgres_repo.create_job(
+        PipelineStage.CLASSIFY,
+        project_id=project_id,
+        status=JobStatus.QUEUED,
+        summary="leased classification",
+    )
+    unrelated_job = postgres_repo.create_job(
+        PipelineStage.SEGMENT,
+        project_id=project_id,
+        status=JobStatus.QUEUED,
+        summary="unrelated segmentation",
+    )
+    claimed = postgres_repo.claim_jobs("classification-worker", stages=[PipelineStage.CLASSIFY], limit=1)
+    leased_id = str(claimed[0]["id"])
+    paused_id = str(leased_job["id"] if leased_id == str(queued_job["id"]) else queued_job["id"])
+
+    paused = postgres_repo.pause_jobs(
+        project_id=project_id,
+        stages=[PipelineStage.CLASSIFY.value],
+        reason="hold classification",
+    )
+
+    assert paused["matched_count"] == 2
+    assert paused["paused_count"] == 1
+    assert paused["pause_requested_count"] == 1
+    paused_row = postgres_repo.get_job(paused_id)
+    leased_row = postgres_repo.get_job(leased_id)
+    assert paused_row["status"] == JobStatus.PAUSED.value
+    assert leased_row["status"] == JobStatus.LEASED.value
+    assert leased_row["control_reason"].startswith("pause_requested:")
+    assert postgres_repo.get_job(str(unrelated_job["id"]))["status"] == JobStatus.QUEUED.value
+
+    resumed = postgres_repo.resume_jobs(
+        project_id=project_id,
+        stages=[PipelineStage.CLASSIFY.value],
+        reason="resume classification",
+    )
+
+    assert resumed["resumed_count"] == 1
+    assert postgres_repo.get_job(paused_id)["status"] == JobStatus.QUEUED.value
 
 def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     run_id = str(uuid.uuid4())

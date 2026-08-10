@@ -36,6 +36,7 @@ class FakeRepository:
         self.shutdown_requests = []
         self.priority_updates = []
         self.cancel_job_calls = []
+        self.control_job_calls = []
         self.delete_job_calls = []
         self.logs = []
         self.preprocessed_payload_ref = None
@@ -759,6 +760,14 @@ class FakeRepository:
         if not self._visible(job_id, kwargs.get("project_id")):
             return None
         return {"id": job_id, "status": "queued", "reason": reason}
+
+    def pause_jobs(self, **kwargs):
+        self.control_job_calls.append(("pause", kwargs))
+        return {"matched_count": 1, "paused_count": 1, "pause_requested_count": 0, "jobs": []}
+
+    def resume_jobs(self, **kwargs):
+        self.control_job_calls.append(("resume", kwargs))
+        return {"matched_count": 1, "resumed_count": 1, "jobs": []}
 
     def retry_job(self, job_id, **kwargs):
         if not self._visible(job_id, kwargs.get("project_id")):
@@ -2570,6 +2579,8 @@ def test_api_can_create_queue_job():
     assert response.json()["job"]["project_id"] == "project-1"
     assert repository.created_jobs[0]["run_id"] == "run-1"
     assert repository.created_jobs[0]["project_id"] == "project-1"
+    assert repository.created_jobs[0]["submitted_by_user_id"] == "user-1"
+    assert repository.created_jobs[0]["submitted_by_username"] == "ada"
 
 
 def test_api_create_queue_job_rejects_cross_project_asset():
@@ -2641,6 +2652,39 @@ def test_api_can_clear_jobs():
     assert repository.cancel_job_calls[-1]["stages"] == ["extract_frames"]
     assert repository.cancel_job_calls[-1]["statuses"] == ["queued", "leased"]
     assert repository.cancel_job_calls[-1]["reason"] == "reset queue"
+
+
+def test_api_can_pause_and_resume_a_stage_queue():
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+
+    paused = client.post(
+        "/jobs/control",
+        headers=headers,
+        json={"action": "pause", "stage": ["classify"], "reason": "hold ML work"},
+    )
+    resumed = client.post(
+        "/jobs/control",
+        headers=headers,
+        json={"action": "resume", "stage": ["classify"]},
+    )
+
+    assert paused.status_code == 200
+    assert paused.json()["paused_count"] == 1
+    assert resumed.status_code == 200
+    assert resumed.json()["resumed_count"] == 1
+    assert repository.control_job_calls[0] == (
+        "pause",
+        {
+            "project_id": "project-1",
+            "run_id": None,
+            "asset_id": None,
+            "stages": ["classify"],
+            "job_ids": [],
+            "worker_id": None,
+            "reason": "hold ML work",
+        },
+    )
 
 
 def test_api_clear_jobs_supports_dry_run():

@@ -608,6 +608,8 @@ if APIRouter is not None:
                 asset_id=asset_id,
                 payload=payload,
                 summary=f"extract_frames queued for {Path(asset.path).name}",
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
             jobs.append(job)
 
@@ -802,6 +804,8 @@ if APIRouter is not None:
                 "checksum_status": checksum_status,
             }).to_payload(),
             summary=f"extract_frames queued for {source_path.name}",
+            submitted_by_user_id=auth.user_id,
+            submitted_by_username=auth.username,
         )
         return as_response(
             {

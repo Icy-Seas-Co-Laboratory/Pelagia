@@ -5,6 +5,7 @@ import hmac
 import json
 import math
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
@@ -71,6 +72,20 @@ FRAME_PROCESSING_STATUS_VALUES = (
 FRAME_PROCESSING_STATUSES = set(FRAME_PROCESSING_STATUS_VALUES)
 PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationEvidenceContext:
+    """Run-scoped database identifiers required to persist classification evidence.
+
+    A model's artifact and class mapping are invariant for a classification run.
+    Resolving them once avoids repeating catalog writes for every ROI.
+    """
+
+    project_id: str
+    inference_run_id: str
+    model_artifact_id: str
+    class_label_ids: Mapping[int, str]
 
 
 def _initial_job_progress(
@@ -5306,36 +5321,15 @@ class PostgresRepository:
             )
         return artifact_row_id, mappings
 
-    def store_classification_evidence(
+    def prepare_classification_evidence_context(
         self,
         *,
         project_id: str,
         inference_run_id: str,
-        refined_detection_id: str,
         model: dict[str, Any],
-        output: dict[str, Any],
-        oracle_result: dict[str, Any],
-        embedding_payload_ref: str | None = None,
-        embedding_dtype: str | None = None,
-        embedding_shape: Sequence[int] | None = None,
-        embedding_sha256: str | None = None,
-    ) -> dict[str, Any]:
-        probabilities = list(output.get("probabilities") or [])
-        decision = dict(output.get("decision") or {})
-        packet = dict(output.get("evidence") or {})
-        prototype = dict(packet.get("prototype") or {})
-        knn = dict(packet.get("knn") or {})
-        probability_values = sorted(
-            (float(value.get("probability") or 0.0) for value in probabilities),
-            reverse=True,
-        )
-        entropy = -sum(
-            value * math.log(value)
-            for value in probability_values
-            if value > 0
-        )
-        margin = probability_values[0] - probability_values[1] if len(probability_values) > 1 else (probability_values[0] if probability_values else 0.0)
-        predicted_class_index = decision.get("class_index")
+        probabilities: Sequence[dict[str, Any]],
+    ) -> ClassificationEvidenceContext:
+        """Resolve the invariant model catalog rows once for an inference run."""
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 artifact_row_id, mappings = self._ensure_classification_artifact(
@@ -5348,101 +5342,165 @@ class PostgresRepository:
                     f"UPDATE {self.schema}.classification_inference_runs SET model_artifact_id = %s WHERE id = %s",
                     (artifact_row_id, inference_run_id),
                 )
-                prototype_class = prototype.get("predicted_class")
-                knn_class = knn.get("strongest_label")
-                prototype_similarities = prototype.get("similarities") or {}
-                weighted_support = knn.get("weighted_label_support") or {}
-                cursor.execute(
-                    f"""
-                    INSERT INTO {self.schema}.classification_evidence
-                        (project_id, refined_detection_id, inference_run_id,
-                         predicted_label_id, predicted_class_index, predicted_label_name,
-                         confidence, entropy, probability_margin,
-                         prototype_class_index, prototype_similarity, prototype_margin,
-                         knn_class_index, knn_agreement, knn_weighted_support, knn_margin,
-                         embedding_payload_ref, embedding_dtype, embedding_shape,
-                         embedding_sha256, probabilities, evidence_packet, oracle_result)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb)
-                    ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
-                        predicted_label_id = EXCLUDED.predicted_label_id,
-                        predicted_class_index = EXCLUDED.predicted_class_index,
-                        predicted_label_name = EXCLUDED.predicted_label_name,
-                        confidence = EXCLUDED.confidence,
-                        entropy = EXCLUDED.entropy,
-                        probability_margin = EXCLUDED.probability_margin,
-                        prototype_class_index = EXCLUDED.prototype_class_index,
-                        prototype_similarity = EXCLUDED.prototype_similarity,
-                        prototype_margin = EXCLUDED.prototype_margin,
-                        knn_class_index = EXCLUDED.knn_class_index,
-                        knn_agreement = EXCLUDED.knn_agreement,
-                        knn_weighted_support = EXCLUDED.knn_weighted_support,
-                        knn_margin = EXCLUDED.knn_margin,
-                        embedding_payload_ref = EXCLUDED.embedding_payload_ref,
-                        embedding_dtype = EXCLUDED.embedding_dtype,
-                        embedding_shape = EXCLUDED.embedding_shape,
-                        embedding_sha256 = EXCLUDED.embedding_sha256,
-                        probabilities = EXCLUDED.probabilities,
-                        evidence_packet = EXCLUDED.evidence_packet,
-                        oracle_result = EXCLUDED.oracle_result
-                    RETURNING *
-                    """,
-                    (
-                        project_id,
-                        refined_detection_id,
-                        inference_run_id,
-                        mappings.get(int(predicted_class_index)) if predicted_class_index is not None else None,
-                        predicted_class_index,
-                        decision.get("label_name"),
-                        max(probability_values) if probability_values else None,
-                        entropy,
-                        margin,
-                        prototype_class,
-                        prototype_similarities.get(str(prototype_class)) if prototype_class is not None else None,
-                        prototype.get("similarity_margin"),
-                        knn_class,
-                        knn.get("label_agreement"),
-                        weighted_support.get(str(knn_class)) if knn_class is not None else None,
-                        knn.get("label_support_margin"),
-                        embedding_payload_ref,
-                        embedding_dtype,
-                        json.dumps(list(embedding_shape or [])),
-                        embedding_sha256,
-                        json.dumps(json_ready(probabilities)),
-                        json.dumps(json_ready(packet)),
-                        json.dumps(json_ready(oracle_result)),
-                    ),
+            connection.commit()
+        return ClassificationEvidenceContext(
+            project_id=project_id,
+            inference_run_id=inference_run_id,
+            model_artifact_id=artifact_row_id,
+            class_label_ids=mappings,
+        )
+
+    def store_classification_evidence_batch(
+        self,
+        *,
+        evidence_context: ClassificationEvidenceContext,
+        records: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist one Oracle response batch in one database transaction.
+
+        ``records`` contain only values that vary by ROI.  Model catalog rows and
+        class mappings are provided by ``evidence_context`` and are never written
+        again here.  The method remains idempotent for a run/ROI pair.
+        """
+        if not records:
+            return []
+
+        values: list[tuple[Any, ...]] = []
+        neighbors_by_detection: dict[str, list[tuple[Any, ...]]] = {}
+        for record in records:
+            output = dict(record["output"])
+            probabilities = list(output.get("probabilities") or [])
+            decision = dict(output.get("decision") or {})
+            packet = dict(output.get("evidence") or {})
+            prototype = dict(packet.get("prototype") or {})
+            knn = dict(packet.get("knn") or {})
+            probability_values = sorted(
+                (float(value.get("probability") or 0.0) for value in probabilities),
+                reverse=True,
+            )
+            entropy = -sum(value * math.log(value) for value in probability_values if value > 0)
+            margin = (
+                probability_values[0] - probability_values[1]
+                if len(probability_values) > 1
+                else (probability_values[0] if probability_values else 0.0)
+            )
+            predicted_class_index = decision.get("class_index")
+            prototype_class = prototype.get("predicted_class")
+            knn_class = knn.get("strongest_label")
+            prototype_similarities = prototype.get("similarities") or {}
+            weighted_support = knn.get("weighted_label_support") or {}
+            refined_detection_id = str(record["refined_detection_id"])
+            values.append(
+                (
+                    evidence_context.project_id,
+                    refined_detection_id,
+                    evidence_context.inference_run_id,
+                    evidence_context.class_label_ids.get(int(predicted_class_index))
+                    if predicted_class_index is not None
+                    else None,
+                    predicted_class_index,
+                    decision.get("label_name"),
+                    max(probability_values) if probability_values else None,
+                    entropy,
+                    margin,
+                    prototype_class,
+                    prototype_similarities.get(str(prototype_class)) if prototype_class is not None else None,
+                    prototype.get("similarity_margin"),
+                    knn_class,
+                    knn.get("label_agreement"),
+                    weighted_support.get(str(knn_class)) if knn_class is not None else None,
+                    knn.get("label_support_margin"),
+                    record.get("embedding_payload_ref"),
+                    record.get("embedding_dtype"),
+                    json.dumps(list(record.get("embedding_shape") or [])),
+                    record.get("embedding_sha256"),
+                    json.dumps(json_ready(probabilities)),
+                    json.dumps(json_ready(packet)),
+                    json.dumps(json_ready(record.get("oracle_result") or {})),
                 )
-                evidence = cursor.fetchone()
-                cursor.execute(
-                    f"DELETE FROM {self.schema}.classification_evidence_neighbors WHERE evidence_id = %s",
-                    (evidence["id"],),
+            )
+            label_names = {
+                value.get("class_index"): value.get("label_name") for value in probabilities
+            }
+            neighbors_by_detection[refined_detection_id] = [
+                (
+                    rank,
+                    str(neighbor["uuid"]),
+                    neighbor.get("label"),
+                    label_names.get(neighbor.get("label")),
+                    neighbor.get("similarity"),
                 )
-                for rank, neighbor in enumerate(knn.get("neighbors") or []):
+                for rank, neighbor in enumerate(knn.get("neighbors") or [])
+            ]
+
+        columns = """
+            project_id, refined_detection_id, inference_run_id,
+            predicted_label_id, predicted_class_index, predicted_label_name,
+            confidence, entropy, probability_margin,
+            prototype_class_index, prototype_similarity, prototype_margin,
+            knn_class_index, knn_agreement, knn_weighted_support, knn_margin,
+            embedding_payload_ref, embedding_dtype, embedding_shape,
+            embedding_sha256, probabilities, evidence_packet, oracle_result
+        """
+        row_placeholder = "(" + ", ".join(
+            ["%s"] * 18 + ["%s::jsonb", "%s", "%s::jsonb", "%s::jsonb", "%s::jsonb"]
+        ) + ")"
+        evidence_sql = f"""
+            INSERT INTO {self.schema}.classification_evidence ({columns})
+            VALUES {", ".join(row_placeholder for _ in values)}
+            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
+                predicted_label_id = EXCLUDED.predicted_label_id,
+                predicted_class_index = EXCLUDED.predicted_class_index,
+                predicted_label_name = EXCLUDED.predicted_label_name,
+                confidence = EXCLUDED.confidence,
+                entropy = EXCLUDED.entropy,
+                probability_margin = EXCLUDED.probability_margin,
+                prototype_class_index = EXCLUDED.prototype_class_index,
+                prototype_similarity = EXCLUDED.prototype_similarity,
+                prototype_margin = EXCLUDED.prototype_margin,
+                knn_class_index = EXCLUDED.knn_class_index,
+                knn_agreement = EXCLUDED.knn_agreement,
+                knn_weighted_support = EXCLUDED.knn_weighted_support,
+                knn_margin = EXCLUDED.knn_margin,
+                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
+                embedding_dtype = EXCLUDED.embedding_dtype,
+                embedding_shape = EXCLUDED.embedding_shape,
+                embedding_sha256 = EXCLUDED.embedding_sha256,
+                probabilities = EXCLUDED.probabilities,
+                evidence_packet = EXCLUDED.evidence_packet,
+                oracle_result = EXCLUDED.oracle_result
+            RETURNING id, refined_detection_id
+        """
+        parameters = tuple(value for row in values for value in row)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(evidence_sql, parameters)
+                evidence_rows = cursor.fetchall()
+                evidence_ids = [row["id"] for row in evidence_rows]
+                cursor.execute(
+                    f"DELETE FROM {self.schema}.classification_evidence_neighbors WHERE evidence_id = ANY(%s)",
+                    (evidence_ids,),
+                )
+                evidence_ids_by_detection = {
+                    str(row["refined_detection_id"]): row["id"] for row in evidence_rows
+                }
+                neighbor_values = [
+                    (evidence_ids_by_detection[detection_id], *neighbor)
+                    for detection_id, neighbors in neighbors_by_detection.items()
+                    for neighbor in neighbors
+                ]
+                if neighbor_values:
+                    neighbor_placeholder = "(" + ", ".join(["%s"] * 6) + ")"
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.classification_evidence_neighbors
-                            (evidence_id, rank, exemplar_id, class_index,
-                             label_name, similarity)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (evidence_id, rank, exemplar_id, class_index, label_name, similarity)
+                        VALUES {", ".join(neighbor_placeholder for _ in neighbor_values)}
                         """,
-                        (
-                            evidence["id"], rank, str(neighbor["uuid"]),
-                            neighbor.get("label"),
-                            next(
-                                (
-                                    value.get("label_name")
-                                    for value in probabilities
-                                    if value.get("class_index") == neighbor.get("label")
-                                ),
-                                None,
-                            ),
-                            neighbor.get("similarity"),
-                        ),
+                        tuple(value for row in neighbor_values for value in row),
                     )
             connection.commit()
-        return evidence
+        return evidence_rows
 
     def complete_classification_inference_run(
         self,
@@ -5623,6 +5681,8 @@ class PostgresRepository:
         depends_on: Sequence[str] | None = None,
         summary: str | None = None,
         progress: dict[str, Any] | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
     ) -> dict[str, Any]:
         stage_value = stage.value if isinstance(stage, PipelineStage) else stage
         status_value = status.value if isinstance(status, JobStatus) else status
@@ -5659,8 +5719,9 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.processing_jobs
-                    (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary)
-                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s)
+                    (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary,
+                     submitted_by_user_id, submitted_by_username)
+                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s, %s, %s)
                     RETURNING *;
                     """,
                     (
@@ -5674,6 +5735,8 @@ class PostgresRepository:
                         json.dumps(json_ready(resolved_payload)),
                         json.dumps(json_ready(resolved_progress)),
                         summary,
+                        submitted_by_user_id,
+                        submitted_by_username,
                     ),
                 )
                 row = cursor.fetchone()
@@ -5697,6 +5760,8 @@ class PostgresRepository:
                         "asset_id": row.get("asset_id"),
                         "priority": row.get("priority"),
                         "depends_on": [str(dependency) for dependency in depends_on or []],
+                        "submitted_by_user_id": submitted_by_user_id,
+                        "submitted_by_username": submitted_by_username,
                     },
                 )
                 status_frame_ids = self._job_frame_status_ids(
@@ -5824,6 +5889,8 @@ class PostgresRepository:
         jobs: Sequence[dict[str, Any]],
         eligible_statuses: Sequence[str],
         priority: int | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
     ) -> list[dict[str, Any]]:
         """Create planned preprocessing jobs and queue their frames atomically."""
         if not jobs:
@@ -5861,9 +5928,10 @@ class PostgresRepository:
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.processing_jobs
-                            (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary)
+                            (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary,
+                             submitted_by_user_id, submitted_by_username)
                         VALUES (%s, %s, %s, 'preprocess_frames'::{self.schema}.stage_name,
-                                'queued'::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s)
+                                'queued'::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s, %s, %s)
                         RETURNING *
                         """,
                         (
@@ -5875,6 +5943,8 @@ class PostgresRepository:
                             json.dumps(json_ready(job["payload"])),
                             json.dumps(json_ready(progress)),
                             job["summary"],
+                            submitted_by_user_id,
+                            submitted_by_username,
                         ),
                     )
                     row = cursor.fetchone()
@@ -6331,6 +6401,112 @@ class PostgresRepository:
                         )
             connection.commit()
         return row
+
+    def pause_jobs(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Pause matching queued work and cooperatively request pauses for running work."""
+        clauses, params = self._job_filter_clauses(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        clauses.append("status IN ('queued', 'leased', 'working')")
+        where = f"WHERE {' AND '.join(clauses)}"
+        requested_reason = f"pause_requested:{reason or 'user_requested'}"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH matched AS (
+                        SELECT id, status AS previous_status
+                        FROM {self.schema}.processing_jobs
+                        {where}
+                    )
+                    UPDATE {self.schema}.processing_jobs jobs
+                    SET status = CASE WHEN matched.previous_status = 'queued'
+                                      THEN 'paused'::{self.schema}.job_status
+                                      ELSE jobs.status END,
+                        control_reason = CASE WHEN matched.previous_status = 'queued' THEN %s ELSE %s END,
+                        updated_at = NOW()
+                    FROM matched
+                    WHERE jobs.id = matched.id
+                    RETURNING jobs.*, matched.previous_status;
+                    """,
+                    tuple([*params, reason, requested_reason]),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    was_queued = row["previous_status"] == JobStatus.QUEUED.value
+                    self._append_job_event(
+                        cursor,
+                        row["id"],
+                        "job.paused" if was_queued else "job.pause_requested",
+                        {"reason": reason, "previous_status": row["previous_status"]},
+                    )
+            connection.commit()
+        paused_count = sum(row["previous_status"] == JobStatus.QUEUED.value for row in rows)
+        return {
+            "matched_count": len(rows),
+            "paused_count": paused_count,
+            "pause_requested_count": len(rows) - paused_count,
+            "jobs": rows,
+        }
+
+    def resume_jobs(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Resume matching paused work as queued work."""
+        clauses, params = self._job_filter_clauses(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        clauses.append("status = 'paused'")
+        where = f"WHERE {' AND '.join(clauses)}"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.processing_jobs
+                    SET status = 'queued',
+                        control_reason = %s,
+                        lease_expires_at = NULL,
+                        worker_id = NULL,
+                        finished_at = NULL,
+                        updated_at = NOW()
+                    {where}
+                    RETURNING *;
+                    """,
+                    tuple([reason, *params]),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    self._append_job_event(cursor, row["id"], "job.resumed", {"reason": reason})
+            connection.commit()
+        return {"matched_count": len(rows), "resumed_count": len(rows), "jobs": rows}
 
     def finalize_paused_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:

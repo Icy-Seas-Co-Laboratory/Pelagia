@@ -131,6 +131,8 @@ class JobSummary(FlexibleModel):
     attempt_count: int | None = None
     max_attempts: int | None = None
     worker_id: str | None = None
+    submitted_by_user_id: str | None = None
+    submitted_by_username: str | None = None
     summary: str | None = None
     progress: dict[str, Any] | None = None
     control_reason: str | None = None

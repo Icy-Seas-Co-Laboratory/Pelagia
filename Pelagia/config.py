@@ -144,7 +144,7 @@ class OracleConfig:
     api_token: str | None = None
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 120.0
-    max_items_per_request: int = 32
+    max_items_per_request: int = 256
     max_payload_bytes: int = 256 * 1024 * 1024
 
 

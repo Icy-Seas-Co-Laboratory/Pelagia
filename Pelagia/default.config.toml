@@ -290,7 +290,7 @@ default_classification_model = "pelagia-classifier"
 api_token = null
 connect_timeout_seconds = 5.0
 read_timeout_seconds = 120.0
-max_items_per_request = 32
+max_items_per_request = 256
 max_payload_bytes = 268435456
 
 [logging]

@@ -24,7 +24,16 @@ class QueueRepository:
             {"frame_id": "frame-c", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 2, "payload_ref": "a-key"},
         ]
 
-    def create_preprocess_jobs(self, *, project_id, jobs, eligible_statuses, priority):
+    def create_preprocess_jobs(
+        self,
+        *,
+        project_id,
+        jobs,
+        eligible_statuses,
+        priority,
+        submitted_by_user_id=None,
+        submitted_by_username=None,
+    ):
         assert eligible_statuses == ["unknown", "failed"]
         self.created = jobs
         return [{"id": f"job-{index}"} for index, _ in enumerate(jobs, start=1)]

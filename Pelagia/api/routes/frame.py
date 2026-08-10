@@ -647,6 +647,8 @@ if APIRouter is not None:
                 payload=payload,
                 depends_on=body.depends_on or [],
                 summary=f"preprocess queued for asset {asset_id}",
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -730,6 +732,8 @@ if APIRouter is not None:
                 payload=payload,
                 depends_on=body.depends_on or [],
                 summary=f"background queued for asset {asset_id}",
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

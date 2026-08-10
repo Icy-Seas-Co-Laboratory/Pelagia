@@ -717,6 +717,8 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     max_attempts integer NOT NULL DEFAULT 3,
     lease_expires_at timestamptz,
     worker_id text,
+    submitted_by_user_id text,
+    submitted_by_username text,
     payload jsonb NOT NULL DEFAULT '{}'::jsonb,
     result jsonb,
     progress jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -729,6 +731,10 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     started_at timestamptz,
     finished_at timestamptz
 );
+
+ALTER TABLE {schema}.processing_jobs
+    ADD COLUMN IF NOT EXISTS submitted_by_user_id text,
+    ADD COLUMN IF NOT EXISTS submitted_by_username text;
 
 ALTER TABLE {schema}.processing_jobs
     ADD COLUMN IF NOT EXISTS project_id uuid;

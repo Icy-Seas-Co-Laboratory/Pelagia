@@ -440,6 +440,8 @@ if APIRouter is not None:
                 payload=payload,
                 depends_on=body.depends_on or [],
                 summary=f"roi refinement queued for {len(body.detection_ids)} detections",
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
