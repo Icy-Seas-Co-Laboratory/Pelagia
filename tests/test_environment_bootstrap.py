@@ -19,6 +19,7 @@ def test_environment_bootstrap_sync_dry_run(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
+            "-S",
             str(ENVIRONMENT_SCRIPT),
             "sync",
             "cpu",
@@ -44,3 +45,9 @@ def test_environment_bootstrap_sync_dry_run(tmp_path):
     assert "worker-cpu" in body["extras"]
     assert body["commands"][0][1] == "sync"
     assert "--locked" in body["commands"][0]
+
+
+def test_top_level_core_config_remains_available():
+    from Pelagia import CoreConfig
+
+    assert CoreConfig.__name__ == "CoreConfig"
