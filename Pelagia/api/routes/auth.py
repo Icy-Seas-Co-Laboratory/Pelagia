@@ -19,6 +19,7 @@ if APIRouter is not None:
         resolve_project_settings,
         resolve_project_storage_settings,
         storage_settings_payload,
+        validate_allowed_storage_encodings,
     )
     from ...storage.blob_store import named_kvstore_path
     from ...storage.postgres import PROJECT_ROLES
@@ -60,7 +61,11 @@ if APIRouter is not None:
     class UpdateProjectStorageSettingsRequest(BaseModel):
         frame_encoding: str | None = None
         frame_quality: int | None = None
-        roi_encoding: str | None = None
+        small_roi_encoding: str | None = None
+        large_roi_encoding: str | None = None
+        large_roi_min_pixels: int | None = None
+        roi_quality: int | None = None
+        mask_encoding: str | None = None
 
     class CreateUserRequest(BaseModel):
         username: str
@@ -410,8 +415,26 @@ if APIRouter is not None:
             patch = storage_settings_payload(
                 frame_encoding=body.frame_encoding,
                 frame_quality=body.frame_quality,
-                roi_encoding=body.roi_encoding,
+                small_roi_encoding=body.small_roi_encoding,
+                large_roi_encoding=body.large_roi_encoding,
+                large_roi_min_pixels=body.large_roi_min_pixels,
+                roi_quality=body.roi_quality,
+                mask_encoding=body.mask_encoding,
             )
+            storage_patch = patch.get("storage", {})
+            frame_patch = storage_patch.get("frame", {})
+            roi_patch = storage_patch.get("roi", {})
+            requested = [
+                value
+                for value in (
+                    frame_patch.get("encoding"),
+                    roi_patch.get("small_encoding"),
+                    roi_patch.get("large_encoding"),
+                    roi_patch.get("mask_encoding"),
+                )
+                if value is not None
+            ]
+            validate_allowed_storage_encodings(get_context(request), *requested)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not patch:

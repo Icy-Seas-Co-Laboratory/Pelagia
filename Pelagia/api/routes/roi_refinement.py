@@ -13,6 +13,7 @@ if APIRouter is not None:
     from ..auth import require_project_write, scoped_project_id
     from ..schemas import OptionsResponse
     from ...domain import DetectionRecord, PipelineStage
+    from ...processing.detection_recording import choose_roi_encoding
     from ...processing.detection_refinement import RoiRefinementOptions, identity_refine_detections, refine_detections, refined_storage_candidate_detection_id
     from ...processing.frame_store import retrieve_frame
     from ...processing.oracle_client import (
@@ -24,6 +25,7 @@ if APIRouter is not None:
     )
     from ...processing.capabilities import roi_refinement_capabilities
     from ...services.job_commands import RoiRefinementCommand
+    from ...services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
     from ...services.pipeline import PipelineService
     from ._common import (
         as_response,
@@ -35,7 +37,7 @@ if APIRouter is not None:
         touch_processing_status_snapshot,
     )
 
-    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"]
 
     class RoiRefinementRequest(BaseModel):
         model_config = ConfigDict(protected_namespaces=(), extra="forbid")
@@ -84,10 +86,11 @@ if APIRouter is not None:
         return None if normalized in {"", "auto", "default", "none", "null"} else normalized
 
     def _resolve_options(request: Request, body: RoiRefinementRequest) -> RoiRefinementOptions:
-        defaults = get_context(request).config.processing.roi_refinement
+        context = get_context(request)
+        defaults = context.config.processing.roi_refinement
         values = _model_dict(body)
         try:
-            return RoiRefinementOptions(
+            options = RoiRefinementOptions(
                 max_iterations=values.get("max_iterations") or defaults.max_iterations,
                 expansion_pixels=(
                     defaults.expansion_pixels
@@ -157,6 +160,9 @@ if APIRouter is not None:
                     else values["residual_padding"]
                 ),
             )
+            if options.encoding is not None:
+                validate_allowed_storage_encodings(context, options.encoding)
+            return options
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -312,8 +318,19 @@ if APIRouter is not None:
                     method=method,
                 )
             )
+            storage = resolve_project_storage_settings(context, project_id)
             refined_records = [
-                result.as_detection_record(encoding=options.encoding)
+                result.as_detection_record(
+                    encoding=choose_roi_encoding(
+                        result.roi,
+                        encoding=options.encoding,
+                        small_roi_encoding=storage.small_roi_encoding,
+                        large_roi_encoding=storage.large_roi_encoding,
+                        large_roi_min_pixels=storage.large_roi_min_pixels,
+                    ),
+                    quality=storage.roi_quality,
+                    mask_encoding=storage.mask_encoding,
+                )
                 for result in results
             ]
         except OracleRejectedError as exc:

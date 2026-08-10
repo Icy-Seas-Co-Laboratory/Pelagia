@@ -112,6 +112,7 @@ max_blob_bytes = 67_108_864    # Used by kvstore2.
 [api]
 host = "0.0.0.0"
 port = 8000
+root_path = ""
 cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
 
 [auth]
@@ -123,7 +124,7 @@ dev_project_key = "default"
 `config.toml` is ignored by git. You can also use environment variables such as
 `PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_BACKEND`,
 `PELAGIA_KVSTORE_ROOT`,
-`PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_AUTH_ENABLED`,
+`PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`, `PELAGIA_AUTH_ENABLED`,
 `PELAGIA_AUTH_SESSION_TTL_SECONDS`, and `PELAGIA_AUTH_DEV_PROJECT_KEY`.
 
 ### Initialize And Run The Backend
@@ -388,6 +389,11 @@ The v0 API exposes the same core workflows as the CLI and workers:
 uvicorn Pelagia.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
+When a reverse proxy exposes the API below a prefix, set its externally visible
+ASGI root path in configuration or the environment, for example
+`PELAGIA_API_ROOT_PATH=/pelagia-api`. The proxy should strip that prefix before
+forwarding requests to Pelagia.
+
 For local end-to-end testing, the dev stack script initializes storage, starts
 the API, and starts workers for currently runnable stages:
 
@@ -398,7 +404,7 @@ the API, and starts workers for currently runnable stages:
 ```
 
 Override defaults with environment variables such as `PELAGIA_DATABASE_DSN`,
-`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`,
+`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`,
 `PELAGIA_RUN_DIR`, and `PELAGIA_WORKER_STAGES`. Use `PELAGIA_WORKER_COUNT=3` to
 start three workers for every configured stage, or
 `PELAGIA_WORKER_COUNTS=extract_frames=2,segment=4` for per-stage counts.
@@ -500,6 +506,26 @@ The equivalent environment variables are
 `PELAGIA_VIDEO_INGEST_OPENCV_THREADS` and
 `PELAGIA_VIDEO_INGEST_DECODER_THREADS`. The decoder setting applies to both
 OpenCV's FFmpeg backend and the FFmpeg CLI fallback.
+
+ROI storage uses an explicit small/large image policy. Size is the padded crop
+width multiplied by height; masks have an independent lossless codec. An
+installation can restrict the codecs advertised and accepted by the API:
+
+```toml
+[image_data_storage]
+allowed_encodings = ["zstd", "png", "jpg"]
+
+[processing.roi_recording]
+small_roi_encoding = "zstd"
+large_roi_encoding = "jpg"
+large_roi_min_pixels = 50000
+roi_quality = 90
+mask_encoding = "zstd"
+```
+
+Every configured frame, ROI, and mask codec must be present in the deployment
+allowlist. The equivalent comma-separated allowlist environment variable is
+`PELAGIA_IMAGE_DATA_STORAGE_ALLOWED_ENCODINGS`.
 
 Model and plugin artifacts are split between packaged assets under
 `Pelagia/assets/` and a local runtime library under `./.pelagia/`. See

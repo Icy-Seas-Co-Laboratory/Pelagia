@@ -19,6 +19,7 @@ from .codec_registry import image_codec_available
 def system_capabilities(config: CoreConfig) -> dict[str, Any]:
     """Return a GUI-facing capability map for the Pelagia backend."""
     processing = config.processing
+    allowed_encodings = list(config.image_data_storage.allowed_encodings)
     return {
         "name": "Pelagia",
         "version": __version__,
@@ -60,13 +61,19 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
             "asset_kinds": [kind.value for kind in AssetKind],
             "pipeline_stages": [stage.value for stage in PipelineStage],
             "job_statuses": [status.value for status in JobStatus],
-            "image_encodings": sorted(IMAGE_DATA_STORAGE_ENCODINGS),
+            "image_encodings": allowed_encodings,
             "image_codec_availability": {
                 encoding: image_codec_available(encoding)
-                for encoding in sorted(IMAGE_DATA_STORAGE_ENCODINGS)
+                for encoding in allowed_encodings
+            },
+            "image_storage_policy": {
+                "allowed_encodings": allowed_encodings,
+                "unavailable_encodings": [
+                    encoding for encoding in allowed_encodings if not image_codec_available(encoding)
+                ],
             },
             "frame_payload_kinds": FRAME_PAYLOAD_KINDS,
-            "roi_encoding_options": ROI_ENCODINGS,
+            "roi_encoding_options": allowed_encodings,
         },
         "processing": {
             "groups": [
@@ -84,7 +91,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "roi_refinement",
             ],
             "preprocessing": preprocessing_capabilities(processing),
-            "segmentation": segmentation_capabilities(processing),
+            "segmentation": segmentation_capabilities(processing, allowed_encodings=allowed_encodings),
             "roi_refinement": roi_refinement_capabilities(config),
         },
         "jobs": {
@@ -145,6 +152,7 @@ def roi_refinement_capabilities(
 ) -> dict[str, Any]:
     """Return GUI-facing ROI refinement defaults, valid options, and model refs."""
     defaults = config.processing.roi_refinement
+    allowed_encodings = list(config.image_data_storage.allowed_encodings)
     models = list(oracle_models or [])
     model_refs = [str(model["alias"]) for model in models if model.get("alias")]
     if config.oracle.default_mask_model not in model_refs:
@@ -165,7 +173,7 @@ def roi_refinement_capabilities(
             "model_refs": model_refs,
             "models": models,
             "oracle": oracle_health or {"enabled": config.oracle.enabled, "status": "unknown"},
-            "roi_encoding_options": ROI_ENCODINGS,
+            "roi_encoding_options": allowed_encodings,
         },
         "defaults": {
             "roi_refinement": {
@@ -206,7 +214,7 @@ def roi_refinement_capabilities(
             ],
             "recording": [
                 _field("store", "Store Refined Detections", "boolean", default=True),
-                _field("encoding", "ROI Encoding", "enum", options=ROI_ENCODINGS, config_section="processing.roi_refinement"),
+                _field("encoding", "ROI Codec Override", "enum", options=allowed_encodings, config_section="processing.roi_refinement"),
                 _field("dry_run", "Dry Run", "boolean", default=False),
             ],
         },

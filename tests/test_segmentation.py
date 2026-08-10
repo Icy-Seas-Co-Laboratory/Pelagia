@@ -30,13 +30,28 @@ from Pelagia.processing.frame_threshold import (
     threshold_sobel_edges,
 )
 from Pelagia.processing.detection_candidate import live_detection_candidate_wrapper, live_segment_wrapper, segment_frame, threshold_frame
-from Pelagia.processing.detection_recording import build_candidate_detection_record
+from Pelagia.processing.detection_recording import build_candidate_detection_record, choose_roi_encoding
 from Pelagia.processing.mask_augmentation import augment_mask
 from Pelagia.processing.roi_assembly import assemble_candidate_rois
 from Pelagia.processing.roi_filter import filter_candidate_rois, should_store_roi_payload
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
+
+
+def test_roi_storage_tier_uses_padded_image_pixel_count_not_bytes_or_channels():
+    assert choose_roi_encoding(
+        np.zeros((199, 251, 4), dtype=np.uint16),
+        small_roi_encoding="zstd",
+        large_roi_encoding="jpg",
+        large_roi_min_pixels=50_000,
+    ) == "zstd"
+    assert choose_roi_encoding(
+        np.zeros((200, 250, 3), dtype=np.uint8),
+        small_roi_encoding="zstd",
+        large_roi_encoding="jpg",
+        large_roi_min_pixels=50_000,
+    ) == "jpg"
 
 
 class FakeDatabaseLogger:
@@ -234,7 +249,7 @@ def test_recording_can_store_masks_without_small_roi_image_payloads():
     assert detection.roi_payload is None
     assert detection.roi_encoding is None
     assert detection.mask_payload is not None
-    assert detection.mask_encoding == "raw"
+    assert detection.mask_encoding == "zstd"
 
 
 def test_preprocess_frame_for_segmentation_applies_ordered_steps():
@@ -942,7 +957,7 @@ def test_segment_frame_returns_roi_detection_records_with_raw_payload():
     assert detection.mean_gray_value == 50
     assert detection.roi_encoding == "raw"
     assert detection.roi_shape == [3, 4]
-    assert detection.mask_encoding == "raw"
+    assert detection.mask_encoding == "zstd"
     assert detection.mask_shape == [3, 4]
     assert detection.mask_payload is not None
 
@@ -1060,9 +1075,8 @@ def test_live_detection_candidate_wrapper_returns_transient_detection_records(mo
     )
 
     assert len(detections) == 1
-    assert detections[0].roi_payload.startswith(b"\x89PNG\r\n\x1a\n")
-    assert detections[0].mask_payload.startswith(b"\x89PNG\r\n\x1a\n")
-    assert detections[0].roi_encoding == "png"
+    assert detections[0].roi_encoding == "zstd"
+    assert detections[0].mask_encoding == "zstd"
     assert live_segment_wrapper(
         FRAME_ID,
         threshold=1,
@@ -1074,7 +1088,7 @@ def test_live_detection_candidate_wrapper_returns_transient_detection_records(mo
         store_roi_payload_min_width=0,
         store_roi_payload_min_height=0,
         store_roi_payload_min_width_plus_height=0,
-    )[0].roi_encoding == "png"
+    )[0].roi_encoding == "zstd"
 
 
 def test_segment_frame_stores_padded_roi_context_and_mask():
@@ -1186,8 +1200,9 @@ def test_candidate_recording_auto_uses_png_for_small_roi_payloads():
         candidate,
         source_frame=source,
         processed_frame=source,
-        encoding="auto",
-        zstd_min_bytes=100,
+        small_roi_encoding="png",
+        large_roi_encoding="zstd",
+        large_roi_min_pixels=100,
     )
 
     assert detection.roi_payload.startswith(b"\x89PNG\r\n\x1a\n")

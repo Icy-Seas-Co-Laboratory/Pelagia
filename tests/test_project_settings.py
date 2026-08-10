@@ -25,7 +25,7 @@ def test_project_storage_settings_override_global_defaults():
     settings = {
         "storage": {
             "frame": {"encoding": "jpeg-xl", "quality": 72},
-            "roi": {"encoding": "png"},
+            "roi": {"small_encoding": "png", "large_encoding": "jpg", "large_min_pixels": 40000},
         }
     }
 
@@ -33,9 +33,10 @@ def test_project_storage_settings_override_global_defaults():
 
     assert resolved.frame_encoding == "jxl"
     assert resolved.frame_quality == 72
-    assert resolved.roi_encoding == "png"
+    assert resolved.small_roi_encoding == "png"
+    assert resolved.large_roi_min_pixels == 40000
     assert resolved.frame_encoding_source == "project"
-    assert resolved.roi_encoding_source == "project"
+    assert resolved.small_roi_encoding_source == "project"
 
 
 def test_explicit_storage_overrides_take_precedence_over_project_settings():
@@ -43,7 +44,7 @@ def test_explicit_storage_overrides_take_precedence_over_project_settings():
         "settings": {
             "storage": {
                 "frame": {"encoding": "png", "quality": 10},
-                "roi": {"encoding": "zstd"},
+                "roi": {"small_encoding": "zstd", "large_encoding": "png"},
             }
         }
     }
@@ -53,13 +54,13 @@ def test_explicit_storage_overrides_take_precedence_over_project_settings():
         "project-1",
         frame_encoding="jpg",
         frame_quality=65,
-        roi_encoding="auto",
+        small_roi_encoding="png",
     )
 
-    assert (resolved.frame_encoding, resolved.frame_quality, resolved.roi_encoding) == ("jpg", 65, "auto")
+    assert (resolved.frame_encoding, resolved.frame_quality, resolved.small_roi_encoding) == ("jpg", 65, "png")
     assert resolved.frame_encoding_source == "override"
     assert resolved.frame_quality_source == "override"
-    assert resolved.roi_encoding_source == "override"
+    assert resolved.small_roi_encoding_source == "override"
 
 
 def test_legacy_project_metadata_remains_a_frame_storage_fallback():
@@ -69,17 +70,18 @@ def test_legacy_project_metadata_remains_a_frame_storage_fallback():
 
     assert resolved.frame_encoding == "raw"
     assert resolved.frame_encoding_source == "legacy-project"
-    assert resolved.roi_encoding == "zstd"
+    assert resolved.small_roi_encoding == "zstd"
+    assert resolved.large_roi_encoding == "jpg"
 
 
 def test_project_storage_setting_patches_merge_nested_sections():
-    existing = {"storage": {"frame": {"encoding": "png", "quality": 90}, "roi": {"encoding": "zstd"}}}
-    patch = storage_settings_payload(frame_encoding="jpeg-xs", roi_encoding="auto")
+    existing = {"storage": {"frame": {"encoding": "png", "quality": 90}, "roi": {"small_encoding": "zstd"}}}
+    patch = storage_settings_payload(frame_encoding="jpeg-xs", large_roi_encoding="jpg", large_roi_min_pixels=50000)
 
     merged = merge_project_settings(existing, patch)
 
     assert merged["storage"]["frame"] == {"encoding": "jxs", "quality": 90}
-    assert merged["storage"]["roi"] == {"encoding": "auto"}
+    assert merged["storage"]["roi"] == {"small_encoding": "zstd", "large_encoding": "jpg", "large_min_pixels": 50000}
 
 
 def test_project_settings_resolution_caches_and_can_be_invalidated():

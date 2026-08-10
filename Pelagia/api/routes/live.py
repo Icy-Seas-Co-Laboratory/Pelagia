@@ -21,7 +21,7 @@ if APIRouter is not None:
         resolve_segmentation_options,
         segment_frame_kwargs,
     )
-    from ...services.project_settings import resolve_project_storage_settings
+    from ...services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
     from ._common import as_response, detection_summary, frame_summary, get_context, get_repository
 
     router = APIRouter(prefix="/live", tags=["live"])
@@ -638,7 +638,11 @@ if APIRouter is not None:
         max_width_plus_height: int | float | None = None,
         padding: int | None = None,
         roi_encoding: str | None = None,
-        zstd_min_bytes: int | None = None,
+        small_roi_encoding: str | None = None,
+        large_roi_encoding: str | None = None,
+        large_roi_min_pixels: int | None = None,
+        roi_quality: int | None = None,
+        mask_encoding: str | None = None,
         store_roi_payload_min_area: int | float | None = None,
         store_roi_payload_min_width: int | float | None = None,
         store_roi_payload_min_height: int | float | None = None,
@@ -724,7 +728,11 @@ if APIRouter is not None:
             "max_width_plus_height",
             "padding",
             "roi_encoding",
-            "zstd_min_bytes",
+            "small_roi_encoding",
+            "large_roi_encoding",
+            "large_roi_min_pixels",
+            "roi_quality",
+            "mask_encoding",
             "store_roi_payload_min_area",
             "store_roi_payload_min_width",
             "store_roi_payload_min_height",
@@ -734,14 +742,27 @@ if APIRouter is not None:
         try:
             local_values = locals()
             overrides = _option_overrides(request, local_values, option_names)
-            if overrides.get("roi_encoding") is None:
-                overrides["roi_encoding"] = resolve_project_storage_settings(
-                    context,
-                    project_id,
-                ).roi_encoding
+            storage = resolve_project_storage_settings(context, project_id)
+            for key, value in storage.roi_policy_payload().items():
+                if overrides.get(key) is None:
+                    overrides[key] = value
             resolved_options = resolve_segmentation_options(
                 overrides,
                 context.config.processing,
+            )
+            recording_options = resolved_options["roi_recording"]
+            validate_allowed_storage_encodings(
+                context,
+                *[
+                    value
+                    for value in (
+                        recording_options.get("roi_encoding"),
+                        recording_options["small_roi_encoding"],
+                        recording_options["large_roi_encoding"],
+                        recording_options["mask_encoding"],
+                    )
+                    if value is not None
+                ],
             )
             flat_options = flatten_segmentation_options(resolved_options)
             _require_live_payload(

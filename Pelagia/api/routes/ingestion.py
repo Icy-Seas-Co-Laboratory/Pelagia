@@ -250,7 +250,8 @@ if APIRouter is not None:
             "apply_mask": preprocessing_defaults.apply_mask,
             "mask_path": preprocessing_defaults.mask_path,
             "roi_padding": roi_recording_defaults.padding,
-            "roi_encoding": storage_settings.roi_encoding,
+            "roi_encoding": None,
+            **storage_settings.roi_policy_payload(),
             "generate_backgrounds": preprocessing_defaults.background_correction,
             "generate_flatfield_profiles": (
                 flatfield_defaults.flatfield_correction
@@ -385,6 +386,11 @@ if APIRouter is not None:
             ),
             "padding": resolve_option(asset.roi_padding, "roi_padding", "roi_padding"),
             "roi_encoding": resolve_option(asset.roi_encoding, "roi_encoding", "roi_encoding"),
+            "small_roi_encoding": defaults["small_roi_encoding"],
+            "large_roi_encoding": defaults["large_roi_encoding"],
+            "large_roi_min_pixels": defaults["large_roi_min_pixels"],
+            "roi_quality": defaults["roi_quality"],
+            "mask_encoding": defaults["mask_encoding"],
             "generate_backgrounds": generate_backgrounds,
             "generate_flatfield_profiles": generate_flatfield_profiles,
             "flatfield_axis": flatfield_axis,
@@ -508,6 +514,11 @@ if APIRouter is not None:
                     "mask_path": defaults["mask_path"],
                     "roi_padding": defaults["roi_padding"],
                     "roi_encoding": defaults["roi_encoding"],
+                    "small_roi_encoding": defaults["small_roi_encoding"],
+                    "large_roi_encoding": defaults["large_roi_encoding"],
+                    "large_roi_min_pixels": defaults["large_roi_min_pixels"],
+                    "roi_quality": defaults["roi_quality"],
+                    "mask_encoding": defaults["mask_encoding"],
                     "generate_backgrounds": defaults["generate_backgrounds"],
                     "generate_flatfield_profiles": defaults["generate_flatfield_profiles"],
                     "flatfield_axis": defaults["flatfield_axis"],
@@ -707,7 +718,7 @@ if APIRouter is not None:
             if body.roi_padding is None
             else body.roi_padding
         )
-        roi_encoding = defaults["roi_encoding"] if body.roi_encoding is None else body.roi_encoding
+        roi_encoding = body.roi_encoding
         if n_tile < 1:
             raise HTTPException(status_code=422, detail="n_tile must be >= 1.")
         if adaptive_background_period < 1:
@@ -791,6 +802,11 @@ if APIRouter is not None:
                 },
                 "padding": roi_padding,
                 "roi_encoding": roi_encoding,
+                "small_roi_encoding": defaults["small_roi_encoding"],
+                "large_roi_encoding": defaults["large_roi_encoding"],
+                "large_roi_min_pixels": defaults["large_roi_min_pixels"],
+                "roi_quality": defaults["roi_quality"],
+                "mask_encoding": defaults["mask_encoding"],
                 "generate_backgrounds": generate_backgrounds,
                 "generate_flatfield_profiles": generate_flatfield_profiles,
                 "flatfield_axis": flatfield_axis,

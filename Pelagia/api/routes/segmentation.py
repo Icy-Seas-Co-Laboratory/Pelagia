@@ -25,7 +25,7 @@ if APIRouter is not None:
         segmentation_capabilities,
         segment_frame_kwargs,
     )
-    from ...services.project_settings import resolve_project_storage_settings
+    from ...services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
     from ...services.job_commands import SegmentFramesCommand
     from ...services.pipeline import PipelineService
     from ._common import (
@@ -62,7 +62,7 @@ if APIRouter is not None:
         "clear_border",
     ]
     RoiAssemblyMethod = Literal["connected_components", "contours"]
-    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd", "auto"]
+    RoiEncoding = Literal["png", "jpg", "jxl", "jxs", "raw", "zstd"]
 
     class SegmentFrameRequest(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -129,7 +129,11 @@ if APIRouter is not None:
         max_width_plus_height: int | float | None = None
         padding: int | None = None
         roi_encoding: RoiEncoding | None = None
-        zstd_min_bytes: int | None = None
+        small_roi_encoding: RoiEncoding | None = None
+        large_roi_encoding: RoiEncoding | None = None
+        large_roi_min_pixels: int | None = None
+        roi_quality: int | None = None
+        mask_encoding: RoiEncoding | None = None
         store_roi_payload_min_area: int | float | None = None
         store_roi_payload_min_width: int | float | None = None
         store_roi_payload_min_height: int | float | None = None
@@ -171,15 +175,32 @@ if APIRouter is not None:
     def _resolve_options(request: Request, body: SegmentFrameRequest | QueueSegmentationRequest) -> dict[str, dict[str, Any]]:
         try:
             overrides = _segmentation_overrides(body)
-            if overrides.get("roi_encoding") is None:
-                overrides["roi_encoding"] = resolve_project_storage_settings(
-                    get_context(request),
-                    scoped_project_id(request),
-                ).roi_encoding
-            return resolve_segmentation_options(
+            storage = resolve_project_storage_settings(
+                get_context(request),
+                scoped_project_id(request),
+            )
+            for key, value in storage.roi_policy_payload().items():
+                if overrides.get(key) is None:
+                    overrides[key] = value
+            resolved = resolve_segmentation_options(
                 overrides,
                 get_context(request).config.processing,
             )
+            recording = resolved["roi_recording"]
+            validate_allowed_storage_encodings(
+                get_context(request),
+                *[
+                    value
+                    for value in (
+                        recording.get("roi_encoding"),
+                        recording["small_roi_encoding"],
+                        recording["large_roi_encoding"],
+                        recording["mask_encoding"],
+                    )
+                    if value is not None
+                ],
+            )
+            return resolved
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -260,7 +281,13 @@ if APIRouter is not None:
 
     @router.get("/options", response_model=OptionsResponse)
     def get_segmentation_options(request: Request) -> dict:
-        return as_response(segmentation_capabilities(get_context(request).config.processing))
+        context = get_context(request)
+        return as_response(
+            segmentation_capabilities(
+                context.config.processing,
+                allowed_encodings=context.config.image_data_storage.allowed_encodings,
+            )
+        )
 
     @router.post("/validate")
     def validate_segmentation_request(request: Request, body: QueueSegmentationRequest) -> dict:
@@ -286,7 +313,7 @@ if APIRouter is not None:
                     "threshold_methods": THRESHOLD_METHODS,
                     "mask_augmentation_steps": MASK_AUGMENTATION_STEPS,
                     "roi_assembly_methods": ROI_ASSEMBLY_METHODS,
-                    "roi_encoding_options": ROI_ENCODINGS,
+                    "roi_encoding_options": get_context(request).config.image_data_storage.allowed_encodings,
                 },
             }
         )

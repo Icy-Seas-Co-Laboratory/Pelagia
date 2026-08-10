@@ -33,7 +33,11 @@ def build_candidate_detection_record(
     roi_index: int | None = None,
     padding: int = 0,
     encoding: str | None = None,
-    zstd_min_bytes: int | None = None,
+    small_roi_encoding: str | None = None,
+    large_roi_encoding: str | None = None,
+    large_roi_min_pixels: int | None = None,
+    roi_quality: int | None = None,
+    mask_encoding: str | None = None,
     store_roi_payload: bool = True,
     always_store_mask: bool = True,
     extra_metadata: dict[str, Any] | None = None,
@@ -97,7 +101,16 @@ def build_candidate_detection_record(
         raise ValueError("Source frame metadata must include run_id before storing ROIs.")
 
     encoding_reference = roi_array if roi_array is not None else object_array
-    selected_encoding = choose_roi_encoding(encoding_reference, encoding, zstd_min_bytes)
+    selected_encoding = choose_roi_encoding(
+        encoding_reference,
+        encoding,
+        small_roi_encoding=small_roi_encoding,
+        large_roi_encoding=large_roi_encoding,
+        large_roi_min_pixels=large_roi_min_pixels,
+    )
+    defaults = default_processing_config().roi_recording
+    selected_quality = defaults.roi_quality if roi_quality is None else int(roi_quality)
+    selected_mask_encoding = str(mask_encoding or defaults.mask_encoding)
     if store_roi_payload:
         if roi_array is None:
             raise RuntimeError("ROI payload was requested but no ROI array was prepared.")
@@ -105,6 +118,7 @@ def build_candidate_detection_record(
             payload, array_encoding, array_format = encode_array_payload(
                 roi_array,
                 selected_encoding,
+                quality=selected_quality,
             )
         roi_dtype = str(roi_array.dtype)
         roi_shape = list(roi_array.shape)
@@ -121,7 +135,7 @@ def build_candidate_detection_record(
         with measure_phase("segmentation.mask_encode"):
             mask_payload, mask_encoding, mask_format = encode_array_payload(
                 mask_crop,
-                selected_encoding,
+                selected_mask_encoding,
             )
         mask_dtype = str(mask_crop.dtype)
         mask_shape = list(mask_crop.shape)
@@ -177,6 +191,13 @@ def build_candidate_detection_record(
             },
             "roi_payload_stored": bool(store_roi_payload),
             "mask_payload_stored": bool(mask_payload is not None),
+            "roi_storage_policy": {
+                "selected_encoding": selected_encoding,
+                "pixel_count": int(encoding_reference.shape[0] * encoding_reference.shape[1]),
+                "large_min_pixels": int(defaults.large_roi_min_pixels if large_roi_min_pixels is None else large_roi_min_pixels),
+                "quality": selected_quality,
+                "mask_encoding": selected_mask_encoding,
+            },
         }
     )
 
@@ -212,14 +233,23 @@ def build_candidate_detection_record(
     )
 
 
-def choose_roi_encoding(roi: np.ndarray, encoding: str | None, zstd_min_bytes: int | None) -> str:
+def choose_roi_encoding(
+    roi: np.ndarray,
+    encoding: str | None = None,
+    *,
+    small_roi_encoding: str | None = None,
+    large_roi_encoding: str | None = None,
+    large_roi_min_pixels: int | None = None,
+) -> str:
+    """Select a storage codec from the padded ROI's two-dimensional pixel count."""
     defaults = default_processing_config().roi_recording
-    requested = str(encoding or defaults.roi_encoding).lower()
-    resolved_zstd_min_bytes = defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
-    if requested == "auto":
-        # Small crops favor image compression; larger arrays favor fast lossless zstd.
-        return "png" if roi.nbytes < resolved_zstd_min_bytes else "zstd"
-    return requested
+    if encoding is not None and str(encoding).lower() != "auto":
+        return str(encoding).lower()
+    small = str(small_roi_encoding or defaults.small_roi_encoding).lower()
+    large = str(large_roi_encoding or defaults.large_roi_encoding).lower()
+    cutoff = defaults.large_roi_min_pixels if large_roi_min_pixels is None else int(large_roi_min_pixels)
+    pixel_count = int(roi.shape[0] * roi.shape[1])
+    return large if pixel_count >= cutoff else small
 
 
 def candidate_mask_crop(

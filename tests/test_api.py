@@ -1169,6 +1169,15 @@ def make_client(*, auth_enabled=False):
     return TestClient(app), repository, kvstore
 
 
+def test_api_uses_configured_proxy_root_path():
+    config = CoreConfig()
+    config.api.root_path = "/pelagia-api"
+
+    app = create_app(config)
+
+    assert app.app.root_path == "/pelagia-api"
+
+
 def auth_headers(client, *, username="ada", project_key="default"):
     response = client.post(
         "/auth/login",
@@ -1513,7 +1522,8 @@ def test_api_exposes_system_config():
     assert "roi_assembly" in body["effective"]["processing"]
     assert "roi_filter" in body["effective"]["processing"]
     assert "roi_recording" in body["effective"]["processing"]
-    assert body["effective"]["processing"]["roi_recording"]["roi_encoding"] == "zstd"
+    assert body["effective"]["processing"]["roi_recording"]["small_roi_encoding"] == "zstd"
+    assert body["effective"]["processing"]["roi_recording"]["large_roi_encoding"] == "jpg"
     assert body["effective"]["kvstore"]["root_path"]
     assert body["defaults"]["processing"]["video_ingest"]["n_tile"] == 4
     assert body["defaults"]["processing"]["preprocessing"]["mask_path"] is None
@@ -2164,7 +2174,7 @@ def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeyp
     assert body["refined_detections"][0]["metadata"]["refinement_initial_roi_source"] == "frame"
 
 
-def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
+def test_api_roi_refinement_uses_project_size_policy_without_override():
     client, _, _ = make_client()
 
     response = client.post(
@@ -2174,7 +2184,6 @@ def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
             "model_ref": "test-refiner",
             "allow_frame_expansion": False,
             "store": True,
-            "encoding": "auto",
         },
     )
 
@@ -2182,6 +2191,7 @@ def test_api_roi_refinement_auto_encoding_reuses_candidate_encoding():
     body = response.json()
     assert body["stored_count"] == 1
     assert body["resolved_options"]["encoding"] is None
+    assert body["refined_detections"][0]["roi_encoding"] == "zstd"
 
 
 def test_api_queue_roi_refinement_job():
@@ -2545,7 +2555,9 @@ def test_api_segmentation_options_are_ui_ready():
     assert "erode" in body["supported"]["mask_augmentation_steps"]
     assert "connected_components" in body["supported"]["roi_assembly_methods"]
     assert body["defaults"]["roi_filter"]["min_perimeter"] is None
-    assert body["defaults"]["roi_recording"]["roi_encoding"] == "zstd"
+    assert body["defaults"]["roi_recording"]["small_roi_encoding"] == "zstd"
+    assert body["defaults"]["roi_recording"]["large_roi_encoding"] == "jpg"
+    assert body["defaults"]["roi_recording"]["large_roi_min_pixels"] == 50_000
     assert body["defaults"]["preprocessing"]["min_field_value"] is None
     assert body["defaults"]["preprocessing"]["max_field_value"] is None
     preprocessing_fields = {field["key"]: field for field in body["fields"]["preprocessing"]}

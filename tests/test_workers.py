@@ -554,9 +554,14 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
         "command_type": "segment_frames",
         "command_version": 1,
         "frame_ids": [10],
-        "padding": 4,
-        "roi_encoding": "raw",
-        "collections": ["test"],
+            "padding": 4,
+            "roi_encoding": "raw",
+            "small_roi_encoding": "zstd",
+            "large_roi_encoding": "jpg",
+            "large_roi_min_pixels": 50000,
+            "roi_quality": 90,
+            "mask_encoding": "zstd",
+            "collections": ["test"],
     }
     assert repo.created_jobs[0]["depends_on"] == ["job-1"]
 
@@ -1402,7 +1407,7 @@ def test_roi_refinement_handler_preserves_project_id():
     assert repo.processing_status_snapshot_touches == [{"project_id": "project-1"}]
 
 
-def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
+def test_roi_refinement_handler_uses_project_size_policy():
     repo = FakeRepository()
     context = make_context(repo)
 
@@ -1424,7 +1429,7 @@ def test_roi_refinement_handler_auto_encoding_reuses_candidate_encoding():
 
     assert result["refined_count"] == 1
     assert result["resolved_options"]["encoding"] is None
-    assert repo.refined_detections[0][0][1].roi_encoding == "raw"
+    assert repo.refined_detections[0][0][1].roi_encoding == "zstd"
 
 
 def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(monkeypatch):

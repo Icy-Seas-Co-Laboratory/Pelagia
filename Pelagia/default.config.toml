@@ -49,6 +49,9 @@ allowed_root_paths = []
 encoding = "jpg"
 # Default lossy image quality for jpg and jxl payloads.
 quality = 90
+# Deployment-level codec allowlist. Pelagia only advertises and accepts storage
+# codecs listed here; optional codecs must also be available in imagecodecs.
+allowed_encodings = ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
 
 [auth]
 # Enable bearer-token authentication for API clients. Set false for single-user
@@ -111,10 +114,15 @@ max_width_plus_height = null
 [processing.roi_recording]
 # Stored candidate ROI payload and mask behavior.
 padding = 50
-# ROI and mask payload encoding. Options: zstd, png, jpg, jxl, raw, auto.
-roi_encoding = "zstd"
-# Minimum ROI byte size before auto encoding prefers zstd over png.
-zstd_min_bytes = 8192
+# ROI size uses padded crop width × height; channel count and dtype do not alter
+# the classification. Crops at or above the cutoff use the large-ROI policy.
+small_roi_encoding = "zstd"
+large_roi_encoding = "jpg"
+large_roi_min_pixels = 50000
+# Lossy ROI quality for jpg and jxl payloads.
+roi_quality = 90
+# Masks are independent scientific payloads and remain lossless by default.
+mask_encoding = "zstd"
 # Store masks for every retained candidate, even when ROI image bytes are skipped.
 always_store_mask = true
 # ROI image blobs are only stored when all non-null thresholds are satisfied.
@@ -276,6 +284,9 @@ residual_padding = null
 # FastAPI development server defaults.
 host = "127.0.0.1"
 port = 8000
+# Optional externally visible path prefix when hosted behind a reverse proxy.
+# Use an empty string when the API is served at the origin root.
+root_path = ""
 # Browser origins allowed to call the API. Defaults allow localhost and
 # common private LAN IPv4 origins, e.g. PelagiaView at http://192.168.x.y:5173.
 cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"

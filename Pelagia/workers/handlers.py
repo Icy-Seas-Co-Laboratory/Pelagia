@@ -15,6 +15,7 @@ from ..processing.classification import (
     refined_bbox_classification_crop,
 )
 from ..processing.detection_candidate import segment_frame
+from ..processing.detection_recording import choose_roi_encoding
 from ..processing.detection_refinement import (
     RoiRefinementOptions,
     identity_refine_detections,
@@ -30,7 +31,7 @@ from ..processing.oracle_client import OracleInferenceClient, OracleInferenceIte
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
-from ..services.project_settings import resolve_project_storage_settings
+from ..services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
 from ..services.pipeline import PipelineService
 from ..services.job_commands import (
     ExtractFramesCommand,
@@ -458,7 +459,12 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 selection=FrameSelection(frame_ids=tuple(result["frame_ids"])),
                 options={
                     "padding": payload.get("padding", roi_recording_defaults.padding),
-                    "roi_encoding": payload.get("roi_encoding", roi_recording_defaults.roi_encoding),
+                    "roi_encoding": payload.get("roi_encoding"),
+                    "small_roi_encoding": payload.get("small_roi_encoding", roi_recording_defaults.small_roi_encoding),
+                    "large_roi_encoding": payload.get("large_roi_encoding", roi_recording_defaults.large_roi_encoding),
+                    "large_roi_min_pixels": payload.get("large_roi_min_pixels", roi_recording_defaults.large_roi_min_pixels),
+                    "roi_quality": payload.get("roi_quality", roi_recording_defaults.roi_quality),
+                    "mask_encoding": payload.get("mask_encoding", roi_recording_defaults.mask_encoding),
                     "collections": collections,
                 },
             ).to_payload(),
@@ -760,12 +766,25 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     asset_ids: set[str] = set()
     run_ids: set[str] = set()
     segmentation_payload = dict(payload)
-    if segmentation_payload.get("roi_encoding") is None:
-        segmentation_payload["roi_encoding"] = resolve_project_storage_settings(
-            context,
-            project_id,
-        ).roi_encoding
+    storage = resolve_project_storage_settings(context, project_id)
+    for key, value in storage.roi_policy_payload().items():
+        if segmentation_payload.get(key) is None:
+            segmentation_payload[key] = value
     resolved_options = resolve_segmentation_options(segmentation_payload, context.config.processing)
+    recording_options = resolved_options["roi_recording"]
+    validate_allowed_storage_encodings(
+        context,
+        *[
+            value
+            for value in (
+                recording_options.get("roi_encoding"),
+                recording_options["small_roi_encoding"],
+                recording_options["large_roi_encoding"],
+                recording_options["mask_encoding"],
+            )
+            if value is not None
+        ],
+    )
     frame_payload_kind = resolved_options["source"]["frame_payload_kind"]
     frame_kwargs = segment_frame_kwargs(resolved_options)
     progress = JobProgressReporter(
@@ -984,8 +1003,9 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         method = backend.method_name
     with measure_phase("refinement.options_resolution"):
         options = _roi_refinement_options_from_payload(payload, context)
-        if payload.get("encoding") is None:
-            options.encoding = resolve_project_storage_settings(context, project_id).roi_encoding
+        storage = resolve_project_storage_settings(context, project_id)
+        if options.encoding is not None:
+            validate_allowed_storage_encodings(context, options.encoding)
     allow_frame_expansion = bool(payload.get("allow_frame_expansion", True))
     expansion_payload_kind = str(payload.get("expansion_frame_payload_kind", "preprocessed"))
     frame_loader = None
@@ -1016,7 +1036,20 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             method=method,
         )
     )
-    refined_records = [result.as_detection_record(encoding=options.encoding) for result in results]
+    refined_records = [
+        result.as_detection_record(
+            encoding=choose_roi_encoding(
+                result.roi,
+                encoding=options.encoding,
+                small_roi_encoding=storage.small_roi_encoding,
+                large_roi_encoding=storage.large_roi_encoding,
+                large_roi_min_pixels=storage.large_roi_min_pixels,
+            ),
+            quality=storage.roi_quality,
+            mask_encoding=storage.mask_encoding,
+        )
+        for result in results
+    ]
     with measure_phase("refinement.database_update"):
         stored = context.repository.upsert_refined_detections(
             [

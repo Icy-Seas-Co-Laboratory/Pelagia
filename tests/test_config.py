@@ -62,6 +62,14 @@ def test_core_config_load_applies_auth_env(monkeypatch):
     assert config.auth.dev_project_key == "sandbox"
 
 
+def test_core_config_load_applies_normalized_api_root_path(monkeypatch):
+    monkeypatch.setenv("PELAGIA_API_ROOT_PATH", "pelagia-api/")
+
+    config = CoreConfig.load(local_config_path=None)
+
+    assert config.api.root_path == "/pelagia-api"
+
+
 def test_core_config_load_applies_kvstore_backend_env(monkeypatch):
     monkeypatch.setenv("PELAGIA_KVSTORE_BACKEND", "kvstore2")
     monkeypatch.setenv("PELAGIA_KVSTORE_MAX_BLOB_BYTES", "123456")
@@ -143,8 +151,11 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_filter.min_perimeter is None
     assert config.processing.roi_filter.min_area is None
     assert config.processing.roi_recording.padding == 50
-    assert config.processing.roi_recording.roi_encoding == "zstd"
-    assert config.processing.roi_recording.zstd_min_bytes == 8192
+    assert config.processing.roi_recording.small_roi_encoding == "zstd"
+    assert config.processing.roi_recording.large_roi_encoding == "jpg"
+    assert config.processing.roi_recording.large_roi_min_pixels == 50_000
+    assert config.processing.roi_recording.roi_quality == 90
+    assert config.processing.roi_recording.mask_encoding == "zstd"
     assert config.processing.roi_recording.always_store_mask is True
     assert config.processing.preprocessing.apply_mask is False
     assert config.processing.preprocessing.mask_path is None
@@ -251,7 +262,10 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
 
         [processing.roi_recording]
         padding = 8
-        roi_encoding = "png"
+        small_roi_encoding = "png"
+        large_roi_encoding = "jxl"
+        large_roi_min_pixels = 12000
+        roi_quality = 82
         store_roi_payload_min_area = 25
 
         [processing.preprocessing]
@@ -340,7 +354,10 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.roi_filter.min_width_plus_height == 9.0
     assert config.processing.roi_filter.min_perimeter == 12.5
     assert config.processing.roi_recording.padding == 8
-    assert config.processing.roi_recording.roi_encoding == "png"
+    assert config.processing.roi_recording.small_roi_encoding == "png"
+    assert config.processing.roi_recording.large_roi_encoding == "jxl"
+    assert config.processing.roi_recording.large_roi_min_pixels == 12000
+    assert config.processing.roi_recording.roi_quality == 82
     assert config.processing.roi_recording.store_roi_payload_min_area == 25.0
     assert config.processing.preprocessing.apply_mask is False
     assert config.processing.preprocessing.mask_path == "/tmp/mask.png"
@@ -503,3 +520,18 @@ def test_core_config_uses_pelagia_config_env(monkeypatch, tmp_path):
     assert config.logging.log_path.as_posix() == "/tmp/pelagia-logs"
     assert config.logging.level == "DEBUG"
     assert config.logging.console is False
+
+
+def test_core_config_rejects_roi_codec_outside_deployment_allowlist(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [image_data_storage]
+        encoding = "zstd"
+        allowed_encodings = ["zstd"]
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ROI storage codecs must be included"):
+        CoreConfig.load(config_path=config_path, use_env=False)

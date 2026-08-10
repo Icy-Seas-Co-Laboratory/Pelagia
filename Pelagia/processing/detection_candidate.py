@@ -115,8 +115,12 @@ def live_detection_candidate_wrapper(
     min_width_plus_height: int | float | None = None,
     max_width_plus_height: int | float | None = None,
     padding: int | None = None,
-    roi_encoding: str | None = "png",
-    zstd_min_bytes: int | None = None,
+    roi_encoding: str | None = None,
+    small_roi_encoding: str | None = None,
+    large_roi_encoding: str | None = None,
+    large_roi_min_pixels: int | None = None,
+    roi_quality: int | None = None,
+    mask_encoding: str | None = None,
     store_roi_payload_min_area: int | float | None = None,
     store_roi_payload_min_width: int | float | None = None,
     store_roi_payload_min_height: int | float | None = None,
@@ -217,7 +221,11 @@ def live_detection_candidate_wrapper(
             max_width_plus_height=max_width_plus_height,
             padding=padding,
             roi_encoding=roi_encoding,
-            zstd_min_bytes=zstd_min_bytes,
+            small_roi_encoding=small_roi_encoding,
+            large_roi_encoding=large_roi_encoding,
+            large_roi_min_pixels=large_roi_min_pixels,
+            roi_quality=roi_quality,
+            mask_encoding=mask_encoding,
             store_roi_payload_min_area=store_roi_payload_min_area,
             store_roi_payload_min_width=store_roi_payload_min_width,
             store_roi_payload_min_height=store_roi_payload_min_height,
@@ -491,7 +499,11 @@ def segment_frame(
     max_width_plus_height: int | float | None = None,
     padding: int | None = None,
     roi_encoding: str | None = None,
-    zstd_min_bytes: int | None = None,
+    small_roi_encoding: str | None = None,
+    large_roi_encoding: str | None = None,
+    large_roi_min_pixels: int | None = None,
+    roi_quality: int | None = None,
+    mask_encoding: str | None = None,
     store_roi_payload_min_area: int | float | None = None,
     store_roi_payload_min_width: int | float | None = None,
     store_roi_payload_min_height: int | float | None = None,
@@ -562,8 +574,12 @@ def segment_frame(
         else max_width_plus_height
     )
     resolved_padding = recording_defaults.padding if padding is None else padding
-    resolved_roi_encoding = recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
-    resolved_zstd_min_bytes = recording_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes
+    resolved_roi_encoding = roi_encoding
+    resolved_small_roi_encoding = recording_defaults.small_roi_encoding if small_roi_encoding is None else small_roi_encoding
+    resolved_large_roi_encoding = recording_defaults.large_roi_encoding if large_roi_encoding is None else large_roi_encoding
+    resolved_large_roi_min_pixels = recording_defaults.large_roi_min_pixels if large_roi_min_pixels is None else large_roi_min_pixels
+    resolved_roi_quality = recording_defaults.roi_quality if roi_quality is None else roi_quality
+    resolved_mask_encoding = recording_defaults.mask_encoding if mask_encoding is None else mask_encoding
     resolved_store_roi_payload_min_area = (
         recording_defaults.store_roi_payload_min_area
         if store_roi_payload_min_area is None
@@ -704,6 +720,11 @@ def segment_frame(
         "max_width_plus_height": resolved_max_width_plus_height,
         "padding": resolved_padding,
         "roi_encoding": resolved_roi_encoding,
+        "small_roi_encoding": resolved_small_roi_encoding,
+        "large_roi_encoding": resolved_large_roi_encoding,
+        "large_roi_min_pixels": resolved_large_roi_min_pixels,
+        "roi_quality": resolved_roi_quality,
+        "mask_encoding": resolved_mask_encoding,
         "always_store_mask": bool(resolved_always_store_mask),
         "encode_payloads": bool(encode_payloads),
         "max_detections": max_detections,
@@ -825,7 +846,11 @@ def segment_frame(
                     roi_index=candidate.roi_index,
                     padding=int(resolved_padding),
                     encoding=resolved_roi_encoding,
-                    zstd_min_bytes=resolved_zstd_min_bytes,
+                    small_roi_encoding=resolved_small_roi_encoding,
+                    large_roi_encoding=resolved_large_roi_encoding,
+                    large_roi_min_pixels=int(resolved_large_roi_min_pixels),
+                    roi_quality=int(resolved_roi_quality),
+                    mask_encoding=resolved_mask_encoding,
                     store_roi_payload=store_payload,
                     always_store_mask=bool(encode_payloads) and bool(resolved_always_store_mask),
                     extra_metadata={

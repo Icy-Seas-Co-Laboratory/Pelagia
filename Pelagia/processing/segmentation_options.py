@@ -43,7 +43,7 @@ MASK_AUGMENTATION_STEPS = [
     "clear_border",
 ]
 ROI_ASSEMBLY_METHODS = ["connected_components", "contours"]
-ROI_ENCODINGS = ["zstd", "png", "jpg", "jxl", "jxs", "raw", "auto"]
+ROI_ENCODINGS = ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
 
 
 def resolve_segmentation_options(
@@ -225,12 +225,34 @@ def resolve_segmentation_options(
         },
         "roi_recording": {
             "padding": int(_get(values, "padding", recording.padding)),
-            "roi_encoding": _normalize_method(
-                _get(values, "roi_encoding", recording.roi_encoding),
-                supported=ROI_ENCODINGS,
-                field_name="roi_encoding",
+            "roi_encoding": (
+                _normalize_method(
+                    values["roi_encoding"],
+                    supported=ROI_ENCODINGS,
+                    field_name="roi_encoding",
+                )
+                if "roi_encoding" in values
+                else None
             ),
-            "zstd_min_bytes": int(_get(values, "zstd_min_bytes", recording.zstd_min_bytes)),
+            "small_roi_encoding": _normalize_method(
+                _get(values, "small_roi_encoding", recording.small_roi_encoding),
+                supported=ROI_ENCODINGS,
+                field_name="small_roi_encoding",
+            ),
+            "large_roi_encoding": _normalize_method(
+                _get(values, "large_roi_encoding", recording.large_roi_encoding),
+                supported=ROI_ENCODINGS,
+                field_name="large_roi_encoding",
+            ),
+            "large_roi_min_pixels": int(
+                _get(values, "large_roi_min_pixels", recording.large_roi_min_pixels)
+            ),
+            "roi_quality": int(_get(values, "roi_quality", recording.roi_quality)),
+            "mask_encoding": _normalize_method(
+                _get(values, "mask_encoding", recording.mask_encoding),
+                supported=ROI_ENCODINGS,
+                field_name="mask_encoding",
+            ),
             "store_roi_payload_min_area": _get(
                 values,
                 "store_roi_payload_min_area",
@@ -255,6 +277,11 @@ def resolve_segmentation_options(
         },
     }
     _validate_positive_ints(resolved)
+    roi_quality = int(resolved["roi_recording"]["roi_quality"])
+    if roi_quality < 0 or roi_quality > 100:
+        raise ValueError("roi_quality must be between 0 and 100.")
+    if resolved["roi_recording"]["mask_encoding"] not in {"zstd", "png", "raw"}:
+        raise ValueError("mask_encoding must be lossless: zstd, png, or raw.")
     return resolved
 
 
@@ -273,17 +300,21 @@ def segment_frame_kwargs(resolved: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return kwargs
 
 
-def segmentation_capabilities(config: ProcessingConfig) -> dict[str, Any]:
+def segmentation_capabilities(
+    config: ProcessingConfig,
+    *,
+    allowed_encodings: list[str] | None = None,
+) -> dict[str, Any]:
     """Return GUI-facing segmentation capabilities and effective defaults."""
     defaults = resolve_segmentation_options({}, config)
-    return {
+    capabilities = {
         "pipeline_stage_order": PIPELINE_STAGE_ORDER,
         "supported": {
             "frame_payload_kinds": FRAME_PAYLOAD_KINDS,
             "threshold_methods": THRESHOLD_METHODS,
             "mask_augmentation_steps": MASK_AUGMENTATION_STEPS,
             "roi_assembly_methods": ROI_ASSEMBLY_METHODS,
-            "roi_encoding_options": ROI_ENCODINGS,
+            "roi_encoding_options": allowed_encodings or ROI_ENCODINGS,
         },
         "defaults": defaults,
         "fields": _field_groups(),
@@ -297,6 +328,15 @@ def segmentation_capabilities(config: ProcessingConfig) -> dict[str, Any]:
             "roi_recording": _dataclass_dict(config.roi_recording),
         },
     }
+    if allowed_encodings is not None:
+        for field in capabilities["fields"]["roi_recording"]:
+            if field["key"] in {"small_roi_encoding", "large_roi_encoding"}:
+                field["options"] = allowed_encodings
+            elif field["key"] == "mask_encoding":
+                field["options"] = [
+                    encoding for encoding in allowed_encodings if encoding in {"zstd", "png", "raw"}
+                ]
+    return capabilities
 
 
 def _get(values: dict[str, Any], key: str, default: Any) -> Any:
@@ -351,7 +391,7 @@ def _validate_positive_ints(resolved: dict[str, dict[str, Any]]) -> None:
             "close_iterations",
         ],
         "roi_assembly": ["roi_assembly_connectivity"],
-        "roi_recording": ["zstd_min_bytes"],
+        "roi_recording": ["large_roi_min_pixels"],
     }.items():
         for key in keys:
             value = resolved[group][key]
@@ -435,8 +475,11 @@ def _field_groups() -> dict[str, list[dict[str, Any]]]:
         ],
         "roi_recording": [
             _field("padding", "ROI Padding", "integer", minimum=0, step=1),
-            _field("roi_encoding", "ROI Encoding", "enum", options=ROI_ENCODINGS),
-            _field("zstd_min_bytes", "Zstd Minimum Bytes", "integer", minimum=1, step=1),
+            _field("small_roi_encoding", "Small ROI Codec", "enum", options=ROI_ENCODINGS),
+            _field("large_roi_encoding", "Large ROI Codec", "enum", options=ROI_ENCODINGS),
+            _field("large_roi_min_pixels", "Large ROI Cutoff (px²)", "integer", minimum=1, step=1),
+            _field("roi_quality", "Lossy ROI Quality (%)", "integer", minimum=0, maximum=100, step=1),
+            _field("mask_encoding", "Mask Codec", "enum", options=ROI_ENCODINGS),
             _field("store_roi_payload_min_area", "Store Payload Min Area", "nullable-number", minimum=0, step=1),
             _field("store_roi_payload_min_width", "Store Payload Min Width", "nullable-number", minimum=0, step=1),
             _field("store_roi_payload_min_height", "Store Payload Min Height", "nullable-number", minimum=0, step=1),
@@ -549,7 +592,11 @@ def _group_for_key(key: str) -> str:
         "roi_recording": [
             "padding",
             "roi_encoding",
-            "zstd_min_bytes",
+            "small_roi_encoding",
+            "large_roi_encoding",
+            "large_roi_min_pixels",
+            "roi_quality",
+            "mask_encoding",
             "store_roi_payload_min_area",
             "store_roi_payload_min_width",
             "store_roi_payload_min_height",

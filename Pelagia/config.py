@@ -104,6 +104,9 @@ class ImageDataStorageConfig:
 
     encoding: ImageDataStorageEncoding = "jpg"
     quality: int = 90
+    allowed_encodings: list[str] = field(
+        default_factory=lambda: ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
+    )
 
     def __post_init__(self) -> None:
         self.encoding = _normalize_image_data_storage_encoding(self.encoding)
@@ -114,6 +117,16 @@ class ImageDataStorageConfig:
         self.quality = int(self.quality)
         if self.quality < 0 or self.quality > 100:
             raise ValueError("image data storage quality must be between 0 and 100.")
+        self.allowed_encodings = list(
+            dict.fromkeys(_normalize_image_data_storage_encoding(value) for value in self.allowed_encodings)
+        )
+        invalid = set(self.allowed_encodings) - IMAGE_DATA_STORAGE_ENCODINGS
+        if invalid:
+            raise ValueError(f"unsupported allowed image encodings: {', '.join(sorted(invalid))}.")
+        if not self.allowed_encodings:
+            raise ValueError("image data storage allowed_encodings cannot be empty.")
+        if self.encoding not in self.allowed_encodings:
+            raise ValueError("image data storage encoding must be included in allowed_encodings.")
 
 
 @dataclass(slots=True)
@@ -122,6 +135,7 @@ class APIConfig:
 
     host: str = "127.0.0.1"
     port: int = 8000
+    root_path: str = ""
     cors_allow_origin_regex: str = (
         r"https?://("
         r"localhost|127\.0\.0\.1|\[::1\]|"
@@ -131,6 +145,10 @@ class APIConfig:
         r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
         r")(?::\d+)?"
     )
+
+    def __post_init__(self) -> None:
+        value = str(self.root_path).strip()
+        self.root_path = "" if value in {"", "/"} else f"/{value.strip('/')}"
 
 
 @dataclass(slots=True)
@@ -242,13 +260,32 @@ class RoiRecordingProcessingConfig:
     """Default candidate ROI recording parameters."""
 
     padding: int = 50
-    roi_encoding: str = "zstd"
-    zstd_min_bytes: int = 16_384
+    small_roi_encoding: str = "zstd"
+    large_roi_encoding: str = "jpg"
+    large_roi_min_pixels: int = 50_000
+    roi_quality: int = 90
+    mask_encoding: str = "zstd"
     always_store_mask: bool = True
     store_roi_payload_min_area: float | None = None
     store_roi_payload_min_width: float | None = None
     store_roi_payload_min_height: float | None = None
     store_roi_payload_min_width_plus_height: float | None = None
+
+    def __post_init__(self) -> None:
+        self.small_roi_encoding = _normalize_image_data_storage_encoding(self.small_roi_encoding)
+        self.large_roi_encoding = _normalize_image_data_storage_encoding(self.large_roi_encoding)
+        self.mask_encoding = _normalize_image_data_storage_encoding(self.mask_encoding)
+        for field_name in ("small_roi_encoding", "large_roi_encoding", "mask_encoding"):
+            if getattr(self, field_name) not in IMAGE_DATA_STORAGE_ENCODINGS:
+                raise ValueError(f"processing.roi_recording.{field_name} is not a supported storage codec.")
+        if self.mask_encoding not in {"zstd", "png", "raw"}:
+            raise ValueError("processing.roi_recording.mask_encoding must be lossless: zstd, png, or raw.")
+        self.large_roi_min_pixels = int(self.large_roi_min_pixels)
+        if self.large_roi_min_pixels < 1:
+            raise ValueError("processing.roi_recording.large_roi_min_pixels must be positive.")
+        self.roi_quality = int(self.roi_quality)
+        if self.roi_quality < 0 or self.roi_quality > 100:
+            raise ValueError("processing.roi_recording.roi_quality must be between 0 and 100.")
 
 
 @dataclass(slots=True)
@@ -400,6 +437,17 @@ class CoreConfig:
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
 
+    def __post_init__(self) -> None:
+        allowed = set(self.image_data_storage.allowed_encodings)
+        roi = self.processing.roi_recording
+        configured = {roi.small_roi_encoding, roi.large_roi_encoding, roi.mask_encoding}
+        disallowed = configured - allowed
+        if disallowed:
+            raise ValueError(
+                "ROI storage codecs must be included in image_data_storage.allowed_encodings: "
+                + ", ".join(sorted(disallowed))
+            )
+
     @classmethod
     def load(
         cls,
@@ -495,6 +543,10 @@ def _env_path_list(value: str) -> list[Path]:
     return [Path(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def _env_string_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "database", "dsn", "PELAGIA_DATABASE_DSN")
     _set_from_env(settings, "database", "schema_name", "PELAGIA_DATABASE_SCHEMA")
@@ -524,9 +576,17 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
 
     _set_from_env(settings, "image_data_storage", "encoding", "PELAGIA_IMAGE_DATA_STORAGE_ENCODING")
     _set_from_env(settings, "image_data_storage", "quality", "PELAGIA_IMAGE_DATA_STORAGE_QUALITY", int)
+    _set_from_env(
+        settings,
+        "image_data_storage",
+        "allowed_encodings",
+        "PELAGIA_IMAGE_DATA_STORAGE_ALLOWED_ENCODINGS",
+        _env_string_list,
+    )
 
     _set_from_env(settings, "api", "host", "PELAGIA_API_HOST")
     _set_from_env(settings, "api", "port", "PELAGIA_API_PORT", int)
+    _set_from_env(settings, "api", "root_path", "PELAGIA_API_ROOT_PATH")
     _set_from_env(settings, "api", "cors_allow_origin_regex", "PELAGIA_API_CORS_ALLOW_ORIGIN_REGEX")
 
     _set_from_env(settings, "oracle", "enabled", "PELAGIA_ORACLE_ENABLED", _env_bool)
@@ -636,8 +696,11 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.roi_filter", "max_width_plus_height", "PELAGIA_ROI_FILTER_MAX_WIDTH_PLUS_HEIGHT", float)
 
     _set_from_env(settings, "processing.roi_recording", "padding", "PELAGIA_ROI_RECORDING_PADDING", int)
-    _set_from_env(settings, "processing.roi_recording", "roi_encoding", "PELAGIA_ROI_RECORDING_ROI_ENCODING")
-    _set_from_env(settings, "processing.roi_recording", "zstd_min_bytes", "PELAGIA_ROI_RECORDING_ZSTD_MIN_BYTES", int)
+    _set_from_env(settings, "processing.roi_recording", "small_roi_encoding", "PELAGIA_ROI_RECORDING_SMALL_ENCODING")
+    _set_from_env(settings, "processing.roi_recording", "large_roi_encoding", "PELAGIA_ROI_RECORDING_LARGE_ENCODING")
+    _set_from_env(settings, "processing.roi_recording", "large_roi_min_pixels", "PELAGIA_ROI_RECORDING_LARGE_MIN_PIXELS", int)
+    _set_from_env(settings, "processing.roi_recording", "roi_quality", "PELAGIA_ROI_RECORDING_QUALITY", int)
+    _set_from_env(settings, "processing.roi_recording", "mask_encoding", "PELAGIA_ROI_RECORDING_MASK_ENCODING")
     _set_from_env(settings, "processing.roi_recording", "always_store_mask", "PELAGIA_ROI_RECORDING_ALWAYS_STORE_MASK", _env_bool)
     _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_area", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_AREA", float)
     _set_from_env(settings, "processing.roi_recording", "store_roi_payload_min_width", "PELAGIA_ROI_RECORDING_STORE_ROI_PAYLOAD_MIN_WIDTH", float)
@@ -775,10 +838,17 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
         image_data_storage=ImageDataStorageConfig(
             encoding=image_data_storage.get("encoding", ImageDataStorageConfig.encoding),
             quality=int(image_data_storage.get("quality", ImageDataStorageConfig.quality)),
+            allowed_encodings=_string_list(
+                image_data_storage.get(
+                    "allowed_encodings",
+                    ImageDataStorageConfig().allowed_encodings,
+                )
+            ),
         ),
         api=APIConfig(
             host=str(api.get("host", APIConfig.host)),
             port=int(api.get("port", APIConfig.port)),
+            root_path=str(api.get("root_path", APIConfig.root_path)),
             cors_allow_origin_regex=str(
                 api.get("cors_allow_origin_regex", APIConfig.cors_allow_origin_regex)
             ),
@@ -983,11 +1053,20 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 padding=int(
                     roi_recording.get("padding", recording_defaults.padding)
                 ),
-                roi_encoding=str(
-                    roi_recording.get("roi_encoding", recording_defaults.roi_encoding)
+                small_roi_encoding=str(
+                    roi_recording.get("small_roi_encoding", recording_defaults.small_roi_encoding)
                 ),
-                zstd_min_bytes=int(
-                    roi_recording.get("zstd_min_bytes", recording_defaults.zstd_min_bytes)
+                large_roi_encoding=str(
+                    roi_recording.get("large_roi_encoding", recording_defaults.large_roi_encoding)
+                ),
+                large_roi_min_pixels=int(
+                    roi_recording.get("large_roi_min_pixels", recording_defaults.large_roi_min_pixels)
+                ),
+                roi_quality=int(
+                    roi_recording.get("roi_quality", recording_defaults.roi_quality)
+                ),
+                mask_encoding=str(
+                    roi_recording.get("mask_encoding", recording_defaults.mask_encoding)
                 ),
                 always_store_mask=bool(
                     roi_recording.get(

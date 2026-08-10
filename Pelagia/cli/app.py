@@ -218,7 +218,11 @@ if typer is not None:
             "max_perimeter": roi_filter_defaults.max_perimeter if max_perimeter is None else max_perimeter,
             "padding": roi_recording_defaults.padding if padding is None else padding,
             "roi_encoding": roi_encoding,
-            "zstd_min_bytes": roi_recording_defaults.zstd_min_bytes if zstd_min_bytes is None else zstd_min_bytes,
+            "small_roi_encoding": roi_recording_defaults.small_roi_encoding,
+            "large_roi_encoding": roi_recording_defaults.large_roi_encoding,
+            "large_roi_min_pixels": roi_recording_defaults.large_roi_min_pixels,
+            "roi_quality": roi_recording_defaults.roi_quality,
+            "mask_encoding": roi_recording_defaults.mask_encoding,
         }
 
     def _preprocess_payload(
@@ -1196,7 +1200,7 @@ if typer is not None:
         resolved_roi_padding = (
             roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
-        resolved_roi_encoding = roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
+        resolved_roi_encoding = roi_encoding
         normalized_collections = normalize_collections(collections)
         resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
             context,
@@ -1229,6 +1233,11 @@ if typer is not None:
                 "enqueue_segment": enqueue_segment,
                 "padding": resolved_roi_padding,
                 "roi_encoding": resolved_roi_encoding,
+                "small_roi_encoding": roi_recording_defaults.small_roi_encoding,
+                "large_roi_encoding": roi_recording_defaults.large_roi_encoding,
+                "large_roi_min_pixels": roi_recording_defaults.large_roi_min_pixels,
+                "roi_quality": roi_recording_defaults.roi_quality,
+                "mask_encoding": roi_recording_defaults.mask_encoding,
                 "collections": normalized_collections,
                 "checksum_status": "computed" if compute_checksum else "deferred",
             }).to_payload(),
@@ -1293,7 +1302,7 @@ if typer is not None:
         resolved_roi_padding = (
             roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
-        resolved_roi_encoding = roi_recording_defaults.roi_encoding if roi_encoding is None else roi_encoding
+        resolved_roi_encoding = roi_encoding
         normalized_collections = normalize_collections(collections)
 
         queued = []
@@ -1328,6 +1337,11 @@ if typer is not None:
                     "enqueue_segment": enqueue_segment,
                     "padding": resolved_roi_padding,
                     "roi_encoding": resolved_roi_encoding,
+                    "small_roi_encoding": roi_recording_defaults.small_roi_encoding,
+                    "large_roi_encoding": roi_recording_defaults.large_roi_encoding,
+                    "large_roi_min_pixels": roi_recording_defaults.large_roi_min_pixels,
+                    "roi_quality": roi_recording_defaults.roi_quality,
+                    "mask_encoding": roi_recording_defaults.mask_encoding,
                     "collections": normalized_collections,
                     "checksum_status": "computed" if compute_checksum else "deferred",
                 }).to_payload(),

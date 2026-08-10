@@ -162,7 +162,13 @@ class DetectionRefinementResult:
     method: str = "identity"
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def as_detection_record(self, *, encoding: str | None = None) -> DetectionRecord:
+    def as_detection_record(
+        self,
+        *,
+        encoding: str | None = None,
+        quality: int | None = None,
+        mask_encoding: str | None = None,
+    ) -> DetectionRecord:
         """Return a copy of the candidate record annotated as refined metadata."""
         if _refined_mask_area(self) <= 0:
             raise ValueError(
@@ -183,11 +189,12 @@ class DetectionRefinementResult:
             roi_payload, roi_encoding, roi_format = encode_array_payload(
                 self.roi,
                 requested_encoding,
+                quality=quality,
             )
         with measure_phase("refinement.mask_encode"):
             mask_payload, mask_encoding, mask_format = encode_array_payload(
                 self.refined_mask,
-                requested_encoding,
+                mask_encoding or requested_encoding,
             )
         with measure_phase("refinement.measurements"):
             bbox = self.bbox or _mask_bbox_in_frame(

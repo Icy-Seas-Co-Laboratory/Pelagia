@@ -33,7 +33,12 @@ def create_app(config: CoreConfig | None = None):
         finally:
             context.close()
 
-    app = FastAPI(title="Pelagia", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="Pelagia",
+        version=__version__,
+        lifespan=lifespan,
+        root_path=resolved_config.api.root_path,
+    )
     exposed_headers = [
         "X-Pelagia-Frame-Id",
         "X-Pelagia-Payload-Kind",
