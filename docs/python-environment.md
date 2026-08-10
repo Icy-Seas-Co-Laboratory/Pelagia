@@ -34,6 +34,11 @@ from the lockfile. For development and tests:
 ./scripts/pelagia_env sync dev
 ```
 
+Run Pelagia commands from the repository root using `.venv/bin/pelagia`, as in
+the examples below. Activation is optional. Avoid bare `python` or `pelagia`
+commands unless the managed `.venv` is activated, because another system,
+Conda, or user environment may not contain Pelagia's optional runtime extras.
+
 Pelagia has no TensorFlow/Keras dependency. Oracle Builder owns model execution
 and GPU isolation. All Pelagia workers, including ROI refinement orchestration,
 use `.venv`:
@@ -98,7 +103,7 @@ default_mask_model = "pelagia-refiner"
 Initialize storage:
 
 ```bash
-python -m Pelagia.cli.app init-system
+.venv/bin/pelagia init-system
 ```
 
 Start the local development stack:
@@ -117,10 +122,10 @@ Stop it when finished:
 ## 5. Run Tests
 
 ```bash
-python -m pytest
+.venv/bin/python -m pytest
 ```
 
-You can also run these without activation:
+The managed entry points work without activation:
 
 ```bash
 .venv/bin/pelagia init-system

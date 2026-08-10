@@ -58,16 +58,14 @@ This uses `uv.lock`, installs a uv-managed Python 3.12 when necessary, and
 synchronizes `.venv` exactly. Activation is optional; Pelagia's stack scripts
 select the managed environment automatically.
 
+Run the CLI examples in this guide from the repository root. They use
+`.venv/bin/pelagia` explicitly so an unrelated system, Conda, or user Python
+cannot accidentally run Pelagia without its runtime extras.
+
 For development and tests, install the dev target instead:
 
 ```bash
 ./scripts/pelagia_env sync dev
-```
-
-For the API and all Pelagia workers, create and synchronize the CPU profile:
-
-```bash
-./scripts/pelagia_env sync cpu
 ```
 
 Oracle Builder owns TensorFlow/Keras and GPU isolation. Pelagia only verifies
@@ -132,15 +130,15 @@ dev_project_key = "default"
 Initialize the database schema and bootstrap the admin user:
 
 ```bash
-python -m Pelagia.cli.app init-system
-python -m Pelagia.cli.app create-dev-login --username dev-admin --password pelagia-dev
+.venv/bin/pelagia init-system
+.venv/bin/pelagia create-dev-login --username dev-admin --password pelagia-dev
 ```
 
 For code upgrades where storage already exists, apply database migrations with:
 
 ```bash
-python -m Pelagia.cli.app migrate-db
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia migrate-db
+.venv/bin/pelagia check-system
 ```
 
 With the default projectless configuration, `create-dev-login` creates or
@@ -152,10 +150,10 @@ returns an authenticated projectless session with `project: null` and
 project, adding membership, and returning a session token. For manual setup use:
 
 ```bash
-python -m Pelagia.cli.app create-user ada --password secret --admin
-python -m Pelagia.cli.app create-project field-survey --project-name "Field Survey"
-python -m Pelagia.cli.app add-project-user ada field-survey --role editor
-python -m Pelagia.cli.app list-projects --username ada
+.venv/bin/pelagia create-user ada --password secret --admin
+.venv/bin/pelagia create-project field-survey --project-name "Field Survey"
+.venv/bin/pelagia add-project-user ada field-survey --role editor
+.venv/bin/pelagia list-projects --username ada
 ```
 
 For a local one-command backend stack, start the API and workers:

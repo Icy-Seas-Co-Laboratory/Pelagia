@@ -37,7 +37,7 @@ Before large imports or processing runs, verify that the API, database, and
 KVStore are reachable.
 
 ```bash
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 curl http://127.0.0.1:8000/health
 curl -H "Authorization: Bearer $PELAGIA_TOKEN" \
   http://127.0.0.1:8000/system/status/default
@@ -149,11 +149,11 @@ For maintenance that touches storage, use this pattern:
 
 1. Stop PelagiaView if users are active.
 2. Stop API and worker processes.
-3. Confirm the active configuration with `python -m Pelagia.cli.app check-system`.
+3. Confirm the active configuration with `.venv/bin/pelagia check-system`.
 4. Back up PostgreSQL, KVStore, `config.toml`, and `.pelagia/`.
 5. Perform the reset, migration, or restore.
-6. Run `python -m Pelagia.cli.app init-system`.
-7. Run `python -m Pelagia.cli.app check-system`.
+6. Run `.venv/bin/pelagia init-system`.
+7. Run `.venv/bin/pelagia check-system`.
 8. Start the API and workers.
 9. Confirm project-specific status with `/system/status/{project}`.
 
@@ -178,8 +178,8 @@ For the TOML-driven worker stack:
 Initialize a local admin session with:
 
 ```bash
-python -m Pelagia.cli.app init-system
-python -m Pelagia.cli.app create-dev-login \
+.venv/bin/pelagia init-system
+.venv/bin/pelagia create-dev-login \
   --username dev-admin \
   --password pelagia-dev
 ```
@@ -187,10 +187,10 @@ python -m Pelagia.cli.app create-dev-login \
 Manual account and project setup:
 
 ```bash
-python -m Pelagia.cli.app create-user ada --password secret --admin
-python -m Pelagia.cli.app create-project field-survey --project-name "Field Survey"
-python -m Pelagia.cli.app add-project-user ada field-survey --role editor
-python -m Pelagia.cli.app list-projects --username ada
+.venv/bin/pelagia create-user ada --password secret --admin
+.venv/bin/pelagia create-project field-survey --project-name "Field Survey"
+.venv/bin/pelagia add-project-user ada field-survey --role editor
+.venv/bin/pelagia list-projects --username ada
 ```
 
 PelagiaView should log in with `POST /auth/login`, store the returned bearer

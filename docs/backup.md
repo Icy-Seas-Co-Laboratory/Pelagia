@@ -93,7 +93,7 @@ rsync -a ./.pelagia/ "$BACKUP_DIR/.pelagia/"
 
 ```bash
 git rev-parse HEAD > "$BACKUP_DIR/git-commit.txt"
-python -m Pelagia.cli.app check-system > "$BACKUP_DIR/check-system.json"
+.venv/bin/pelagia check-system > "$BACKUP_DIR/check-system.json"
 ```
 
 7. Start Pelagia again.
@@ -158,8 +158,8 @@ If restored paths differ from the old machine, update
 6. Apply current schema compatibility updates.
 
 ```bash
-python -m Pelagia.cli.app init-system
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia init-system
+.venv/bin/pelagia check-system
 ```
 
 7. Start Pelagia.
@@ -185,8 +185,8 @@ Recommended validation:
 
 - Restore to a temporary database name or separate machine.
 - Point a temporary `config.toml` at a copied KVStore.
-- Run `python -m Pelagia.cli.app init-system`.
-- Run `python -m Pelagia.cli.app check-system`.
+- Run `.venv/bin/pelagia init-system`.
+- Run `.venv/bin/pelagia check-system`.
 - Run `/system/status/{project}?deep_kvstore=true` for at least one project.
 - Load a known original frame, preprocessed frame, candidate ROI, and refined
   ROI through the API or PelagiaView.

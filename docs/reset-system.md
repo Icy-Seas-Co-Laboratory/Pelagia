@@ -28,20 +28,20 @@ existing data.
 ```bash
 ./scripts/pelagia_dev_stack.sh stop
 
-python -m Pelagia.cli.app reset --delete
-python -m Pelagia.cli.app create-dev-login \
+.venv/bin/pelagia reset --delete
+.venv/bin/pelagia create-dev-login \
   --username dev-admin \
   --password pelagia-dev
 
 ./scripts/pelagia_dev_stack.sh start
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 ```
 
 If you use the TOML stack, stop and start that stack instead:
 
 ```bash
 ./scripts/pelagia_stack_from_toml.sh stop scripts/pelagia_workers.toml
-python -m Pelagia.cli.app reset --delete
+.venv/bin/pelagia reset --delete
 ./scripts/pelagia_stack_from_toml.sh start scripts/pelagia_workers.toml
 ```
 
@@ -59,13 +59,13 @@ KVStore directories.
 2. Confirm the configured database and KVStore root.
 
 ```bash
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 ```
 
 3. Reset the database rows and all configured project KVStores.
 
 ```bash
-python -m Pelagia.cli.app reset --delete
+.venv/bin/pelagia reset --delete
 ```
 
 4. Review the `kvstores.results` entries in the command output. Stores marked
@@ -76,7 +76,7 @@ you also want their configuration files removed.
 5. Recreate the admin login. The first UI login can create the first project.
 
 ```bash
-python -m Pelagia.cli.app create-dev-login \
+.venv/bin/pelagia create-dev-login \
   --username dev-admin \
   --password pelagia-dev
 ```
@@ -85,7 +85,7 @@ python -m Pelagia.cli.app create-dev-login \
 
 ```bash
 ./scripts/pelagia_dev_stack.sh start
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 ```
 
 ## Reset A Projectless System
@@ -94,7 +94,7 @@ The same command works when no projects or KVStores exist. In that case it
 resets only PostgreSQL and reports a KVStore count of zero:
 
 ```bash
-python -m Pelagia.cli.app reset --delete
+.venv/bin/pelagia reset --delete
 ```
 
 ## Reset Only KVStore
@@ -108,7 +108,7 @@ The only generally safe KVStore-only reset is for an empty database or a fresh
 installation.
 
 ```bash
-python -m Pelagia.cli.app init-kvstore
+.venv/bin/pelagia init-kvstore
 ```
 
 If the KVStore path already contains data, use the full reset procedure instead.
@@ -120,8 +120,8 @@ creates missing tables, and adds missing columns where supported. Project
 KVStores are created when projects are created.
 
 ```bash
-python -m Pelagia.cli.app init-system
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia init-system
+.venv/bin/pelagia check-system
 ```
 
 This is the first repair step when a new checkout expects newer tables or
@@ -129,12 +129,28 @@ columns.
 
 ## Common Reset Failures
 
+`psycopg and psycopg-pool are required for PostgreSQL operations`
+
+The reset was launched with a Python environment that does not contain
+Pelagia's PostgreSQL runtime extra. From the repository root, synchronize the
+supported environment and invoke its CLI explicitly:
+
+```bash
+./scripts/pelagia_env sync cpu
+.venv/bin/python -c "import psycopg, psycopg_pool"
+.venv/bin/pelagia reset --delete
+```
+
+Do not use bare `python -m Pelagia.cli.app` for operational commands unless
+`.venv` is activated. A bare command may select the operating system or Conda
+interpreter even when the API and workers correctly use Pelagia's `.venv`.
+
 `Refusing to reset Pelagia storage without --delete`
 
 The CLI requires an explicit destructive flag:
 
 ```bash
-python -m Pelagia.cli.app reset --delete
+.venv/bin/pelagia reset --delete
 ```
 
 `KVStore is not initialized`

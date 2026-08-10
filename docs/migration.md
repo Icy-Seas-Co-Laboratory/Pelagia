@@ -124,8 +124,8 @@ WHERE project_key = 'field-survey';
 8. Apply database migrations and verify.
 
 ```bash
-python -m Pelagia.cli.app migrate-db
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia migrate-db
+.venv/bin/pelagia check-system
 ```
 
 9. Start the API and workers, then verify project status.
@@ -166,7 +166,7 @@ root_path_kvstore = "/new/storage/pelagia-kvstore"
 4. Run checks.
 
 ```bash
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 ```
 
 5. Start the stack and verify frame retrieval in PelagiaView.
@@ -227,8 +227,8 @@ schema_name = "pelagia"
 Then initialize and check:
 
 ```bash
-python -m Pelagia.cli.app init-system
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia init-system
+.venv/bin/pelagia check-system
 ```
 
 Changing `schema_name` points Pelagia at a different PostgreSQL schema. It does
@@ -271,7 +271,7 @@ Each row records:
 Check migration readiness with:
 
 ```bash
-python -m Pelagia.cli.app check-system
+.venv/bin/pelagia check-system
 ```
 
 The JSON output includes:
