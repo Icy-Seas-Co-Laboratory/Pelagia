@@ -1385,7 +1385,9 @@ if typer is not None:
         if context.repository is None:
             raise RuntimeError("Reset requires a PostgresRepository.")
         config = context.config
-        context.repository.initialize_schema()
+        schema_status = context.repository.schema_status()
+        if schema_status.get("missing_tables"):
+            context.repository.initialize_schema()
         projects = _list_all_projects(context.repository, active_only=False)
 
         kvstore_results = []
@@ -1447,7 +1449,7 @@ if typer is not None:
                         "result": reset_result,
                     }
                 )
-        database_result = context.repository.purge_all()
+        database_result = context.repository.purge_all(exact_counts=False)
         typer.echo(
             json.dumps(
                 json_ready(

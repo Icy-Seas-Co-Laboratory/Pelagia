@@ -20,6 +20,11 @@ each available store, then clears PostgreSQL rows. It preserves the database
 schema but does not create a default project or KVStore. A system with no
 projects or stores is valid and resets PostgreSQL normally.
 
+Database reset uses `TRUNCATE` and does not scan large tables to calculate an
+exact deleted-row count. The result therefore reports `total_rows_deleted` as
+`null` and `exact_counts_collected` as `false`. This keeps reset time dependent
+primarily on lock acquisition rather than database size.
+
 ## Development Reset
 
 Use this when you want a clean local development system and do not need to keep
@@ -144,6 +149,22 @@ supported environment and invoke its CLI explicitly:
 Do not use bare `python -m Pelagia.cli.app` for operational commands unless
 `.venv` is activated. A bare command may select the operating system or Conda
 interpreter even when the API and workers correctly use Pelagia's `.venv`.
+
+`canceling statement due to statement timeout`
+
+Update to a version containing the large-database reset path. It disables the
+interactive statement timeout only for the destructive purge transaction and
+skips exact row-count scans. Stop the API and every worker before retrying so
+`TRUNCATE` can acquire exclusive table locks:
+
+```bash
+./scripts/pelagia_stack_from_toml.sh stop scripts/pelagia_workers.toml
+.venv/bin/pelagia reset --delete
+```
+
+If a different stack configuration is in use, pass that same TOML file to the
+stop command. A reset that still waits after all Pelagia processes stop is
+usually blocked by another PostgreSQL session, backup, or administration tool.
 
 `Refusing to reset Pelagia storage without --delete`
 

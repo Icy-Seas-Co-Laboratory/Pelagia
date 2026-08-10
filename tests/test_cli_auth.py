@@ -31,9 +31,13 @@ class _FakeRepository:
     def schema_status(self):
         return {"schema": "pelagia", "ready": True, "missing_tables": []}
 
-    def purge_all(self):
+    def purge_all(self, *, exact_counts=True):
         self.purged = True
-        return {"schema": "pelagia", "total_rows_deleted": 0}
+        return {
+            "schema": "pelagia",
+            "total_rows_deleted": 0 if exact_counts else None,
+            "exact_counts_collected": exact_counts,
+        }
 
     def create_user(self, username, **kwargs):
         user = {
@@ -252,13 +256,14 @@ def test_cli_reset_allows_projectless_system_without_kvstore(monkeypatch):
     assert result.exit_code == 0, result.output
     body = json.loads(result.output)
     assert body["deleted"] is True
-    assert body["database"]["total_rows_deleted"] == 0
+    assert body["database"]["total_rows_deleted"] is None
+    assert body["database"]["exact_counts_collected"] is False
     assert body["kvstores"] == {
         "project_count": 0,
         "reset_count": 0,
         "results": [],
     }
-    assert repo.initialized is True
+    assert repo.initialized is False
     assert repo.purged is True
 
 

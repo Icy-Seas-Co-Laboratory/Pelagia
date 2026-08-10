@@ -1442,6 +1442,7 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     assert result["tables"]["worker_sessions"] == 1
     assert result["tables"]["models"] == 1
     assert result["tables"]["job_events"] >= 2
+    assert result["exact_counts_collected"] is True
     assert postgres_repo.list_runs() == []
     assert postgres_repo.list_assets() == []
     assert postgres_repo.list_jobs() == []
@@ -1449,3 +1450,11 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     assert postgres_repo.list_collections() == []
     assert postgres_repo.list_models() == []
     assert postgres_repo.list_job_events() == []
+
+
+def test_postgres_repository_purge_all_can_skip_exact_counts(postgres_repo):
+    result = postgres_repo.purge_all(exact_counts=False)
+
+    assert result["tables"] is None
+    assert result["total_rows_deleted"] is None
+    assert result["exact_counts_collected"] is False

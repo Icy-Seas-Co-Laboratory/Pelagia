@@ -467,22 +467,32 @@ class PostgresRepository:
             "migrations": migrations,
         }
 
-    def purge_all(self) -> dict[str, Any]:
-        """Delete all Pelagia rows while preserving the schema, indexes, and functions."""
+    def purge_all(self, *, exact_counts: bool = True) -> dict[str, Any]:
+        """Delete all Pelagia rows while preserving the schema, indexes, and functions.
+
+        Destructive maintenance must not inherit the statement timeout used to
+        protect interactive queries. Callers resetting a large installation can
+        also omit the pre-reset ``COUNT(*)`` scans, which are informational and
+        can be substantially slower than the ``TRUNCATE`` itself.
+        """
         tables = [table for table in REQUIRED_SCHEMA_TABLES if table != "schema_migrations"]
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                before: dict[str, int] = {}
-                for table in tables:
-                    cursor.execute(f"SELECT COUNT(*) AS count FROM {self.schema}.{table}")
-                    before[table] = cursor.fetchone()["count"]
+                cursor.execute("SET LOCAL statement_timeout = 0")
+                before: dict[str, int] | None = None
+                if exact_counts:
+                    before = {}
+                    for table in tables:
+                        cursor.execute(f"SELECT COUNT(*) AS count FROM {self.schema}.{table}")
+                        before[table] = cursor.fetchone()["count"]
                 table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
                 cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
             connection.commit()
         return {
             "schema": self.schema,
             "tables": before,
-            "total_rows_deleted": sum(before.values()),
+            "total_rows_deleted": None if before is None else sum(before.values()),
+            "exact_counts_collected": exact_counts,
             "preserved_tables": ["schema_migrations"],
         }
 
