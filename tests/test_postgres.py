@@ -1458,3 +1458,29 @@ def test_postgres_repository_purge_all_can_skip_exact_counts(postgres_repo):
     assert result["tables"] is None
     assert result["total_rows_deleted"] is None
     assert result["exact_counts_collected"] is False
+    assert result["missing_tables"] == []
+    assert set(result["purged_tables"]) == set(postgres.REQUIRED_SCHEMA_TABLES) - {"schema_migrations"}
+
+
+def test_postgres_large_reset_sequence_repairs_incomplete_schema(postgres_repo):
+    missing_table = "classification_evidence"
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP TABLE {postgres_repo.schema}.{missing_table} CASCADE")
+        connection.commit()
+
+    status = postgres_repo.schema_status()
+    assert missing_table in status["missing_tables"]
+
+    purge_result = postgres_repo.purge_all(
+        exact_counts=False,
+        preserve_migrations=False,
+    )
+    assert missing_table in purge_result["missing_tables"]
+    assert purge_result["preserved_tables"] == []
+
+    postgres_repo.initialize_schema(statement_timeout_ms=0)
+
+    repaired = postgres_repo.schema_status()
+    assert repaired["missing_tables"] == []
+    assert repaired["ready"] is True

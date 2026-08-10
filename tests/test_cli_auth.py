@@ -23,20 +23,23 @@ class _FakeRepository:
         self.memberships = {}
         self.sessions = {}
         self.initialized = False
+        self.initialize_statement_timeout_ms = None
         self.purged = False
 
-    def initialize_schema(self):
+    def initialize_schema(self, *, statement_timeout_ms=None):
         self.initialized = True
+        self.initialize_statement_timeout_ms = statement_timeout_ms
 
     def schema_status(self):
         return {"schema": "pelagia", "ready": True, "missing_tables": []}
 
-    def purge_all(self, *, exact_counts=True):
+    def purge_all(self, *, exact_counts=True, preserve_migrations=True):
         self.purged = True
         return {
             "schema": "pelagia",
             "total_rows_deleted": 0 if exact_counts else None,
             "exact_counts_collected": exact_counts,
+            "preserved_tables": ["schema_migrations"] if preserve_migrations else [],
         }
 
     def create_user(self, username, **kwargs):
@@ -258,12 +261,15 @@ def test_cli_reset_allows_projectless_system_without_kvstore(monkeypatch):
     assert body["deleted"] is True
     assert body["database"]["total_rows_deleted"] is None
     assert body["database"]["exact_counts_collected"] is False
+    assert body["database"]["schema_initialized"] is True
+    assert body["database"]["preserved_tables"] == []
     assert body["kvstores"] == {
         "project_count": 0,
         "reset_count": 0,
         "results": [],
     }
-    assert repo.initialized is False
+    assert repo.initialized is True
+    assert repo.initialize_statement_timeout_ms == 0
     assert repo.purged is True
 
 

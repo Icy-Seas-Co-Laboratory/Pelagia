@@ -291,14 +291,18 @@ class PostgresRepository:
                     sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
                 )
 
-    def initialize_schema(self) -> None:
+    def initialize_schema(self, *, statement_timeout_ms: int | None = None) -> None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                if self.config.database.statement_timeout_ms > 0:
-                    cursor.execute(
-                        "SELECT set_config('statement_timeout', %s, true)",
-                        (str(self.config.database.statement_timeout_ms),),
-                    )
+                timeout_ms = (
+                    self.config.database.statement_timeout_ms
+                    if statement_timeout_ms is None
+                    else max(0, int(statement_timeout_ms))
+                )
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (str(timeout_ms),),
+                )
                 cursor.execute(render_schema(self.schema))
                 self._apply_migrations(cursor)
             connection.commit()
@@ -467,7 +471,12 @@ class PostgresRepository:
             "migrations": migrations,
         }
 
-    def purge_all(self, *, exact_counts: bool = True) -> dict[str, Any]:
+    def purge_all(
+        self,
+        *,
+        exact_counts: bool = True,
+        preserve_migrations: bool = True,
+    ) -> dict[str, Any]:
         """Delete all Pelagia rows while preserving the schema, indexes, and functions.
 
         Destructive maintenance must not inherit the statement timeout used to
@@ -475,25 +484,42 @@ class PostgresRepository:
         also omit the pre-reset ``COUNT(*)`` scans, which are informational and
         can be substantially slower than the ``TRUNCATE`` itself.
         """
-        tables = [table for table in REQUIRED_SCHEMA_TABLES if table != "schema_migrations"]
+        requested_tables = [
+            table
+            for table in REQUIRED_SCHEMA_TABLES
+            if not preserve_migrations or table != "schema_migrations"
+        ]
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SET LOCAL statement_timeout = 0")
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = ANY(%s)
+                    """,
+                    (self.schema, requested_tables),
+                )
+                existing = {row["table_name"] for row in cursor.fetchall()}
+                tables = [table for table in requested_tables if table in existing]
                 before: dict[str, int] | None = None
                 if exact_counts:
                     before = {}
                     for table in tables:
                         cursor.execute(f"SELECT COUNT(*) AS count FROM {self.schema}.{table}")
                         before[table] = cursor.fetchone()["count"]
-                table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
-                cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
+                if tables:
+                    table_list = ", ".join(f"{self.schema}.{table}" for table in tables)
+                    cursor.execute(f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE")
             connection.commit()
         return {
             "schema": self.schema,
             "tables": before,
             "total_rows_deleted": None if before is None else sum(before.values()),
             "exact_counts_collected": exact_counts,
-            "preserved_tables": ["schema_migrations"],
+            "purged_tables": tables,
+            "missing_tables": [table for table in requested_tables if table not in existing],
+            "preserved_tables": ["schema_migrations"] if preserve_migrations else [],
         }
 
     def create_user(

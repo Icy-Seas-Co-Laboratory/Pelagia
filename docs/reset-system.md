@@ -23,7 +23,10 @@ projects or stores is valid and resets PostgreSQL normally.
 Database reset uses `TRUNCATE` and does not scan large tables to calculate an
 exact deleted-row count. The result therefore reports `total_rows_deleted` as
 `null` and `exact_counts_collected` as `false`. This keeps reset time dependent
-primarily on lock acquisition rather than database size.
+primarily on lock acquisition rather than database size. If the installed
+schema is incomplete or from an older version, reset purges the tables that
+already exist, clears the migration ledger, and replays the idempotent schema
+migrations on the empty database without a statement timeout.
 
 ## Development Reset
 
