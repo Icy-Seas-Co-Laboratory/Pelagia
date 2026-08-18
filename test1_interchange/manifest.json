@@ -1,0 +1,622 @@
+{
+  "calibration": [],
+  "created_at": "2026-08-18T23:00:07.063665Z",
+  "dataset_uuid": "ceb2bc95-6bfe-42bd-aa8a-2280a829f950",
+  "extensions": {},
+  "format": "scientific-image-interchange",
+  "format_version": "1.0",
+  "previews": [],
+  "schema_version": "1",
+  "shards": [
+    {
+      "byte_size": 528089088,
+      "encoded_bytes": 518822986,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "e5ce1e080fd43389b281409ed755b49b39f1edb435f329c23ded1fb2e245aa52"
+      },
+      "first_frame": 0,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 1012,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000001.sqlite",
+      "shard_uuid": "43bfaaee-f1cf-4ae1-86ee-800c3650e272",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 452329472,
+      "encoded_bytes": 441054959,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "007c144a090e183bda2c5e48e468731719a20f1f1a89648c8e22c3443c82be11"
+      },
+      "first_frame": 1013,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 2025,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000002.sqlite",
+      "shard_uuid": "43157335-af55-4991-95d4-109e62328e93",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 357498880,
+      "encoded_bytes": 352756649,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "4fe1fd548adeea8bbd174a8fb8f89b5cc72e4143dbfd4793522ad158950eb055"
+      },
+      "first_frame": 2026,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 3038,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000003.sqlite",
+      "shard_uuid": "34868e49-ff19-4af8-95aa-dc5cc26fc7ba",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 551747584,
+      "encoded_bytes": 541748509,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "9121af67e9b617b45915a46c5d7714a90e4a86d23f7af3b4092188155568479e"
+      },
+      "first_frame": 3039,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 4051,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000004.sqlite",
+      "shard_uuid": "e4c013e7-c719-45bd-90f0-46aa2dae4b1d",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 457572352,
+      "encoded_bytes": 444736446,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "82f76bd89e430e391344018abbaa9022b2b7f731d0a85b5f94f4d669f768ad99"
+      },
+      "first_frame": 4052,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 5064,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000005.sqlite",
+      "shard_uuid": "35a2713e-092c-4746-b66a-2cd4ac040b98",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 422445056,
+      "encoded_bytes": 411203329,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "810d6730a203d4628924bc84db45df89d708b4b8d280a56f0c74e085f4b03bfb"
+      },
+      "first_frame": 5065,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 6077,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000006.sqlite",
+      "shard_uuid": "5873b570-eb68-4176-ad4a-0f68bbf93ac2",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 462028800,
+      "encoded_bytes": 445828357,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "48da7a1aca492e1767e800c5faa6ad8f7abc43790856f1aaf23ab1f7562b5ba3"
+      },
+      "first_frame": 6078,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 7090,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000007.sqlite",
+      "shard_uuid": "2f6f5d8a-b26e-40d8-a716-1f92719ed826",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 213123072,
+      "encoded_bytes": 205490944,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "976056dfc5d2e522cda456a76ae7bb174e01b86a518a0926972f91fd0a8e6a16"
+      },
+      "first_frame": 7091,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 8103,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000008.sqlite",
+      "shard_uuid": "064187a9-0929-4dec-a7a0-d57eceb1c689",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 405536768,
+      "encoded_bytes": 394865313,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "24891acb4072274b6288236133573430ac5bf5fbed2c87c57be8bc87b93184be"
+      },
+      "first_frame": 8104,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 9116,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000009.sqlite",
+      "shard_uuid": "a2c57572-ec7a-43aa-b2ea-b4d1eddb14dc",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 214106112,
+      "encoded_bytes": 204438914,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "de00bf04e865d2609eda0b830f062c9acaaeaf9c816c15393015a923af63986b"
+      },
+      "first_frame": 9117,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 10129,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000010.sqlite",
+      "shard_uuid": "ba5dcee7-ebec-45f4-b06f-51aede285475",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 615710720,
+      "encoded_bytes": 601034386,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "6f133887d600aad829c52cf37612a139f79682813008ede0791ce74f1bcc3856"
+      },
+      "first_frame": 10130,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 11142,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000011.sqlite",
+      "shard_uuid": "865e897c-ce93-4f42-b16d-d9685890678c",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 298516480,
+      "encoded_bytes": 288991411,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "0155562ec9f4c3fbada64532014d1a810eef8af2da9d3a765623bca6a23a3c76"
+      },
+      "first_frame": 11143,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 12155,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000012.sqlite",
+      "shard_uuid": "88849bbc-fcd6-4b49-a96e-1a247d61ff7e",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 375980032,
+      "encoded_bytes": 362389018,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "9790557ef7d4263e4f880c6e5c154943e1d291290f9e6e452a835f78c18ae079"
+      },
+      "first_frame": 12156,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 13168,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000013.sqlite",
+      "shard_uuid": "a1477efc-57c0-4f43-b290-80d484e5f0d6",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    },
+    {
+      "byte_size": 375980032,
+      "encoded_bytes": 362389018,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "shard_file",
+        "value": "5930a37c1bcdecb2cd528c189e65c860d8f4943e379b4ffa3c807616ea8d5df9"
+      },
+      "first_frame": 13169,
+      "first_timestamp": null,
+      "frame_count": 1013,
+      "last_frame": 14181,
+      "last_timestamp": null,
+      "relative_path": "data/camera0_000014.sqlite",
+      "shard_uuid": "4057016a-c630-4916-8b69-8024ca2c14c8",
+      "stream_name": "camera0",
+      "stream_uuid": "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+    }
+  ],
+  "software": {
+    "name": "pelagia_interchange",
+    "version": "0.1.0"
+  },
+  "source_files": [
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "426f3b6abd7b1d9303f0375007ebf18b417f864b55c8a154c5b701385b89ec11"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        195311,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/camera1-101-2025-06-27 00-05-29.471.avi",
+      "original_filename": "camera1-101-2025-06-27 00-05-29.471.avi",
+      "original_relative_path": "camera1-101-2025-06-27 00-05-29.471.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 1,
+      "source_uuid": "af5895fa-46c3-475b-a9f1-3f9614bf46ab",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "3252e2b12f533057224afb646c4138cbb56bb921b344b0276180c6037a0b9059"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        195311,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/camera1-15-2025-06-26 22-51-08.753.avi",
+      "original_filename": "camera1-15-2025-06-26 22-51-08.753.avi",
+      "original_relative_path": "camera1-15-2025-06-26 22-51-08.753.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 2,
+      "source_uuid": "430e6546-6b83-4d53-8250-0725737b8d3c",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "8e65cd3aa8c3547c8ce7336c76d40f0cfbc14442a8b1d5b198f6239a9d35d8a0"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+      "original_filename": "Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+      "original_relative_path": "Camera1_VIPF-134-2022-07-22-10-44-29.504.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 3,
+      "source_uuid": "bdd8a2a3-919a-4917-a79e-92dd32ec8d3d",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "95df3bbb10ae6e7d9f4f4868dfb20e74968a663e0d945810f085fc257a3524d9"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+      "original_filename": "Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+      "original_relative_path": "Camera1_VIPF-19-2022-07-21-18-40-40.692.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 4,
+      "source_uuid": "b4f9936c-40ec-4c49-9658-f6265868e43f",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "2900e19a18425e1c10ddc9be8c08ed54d50cc2d00d7805b5c1d315fda0f512ee"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+      "original_filename": "Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+      "original_relative_path": "Camera1_VIPF-2-2022-07-21-18-26-41.291.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 5,
+      "source_uuid": "049d78fa-fa21-421f-a9d5-b302322b2124",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "b7f64f9328685f2e8b3ea735100d9b1791bd27d9395cc37378b2f0b2dbb243e3"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+      "original_filename": "Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+      "original_relative_path": "Camera1_VIPF-233-2022-07-22-20-30-23.277.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 6,
+      "source_uuid": "8d5d0b1e-8a96-41cc-8cc5-ebd9a23f96e8",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "f9ef72128ac03a0122cad0f91bfeea83273a5e8360f6b8fb4fa5048de5561584"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+      "original_filename": "Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+      "original_relative_path": "Camera2_VIPF-184-2022-07-22-06-41-36.518.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 7,
+      "source_uuid": "156d2e7a-cef6-492b-8ce2-16d17a1e4632",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "72edc5689ab138f730728420259be90896392a178b8cfe6b48aa09d2ffc2e9e3"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera2_VIPF-256-2022-07-22-02-57-53.315.avi",
+      "original_filename": "Camera2_VIPF-256-2022-07-22-02-57-53.315.avi",
+      "original_relative_path": "Camera2_VIPF-256-2022-07-22-02-57-53.315.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 8,
+      "source_uuid": "defa14c5-695f-469f-8b4e-8147b5db4402",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "4950072d242225a3093134ec5185a5455cc9ff02cce8a394ec6cc9d4e467941a"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera2_VIPF-285-2022-07-22-08-04-43.574.avi",
+      "original_filename": "Camera2_VIPF-285-2022-07-22-08-04-43.574.avi",
+      "original_relative_path": "Camera2_VIPF-285-2022-07-22-08-04-43.574.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 9,
+      "source_uuid": "0c60b2a0-e776-4f1e-b900-794fd0ec20a4",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "9848270d43ab5e71794ef5ccb5d448f0fc540d7b90a7dbbf8516d2f05a28238d"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera2_VIPF-9-2022-07-22-04-17-35.635.avi",
+      "original_filename": "Camera2_VIPF-9-2022-07-22-04-17-35.635.avi",
+      "original_relative_path": "Camera2_VIPF-9-2022-07-22-04-17-35.635.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 10,
+      "source_uuid": "fd38a283-c02c-4675-80df-becc9829f360",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "8456654796dd7df565f528b78b94b3a13ac77c2f0a84f2a12b8c83a17b7fc546"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera3_VIPF-30-2022-07-21-18-49-43.780.avi",
+      "original_filename": "Camera3_VIPF-30-2022-07-21-18-49-43.780.avi",
+      "original_relative_path": "Camera3_VIPF-30-2022-07-21-18-49-43.780.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 11,
+      "source_uuid": "0b48d1df-7a27-4df0-98e4-999cefa29f13",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "70e5bf5fb8ebb2cd4283e07cb8629b41181ca007cece3517cad64b6c2129f622"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera3_VIPF-306-2022-07-21-22-36-51.647.avi",
+      "original_filename": "Camera3_VIPF-306-2022-07-21-22-36-51.647.avi",
+      "original_relative_path": "Camera3_VIPF-306-2022-07-21-22-36-51.647.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 12,
+      "source_uuid": "c8f16b1f-1d7e-4f28-884a-404175efe33f",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "7a6c50484b45e78e2b35233fe83fe56ddd0fc6512e5b4c4fa5a96f4bc868ec6d"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera3_VIPF-342-2022-07-22-22-00-05.291.avi",
+      "original_filename": "Camera3_VIPF-342-2022-07-22-22-00-05.291.avi",
+      "original_relative_path": "Camera3_VIPF-342-2022-07-22-22-00-05.291.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 13,
+      "source_uuid": "9e5650f2-c398-4465-872e-262e3f860931",
+      "start_timestamp": null,
+      "width": 2048
+    },
+    {
+      "byte_size": 4248842240,
+      "codec": "rawvideo",
+      "container": "avi",
+      "end_timestamp": null,
+      "file_hash": {
+        "algorithm": "sha256",
+        "target": "source_file",
+        "value": "7a6c50484b45e78e2b35233fe83fe56ddd0fc6512e5b4c4fa5a96f4bc868ec6d"
+      },
+      "frame_count": 1013,
+      "frame_rate": [
+        205159,
+        10000
+      ],
+      "height": 2048,
+      "original_absolute_path": "/Users/tbkelly/Documents/GitHub/Pelagia/data/import/test1/Camera3_VIPF-342-2022-07-22-22-00-05.292.avi",
+      "original_filename": "Camera3_VIPF-342-2022-07-22-22-00-05.292.avi",
+      "original_relative_path": "Camera3_VIPF-342-2022-07-22-22-00-05.292.avi",
+      "pixel_format": "pal8",
+      "source_file_id": 14,
+      "source_uuid": "17a60f26-1edb-4485-b177-272e1ee5ef0c",
+      "start_timestamp": null,
+      "width": 2048
+    }
+  ],
+  "state": "complete",
+  "validation": {}
+}

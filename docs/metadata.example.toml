@@ -1,0 +1,96 @@
+# Scientific Image Interchange metadata schema version 1.
+# Omit unknown values; never substitute apparent precision for documented accuracy.
+[schema]
+name = "scientific-image-interchange-metadata"
+version = "1"
+
+[dataset]
+title = "Deployment 042"
+description = "Retained grayscale imagery from a pelagic camera deployment."
+project = "Example plankton survey"
+license = "CC-BY-4.0"
+citation = "Example Team (2026), Deployment 042 imagery"
+doi = "10.example/example"
+accession = "EXAMPLE-042"
+embargo_until = "2027-01-01"
+data_use_restrictions = "No additional restrictions after embargo."
+acknowledgments = "Collected aboard RV Example."
+
+[collection]
+start = "2026-07-14T20:10:00Z"
+end = "2026-07-14T22:32:00Z"
+geographic_region = "Gulf of Alaska"
+latitude_min = 57.1
+latitude_max = 57.4
+longitude_min = -149.8
+longitude_max = -149.2
+depth_min_m = 0.0
+depth_max_m = 120.0
+
+[expedition]
+name = "Example Cruise 2026"
+station = "Station 12"
+vessel = "RV Example"
+platform = "towed imaging platform"
+
+[[investigators]]
+name = "Example Investigator"
+role = "principal investigator"
+institution = "Example Ocean Institute"
+email = "investigator@example.org"
+
+[[funding]]
+funder = "Example Foundation"
+award = "EF-2026-42"
+
+[[deployments]]
+deployment_uuid = "e35c913e-5b75-4ccc-9634-d166ca8c7bb0"
+name = "Deployment 042"
+notes = "Clock synchronization was checked immediately before launch."
+
+[[instruments]]
+instrument_uuid = "dbe738f0-e048-48b7-a126-15faba20e77b"
+name = "Example Imaging Instrument"
+manufacturer = "Example Instruments"
+model = "EII-1"
+
+[[instruments.cameras]]
+stream_uuid = "14317b6f-4a23-47c8-ac9a-9af570033a69"
+name = "port"
+serial_number = "CAM-0042"
+sensor = "monochrome CMOS"
+lens = "50 mm"
+illumination = "strobed LED"
+exposure_us = 250
+gain_db = 3.0
+field_of_view_mm = [80.0, 60.0]
+pixel_scale_um_per_pixel = 31.25
+
+[[streams]]
+stream_uuid = "14317b6f-4a23-47c8-ac9a-9af570033a69"
+name = "port"
+frame_rate_num = 60
+frame_rate_den = 1
+storage_description = "JPEG quality 90, 8-bit grayscale"
+
+[streams.timestamp]
+source = "video PTS"
+clock_source = "acquisition-computer clock"
+timezone = "UTC"
+utc_conversion = "host clock recorded as UTC at acquisition"
+precision_ns = 1000000
+synchronization_method = "pre-deployment comparison to GNSS clock"
+known_offset_ns = 12000000
+known_drift_ppb = 20.0
+interpolated = false
+
+[[calibrations]]
+kind = "lens_distortion"
+relative_path = "calibration/port_lens.json"
+instrument_uuid = "dbe738f0-e048-48b7-a126-15faba20e77b"
+description = "Brown-Conrady parameters derived 2026-06-30."
+
+# Organization-specific fields are isolated and preserved verbatim.
+[extensions.example_org]
+internal_campaign_code = "GOA26"
+

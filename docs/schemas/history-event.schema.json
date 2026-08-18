@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:scientific-image-interchange:schema:history-event:1",
+  "title": "Scientific Image Interchange history event",
+  "type": "object",
+  "required": ["event_schema_version", "event_uuid", "timestamp", "operation", "software", "software_version", "parameters", "inputs", "outputs", "environment", "status"],
+  "properties": {
+    "event_schema_version": {"const": "1"}, "event_uuid": {"type": "string", "format": "uuid"},
+    "timestamp": {"type": "string", "format": "date-time"}, "operation": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "software": {"type": "string"}, "software_version": {"type": "string"}, "git_commit": {"type": ["string", "null"]},
+    "operator": {"type": ["string", "null"]}, "parameters": {"type": "object"}, "inputs": {"type": "array"},
+    "outputs": {"type": "array"}, "environment": {"type": "object"}, "status": {"enum": ["success", "failed", "warning", "started"]},
+    "message": {"type": ["string", "null"]}
+  },
+  "additionalProperties": true
+}

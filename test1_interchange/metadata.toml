@@ -1,0 +1,23 @@
+investigators = []
+instruments = []
+deployments = []
+funding = []
+
+[schema]
+name = "scientific-image-interchange-metadata"
+version = "1"
+
+[dataset]
+title = "test1"
+description = "a standardized test set for pelagia dev."
+
+[extensions]
+
+[[streams]]
+stream_uuid = "531d1dd3-1ad7-59bd-a303-c79ca9ca5d33"
+name = "camera0"
+storage_description = "FFmpeg MJPEG qscale 3, grayscale"
+
+[streams.timestamp]
+source = "unknown"
+interpolated = false

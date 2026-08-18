@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:scientific-image-interchange:schema:manifest:1",
+  "title": "Scientific Image Interchange manifest",
+  "type": "object",
+  "required": ["format", "format_version", "schema_version", "dataset_uuid", "created_at", "state", "shards", "source_files", "software", "validation"],
+  "properties": {
+    "format": {"const": "scientific-image-interchange"},
+    "format_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "schema_version": {"const": "1"},
+    "dataset_uuid": {"type": "string", "format": "uuid"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "state": {"enum": ["building", "finalizing", "complete", "verified", "modified"]},
+    "shards": {"type": "array", "items": {"$ref": "#/$defs/shard"}},
+    "source_files": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+    "calibration": {"type": "array", "items": {"$ref": "#/$defs/resource"}},
+    "previews": {"type": "array", "items": {"$ref": "#/$defs/resource"}},
+    "software": {"type": "object"},
+    "validation": {"type": "object"},
+    "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "hash": {
+      "type": "object",
+      "required": ["algorithm", "target", "value"],
+      "properties": {"algorithm": {"type": "string"}, "target": {"type": "string"}, "value": {"type": "string"}},
+      "additionalProperties": true
+    },
+    "shard": {
+      "type": "object",
+      "required": ["shard_uuid", "relative_path", "byte_size", "file_hash", "stream_uuid", "stream_name", "first_frame", "last_frame", "frame_count", "first_timestamp", "last_timestamp"],
+      "properties": {
+        "shard_uuid": {"type": "string", "format": "uuid"}, "relative_path": {"type": "string"},
+        "byte_size": {"type": "integer", "minimum": 0}, "file_hash": {"$ref": "#/$defs/hash"},
+        "stream_uuid": {"type": "string", "format": "uuid"}, "stream_name": {"type": "string"},
+        "first_frame": {"type": ["integer", "null"]}, "last_frame": {"type": ["integer", "null"]},
+        "frame_count": {"type": "integer", "minimum": 0}, "first_timestamp": {"type": ["integer", "null"]},
+        "last_timestamp": {"type": ["integer", "null"]}, "encoded_bytes": {"type": "integer", "minimum": 0}
+      }, "additionalProperties": true
+    },
+    "source": {
+      "type": "object", "required": ["source_file_id", "source_uuid", "original_filename"],
+      "properties": {"source_file_id": {"type": "integer", "minimum": 1}, "source_uuid": {"type": "string", "format": "uuid"}, "original_filename": {"type": "string"}, "file_hash": {"anyOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]}},
+      "additionalProperties": true
+    },
+    "resource": {
+      "type": "object", "required": ["relative_path", "byte_size", "file_hash"],
+      "properties": {"relative_path": {"type": "string"}, "byte_size": {"type": "integer", "minimum": 0}, "file_hash": {"$ref": "#/$defs/hash"}},
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

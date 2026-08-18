@@ -4,6 +4,24 @@
 
 # Pelagia
 
+## Archival image interchange
+
+The repository includes the independent `pelagia_interchange` Python 3.11+ package for portable, archival scientific-image datasets. It has no required third-party dependencies and installs separately with `pip install ./pelagia_interchange`; its command is `pii`.
+
+Create and verify a dataset directly from a directory of videos:
+
+```bash
+python -m pip install ./pelagia_interchange
+pii create deployment_042 \
+  --from-videos /acquisition/deployment_042 \
+  --title "Deployment 042" \
+  --stream port
+pii inspect deployment_042
+pii verify deployment_042 --level structural
+```
+
+FFmpeg and FFprobe are used only during automatic creation; reading and verification retain their standard-library dependency profile. Consecutive videos fill the current shard by default, while `--source-file-boundary` enables source-aligned shards. Creation also generates a bounded, checksummed set of non-authoritative thumbnails, a contact sheet, and a frame/source provenance index; use `--no-previews` to disable it. Run `pii create --interactive` for a guided workflow. The complete [creation walkthrough](docs/interchange-usage.md#create-your-first-dataset), [normative format specification](docs/interchange-specification.md), and [annotated metadata example](docs/metadata.example.toml) provide further detail.
+
 Pelagia is a scalable image-analysis system for extracting, segmenting, organizing, labeling, and training models on biological image data. It is built around video-frame ingestion, ROI-first processing, durable metadata, background workers, and reproducible data products.
 
 <p align="center">

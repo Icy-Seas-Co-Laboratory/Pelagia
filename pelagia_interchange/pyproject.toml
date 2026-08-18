@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pelagia-interchange"
+version = "0.1.0"
+description = "Portable archival interchange for scientific image datasets"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+blake3 = ["blake3>=0.4"]
+xxh3 = ["xxhash>=3.4"]
+test = ["pytest>=8"]
+
+[project.scripts]
+pii = "pelagia_interchange.cli:main"
+
+[tool.setuptools]
+packages = ["pelagia_interchange", "pelagia_interchange.bundled_tools"]
+package-dir = {pelagia_interchange = ".", "pelagia_interchange.bundled_tools" = "bundled_tools"}
+
+[tool.setuptools.package-data]
+"pelagia_interchange.bundled_tools" = ["README.md"]
+

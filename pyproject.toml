@@ -29,9 +29,10 @@ test = ["pytest"]
 
 [project.scripts]
 pelagia = "Pelagia.cli.app:main"
+pii = "pelagia_interchange.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["Pelagia*"]
+include = ["Pelagia*", "pelagia_interchange*"]
 
 [tool.setuptools.package-data]
 "Pelagia" = [
@@ -39,6 +40,7 @@ include = ["Pelagia*"]
     "assets/**/*",
 ]
 "Pelagia.storage" = ["sql/*.sql"]
+"pelagia_interchange.bundled_tools" = ["README.md"]
 
 [tool.setuptools.exclude-package-data]
 "Pelagia" = [
