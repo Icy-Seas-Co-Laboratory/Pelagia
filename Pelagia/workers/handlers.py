@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from ..domain import DetectionRecord, FrameRecord, JobStatus, PipelineStage
+from ..domain import AssetKind, DetectionRecord, FrameRecord, JobStatus, PipelineStage
 from ..domain import normalize_collections
 from ..processing import ingest as ingest_module
 from ..processing.classification import (
@@ -330,7 +330,17 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     source_is_folder = Path(str(source_path)).expanduser().is_dir()
     asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
-    if source_is_folder or asset_kind == "image_sequence":
+    if asset_kind == AssetKind.INTERCHANGE.value:
+        frame_rows = ingest_module.ingest_interchange_dataset(
+            source_path,
+            context=context,
+            run_id=run_id,
+            asset_id=asset_id,
+            metadata=metadata,
+            progress_callback=report_ingest_progress,
+            frame_stored_callback=None if background_addon is None else background_addon.consume,
+        )
+    elif source_is_folder or asset_kind == "image_sequence":
         frame_rows = ingest_module.ingest_image_folder(
             source_path,
             recursive=bool(payload.get("recursive", False)),

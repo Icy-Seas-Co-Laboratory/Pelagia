@@ -66,6 +66,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0006_registry_workspaces",
         "0007_registry_generation",
         "0008_registry_item_geometry",
+        "0009_interchange_ingestion",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -115,8 +116,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 8
-    assert status["migrations"]["applied_count"] == 8
+    assert status["migrations"]["available_count"] == 9
+    assert status["migrations"]["applied_count"] == 9
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 

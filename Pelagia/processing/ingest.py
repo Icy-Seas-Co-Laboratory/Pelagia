@@ -6,16 +6,19 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from ..domain import AssetKind
 from ..services.context import AppContext
 from ._logging import log_processing_event, processing_core_logger
 from .defaults import default_processing_config
 from .frame_model import FrameData
+from .frame_codec import decode_array_payload
 from .frame_store import store_frame
 from .frame_time import parse_filename_timestamp_utc, timestamp_for_frame
 from .timing import measure_phase
@@ -328,6 +331,14 @@ def is_supported_video_file(path: str | os.PathLike[str]) -> bool:
     return Path(path).suffix.lower() in VIDEO_FRAME_EXTENSIONS
 
 
+def is_interchange_dataset(path: str | os.PathLike[str]) -> bool:
+    root = Path(path)
+    return root.is_dir() and all(
+        (root / name).is_file()
+        for name in ("manifest.json", "metadata.toml", "history.jsonl", "checksums.sha256")
+    ) and (root / "data").is_dir()
+
+
 def _direct_image_files(folder_path: Path) -> list[Path]:
     return sorted(
         (
@@ -363,6 +374,8 @@ def discover_ingest_sources(
 
     if not root.is_dir():
         raise ValueError(f"Ingest path is neither a file nor a directory: {root}")
+    if is_interchange_dataset(root):
+        return [IngestSource(path=root, kind=AssetKind.INTERCHANGE.value)]
 
     sources: list[IngestSource] = []
     folders = [root]
@@ -435,6 +448,16 @@ def ingest(
         )
 
     source = sources[0]
+    if source.kind == AssetKind.INTERCHANGE.value:
+        return ingest_interchange_dataset(
+            source.path,
+            context=context,
+            run_id=run_id,
+            asset_id=asset_id,
+            metadata=metadata,
+            progress_callback=progress_callback,
+            frame_stored_callback=frame_stored_callback,
+        )
     if source.kind == "image_sequence":
         return ingest_image_folder(
             source.path,
@@ -462,6 +485,255 @@ def ingest(
             frame_stored_callback=frame_stored_callback,
         )
     raise ValueError(f"Unsupported ingest source kind: {source.kind!r}")
+
+
+def _iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _source_frame_rate(source: dict[str, Any]) -> tuple[float, float] | None:
+    rational_rate = source.get("frame_rate") or ()
+    numerator = source.get("frame_rate_num") or (
+        rational_rate[0] if isinstance(rational_rate, (list, tuple)) and len(rational_rate) == 2 else None
+    )
+    denominator = source.get("frame_rate_den") or (
+        rational_rate[1] if isinstance(rational_rate, (list, tuple)) and len(rational_rate) == 2 else None
+    )
+    try:
+        if float(numerator) > 0 and float(denominator) > 0:
+            return float(numerator), float(denominator)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _interchange_captured_at(
+    record: Any,
+    source: dict[str, Any],
+    *,
+    fallback_start: datetime | None = None,
+    fallback_source: str | None = None,
+) -> tuple[datetime | None, str | None]:
+    timestamp_ns = getattr(record, "timestamp_ns", None)
+    timezone_name = str(getattr(record, "timezone", "") or "").upper()
+    utc_conversion = getattr(record, "utc_conversion", None)
+    if timestamp_ns is not None and (timezone_name in {"UTC", "Z", "+00:00"} or utc_conversion):
+        try:
+            return datetime.fromtimestamp(int(timestamp_ns) / 1_000_000_000, tz=timezone.utc), "interchange.timestamp_ns"
+        except (OverflowError, OSError, ValueError):
+            pass
+
+    start = _iso_datetime(source.get("start_timestamp"))
+    inference = "interchange.source_start_timestamp"
+    if start is None:
+        start = parse_filename_timestamp_utc(str(source.get("original_filename") or ""))
+        inference = "interchange.original_filename"
+    if start is None and fallback_start is not None:
+        start = fallback_start
+        inference = fallback_source or "interchange.dataset_metadata"
+    rate = _source_frame_rate(source)
+    if start is not None and rate is not None:
+        numerator, denominator = rate
+        seconds = int(record.source_frame_number) * float(denominator) / numerator
+        return start + timedelta(seconds=seconds), inference
+    return start, inference if start is not None else None
+
+
+def ingest_interchange_dataset(
+    dataset_path: str | os.PathLike[str],
+    *,
+    context: AppContext | None = None,
+    run_id: str | None = None,
+    asset_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    progress_callback: IngestProgressCallback | None = None,
+    frame_stored_callback: IngestFrameStoredCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Import a complete pelagia_interchange package without re-encoding native payloads."""
+    from pelagia_interchange import Dataset, FrameStatus
+
+    root = Path(dataset_path).expanduser().resolve()
+    dataset = Dataset.open(root)
+    source_files = {
+        int(source["source_file_id"]): dict(source)
+        for source in dataset.manifest.source_files
+    }
+    total = dataset.frame_count
+    base_metadata = dict(metadata or {})
+    base_metadata.pop("pelagia_interchange", None)
+    dataset_uuid = str(dataset.manifest.dataset_uuid)
+    base_metadata.update({
+        "source_type": AssetKind.INTERCHANGE.value,
+        "source_path": str(root),
+        "pelagia_interchange_dataset_uuid": dataset_uuid,
+        "pelagia_interchange_format_version": dataset.manifest.format_version,
+        "pelagia_interchange_schema_version": dataset.manifest.schema_version,
+        "pelagia_interchange_metadata_ref": "raw_assets.metadata.pelagia_interchange.metadata",
+    })
+    if run_id is not None:
+        base_metadata["run_id"] = run_id
+    if asset_id is not None:
+        base_metadata["asset_id"] = asset_id
+
+    dataset_start = _iso_datetime(base_metadata.get("source_timestamp_utc"))
+    dataset_start_source = "asset_metadata.source_timestamp_utc"
+    if dataset_start is None:
+        dataset_start = _iso_datetime(
+            (dataset.metadata.data.get("collection") or {}).get("start")
+        )
+        dataset_start_source = "interchange.metadata.collection.start"
+    inferred_source_starts: dict[int, datetime] = {}
+    inferred_source_start_sources: dict[int, str] = {}
+    current_start = dataset_start
+    current_start_source = dataset_start_source
+    for source_id in sorted(source_files):
+        source = source_files[source_id]
+        explicit_start = _iso_datetime(source.get("start_timestamp")) or parse_filename_timestamp_utc(
+            str(source.get("original_filename") or "")
+        )
+        source_start = explicit_start or current_start
+        if source_start is not None:
+            inferred_source_starts[source_id] = source_start
+            inferred_source_start_sources[source_id] = (
+                "interchange.source_start_or_filename"
+                if explicit_start is not None
+                else current_start_source
+            )
+        rate = _source_frame_rate(source)
+        frame_count = int(source.get("frame_count") or 0)
+        if source_start is not None and rate is not None and frame_count > 0:
+            numerator, denominator = rate
+            current_start = source_start + timedelta(seconds=frame_count * float(denominator) / numerator)
+            current_start_source = "interchange.sequential_source_frame_rates"
+        else:
+            current_start = None
+
+    _emit_ingest_progress(progress_callback, "started", {
+        "source_path": str(root), "source_frame_count": total,
+        "source_frames_read": 0, "stored_frame_count": 0,
+    })
+    stored_frames: list[dict[str, Any]] = []
+    skipped = 0
+    processed = 0
+    for shard, reader in dataset.iter_shards():
+        stream_name = str(shard.get("stream_name") or shard.get("stream_uuid") or "camera")
+        stream_uuid = shard.get("stream_uuid")
+        for interchange_frame in reader.iter_frames():
+            processed += 1
+            record = interchange_frame.record
+            if record.status is not FrameStatus.VALID or record.encoded_bytes is None:
+                skipped += 1
+                _emit_ingest_progress(progress_callback, "frame_skipped", {
+                    "source_path": str(root), "source_frame_count": total,
+                    "source_frames_read": processed, "stored_frame_count": len(stored_frames),
+                    "interchange_frame_id": record.frame_id, "status": record.status.value,
+                })
+                continue
+            if record.storage_format is None:
+                raise ValueError(f"Interchange frame {record.frame_id} has no storage format.")
+            source = source_files.get(int(record.source_file_id), {})
+            codec = str(record.storage_format.codec).lower()
+            decode_metadata = {
+                "kvstore_encoding": codec,
+                "shape": [record.height, record.width] if record.height and record.width else None,
+                "dtype": "uint8",
+            }
+            try:
+                image = decode_array_payload(record.encoded_bytes, decode_metadata)
+            except Exception:
+                decoded = cv2.imdecode(np.frombuffer(record.encoded_bytes, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                if decoded is None:
+                    raise ValueError(
+                        f"Interchange frame {record.frame_id} codec {codec!r} could not be decoded."
+                    )
+                image = np.ascontiguousarray(decoded)
+            captured_at, captured_at_source = _interchange_captured_at(
+                record,
+                source,
+                fallback_start=inferred_source_starts.get(int(record.source_file_id)),
+                fallback_source=inferred_source_start_sources.get(int(record.source_file_id)),
+            )
+            source_filename = str(source.get("original_filename") or f"source-{record.source_file_id}")
+            frame_metadata = {
+                **base_metadata,
+                "frame_index": len(stored_frames) + 1,
+                "interchange": {
+                    "dataset_uuid": dataset_uuid,
+                    "frame_id": record.frame_id,
+                    "source_file_id": record.source_file_id,
+                    "source_uuid": source.get("source_uuid"),
+                    "source_frame_number": record.source_frame_number,
+                    "stream_name": stream_name,
+                    "stream_uuid": stream_uuid,
+                    "status": record.status.value,
+                    "blob_hash": None if record.blob_hash is None else record.blob_hash.to_dict(),
+                    "storage_format": {
+                        "codec": record.storage_format.codec,
+                        "quality": record.storage_format.quality,
+                        "pixel_format": record.storage_format.pixel_format,
+                        "bit_depth": record.storage_format.bit_depth,
+                        "encoder": record.storage_format.encoder,
+                        "encoder_version": record.storage_format.encoder_version,
+                        "parameters": dict(record.storage_format.parameters),
+                    },
+                    "timestamp": {
+                        "timestamp_ns": record.timestamp_ns,
+                        "source_timestamp_ns": record.source_timestamp_ns,
+                        "source": record.timestamp_source,
+                        "clock_source": record.clock_source,
+                        "timezone": record.timezone,
+                        "utc_conversion": record.utc_conversion,
+                        "precision_ns": record.timestamp_precision_ns,
+                        "synchronization_method": record.synchronization_method,
+                        "known_offset_ns": record.known_offset_ns,
+                        "known_drift_ppb": record.known_drift_ppb,
+                        "interpolated": record.interpolated,
+                        "captured_at_source": captured_at_source,
+                    },
+                },
+            }
+            normalized_codec = {"jpeg": "jpg"}.get(codec, codec)
+            passthrough = normalized_codec in {"jpg", "png", "jxl", "jxs"}
+            stored_row = store_frame(
+                FrameData(
+                    sourcePath=str(root), filename=source_filename,
+                    frameNumber=int(record.source_frame_number), data=image,
+                    tileNumber=len(stored_frames) + 1,
+                    sourceFrameStart=int(record.source_frame_number),
+                    sourceFrameEnd=int(record.source_frame_number),
+                    frameType="interchange", timestamp=captured_at,
+                    width=record.width, height=record.height,
+                    metadata=frame_metadata,
+                ),
+                context=context,
+                encoded_payload=record.encoded_bytes if passthrough else None,
+                encoded_encoding=normalized_codec if passthrough else None,
+                encoded_format=normalized_codec if passthrough else None,
+            )
+            stored_frames.append(stored_row)
+            if frame_stored_callback is not None:
+                frame_stored_callback(stored_row, image)
+            _emit_ingest_progress(progress_callback, "frame_stored", {
+                "source_path": str(root), "source_frame_count": total,
+                "source_frames_read": processed, "stored_frame_count": len(stored_frames),
+                "frame_index": len(stored_frames), "filename": source_filename,
+                "encoded_payload_passthrough": passthrough,
+            })
+
+    _emit_ingest_progress(progress_callback, "completed", {
+        "source_path": str(root), "source_frame_count": total,
+        "source_frames_read": processed, "stored_frame_count": len(stored_frames),
+        "skipped_frame_count": skipped,
+    })
+    return stored_frames
 
 
 def ingest_image_folder(

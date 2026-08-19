@@ -16,6 +16,7 @@ import cv2
 from ..domain import AssetKind, RawAssetManifest, normalize_collections
 from .ingest import (
     discover_ingest_sources,
+    is_interchange_dataset,
     is_supported_image_file,
     is_supported_video_file,
     list_image_frame_files,
@@ -286,6 +287,70 @@ def analyze_image_sequence_asset(
     )
 
 
+def analyze_interchange_asset(
+    path: Path,
+    *,
+    collections: Any = None,
+    metadata: dict[str, Any] | None = None,
+) -> AnalyzedAsset:
+    """Read package metadata without decoding or hashing every stored frame."""
+    from pelagia_interchange import Dataset
+
+    resolved = path.expanduser().resolve()
+    if not is_interchange_dataset(resolved):
+        raise ValueError(f"Path is not a pelagia_interchange dataset: {resolved}")
+    dataset = Dataset.open(resolved)
+    package_size = sum(item.stat().st_size for item in resolved.rglob("*") if item.is_file())
+    checksum_catalog = resolved / "checksums.sha256"
+    checksum = f"sha256:{sha256_file(checksum_catalog)}"
+    dataset_metadata = dict(dataset.metadata.data)
+    dataset_document = dict(dataset_metadata.get("dataset") or {})
+    inferred_collection = str(
+        dataset_document.get("title") or resolved.name or dataset.manifest.dataset_uuid
+    ).strip()
+    resolved_collections = normalize_collections(
+        collections if collections is not None else [inferred_collection]
+    )
+    summary = dataset.summary()
+    asset_metadata = {
+        **dict(metadata or {}),
+        "analysis_endpoint": "POST /ingestion/analyze",
+        "source_type": AssetKind.INTERCHANGE.value,
+        "checksum_status": "checksum_catalog",
+        "source_frame_count": dataset.frame_count,
+        "pelagia_interchange": {
+            "dataset_uuid": str(dataset.manifest.dataset_uuid),
+            "format": dataset.manifest.format,
+            "format_version": dataset.manifest.format_version,
+            "schema_version": dataset.manifest.schema_version,
+            "state": dataset.manifest.state,
+            "created_at": dataset.manifest.created_at,
+            "summary": summary,
+            "metadata": dataset_metadata,
+            "source_files": list(dataset.manifest.source_files),
+            "extensions": dict(dataset.manifest.extensions),
+            "checksum": {
+                "algorithm": "sha256",
+                "target": "checksums.sha256",
+                "value": checksum.removeprefix("sha256:"),
+            },
+        },
+    }
+    return AnalyzedAsset(
+        asset_id=str(uuid.uuid4()),
+        filename=resolved.name,
+        path=str(resolved),
+        kind=AssetKind.INTERCHANGE.value,
+        size_bytes=package_size,
+        checksum=checksum,
+        checksum_status="checksum_catalog",
+        collections=resolved_collections,
+        media_count=dataset.frame_count,
+        metadata=asset_metadata,
+        warnings=[],
+    )
+
+
 def analyze_ingest_path(
     input_path: str | Path,
     *,
@@ -299,8 +364,13 @@ def analyze_ingest_path(
     if not root.exists():
         raise FileNotFoundError(root)
     normalized_kind = str(kind or "auto").lower()
-    if normalized_kind not in {"auto", "video", "image_sequence"}:
-        raise ValueError("kind must be one of: auto, video, image_sequence.")
+    if normalized_kind not in {"auto", "video", "image_sequence", "interchange"}:
+        raise ValueError("kind must be one of: auto, video, image_sequence, interchange.")
+
+    if normalized_kind == "interchange" or (
+        normalized_kind == "auto" and is_interchange_dataset(root)
+    ):
+        return [analyze_interchange_asset(root, collections=collections, metadata=metadata)]
 
     if normalized_kind == "video":
         if not root.is_file() or not is_supported_video_file(root):
@@ -340,6 +410,14 @@ def analyze_ingest_path(
                     recursive=source.recursive,
                     collections=collections,
                     compute_checksum=compute_checksum,
+                    metadata=metadata,
+                )
+            )
+        elif source.kind == AssetKind.INTERCHANGE.value:
+            assets.append(
+                analyze_interchange_asset(
+                    source.path,
+                    collections=collections,
                     metadata=metadata,
                 )
             )

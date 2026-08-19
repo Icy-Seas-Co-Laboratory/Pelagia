@@ -39,6 +39,7 @@ class AssetKind(str, Enum):
     VIDEO = "video"
     IMAGE = "image"
     IMAGE_SEQUENCE = "image_sequence"
+    INTERCHANGE = "interchange"
 
 
 class PipelineStage(str, Enum):

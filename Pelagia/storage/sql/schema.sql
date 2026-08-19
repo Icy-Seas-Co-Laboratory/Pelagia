@@ -4,7 +4,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'asset_kind' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence');
+        CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence', 'interchange');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
         CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'classify', 'publish', 'train_model', 'io_import', 'io_export', 'io_upload', 'io_download');
@@ -13,6 +13,8 @@ BEGIN
         CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'working', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
     END IF;
 END $$;
+
+ALTER TYPE {schema}.asset_kind ADD VALUE IF NOT EXISTS 'interchange';
 
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'train_model';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'background_frames';

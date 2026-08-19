@@ -15,6 +15,9 @@ from .dataset import Dataset
 from .exceptions import InterchangeError
 from .metadata import Metadata
 from .models import StorageFormat
+
+
+DEFAULT_FFMPEG_QSCALE = 2
 from .util import hash_file
 
 DEFAULT_VIDEO_EXTENSIONS = (".avi", ".mov", ".mp4", ".m4v", ".mkv", ".mpg", ".mpeg", ".mts", ".m2ts")
@@ -176,7 +179,7 @@ def ingest_video_directory(
     input_directory: str | Path, output: str | Path, *, title: str | None = None,
     description: str = "", stream: str = "camera", recursive: bool = False,
     shard_target_size: int | str = "10GB", metadata: Metadata | None = None,
-    ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", ffmpeg_qscale: int = 3,
+    ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", ffmpeg_qscale: int = DEFAULT_FFMPEG_QSCALE,
     grayscale: bool = False, hash_sources: bool = True, source_file_boundary: bool = False,
     generate_previews: bool = True, preview_count: int = 12, preview_width: int = 512,
     require_previews: bool = False,

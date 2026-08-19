@@ -25,6 +25,7 @@ from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
 from Pelagia.services.io_exports import ExportPayload, _sqlite_bytes, _xlsx_bytes
+from pelagia_interchange import DatasetBuilder, StorageFormat
 
 
 class FakeRepository:
@@ -4338,6 +4339,56 @@ def test_api_analyzes_image_sequence_before_ingestion(tmp_path):
     assert body["suggested_ingestion_request"]["background_window_width"] == 125
     assert body["suggested_ingestion_request"]["flatfield_window_stride"] == 1
     assert body["suggested_ingestion_request"]["flatfield_window_width"] == 1
+
+
+def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path):
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+    package = tmp_path / "import" / "deployment-42"
+    package.parent.mkdir()
+    ok, encoded = cv2.imencode(".png", np.zeros((3, 4), dtype=np.uint8))
+    assert ok
+    with DatasetBuilder(package, title="Deployment 42") as builder:
+        source = builder.register_source_file(
+            original_filename="camera-2024-05-15 19-27-32.849.avi",
+            frame_count=1,
+        )
+        builder.add_frame(
+            stream="camera", source_file=source, frame_id=0,
+            source_frame_number=0, encoded_bytes=encoded.tobytes(),
+            storage_format=StorageFormat("png"), width=4, height=3,
+        )
+    client.app.state.context.config.file_browser.root_path_import_dir = package.parent
+
+    analyzed_response = client.post(
+        "/ingestion/analyze",
+        headers=headers,
+        json={"source_path": str(package), "kind": "auto"},
+    )
+
+    assert analyzed_response.status_code == 200
+    asset = analyzed_response.json()["assets"][0]
+    assert asset["kind"] == "interchange"
+    assert asset["collections"] == ["Deployment 42"]
+    assert asset["media_count"] == 1
+    assert asset["metadata"]["pelagia_interchange"]["dataset_uuid"]
+    assert analyzed_response.json()["suggested_ingestion_request"]["generate_backgrounds"] is False
+    assert analyzed_response.json()["suggested_ingestion_request"]["generate_flatfield_profiles"] is False
+
+    queued_response = client.post(
+        "/ingestion/assets",
+        headers=headers,
+        json={
+            "assets": [asset],
+        },
+    )
+
+    assert queued_response.status_code == 200
+    registered = repository.registered_runs[0].manifest.assets[0]
+    assert registered.kind.value == "interchange"
+    assert registered.collections == ["Deployment 42"]
+    assert repository.created_jobs[0]["payload"]["kind"] == "interchange"
+    assert repository.created_jobs[0]["payload"]["generate_backgrounds"] is False
 
 
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):

@@ -112,14 +112,14 @@ pii create deployment_042 \
 
 The importer preserves the supplied metadata and uses a matching stream UUID when the TOML already contains a stream with the selected name. Command-line `--title` and `--description` values override those two fields when explicitly supplied. Without `--metadata`, creation writes a valid minimal document that can be reviewed later.
 
-The default output is color JPEG encoded by FFmpeg's MJPEG encoder at qscale 3. Use `--grayscale` for a documented grayscale transform or choose another FFmpeg qscale from 2 (highest quality/largest) through 31:
+The default output is color JPEG encoded by FFmpeg's MJPEG encoder at qscale 2. Use `--grayscale` for a documented grayscale transform or choose another FFmpeg qscale from 2 (highest quality/largest) through 31:
 
 ```bash
 pii create deployment_042 \
   --from-videos /acquisition/deployment_042 \
   --stream port \
   --grayscale \
-  --ffmpeg-qscale 3
+  --ffmpeg-qscale 2
 ```
 
 The importer uses FFmpeg's error-exit behavior and reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap.

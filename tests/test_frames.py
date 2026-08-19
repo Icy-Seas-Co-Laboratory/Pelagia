@@ -32,7 +32,9 @@ from Pelagia.storage.kvstore import KVStore
 from Pelagia.storage.kvstore2 import KVStore2
 from Pelagia.storage.postgres import DEFAULT_PROJECT_ID
 from Pelagia.processing.ingest import convert_frame_to_grayscale, discover_ingest_sources
-from Pelagia.processing.ingest import ingest_image_folder, ingest_video_file
+from Pelagia.processing.ingest import ingest_image_folder, ingest_interchange_dataset, ingest_video_file
+from Pelagia.processing.ingest_analysis import analyze_ingest_path
+from pelagia_interchange import DatasetBuilder, StorageFormat
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
@@ -1300,6 +1302,125 @@ def test_store_frame_can_write_zstd_numpy_payload():
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "zstd"
     assert metadata["kvstore_format"] == "zstd_ndarray_c_order"
+
+
+def test_store_frame_can_preserve_compatible_encoded_payload():
+    ctx = FakeContext()
+    data = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    ok, encoded = ingest_module.cv2.imencode(".png", data)
+    assert ok
+    payload = encoded.tobytes()
+    frame = FrameData(
+        sourcePath="/tmp/", filename="frame.png", frameNumber=1, data=data,
+        metadata={
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "asset_id": "00000000-0000-0000-0000-000000000002",
+            "kvstore_encoding": "zstd",
+        },
+    )
+
+    store_frame(
+        frame,
+        context=ctx,
+        encoded_payload=payload,
+        encoded_encoding="png",
+        encoded_format="png",
+    )
+
+    assert ctx.kvstore.payload == payload
+    metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert metadata["kvstore_encoding"] == "png"
+    assert metadata["encoded_payload_passthrough"] is True
+    assert metadata["requested_kvstore_encoding"] == "zstd"
+
+
+def test_interchange_dataset_analysis_and_direct_ingest_preserve_payload_and_timestamp(tmp_path):
+    package = tmp_path / "deployment-interchange"
+    image = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    ok, encoded = ingest_module.cv2.imencode(".png", image)
+    assert ok
+    payload = encoded.tobytes()
+    with DatasetBuilder(package, title="Deployment 042") as builder:
+        source = builder.register_source_file(
+            original_filename="camera1-1-2024-05-15 19-27-32.849.avi",
+            frame_rate=(2, 1),
+            frame_count=1,
+        )
+        builder.add_frame(
+            stream="camera1", source_file=source, frame_id=0,
+            source_frame_number=2, encoded_bytes=payload,
+            storage_format=StorageFormat("png"), width=4, height=3,
+        )
+
+    analyzed = analyze_ingest_path(package)
+    discovered = discover_ingest_sources(package)
+    assert [(source.kind, source.path) for source in discovered] == [("interchange", package.resolve())]
+    assert len(analyzed) == 1
+    assert analyzed[0].kind == "interchange"
+    assert analyzed[0].collections == ["Deployment 042"]
+    assert analyzed[0].media_count == 1
+    assert analyzed[0].metadata["pelagia_interchange"]["metadata"]["dataset"]["title"] == "Deployment 042"
+
+    ctx = FakeContext()
+    rows = ingest_interchange_dataset(
+        package,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        metadata=analyzed[0].metadata,
+    )
+
+    assert len(rows) == 1
+    assert ctx.kvstore.payload == payload
+    params = ctx.repository.cursor_obj.params
+    assert params[3].isoformat() == "2024-05-15T19:27:33.849000+00:00"
+    frame_metadata = json.loads(params[17])
+    assert frame_metadata["encoded_payload_passthrough"] is True
+    assert frame_metadata["interchange"]["stream_name"] == "camera1"
+    assert frame_metadata["interchange"]["timestamp"]["captured_at_source"] == "interchange.original_filename"
+    assert "pelagia_interchange" not in frame_metadata
+
+
+def test_interchange_ingest_uses_collection_metadata_for_missing_source_timestamp(tmp_path):
+    package = tmp_path / "metadata-timestamp-interchange"
+    image = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    ok, encoded = ingest_module.cv2.imencode(".png", image)
+    assert ok
+    with DatasetBuilder(
+        package,
+        metadata={
+            "schema": {"name": "scientific-image-interchange-metadata", "version": "1"},
+            "dataset": {"title": "Metadata timestamp"},
+            "collection": {"start": "2026-07-14T20:10:00Z"},
+            "investigators": [], "instruments": [], "deployments": [],
+            "streams": [], "funding": [], "extensions": {},
+        },
+    ) as builder:
+        source = builder.register_source_file(
+            original_filename="camera.avi",
+            frame_rate=(4, 1),
+            frame_count=3,
+        )
+        builder.add_frame(
+            stream="camera", source_file=source, frame_id=0,
+            source_frame_number=2, encoded_bytes=encoded.tobytes(),
+            storage_format=StorageFormat("png"), width=4, height=3,
+        )
+
+    ctx = FakeContext()
+    ingest_interchange_dataset(
+        package,
+        context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+    )
+
+    assert ctx.repository.cursor_obj.params[3].isoformat() == "2026-07-14T20:10:00.500000+00:00"
+    frame_metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert (
+        frame_metadata["interchange"]["timestamp"]["captured_at_source"]
+        == "interchange.metadata.collection.start"
+    )
 
 
 def test_retrieve_frame_reconstructs_frame_from_metadata_and_kvstore():

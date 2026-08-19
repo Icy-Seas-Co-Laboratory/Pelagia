@@ -109,6 +109,7 @@ def test_interactive_video_create_collects_and_confirms_options(tmp_path: Path, 
     assert captured["input"] == videos and captured["output"] == output
     assert captured["title"] == "Interactive title" and captured["stream"] == "port"
     assert captured["grayscale"] is True and captured["shard_target_size"] == "1GB"
+    assert captured["ffmpeg_qscale"] == 2
     assert captured["source_file_boundary"] is False
     assert captured["generate_previews"] is True and captured["preview_count"] == 8
     assert captured["preview_width"] == 320 and captured["require_previews"] is False

@@ -9,7 +9,7 @@ from .builder import DatasetBuilder
 from .dataset import Dataset
 from .exceptions import InterchangeError
 from .extraction import extract_frames
-from .ingestion import discover_videos, ingest_video_directory
+from .ingestion import DEFAULT_FFMPEG_QSCALE, discover_videos, ingest_video_directory
 from .metadata import Metadata
 from .validation import Validator
 
@@ -31,7 +31,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--recursive", action="store_true"); create.add_argument("--stream", default="camera")
     create.add_argument("--metadata", type=Path, metavar="TOML"); create.add_argument("--interactive", action="store_true")
     create.add_argument("--ffmpeg", default="ffmpeg"); create.add_argument("--ffprobe", default="ffprobe")
-    create.add_argument("--ffmpeg-qscale", type=int, default=3); create.add_argument("--grayscale", action="store_true")
+    create.add_argument("--ffmpeg-qscale", type=int, default=DEFAULT_FFMPEG_QSCALE); create.add_argument("--grayscale", action="store_true")
     create.add_argument("--no-source-hash", action="store_true"); create.add_argument("--source-file-boundary", action="store_true")
     create.add_argument("--no-previews", action="store_true"); create.add_argument("--preview-count", type=int, default=12)
     create.add_argument("--preview-width", type=int, default=512); create.add_argument("--require-previews", action="store_true")

@@ -368,7 +368,7 @@ docs/assets/             documentation images and branding assets
 
 Current and planned capabilities are organized around an ROI-centered pipeline:
 
-- **Video and image ingestion**: register source assets, extract frames, store full-frame payloads in cold storage, and record searchable metadata.
+- **Video, image, and interchange ingestion**: register source assets, extract or directly import frames, store full-frame payloads in cold storage, and record searchable metadata.
 - **Frame correction**: apply image normalization such as flatfield correction before storage or analysis.
 - **Segmentation**: detect candidate ROIs from extracted frames, store ROI crops, masks, geometry, and image statistics.
 - **Segmentation refinement**: support learned mask refinement models such as U-Net-style models for better ROI boundaries.
@@ -389,6 +389,32 @@ Pelagia separates runtime image data from persistent row models:
 - `raw_assets.collections` is a first-class grouping field assigned at ingestion. Values can be provided as a comma-separated string or list, are normalized into a non-empty array, and default to `none` when unspecified.
 
 This keeps the boundary clear: large source frames can remain cold and only be fetched when needed, while compact ROI-centered data stays available for analysis and curation.
+
+### Importing Pelagia interchange datasets
+
+A complete `pelagia_interchange` directory can be selected on the Ingestion
+page or queued directly:
+
+```bash
+pelagia queue_ingest /data/deployment_042_interchange
+```
+
+Pelagia recognizes the package from its manifest and required files, registers
+it as one raw asset, and uses the dataset title as the collection name unless a
+collection is supplied explicitly. Dataset metadata, source-file identities,
+stream identities, frame timestamps, timestamp provenance, and original frame
+numbers are retained. JPEG, PNG, JPEG XL, and JPEG XS frame payloads are copied
+directly into KVStore without re-encoding; unsupported but decodable image
+codecs fall back to the project's configured frame encoding. Each frame is
+decoded once for geometry validation and its browser thumbhash.
+
+Interchange imports disable background and flatfield generation by default for
+a fast archival-to-operational load. They can be enabled explicitly when those
+derived products are wanted. Absolute per-frame timestamps are preferred;
+otherwise Pelagia uses a source start timestamp or a timestamp parsed from the
+original source filename and advances it using the declared rational frame
+rate. All original timestamp fields remain available in frame metadata even
+when they cannot safely be converted to `captured_at`.
 
 ## Jobs And Workers
 

@@ -683,6 +683,42 @@ def test_extract_frames_handler_ingests_image_sequence_folder(monkeypatch, tmp_p
     assert kwargs["asset_id"] == "asset-1"
 
 
+def test_extract_frames_handler_uses_interchange_fast_path(monkeypatch, tmp_path):
+    repo = FakeRepository()
+    package = tmp_path / "interchange"
+    package.mkdir()
+    repo.assets["asset-1"]["path"] = str(package)
+    repo.assets["asset-1"]["kind"] = "interchange"
+    context = make_context(repo)
+    calls = []
+
+    def fake_ingest_interchange(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"id": "frame-20"}]
+
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.ingest_module.ingest_interchange_dataset",
+        fake_ingest_interchange,
+    )
+
+    result = extract_frames_handler(
+        {
+            "id": "job-1", "project_id": "project-1",
+            "stage": PipelineStage.EXTRACT_FRAMES.value,
+            "run_id": "run-1", "asset_id": "asset-1",
+            "payload": {
+                "kind": "interchange", "generate_backgrounds": False,
+                "generate_flatfield_profiles": False,
+            },
+        },
+        context,
+    )
+
+    assert result["frame_ids"] == ["frame-20"]
+    assert calls[0][0] == (str(package),)
+    assert calls[0][1]["context"] is context
+
+
 def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):
     repo = FakeRepository()
     repo.frames_with_background.add("frame-1")

@@ -14,6 +14,7 @@ from ..storage.blob_store import initialize_kvstore
 from ..utils.serialization import json_ready
 from ._logging import log_processing_event, processing_core_logger
 from .frame_codec import decode_array_payload, encode_array_payload
+from .codec_registry import normalize_image_encoding
 from .frame_model import FrameData
 from .thumbhash import compute_thumbhash
 from .timing import measure_phase
@@ -102,7 +103,20 @@ def _frame_project_id(ctx: AppContext, frame_id: str, *, fallback: str | None = 
     return _asset_project_id(ctx, row.get("asset_id"), fallback=fallback)
 
 
-def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str, Any]:
+def store_frame(
+    frame: FrameData,
+    context: AppContext | None = None,
+    *,
+    encoded_payload: bytes | None = None,
+    encoded_encoding: str | None = None,
+    encoded_format: str | None = None,
+) -> dict[str, Any]:
+    """Store a frame, optionally preserving compatible encoded source bytes.
+
+    ``encoded_payload`` is intended for trusted importers that have already
+    decoded the same bytes into ``frame.data`` for geometry validation and
+    preview generation. This avoids a lossy decode/re-encode cycle.
+    """
     started = time.perf_counter()
     with measure_phase("storage.frame_read"):
         data = frame.read()
@@ -157,11 +171,24 @@ def store_frame(frame: FrameData, context: AppContext | None = None) -> dict[str
                 storage_settings.frame_quality,
             )
         with measure_phase("storage.encode"):
-            payload, kvstore_encoding, kvstore_format = encode_array_payload(
-                array,
-                requested_encoding,
-                quality=int(requested_quality),
-            )
+            if encoded_payload is not None:
+                if not encoded_encoding:
+                    raise ValueError("encoded_encoding is required with encoded_payload.")
+                kvstore_encoding = normalize_image_encoding(encoded_encoding)
+                if kvstore_encoding not in {"jpg", "png", "jxl", "jxs"}:
+                    raise ValueError(
+                        "Encoded payload passthrough supports jpg, png, jxl, and jxs."
+                    )
+                payload = bytes(encoded_payload)
+                kvstore_format = encoded_format or kvstore_encoding
+                metadata["encoded_payload_passthrough"] = True
+                metadata["requested_kvstore_encoding"] = requested_encoding
+            else:
+                payload, kvstore_encoding, kvstore_format = encode_array_payload(
+                    array,
+                    requested_encoding,
+                    quality=int(requested_quality),
+                )
         # Store content first so committed rows never reference a missing blob.
         with measure_phase("storage.kvstore_write"):
             kvstore_key = kvstore.put_store(payload)

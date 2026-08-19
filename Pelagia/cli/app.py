@@ -310,7 +310,7 @@ if typer is not None:
         cli_command: str,
         project_key: Optional[str] = None,
         compute_checksum: bool = True,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, list[str]]:
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to register video assets.")
 
@@ -318,14 +318,31 @@ if typer is not None:
         resolved = input_path.expanduser().resolve()
         resolved_run_id = run_id or str(uuid.uuid4())
         resolved_asset_id = asset_id or str(uuid.uuid4())
-        is_image_sequence = resolved.is_dir()
-        asset_kind = AssetKind.IMAGE_SEQUENCE if is_image_sequence else AssetKind.VIDEO
+        from ..processing.ingest import is_interchange_dataset
+        from ..processing.ingest_analysis import analyze_interchange_asset
+
+        is_interchange = is_interchange_dataset(resolved)
+        is_image_sequence = resolved.is_dir() and not is_interchange
+        asset_kind = (
+            AssetKind.INTERCHANGE
+            if is_interchange
+            else AssetKind.IMAGE_SEQUENCE if is_image_sequence else AssetKind.VIDEO
+        )
         source_type = asset_kind.value
-        run_key_prefix = "image_sequence" if is_image_sequence else "video"
+        run_key_prefix = asset_kind.value
         resolved_run_key = run_key or f"{run_key_prefix}:{resolved.stem}:{uuid.uuid4().hex[:12]}"
         filename = resolved.name
         stat = resolved.stat()
-        normalized_collections = normalize_collections(collections)
+        interchange_analysis = (
+            analyze_interchange_asset(resolved, collections=collections)
+            if is_interchange
+            else None
+        )
+        normalized_collections = (
+            interchange_analysis.collections
+            if interchange_analysis is not None
+            else normalize_collections(collections)
+        )
         checksum = (
             f"sha256:{_sha256_file(resolved)}"
             if compute_checksum and resolved.is_file()
@@ -333,11 +350,25 @@ if typer is not None:
         )
         if compute_checksum and resolved.is_dir():
             checksum = f"directory:size={_path_size_bytes(resolved)}:mtime_ns={stat.st_mtime_ns}"
+        if interchange_analysis is not None:
+            checksum = interchange_analysis.checksum
         size_bytes = (
             _path_size_bytes(resolved)
             if compute_checksum
             else _queued_path_size_bytes(resolved, stat.st_size)
         )
+        if interchange_analysis is not None:
+            size_bytes = interchange_analysis.size_bytes
+        asset_metadata = {
+            "cli_command": cli_command,
+            "checksum_status": (
+                interchange_analysis.checksum_status
+                if interchange_analysis is not None
+                else "computed" if compute_checksum else "deferred"
+            ),
+            "project_id": project_id,
+            **(interchange_analysis.metadata if interchange_analysis is not None else {}),
+        }
 
         planned_run = PlannedRun(
             manifest=RunManifest(
@@ -349,7 +380,7 @@ if typer is not None:
                 created_at=datetime.now(timezone.utc),
                 metadata={
                     "cli_command": cli_command,
-                    "checksum_status": "computed" if compute_checksum else "deferred",
+                    "checksum_status": asset_metadata["checksum_status"],
                     "project_id": project_id,
                 },
                 assets=[
@@ -361,17 +392,18 @@ if typer is not None:
                         size_bytes=size_bytes,
                         checksum=checksum,
                         collections=normalized_collections,
-                        metadata={
-                            "cli_command": cli_command,
-                            "checksum_status": "computed" if compute_checksum else "deferred",
-                            "project_id": project_id,
-                        },
+                        media_count=(
+                            interchange_analysis.media_count
+                            if interchange_analysis is not None
+                            else 1
+                        ),
+                        metadata=asset_metadata,
                     )
                 ],
             )
         )
         context.repository.register_planned_run(planned_run, project_id=project_id)
-        return resolved_run_id, resolved_asset_id, resolved_run_key
+        return resolved_run_id, resolved_asset_id, resolved_run_key, normalized_collections
 
     def _extract_frames_common(
         input_path: Path,
@@ -390,11 +422,11 @@ if typer is not None:
         mask_path: Optional[str] = None,
         project_key: Optional[str] = None,
     ) -> tuple[AppContext, dict]:
-        from ..processing.ingest import ingest_image_folder, ingest_video_file
+        from ..processing.ingest import ingest_image_folder, ingest_interchange_dataset, ingest_video_file, is_interchange_dataset
 
         resolved = input_path.expanduser().resolve()
         context = _context_from_options(kvstore_root, database_dsn, schema)
-        resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
+        resolved_run_id, resolved_asset_id, resolved_run_key, normalized_collections = _register_video(
             context,
             resolved,
             run_id,
@@ -406,7 +438,6 @@ if typer is not None:
             project_key=project_key,
             compute_checksum=True,
         )
-        normalized_collections = normalize_collections(collections)
         ingest_defaults = context.config.processing.video_ingest
         preprocessing_defaults = context.config.processing.preprocessing
         resolved_n_tile = ingest_defaults.n_tile if n_tile is None else n_tile
@@ -422,7 +453,15 @@ if typer is not None:
         )
         resolved_apply_mask = preprocessing_defaults.apply_mask if apply_mask is None else apply_mask
         resolved_mask_path = preprocessing_defaults.mask_path if mask_path is None else mask_path
-        if resolved.is_dir():
+        if is_interchange_dataset(resolved):
+            frame_rows = ingest_interchange_dataset(
+                resolved,
+                context=context,
+                run_id=resolved_run_id,
+                asset_id=resolved_asset_id,
+                metadata={"cli_command": "extract_frames", "collections": normalized_collections},
+            )
+        elif resolved.is_dir():
             frame_rows = ingest_image_folder(
                 resolved,
                 context=context,
@@ -1179,7 +1218,10 @@ if typer is not None:
         mask_path: Optional[str] = None,
         compute_checksum: bool = False,
     ) -> None:
+        from ..processing.ingest import is_interchange_dataset
+
         resolved = input_path.expanduser().resolve()
+        is_interchange = is_interchange_dataset(resolved)
         context = _context_from_options(kvstore_root, database_dsn, schema)
         ingest_defaults = context.config.processing.video_ingest
         preprocessing_defaults = context.config.processing.preprocessing
@@ -1201,8 +1243,7 @@ if typer is not None:
             roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
         resolved_roi_encoding = roi_encoding
-        normalized_collections = normalize_collections(collections)
-        resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
+        resolved_run_id, resolved_asset_id, resolved_run_key, normalized_collections = _register_video(
             context,
             resolved,
             run_id,
@@ -1224,7 +1265,11 @@ if typer is not None:
             asset_id=resolved_asset_id,
             payload=ExtractFramesCommand.from_payload({
                 "source_path": str(resolved),
-                "kind": AssetKind.IMAGE_SEQUENCE.value if resolved.is_dir() else AssetKind.VIDEO.value,
+                "kind": (
+                    AssetKind.INTERCHANGE.value
+                    if is_interchange
+                    else AssetKind.IMAGE_SEQUENCE.value if resolved.is_dir() else AssetKind.VIDEO.value
+                ),
                 "n_tile": resolved_n_tile,
                 "adaptive_background_subtraction": resolved_adaptive_background_subtraction,
                 "adaptive_background_period": resolved_adaptive_background_period,
@@ -1239,7 +1284,13 @@ if typer is not None:
                 "roi_quality": roi_recording_defaults.roi_quality,
                 "mask_encoding": roi_recording_defaults.mask_encoding,
                 "collections": normalized_collections,
-                "checksum_status": "computed" if compute_checksum else "deferred",
+                "checksum_status": (
+                    "checksum_catalog"
+                    if is_interchange
+                    else "computed" if compute_checksum else "deferred"
+                ),
+                "generate_backgrounds": False if is_interchange else None,
+                "generate_flatfield_profiles": False if is_interchange else None,
             }).to_payload(),
             summary=f"extract_frames queued for {resolved.name}",
         )
@@ -1303,12 +1354,10 @@ if typer is not None:
             roi_recording_defaults.padding if roi_padding is None else roi_padding
         )
         resolved_roi_encoding = roi_encoding
-        normalized_collections = normalize_collections(collections)
-
         queued = []
         for source in sources:
             source_path = source.path
-            resolved_run_id, resolved_asset_id, resolved_run_key = _register_video(
+            resolved_run_id, resolved_asset_id, resolved_run_key, source_collections = _register_video(
                 context,
                 source_path,
                 None,
@@ -1342,8 +1391,14 @@ if typer is not None:
                     "large_roi_min_pixels": roi_recording_defaults.large_roi_min_pixels,
                     "roi_quality": roi_recording_defaults.roi_quality,
                     "mask_encoding": roi_recording_defaults.mask_encoding,
-                    "collections": normalized_collections,
-                    "checksum_status": "computed" if compute_checksum else "deferred",
+                    "collections": source_collections,
+                    "checksum_status": (
+                        "checksum_catalog"
+                        if source.kind == AssetKind.INTERCHANGE.value
+                        else "computed" if compute_checksum else "deferred"
+                    ),
+                    "generate_backgrounds": False if source.kind == AssetKind.INTERCHANGE.value else None,
+                    "generate_flatfield_profiles": False if source.kind == AssetKind.INTERCHANGE.value else None,
                 }).to_payload(),
                 summary=f"extract_frames queued for {source_path.name}",
             )
@@ -1356,7 +1411,7 @@ if typer is not None:
                     "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
                     "source_path": str(source_path),
                     "kind": source.kind,
-                    "collections": normalized_collections,
+                    "collections": source_collections,
                 }
             )
 

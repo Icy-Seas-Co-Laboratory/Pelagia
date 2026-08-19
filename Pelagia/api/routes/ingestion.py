@@ -9,6 +9,7 @@ from typing import Any
 
 from ...domain import AssetKind, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
 from ...processing.ingest_analysis import analyze_ingest_path
+from ...processing.ingest import is_interchange_dataset
 
 try:
     from fastapi import APIRouter, HTTPException, Request
@@ -118,8 +119,12 @@ if APIRouter is not None:
         @classmethod
         def _validate_kind(cls, value: str) -> str:
             normalized = str(value).lower()
-            if normalized not in {AssetKind.VIDEO.value, AssetKind.IMAGE_SEQUENCE.value}:
-                raise ValueError("kind must be one of: video, image_sequence.")
+            if normalized not in {
+                AssetKind.VIDEO.value,
+                AssetKind.IMAGE_SEQUENCE.value,
+                AssetKind.INTERCHANGE.value,
+            }:
+                raise ValueError("kind must be one of: video, image_sequence, interchange.")
             return normalized
 
     class QueueAssetsRequest(BaseModel):
@@ -318,8 +323,13 @@ if APIRouter is not None:
                 return body_value
             return defaults[default_name]
 
-        generate_backgrounds = bool(
-            resolve_option(asset.generate_backgrounds, "generate_backgrounds", "generate_backgrounds")
+        interchange_fast_defaults = asset.kind == AssetKind.INTERCHANGE.value
+        generate_backgrounds = (
+            False
+            if interchange_fast_defaults
+            and asset.generate_backgrounds is None
+            and getattr(global_body, "generate_backgrounds", None) is None
+            else bool(resolve_option(asset.generate_backgrounds, "generate_backgrounds", "generate_backgrounds"))
         )
         requested_flatfield_profiles = (
             asset.generate_flatfield_profiles
@@ -327,7 +337,9 @@ if APIRouter is not None:
             else getattr(global_body, "generate_flatfield_profiles", None)
         )
         generate_flatfield_profiles = (
-            bool(requested_flatfield_profiles)
+            False
+            if interchange_fast_defaults and requested_flatfield_profiles is None
+            else bool(requested_flatfield_profiles)
             if requested_flatfield_profiles is not None
             else bool(defaults["generate_flatfield_profiles"] and not generate_backgrounds)
         )
@@ -494,6 +506,13 @@ if APIRouter is not None:
             int(defaults["flatfield_window_width"]),
         )
         asset_payloads = [asset.as_dict() for asset in assets]
+        interchange_only = bool(asset_payloads) and all(
+            asset["kind"] == AssetKind.INTERCHANGE.value for asset in asset_payloads
+        )
+        if interchange_only and body.generate_backgrounds is None:
+            defaults["generate_backgrounds"] = False
+        if interchange_only and body.generate_flatfield_profiles is None:
+            defaults["generate_flatfield_profiles"] = False
         return as_response(
             {
                 "source_path": str(source_path),
@@ -556,6 +575,11 @@ if APIRouter is not None:
                 raise HTTPException(status_code=422, detail=f"Video asset path must be a file: {str(path)!r}.")
             if asset.kind == AssetKind.IMAGE_SEQUENCE.value and not path.is_dir():
                 raise HTTPException(status_code=422, detail=f"Image sequence asset path must be a folder: {str(path)!r}.")
+            if asset.kind == AssetKind.INTERCHANGE.value and not is_interchange_dataset(path):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Interchange asset path must be a complete pelagia_interchange dataset: {str(path)!r}.",
+                )
             stat_size = path.stat().st_size if path.is_file() else sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
             checksum, checksum_status = _checksum_for_asset(
                 path,
