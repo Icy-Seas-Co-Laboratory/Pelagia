@@ -265,6 +265,78 @@ def test_registry_workspace_has_one_active_owner_project_workspace(postgres_repo
     assert "WHERE is_active" in definition
 
 
+def test_registry_workspace_catalog_is_scoped_and_can_reactivate(postgres_repo, tmp_path):
+    project = postgres_repo.create_project(f"registry-catalog-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "registry-tester"}
+    sources = []
+    for index in range(2):
+        source = tmp_path / f"catalog-{index}.sqlite"
+        with sqlite3.connect(source) as connection:
+            initialize_database(connection, "classification", name=f"catalog-{index}")
+            connection.commit()
+        sources.append(source)
+
+    first = load_sqlite_workspace(postgres_repo, sources[0], **scope)
+    second = load_sqlite_workspace(postgres_repo, sources[1], **scope)
+    workspace = RegistryWorkspaceService(postgres_repo, **scope)
+
+    catalog = workspace.list_workspaces()
+    assert [entry["workspace_id"] for entry in catalog] == [second["workspace_id"], first["workspace_id"]]
+    assert catalog[0]["is_active"] is True
+    assert catalog[1]["is_active"] is False
+    assert catalog[0]["item_count"] == 0
+    assert RegistryWorkspaceService(postgres_repo, scope["project_id"], "other-user").list_workspaces() == []
+
+    activated = workspace.activate_workspace(first["workspace_id"])
+    assert activated["workspace_id"] == first["workspace_id"]
+    assert [entry["workspace_id"] for entry in workspace.list_workspaces()] == [first["workspace_id"], second["workspace_id"]]
+
+    with pytest.raises(KeyError):
+        RegistryWorkspaceService(postgres_repo, scope["project_id"], "other-user").activate_workspace(first["workspace_id"])
+
+
+def test_registry_workspace_details_include_pelagia_inference_contract(postgres_repo, tmp_path):
+    source = tmp_path / "pelagia-derived.sqlite"
+    with sqlite3.connect(source) as connection:
+        initialize_database(
+            connection, "classification", name="pelagia-derived",
+            metadata={"pelagia": {"selection_fingerprint_sha256": "selection-digest"}},
+        )
+        connection.commit()
+    project = postgres_repo.create_project(f"registry-details-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "registry-tester"}
+    loaded = load_sqlite_workspace(postgres_repo, source, **scope)
+    run_id = "pelagia-inference-run"
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"""INSERT INTO {postgres_repo.schema}.registry_inference_runs
+            (workspace_id,inference_run_id,dataset_fingerprint_sha256,name,status,created_at,metadata)
+            VALUES (%s,%s,'dataset-digest','Pelagia inference','complete','2026-08-19T00:00:00Z',
+              '{{"evaluation_metrics":{{"accuracy":0.88}}}}'::jsonb)""",
+            (loaded["workspace_id"], run_id),
+        )
+        cursor.execute(
+            f"""INSERT INTO {postgres_repo.schema}.registry_model_evidence
+            (workspace_id,evidence_id,inference_run_id,item_id,prediction_confidence,
+             nearest_neighbor_similarity,top_k_label_agreement,weighted_label_support,label_margin,created_at)
+            VALUES (%s,'evidence-1',%s,'roi-1',0.75,0.9,0.6,0.7,0.2,'2026-08-19T00:00:00Z')""",
+            (loaded["workspace_id"], run_id),
+        )
+        connection.commit()
+
+    details = RegistryWorkspaceService(postgres_repo, **scope).details()
+
+    assert details["dataset"]["lifecycle"] == "working"
+    assert details["dataset"]["metadata"]["pelagia"]["selection_fingerprint_sha256"] == "selection-digest"
+    assert len(details["inference_sources"]) == 1
+    inference = details["inference_sources"][0]
+    assert inference["source_key"] == f"registry:{run_id}"
+    assert inference["evidence"]["item_count"] == 1
+    assert inference["evidence"]["aggregates"]["mean_confidence"] == pytest.approx(0.75)
+    assert inference["performance_metrics"]["run · metadata · evaluation_metrics · accuracy"] == 0.88
+    assert inference["run"]["status"] == "complete"
+
+
 def test_registry_source_overwrite_rejects_changed_bytes(postgres_repo, tmp_path):
     source = tmp_path / "source.sqlite"
     with sqlite3.connect(source) as connection:

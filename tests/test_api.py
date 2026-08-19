@@ -1203,6 +1203,28 @@ def test_registry_open_queues_project_scoped_transfer_job(tmp_path):
     assert queued["payload"]["owner_username"] == "dev"
 
 
+def test_registry_workspace_catalog_and_activation(monkeypatch):
+    from Pelagia.api.routes import registry as registry_routes
+
+    client, _, _ = make_client()
+    visible = [{"workspace_id": "workspace-1", "name": "catalog", "is_active": False}]
+    activated = {"workspace_id": "workspace-1", "name": "catalog", "stats": {"total": 3}}
+    monkeypatch.setattr(registry_routes.RegistryWorkspaceService, "list_workspaces", lambda self: visible)
+    monkeypatch.setattr(
+        registry_routes.RegistryWorkspaceService,
+        "activate_workspace",
+        lambda self, workspace_id: activated if workspace_id == "workspace-1" else (_ for _ in ()).throw(KeyError(workspace_id)),
+    )
+
+    response = client.get("/registry/workspaces")
+    assert response.status_code == 200
+    assert response.json() == {"workspaces": visible}
+    response = client.post("/registry/workspaces/workspace-1/activate")
+    assert response.status_code == 200
+    assert response.json() == activated
+    assert client.post("/registry/workspaces/missing/activate").status_code == 404
+
+
 def test_curation_registry_dataset_preview_and_generation_are_consistent(tmp_path, monkeypatch):
     from Pelagia.api.routes import curation as curation_routes
 

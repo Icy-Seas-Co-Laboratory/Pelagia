@@ -44,11 +44,11 @@ roi_refinement = "cpu"
 
 [[worker]]
 name = "fio-1"
-capabilities = ["ingest", "background", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate"]
 
 [[worker]]
 name = "fio-2"
-capabilities = ["ingest", "background", "preprocess", "segment"]
+capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate"]
 
 [[worker]]
 name = "fio-3"

@@ -15,6 +15,39 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _performance_metrics(value: Any) -> dict[str, str | int | float]:
+    """Collect explicitly named model metrics without interpreting arbitrary numbers."""
+    metric_groups = {
+        "metrics", "performance", "performance_metrics", "evaluation", "evaluation_metrics",
+        "validation_metrics", "test_metrics", "training_metrics", "scores",
+    }
+    metric_names = {
+        "accuracy", "balanced_accuracy", "precision", "recall", "specificity", "sensitivity",
+        "f1", "f1_score", "auc", "auroc", "average_precision", "map", "loss", "error_rate",
+        "r2", "rmse", "mae", "mse", "iou", "dice", "top1", "top5",
+    }
+    result: dict[str, str | int | float] = {}
+
+    def walk(item: Any, path: list[str], inside_group: bool = False) -> None:
+        if len(result) >= 200 or not isinstance(item, dict):
+            return
+        for key, child in item.items():
+            normalized = str(key).lower().replace("-", "_").replace(" ", "_")
+            child_path = [*path, str(key)]
+            grouped = inside_group or normalized in metric_groups or normalized.endswith("_metrics")
+            if isinstance(child, dict):
+                walk(child, child_path, grouped)
+            elif (
+                (grouped or normalized in metric_names)
+                and isinstance(child, (int, float, str))
+                and not isinstance(child, bool)
+            ):
+                result[" · ".join(child_path)] = child
+
+    walk(value, [])
+    return result
+
+
 class RegistryWorkspaceService:
     """Project- and user-scoped Registry operations over a loaded PostgreSQL workspace."""
 
@@ -39,6 +72,50 @@ class RegistryWorkspaceService:
     def active_workspace(self) -> dict[str, Any] | None:
         with self.repository.connect() as connection, connection.cursor() as cursor:
             return self._workspace(cursor, required=False)
+
+    def list_workspaces(self) -> list[dict[str, Any]]:
+        """Return the non-purged workspaces visible to the current project user."""
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT w.id workspace_id,w.dataset_id,w.revision_id,w.parent_revision_id,
+                w.dataset_type,w.name,w.title,w.description,w.dataset_version version,
+                w.dataset_lifecycle lifecycle,w.source_path,w.source_size_bytes,w.status,w.is_active,
+                w.dirty_at,w.loaded_at,w.exported_at,w.last_export_path,w.contract_schema_version,
+                (SELECT count(*) FROM {self.schema}.registry_items i WHERE i.workspace_id=w.id) item_count,
+                (SELECT count(DISTINCT a.item_id) FROM {self.schema}.registry_annotations a
+                  WHERE a.workspace_id=w.id AND a.is_current AND a.status IN ('accepted','candidate')) labeled_count
+                FROM {self.schema}.registry_workspaces w
+                WHERE w.project_id=%s AND w.owner_username=%s AND w.status!='purged'
+                ORDER BY w.is_active DESC,w.loaded_at DESC,w.id""",
+                (self.project_id, self.owner_username),
+            )
+            result = [dict(row) for row in cursor.fetchall()]
+            for workspace in result:
+                workspace["workspace_id"] = str(workspace["workspace_id"])
+            return result
+
+    def activate_workspace(self, workspace_id: str) -> dict[str, Any]:
+        """Make an existing loaded workspace active within the current user/project scope."""
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            lock_key = f"registry:{self.project_id}:{self.owner_username}"
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (lock_key,))
+            cursor.execute(
+                f"""SELECT id FROM {self.schema}.registry_workspaces
+                WHERE id=%s AND project_id=%s AND owner_username=%s AND status='loaded' FOR UPDATE""",
+                (workspace_id, self.project_id, self.owner_username),
+            )
+            if cursor.fetchone() is None:
+                raise KeyError(workspace_id)
+            cursor.execute(
+                f"UPDATE {self.schema}.registry_workspaces SET is_active=false WHERE project_id=%s AND owner_username=%s AND is_active=true",
+                (self.project_id, self.owner_username),
+            )
+            cursor.execute(
+                f"UPDATE {self.schema}.registry_workspaces SET is_active=true WHERE id=%s",
+                (workspace_id,),
+            )
+            connection.commit()
+        return self.summary()
 
     def summary(self) -> dict[str, Any]:
         with self.repository.connect() as connection, connection.cursor() as cursor:
@@ -87,6 +164,7 @@ class RegistryWorkspaceService:
 
     def details(self) -> dict[str, Any]:
         summary = self.summary()
+        sources = {source["source_key"]: source for source in self.evidence_sources()}
         with self.repository.connect() as connection, connection.cursor() as cursor:
             workspace = self._workspace(cursor)
             workspace_id = workspace["id"]
@@ -109,12 +187,50 @@ class RegistryWorkspaceService:
                 (workspace_id,),
             )
             events = list(cursor.fetchall())
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.registry_inference_runs WHERE workspace_id=%s ORDER BY created_at DESC",
+                (workspace_id,),
+            )
+            inference_sources = []
+            for row in cursor.fetchall():
+                run = dict(row)
+                source_key = f"registry:{run['inference_run_id']}"
+                name = run.get("name") or run.get("model_artifact_id") or run["inference_run_id"]
+                evidence = dict(sources.get(source_key) or {
+                    "source_key": source_key, "source_kind": "registry", "source_name": name,
+                    "item_count": 0, "embedding_count": 0, "confidence_count": 0,
+                    "knn_count": 0, "prototype_count": 0,
+                    "capabilities": {"confidence": False, "knn": False, "prototype": False, "embedding": False},
+                })
+                cursor.execute(
+                    f"""SELECT avg(prediction_confidence) mean_confidence,
+                    min(prediction_confidence) min_confidence,max(prediction_confidence) max_confidence,
+                    avg(nearest_neighbor_similarity) mean_knn_similarity,
+                    avg(top_k_label_agreement) mean_knn_agreement,
+                    avg(weighted_label_support) mean_weighted_label_support,
+                    avg(label_margin) mean_label_margin
+                    FROM {self.schema}.registry_model_evidence
+                    WHERE workspace_id=%s AND inference_run_id=%s""",
+                    (workspace_id, run["inference_run_id"]),
+                )
+                evidence["aggregates"] = dict(cursor.fetchone())
+                inference_sources.append({
+                    "source_key": source_key, "source_kind": "registry", "name": name,
+                    "evidence": evidence, "performance_metrics": _performance_metrics({"run": run}),
+                    "run": run,
+                })
         return {
-            "dataset": {key: workspace[key] for key in ("dataset_id", "revision_id", "dataset_type", "name", "title", "description")},
+            "dataset": {
+                "dataset_id": workspace["dataset_id"], "revision_id": workspace["revision_id"],
+                "parent_revision_id": workspace["parent_revision_id"], "dataset_type": workspace["dataset_type"],
+                "name": workspace["name"], "title": workspace["title"], "description": workspace["description"],
+                "version": workspace["dataset_version"], "lifecycle": workspace["dataset_lifecycle"],
+                "metadata": workspace["metadata"],
+            },
             "summary": summary,
             "database": {"path": "postgresql", "size_bytes": 0, "schema": {"name": workspace["contract_schema_name"], "version": workspace["contract_schema_version"]},
                          "table_count": len(counts), "tables": list(counts), "counts": counts},
-            "asset_formats": formats, "recent_events": events, "inference_sources": self.evidence_sources(),
+            "asset_formats": formats, "recent_events": events, "inference_sources": inference_sources,
         }
 
     def labels(self, include_deprecated: bool = True) -> list[dict[str, Any]]:

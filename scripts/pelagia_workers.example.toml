@@ -75,5 +75,5 @@ capabilities = ["registry_load", "registry_export", "registry_generate"]
 
 [[worker]]
 name = "allrounder"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify", "registry_load", "registry_export",  "registry_generate"]
 enabled = false

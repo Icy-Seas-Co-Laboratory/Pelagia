@@ -134,6 +134,17 @@ if APIRouter is not None:
     @router.get("/dataset/details")
     def dataset_details(request: Request): return as_response(service(request).details())
 
+    @router.get("/workspaces")
+    def workspaces(request: Request):
+        return {"workspaces": as_response(service(request).list_workspaces())}
+
+    @router.post("/workspaces/{workspace_id}/activate")
+    def activate_workspace(request: Request, workspace_id: str):
+        try:
+            return as_response(service(request, write=True).activate_workspace(workspace_id))
+        except KeyError as exc:
+            raise HTTPException(404, "Registry workspace was not found") from exc
+
     @router.post("/dataset/export", status_code=202)
     def export_dataset(request: Request, body: ExportDatasetRequest):
         auth = require_project_write(request); workspace = service(request, write=True).active_workspace()
