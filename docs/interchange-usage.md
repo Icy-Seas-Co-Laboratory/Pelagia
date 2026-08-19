@@ -79,7 +79,7 @@ This workflow automatically:
 - generates a bounded representative preview set, contact sheet, and provenance index;
 - finalizes the manifest, generated README, standalone tools, and package checksums.
 
-FFmpeg and FFprobe must be installed and available on `PATH` for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset.
+FFmpeg and FFprobe must be installed and available on `PATH` for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset. The importer probes FFmpeg's supported options and uses either modern `-fps_mode passthrough` or the equivalent legacy `-vsync 0`; the selected frame-synchronization mode is recorded in dataset provenance.
 
 Supported discovery extensions are `.avi`, `.mov`, `.mp4`, `.m4v`, `.mkv`, `.mpg`, `.mpeg`, `.mts`, and `.m2ts`. Add `--recursive` to search subdirectories:
 

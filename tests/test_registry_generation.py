@@ -30,6 +30,8 @@ def test_generate_registry_dataset_writes_valid_contract_and_loads_workspace(tmp
         "id": roi_id, "roi_payload": payload, "roi_encoding": "png", "roi_format": "png",
         "roi_dtype": "uint8", "roi_shape": [3, 4], "source_asset_id": source_asset_id,
         "source_asset_filename": "source.tif", "frame_id": frame_id, "frame_index": 7,
+        "bbox_x": 102, "bbox_y": 203, "bbox_w": 2, "bbox_h": 1,
+        "crop_bbox_x": 101, "crop_bbox_y": 201, "crop_bbox_w": 4, "crop_bbox_h": 3,
         "roi_index": 2, "area": 12.0, "selection_ordinal": 1, "created_at": now,
         "annotation_id": annotation_id, "label_id": label_id, "actor_username": "curator",
         "annotation_method": "human", "annotation_status": "accepted",
@@ -79,8 +81,21 @@ def test_generate_registry_dataset_writes_valid_contract_and_loads_workspace(tmp
         assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM item_label_annotations").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM model_evidence").fetchone()[0] == 1
+        geometry = connection.execute(
+            """SELECT coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+               crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h
+               FROM item_geometry WHERE item_id=?""",
+            (roi_id,),
+        ).fetchone()
+        assert geometry == ("source_frame_pixels", 102, 203, 2, 1, 101, 201, 4, 3)
+        item_metadata = connection.execute(
+            "SELECT metadata_json FROM dataset_items WHERE item_id=?", (roi_id,)
+        ).fetchone()[0]
+        assert '"detection_metadata"' in item_metadata
+        assert '"crop_bbox"' in item_metadata
         metadata = connection.execute("SELECT metadata_json FROM dataset WHERE singleton=1").fetchone()[0]
         assert '"subsample_ratio": 500' in metadata
+        assert '"spatial_contract"' in metadata
 
     resumed = registry_generation.generate_and_load_registry_dataset(
         object(), destination, project_id=loaded["project_id"], owner_username="curator",

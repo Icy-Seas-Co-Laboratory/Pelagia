@@ -417,6 +417,8 @@ class RegistryWorkspaceService:
             cursor.execute("SELECT count(DISTINCT i.item_id) total " + base, params_with_source)
             total = cursor.fetchone()["total"]
             cursor.execute(f"""SELECT i.item_id,i.source_key,i.sample_weight,i.metadata,image.shape,image.encoding,image.media_type,
+              i.coordinate_space,i.bbox_x,i.bbox_y,i.bbox_w,i.bbox_h,
+              i.crop_bbox_x,i.crop_bbox_y,i.crop_bbox_w,i.crop_bbox_h,i.spatial_metadata,
               a.annotation_id,a.label_id,a.annotator,a.created_at annotation_created_at,a.status annotation_status,a.method annotation_source,
               l.name label_name,coalesce(l.display_name,l.name) label_display_name,l.origin label_origin,r.decision review_decision,
               CASE WHEN me.inference_run_id IS NULL THEN NULL ELSE 'registry:'||me.inference_run_id END evidence_source,
@@ -430,7 +432,27 @@ class RegistryWorkspaceService:
             for item in items:
                 h, w = item.get("image_height") or 0, item.get("image_width") or 0
                 item["pixel_area"] = h * w; item["longest_side"] = max(h, w)
+                self._attach_geometry(item)
             return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @staticmethod
+    def _attach_geometry(item: dict[str, Any]) -> None:
+        bbox_values = [item.get(f"bbox_{axis}") for axis in ("x", "y", "w", "h")]
+        crop_values = [item.get(f"crop_bbox_{axis}") for axis in ("x", "y", "w", "h")]
+        if not all(value is not None for value in crop_values):
+            shape = item.get("shape")
+            shape = shape if isinstance(shape, (list, tuple)) else ()
+            width = item.get("image_width") or (shape[1] if len(shape) > 1 else None)
+            height = item.get("image_height") or (shape[0] if shape else None)
+            if width and height:
+                crop_values = [0, 0, int(width), int(height)]
+        if not all(value is not None for value in bbox_values) and all(value is not None for value in crop_values):
+            bbox_values = list(crop_values)
+        if not all(value is not None for value in crop_values) and all(value is not None for value in bbox_values):
+            crop_values = list(bbox_values)
+        item["bbox"] = dict(zip(("x", "y", "w", "h"), bbox_values)) if all(value is not None for value in bbox_values) else None
+        item["crop_bbox"] = dict(zip(("x", "y", "w", "h"), crop_values)) if all(value is not None for value in crop_values) else None
+        item["coordinate_space"] = item.get("coordinate_space") or "image_pixels"
 
     def _attach_tags(self, cursor, workspace_id, items: list[dict[str, Any]]) -> None:
         by_item = {item["item_id"]: [] for item in items}
@@ -455,6 +477,7 @@ class RegistryWorkspaceService:
                 cursor.execute(f"SELECT * FROM {self.schema}.registry_items WHERE workspace_id=%s AND item_id=%s", (workspace["id"], item_id))
                 item = cursor.fetchone()
         if item is None: raise KeyError(item_id)
+        self._attach_geometry(item)
         with self.repository.connect() as connection, connection.cursor() as cursor:
             workspace = self._workspace(cursor)
             cursor.execute(f"""SELECT a.*,l.name label_name,coalesce(l.display_name,l.name) label_display_name,l.metadata label_metadata,l.origin label_origin

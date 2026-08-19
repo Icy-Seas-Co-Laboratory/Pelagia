@@ -12,7 +12,12 @@ from pathlib import Path
 from collections.abc import Iterator
 from typing import Any, Callable, Mapping
 
-from oracle_data_contracts.datasets import initialize_database, read_dataset_info, validate_database
+from oracle_data_contracts.datasets import (
+    initialize_database,
+    normalize_item_geometry,
+    read_dataset_info,
+    validate_database,
+)
 
 from ..processing.frame_codec import decode_array_payload, encode_array_payload
 from .registry_transfer import load_sqlite_workspace
@@ -180,6 +185,17 @@ def _selected_rows(repository, project_id: str, selection: Mapping[str, Any], ra
                 WITH matched AS (
                     SELECT refined.*, frames.frame_index, assets.id AS source_asset_id,
                            assets.filename AS source_asset_filename,
+                           assets.kind AS source_asset_kind,
+                           assets.checksum AS source_asset_checksum,
+                           assets.collections AS source_asset_collections,
+                           assets.metadata AS source_asset_metadata,
+                           frames.captured_at AS frame_captured_at,
+                           frames.width AS frame_width, frames.height AS frame_height,
+                           frames.bbox_x AS frame_bbox_x, frames.bbox_y AS frame_bbox_y,
+                           frames.parent_frame_id, frames.source_ref,
+                           frames.metadata AS frame_metadata,
+                           frames.preprocessed_metadata AS frame_preprocessed_metadata,
+                           frames.flatfield_metadata AS frame_flatfield_metadata,
                            annotation.id AS annotation_id, annotation.label_id,
                            annotation.actor_username, annotation.method AS annotation_method,
                            annotation.status AS annotation_status,
@@ -302,6 +318,14 @@ def generate_and_load_registry_dataset(
                         "subsample_ratio": ratio,
                         "ordering": "asset_id, frame_index, roi_index, refined_detection_id",
                         "selection_fingerprint_sha256": selection_fingerprint,
+                        "spatial_contract": {
+                            "version": "pelagia.item_geometry.v1",
+                            "encoding": "xywh",
+                            "coordinate_space": "source_frame_pixels",
+                            "bbox": "detected object extent",
+                            "crop_bbox": "stored ROI image extent",
+                            "fallback": "bbox equals crop when only one compatible rectangle is available",
+                        },
                     }
                 },
             )
@@ -329,6 +353,54 @@ def generate_and_load_registry_dataset(
                 item_id = str(row["id"])
                 payload, encoding, media_type, portable_shape, portable_dtype = _portable_image(row)
                 asset_id = str(uuid.uuid5(uuid.UUID(dataset_id), f"roi-asset:{item_id}"))
+                pelagia_metadata = {
+                    "source_asset_id": str(row["source_asset_id"]),
+                    "source_asset_filename": row["source_asset_filename"],
+                    "run_id": str(row["run_id"]) if row.get("run_id") else None,
+                    "frame_id": str(row["frame_id"]), "frame_index": row["frame_index"],
+                    "roi_index": row["roi_index"], "area": row["area"],
+                    "selection_ordinal": row["selection_ordinal"],
+                    "detection_metadata": _json(row.get("metadata")),
+                    "source_asset": {
+                        "id": str(row["source_asset_id"]),
+                        "filename": row["source_asset_filename"],
+                        "kind": str(row.get("source_asset_kind")) if row.get("source_asset_kind") else None,
+                        "checksum": row.get("source_asset_checksum"),
+                        "collections": list(row.get("source_asset_collections") or []),
+                        "metadata": _json(row.get("source_asset_metadata")),
+                    },
+                    "frame": {
+                        "id": str(row["frame_id"]), "index": row["frame_index"],
+                        "captured_at": str(row["frame_captured_at"]) if row.get("frame_captured_at") else None,
+                        "width": row.get("frame_width"), "height": row.get("frame_height"),
+                        "origin": {"x": row.get("frame_bbox_x"), "y": row.get("frame_bbox_y")},
+                        "parent_frame_id": str(row["parent_frame_id"]) if row.get("parent_frame_id") else None,
+                        "source_ref": row.get("source_ref"),
+                        "metadata": _json(row.get("frame_metadata")),
+                        "preprocessed_metadata": _json(row.get("frame_preprocessed_metadata")),
+                        "flatfield_metadata": _json(row.get("frame_flatfield_metadata")),
+                    },
+                    "roi_representation": {
+                        "encoding": row.get("roi_encoding"), "format": row.get("roi_format"),
+                        "dtype": row.get("roi_dtype"), "shape": list(row.get("roi_shape") or []),
+                    },
+                    "spatial": {
+                        "coordinate_space": "source_frame_pixels",
+                        "bbox": {
+                            "x": row.get("bbox_x"), "y": row.get("bbox_y"),
+                            "w": row.get("bbox_w"), "h": row.get("bbox_h"),
+                        },
+                        "crop_bbox": {
+                            "x": row.get("crop_bbox_x"), "y": row.get("crop_bbox_y"),
+                            "w": row.get("crop_bbox_w"), "h": row.get("crop_bbox_h"),
+                        },
+                        "encoding": "xywh",
+                    },
+                }
+                item_metadata = {"pelagia": pelagia_metadata}
+                geometry = normalize_item_geometry(item_metadata, image_shape=portable_shape)
+                if geometry is None:
+                    raise RegistryGenerationError(f"Could not resolve spatial geometry for ROI {item_id}")
                 output.execute(
                     "INSERT INTO assets VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (asset_id, info["dataset_id"], hashlib.sha256(payload).hexdigest(), payload, None,
@@ -340,14 +412,26 @@ def generate_and_load_registry_dataset(
                      }}), created_at),
                 )
                 output.execute(
-                    "INSERT INTO dataset_items VALUES(?,?,?,?,?,?,?)",
+                    """INSERT INTO dataset_items
+                    (item_id,dataset_id,sample_weight,source_key,metadata_json,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?)""",
                     (item_id, info["dataset_id"], None, f"pelagia:roi:{item_id}",
-                     _dump({"pelagia": {"source_asset_id": str(row["source_asset_id"]),
-                                           "source_asset_filename": row["source_asset_filename"],
-                                           "frame_id": str(row["frame_id"]), "frame_index": row["frame_index"],
-                                           "roi_index": row["roi_index"], "area": row["area"],
-                                           "selection_ordinal": row["selection_ordinal"]}}),
+                     _dump(item_metadata),
                      str(row["created_at"]), created_at),
+                )
+                output.execute(
+                    """INSERT INTO item_geometry (
+                    item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+                    crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        item_id, geometry["coordinate_space"],
+                        geometry["bbox"]["x"], geometry["bbox"]["y"],
+                        geometry["bbox"]["w"], geometry["bbox"]["h"],
+                        geometry["crop_bbox"]["x"], geometry["crop_bbox"]["y"],
+                        geometry["crop_bbox"]["w"], geometry["crop_bbox"]["h"],
+                        _dump(geometry["metadata"]),
+                    ),
                 )
                 output.execute("INSERT INTO classification_items VALUES(?,?)", (item_id, asset_id))
 

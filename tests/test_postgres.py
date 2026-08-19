@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -64,6 +65,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0005_roi_curation",
         "0006_registry_workspaces",
         "0007_registry_generation",
+        "0008_registry_item_geometry",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -113,8 +115,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 7
-    assert status["migrations"]["applied_count"] == 7
+    assert status["migrations"]["available_count"] == 8
+    assert status["migrations"]["applied_count"] == 8
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -220,13 +222,43 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
     source = tmp_path / f"{dataset_type}-source.sqlite"
     destination = tmp_path / f"{dataset_type}-export.sqlite"
     with sqlite3.connect(source) as connection:
-        initialize_database(connection, dataset_type, name="registry-test")
+        info = initialize_database(connection, dataset_type, name="registry-test")
+        asset_id, item_id = str(uuid.uuid4()), str(uuid.uuid4())
+        payload = b"registry-geometry"
+        connection.execute(
+            """INSERT INTO assets (
+               asset_id,dataset_id,content_sha256,payload,encoding,shape_json,metadata_json,created_at
+               ) VALUES (?,?,?,?,?,'[12, 16, 3]','{}','2026-08-19T00:00:00Z')""",
+            (asset_id, info["dataset_id"], hashlib.sha256(payload).hexdigest(), payload, "raw"),
+        )
+        connection.execute(
+            """INSERT INTO dataset_items (
+               item_id,dataset_id,source_key,metadata_json,created_at,updated_at
+               ) VALUES (?,?,?,'{}','2026-08-19T00:00:00Z','2026-08-19T00:00:00Z')""",
+            (item_id, info["dataset_id"], "geometry-test"),
+        )
+        connection.execute(
+            """INSERT INTO item_geometry (
+               item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+               crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+               ) VALUES (?,'source_frame_pixels',102,203,5,6,100,200,16,12,'{}')""",
+            (item_id,),
+        )
+        relation = "classification_items" if dataset_type == "classification" else "mask_refinement_items"
+        columns = "item_id,image_asset_id" if dataset_type == "classification" else "item_id,image_asset_id,candidate_mask_asset_id"
+        values = (item_id, asset_id) if dataset_type == "classification" else (item_id, asset_id, None)
+        connection.execute(
+            f"INSERT INTO {relation} ({columns}) VALUES ({','.join('?' for _ in values)})", values
+        )
         connection.commit()
     project = postgres_repo.create_project(f"registry-{uuid.uuid4().hex}")
     scope = {"project_id": str(project["id"]), "owner_username": "registry-tester"}
 
     loaded = load_sqlite_workspace(postgres_repo, source, **scope)
     workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
+    registry_item = workspace.list_items(limit=10, offset=0)["items"][0]
+    assert registry_item["bbox"] == {"x": 102, "y": 203, "w": 5, "h": 6}
+    assert registry_item["crop_bbox"] == {"x": 100, "y": 200, "w": 16, "h": 12}
     assert RegistryWorkspaceService(postgres_repo, scope["project_id"], "other-user").active_workspace() is None
     label = workspace.add_label({"name": "copepod", "display_name": "Copepod"})
     assert label["name"] == "copepod"
@@ -236,6 +268,9 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
     )
     with sqlite3.connect(destination) as connection:
         assert validate_database(connection)["valid"] is True
+        assert connection.execute(
+            "SELECT bbox_x,bbox_y,bbox_w,bbox_h,crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h FROM item_geometry"
+        ).fetchone() == (102, 203, 5, 6, 100, 200, 16, 12)
         label_table = "classification_labels" if dataset_type == "classification" else "annotation_labels"
         assert connection.execute(f"SELECT count(*) FROM {label_table}").fetchone()[0] == 1
     assert exported["parent_revision_id"]

@@ -205,17 +205,27 @@ def _load_assets(cursor, schema: str, workspace_id: Any, source: sqlite3.Connect
 def _load_items(cursor, schema: str, workspace_id: Any, source: sqlite3.Connection, dataset_type: str) -> None:
     relation = "classification_items" if dataset_type == "classification" else "mask_refinement_items"
     task_rows = {str(row["item_id"]): row for row in _rows(source, relation)}
+    geometry_rows = {str(row["item_id"]): row for row in _rows(source, "item_geometry")}
     for ordinal, row in enumerate(_rows(source, "dataset_items")):
         task = task_rows[str(row["item_id"])]
+        geometry = geometry_rows.get(str(row["item_id"]))
         cursor.execute(
             f"""INSERT INTO {schema}.registry_items (
               workspace_id,item_id,ordinal,sample_weight,source_key,image_asset_id,
-              candidate_mask_asset_id,metadata,created_at,updated_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+              candidate_mask_asset_id,metadata,created_at,updated_at,
+              coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+              crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,spatial_metadata
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
                 workspace_id,row["item_id"],ordinal,row["sample_weight"],row["source_key"],
                 task["image_asset_id"],task["candidate_mask_asset_id"] if dataset_type == "mask_refinement" else None,
                 _jsonb(row["metadata_json"]),row["created_at"],row["updated_at"],
+                geometry["coordinate_space"] if geometry else None,
+                geometry["bbox_x"] if geometry else None,geometry["bbox_y"] if geometry else None,
+                geometry["bbox_w"] if geometry else None,geometry["bbox_h"] if geometry else None,
+                geometry["crop_bbox_x"] if geometry else None,geometry["crop_bbox_y"] if geometry else None,
+                geometry["crop_bbox_w"] if geometry else None,geometry["crop_bbox_h"] if geometry else None,
+                _jsonb(geometry["metadata_json"] if geometry else {}),
             ),
         )
 
@@ -481,8 +491,17 @@ def _write_workspace(cursor, schema: str, workspace_id: str, output: sqlite3.Con
            row["original_filename"],json.dumps(row["metadata"],sort_keys=True),row["created_at"]))
     if progress_callback: progress_callback(1, "Exported assets")
     for row in pg_rows("registry_items", "ordinal"):
-        output.execute("INSERT INTO dataset_items VALUES(?,?,?,?,?,?,?)",
+        output.execute("""INSERT INTO dataset_items
+          (item_id,dataset_id,sample_weight,source_key,metadata_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?)""",
           (row["item_id"],workspace["dataset_id"],row["sample_weight"],row["source_key"],json.dumps(row["metadata"],sort_keys=True),row["created_at"],row["updated_at"]))
+        output.execute("""INSERT INTO item_geometry (
+          item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+          crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+          (row["item_id"],row["coordinate_space"],row["bbox_x"],row["bbox_y"],row["bbox_w"],row["bbox_h"],
+           row["crop_bbox_x"],row["crop_bbox_y"],row["crop_bbox_w"],row["crop_bbox_h"],
+           json.dumps(row["spatial_metadata"] or {},sort_keys=True)))
         if workspace["dataset_type"] == "classification":
             output.execute("INSERT INTO classification_items VALUES(?,?)",(row["item_id"],row["image_asset_id"]))
         else:

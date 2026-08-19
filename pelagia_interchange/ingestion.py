@@ -128,6 +128,26 @@ def _ffmpeg_version(executable: str) -> str | None:
     return first[2] if len(first) >= 3 else None
 
 
+def _passthrough_timing_arguments(executable: str) -> tuple[list[str], str]:
+    """Select frame-passthrough syntax supported by the installed FFmpeg.
+
+    FFmpeg 5 introduced the per-stream ``-fps_mode`` option. Older supported
+    installations provide the equivalent global ``-vsync 0`` spelling.
+    Inspecting the executable's own help is more reliable than parsing vendor
+    version strings, which may include backported options.
+    """
+    completed = subprocess.run(
+        [executable, "-hide_banner", "-h", "full"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    help_text = f"{completed.stdout}\n{completed.stderr}"
+    if "-fps_mode" in help_text:
+        return ["-fps_mode", "passthrough"], "fps_mode_passthrough"
+    return ["-vsync", "0"], "vsync_0"
+
+
 def _thumbnail(payload: bytes, *, ffmpeg: str, width: int) -> bytes:
     command = [ffmpeg, "-v", "error", "-i", "pipe:0", "-vf", f"scale=w='min(iw,{width})':h=-2:flags=lanczos",
                "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]
@@ -178,9 +198,16 @@ def ingest_video_directory(
     if generate_previews and not 32 <= preview_width <= 8192:
         raise ValueError("preview_width must be between 32 and 8192")
     encoder_version = _ffmpeg_version(ffmpeg_path)
+    timing_arguments, timing_mode = _passthrough_timing_arguments(ffmpeg_path)
+    if progress and timing_mode == "vsync_0":
+        progress(
+            f"FFmpeg {encoder_version or 'unknown'} does not advertise -fps_mode; "
+            "using compatible -vsync 0 frame passthrough"
+        )
     storage = StorageFormat(codec="jpeg", quality=None, pixel_format="gray8" if grayscale else "yuvj444p",
                             bit_depth=8, encoder="ffmpeg mjpeg", encoder_version=encoder_version,
-                            parameters={"qscale": ffmpeg_qscale, "grayscale": grayscale},
+                            parameters={"qscale": ffmpeg_qscale, "grayscale": grayscale,
+                                        "frame_sync_mode": timing_mode},
                             description=f"FFmpeg MJPEG qscale {ffmpeg_qscale}, {'grayscale' if grayscale else 'color'}")
     probes: list[VideoProbe] = []
     for index, video in enumerate(videos, 1):
@@ -227,7 +254,7 @@ def ingest_video_directory(
                 progress(f"[{index}/{len(videos)}] transcoding {probe.frame_count:,} frames from {video.name}")
             with tempfile.TemporaryFile(mode="w+b") as errors:
                 command = [ffmpeg_path, "-v", "error", "-xerror", "-err_detect", "explode", "-i", str(video),
-                           "-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough",
+                           "-map", "0:v:0", "-an", "-sn", "-dn", *timing_arguments,
                            "-c:v", "mjpeg", "-q:v", str(ffmpeg_qscale), "-pix_fmt", "gray" if grayscale else "yuvj444p",
                            "-f", "image2pipe", "pipe:1"]
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
@@ -276,7 +303,8 @@ def ingest_video_directory(
                 raise VideoIngestionError(f"frame-count mismatch for {video}: ffprobe expected {probe.frame_count}, FFmpeg produced {decoded}; the incomplete dataset was preserved for review")
             builder.history.append(operation="frames_transcoded", software="ffmpeg", software_version=encoder_version or "unknown",
                                    parameters={"codec": "mjpeg", "qscale": ffmpeg_qscale, "grayscale": grayscale,
-                                               "source_file_boundary": source_file_boundary},
+                                               "source_file_boundary": source_file_boundary,
+                                               "frame_sync_mode": timing_mode},
                                    inputs=[{"source_uuid": str(source.source_uuid)}],
                                    outputs=[{"stream_uuid": str(stream_uuid), "first_frame": next_frame_id - decoded,
                                              "last_frame": next_frame_id - 1, "frame_count": decoded}])

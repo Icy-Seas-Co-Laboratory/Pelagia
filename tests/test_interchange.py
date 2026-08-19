@@ -16,7 +16,12 @@ from pelagia_interchange import (
 )
 from pelagia_interchange.cli import main
 from pelagia_interchange.extraction import extract_frames
-from pelagia_interchange.ingestion import VideoIngestionError, discover_videos, ingest_video_directory
+from pelagia_interchange.ingestion import (
+    VideoIngestionError,
+    _passthrough_timing_arguments,
+    discover_videos,
+    ingest_video_directory,
+)
 from pelagia_interchange.util import hash_file
 
 JPEG = b"\xff\xd8synthetic-jpeg\xff\xd9"
@@ -65,6 +70,30 @@ def test_video_discovery_is_deterministic_and_optional_recursive(tmp_path: Path)
     nested = tmp_path / "nested"; nested.mkdir(); (nested / "c.mov").write_bytes(b"video")
     assert [path.name for path in discover_videos(tmp_path)] == ["a.avi", "B.MP4"]
     assert [path.name for path in discover_videos(tmp_path, recursive=True)] == ["a.avi", "B.MP4", "c.mov"]
+
+
+@pytest.mark.parametrize(
+    ("help_text", "expected_arguments", "expected_mode"),
+    [
+        ("-fps_mode[:stream_specifier] set framerate mode", ["-fps_mode", "passthrough"], "fps_mode_passthrough"),
+        ("-vsync parameter set video sync method", ["-vsync", "0"], "vsync_0"),
+    ],
+)
+def test_ffmpeg_frame_passthrough_uses_supported_syntax(
+    monkeypatch: pytest.MonkeyPatch,
+    help_text: str,
+    expected_arguments: list[str],
+    expected_mode: str,
+) -> None:
+    monkeypatch.setattr(
+        "pelagia_interchange.ingestion.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=help_text, stderr=""),
+    )
+
+    arguments, mode = _passthrough_timing_arguments("/usr/bin/ffmpeg")
+
+    assert arguments == expected_arguments
+    assert mode == expected_mode
 
 
 def test_interactive_video_create_collects_and_confirms_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
