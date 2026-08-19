@@ -8,6 +8,7 @@ version = "0.0.1"
 description = "Integrated image processing, storage, API, CLI, and worker tools."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "oracle-data-contracts>=0.2,<0.3",
     "numpy",
     "opencv-python>=4.10,<5",
     "psutil>=5.9,<8",
@@ -30,6 +31,9 @@ test = ["pytest"]
 [project.scripts]
 pelagia = "Pelagia.cli.app:main"
 pii = "pelagia_interchange.cli:main"
+
+[tool.uv.sources]
+oracle-data-contracts = { path = "../oracle-builder/oracle_data_contracts", editable = true }
 
 [tool.setuptools.packages.find]
 include = ["Pelagia*", "pelagia_interchange*"]

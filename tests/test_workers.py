@@ -1532,6 +1532,14 @@ def test_default_registry_includes_roi_refinement_handler():
     assert repo.completed[0][1]["refined_count"] == 1
 
 
+def test_default_registry_includes_registry_transfer_handlers():
+    handlers = default_handler_registry()
+
+    assert PipelineStage.REGISTRY_LOAD in handlers._handlers
+    assert PipelineStage.REGISTRY_EXPORT in handlers._handlers
+    assert PipelineStage.REGISTRY_GENERATE in handlers._handlers
+
+
 def test_default_registry_includes_background_frames_handler(monkeypatch):
     repo = FakeRepository()
     repo.claimed_jobs = [

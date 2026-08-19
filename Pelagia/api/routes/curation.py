@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 try:
@@ -15,6 +18,7 @@ if APIRouter is not None:
     from ...domain import PipelineStage
     from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
     from ...services.pipeline import PipelineService
+    from ...services.registry_generation import preview_registry_dataset
     from ...services.taxonomy import default_taxonomy_dictionary
     from ._common import as_response, get_context, get_repository
 
@@ -79,6 +83,26 @@ if APIRouter is not None:
         model_ref: str | None = None
         selection: ClassificationTargetSelectionRequest | None = None
 
+    class RegistryDatasetSelectionRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        asset_ids: list[str] = Field(default_factory=list)
+        annotation_state: Literal["all", "labeled", "unlabeled"] = "all"
+        review_state: Literal[
+            "all", "unreviewed", "verified", "rejected", "needs_review"
+        ] = "all"
+        evidence_state: Literal["all", "available", "missing", "disagreement"] = "all"
+        min_area: float | None = Field(default=None, ge=0)
+        max_area: float | None = Field(default=None, ge=0)
+
+    class RegistryDatasetPreviewRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        selection: RegistryDatasetSelectionRequest = Field(default_factory=RegistryDatasetSelectionRequest)
+        subsample_ratio: int = Field(default=1, ge=1, le=1000)
+
+    class RegistryDatasetExportRequest(RegistryDatasetPreviewRequest):
+        name: str = Field(min_length=1, max_length=160)
+        path: str = Field(min_length=1)
+
     router = APIRouter(prefix="/curation", tags=["curation"])
 
     def _actor_user_id(value: str) -> str | None:
@@ -95,6 +119,28 @@ if APIRouter is not None:
             value["thumbnail_url"] = f"/refined-detections/{roi_id}/roi?format=jpg&width=180"
         value.pop("total_count", None)
         return value
+
+    def _registry_root(request: Request) -> Path:
+        return Path(get_context(request).config.file_browser.root_path_import_dir).expanduser().resolve()
+
+    def _registry_destination(request: Request, value: str) -> Path:
+        destination = Path(value).expanduser().resolve()
+        roots = [_registry_root(request), *(
+            Path(path).expanduser().resolve()
+            for path in get_context(request).config.file_browser.allowed_root_paths
+        )]
+        if roots and not any(destination == root or destination.is_relative_to(root) for root in roots):
+            raise HTTPException(status_code=403, detail="Path is outside the configured Registry roots")
+        if destination.suffix.lower() not in {".sqlite", ".sqlite3", ".db"}:
+            raise HTTPException(status_code=422, detail="Registry datasets must use a .sqlite, .sqlite3, or .db extension")
+        return destination
+
+    def _validated_registry_selection(body: RegistryDatasetPreviewRequest) -> dict:
+        selection = body.selection.model_dump(exclude_none=True)
+        if selection.get("min_area") is not None and selection.get("max_area") is not None:
+            if selection["min_area"] > selection["max_area"]:
+                raise HTTPException(status_code=422, detail="Minimum ROI area cannot exceed maximum ROI area.")
+        return selection
 
     def _classification_request(
         request: Request,
@@ -155,12 +201,24 @@ if APIRouter is not None:
         finally:
             if owns_client:
                 client.close()
+        assets = repository.list_assets(project_id=auth.project_id, limit=1000)
+        export_root = _registry_root(request)
+        default_filename = datetime.now(timezone.utc).strftime("pelagia-registry-%Y%m%d-%H%M%S.sqlite")
         return as_response(
             {
                 "oracle": oracle,
                 "models": models,
                 "default_model_ref": get_context(request).config.oracle.default_classification_model,
                 "labels": repository.list_curation_labels(project_id=auth.project_id),
+                "assets": [
+                    {"id": str(asset["id"]), "filename": asset.get("filename") or str(asset["id"]),
+                     "kind": asset.get("kind")}
+                    for asset in assets if asset.get("id") is not None
+                ],
+                "registry_export": {
+                    "root_path": str(export_root),
+                    "default_path": str(export_root / default_filename),
+                },
                 "default_label_dictionary": default_taxonomy_dictionary(),
                 "ownership": {
                     "human_ground_truth": "pelagia",
@@ -169,6 +227,50 @@ if APIRouter is not None:
                 },
             }
         )
+
+    @router.post("/registry-datasets/preview")
+    def preview_registry_export(request: Request, body: RegistryDatasetPreviewRequest) -> dict:
+        auth = require_project_read(request)
+        selection = _validated_registry_selection(body)
+        return as_response(preview_registry_dataset(
+            get_repository(request), project_id=str(auth.project_id), selection=selection,
+            subsample_ratio=body.subsample_ratio,
+        ))
+
+    @router.post("/registry-datasets", status_code=202)
+    def create_registry_dataset(request: Request, body: RegistryDatasetExportRequest) -> dict:
+        auth = require_project_write(request)
+        selection = _validated_registry_selection(body)
+        preview = preview_registry_dataset(
+            get_repository(request), project_id=str(auth.project_id), selection=selection,
+            subsample_ratio=body.subsample_ratio,
+        )
+        if preview["selected_count"] < 1:
+            raise HTTPException(status_code=422, detail="No refined ROIs match this dataset selection.")
+        destination = _registry_destination(request, body.path)
+        if destination.exists():
+            raise HTTPException(status_code=409, detail="Destination already exists; choose a new SQLite filename.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        required_bytes = max(preview["estimated_sqlite_bytes"] * 2, 16 * 1024 * 1024)
+        if shutil.disk_usage(destination.parent).free < required_bytes:
+            raise HTTPException(status_code=507, detail=f"Dataset generation requires at least {required_bytes} bytes of free space")
+        dataset_id = str(uuid.uuid4())
+        revision_id = str(uuid.uuid4())
+        job = PipelineService(get_context(request)).queue(
+            PipelineStage.REGISTRY_GENERATE, project_id=str(auth.project_id),
+            payload={
+                "destination_path": str(destination), "name": body.name.strip(),
+                "selection": selection, "subsample_ratio": body.subsample_ratio,
+                "selected_count": preview["selected_count"], "dataset_id": dataset_id,
+                "revision_id": revision_id, "owner_username": auth.username,
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+            },
+            summary=f"Generate Registry dataset with {preview['selected_count']} ROIs",
+            submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+        )
+        return {"job": as_response(job), "preview": preview,
+                "dataset_id": dataset_id, "revision_id": revision_id,
+                "destination_path": str(destination)}
 
     @router.get("/labels")
     def labels(request: Request, include_deprecated: bool = False) -> dict:

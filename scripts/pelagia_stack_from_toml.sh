@@ -135,6 +135,10 @@ stage_aliases = {
     "roi_refinement": "roi_refinement",
     "classify": "classify",
     "classification": "classify",
+    "registry": "registry_load",
+    "registry_load": "registry_load",
+    "registry_export": "registry_export",
+    "registry_generate": "registry_generate",
     "refine_rois": "roi_refinement",
 }
 

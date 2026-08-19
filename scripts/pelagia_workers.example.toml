@@ -70,6 +70,10 @@ name = "refine-1"
 capabilities = ["roi_refinement"]
 
 [[worker]]
+name = "registry-1"
+capabilities = ["registry_load", "registry_export", "registry_generate"]
+
+[[worker]]
 name = "allrounder"
 capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify"]
 enabled = false

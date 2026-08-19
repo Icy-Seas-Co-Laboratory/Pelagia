@@ -55,6 +55,9 @@ class PipelineStage(str, Enum):
     IO_EXPORT = "io_export"
     IO_UPLOAD = "io_upload"
     IO_DOWNLOAD = "io_download"
+    REGISTRY_LOAD = "registry_load"
+    REGISTRY_EXPORT = "registry_export"
+    REGISTRY_GENERATE = "registry_generate"
 
 
 class JobStatus(str, Enum):

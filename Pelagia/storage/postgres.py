@@ -47,6 +47,8 @@ REQUIRED_SCHEMA_TABLES = (
     "classification_evidence",
     "roi_label_annotations",
     "roi_annotation_reviews",
+    "registry_workspaces",
+    "registry_items",
     "processing_jobs",
     "processing_job_dependencies",
     "project_processing_status_snapshots",

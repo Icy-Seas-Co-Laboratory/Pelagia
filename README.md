@@ -44,6 +44,16 @@ database and blob storage in sync.
 For large-frame filtering and project processing summaries, see the
 [Processing Status Projection](docs/processing-status.md) guide.
 
+### Registry workspaces
+
+PelagiaView includes Registry at `/registry/`. Opening an Oracle Dataset SQLite
+file queues a progress-reporting worker job that loads a validated, user- and project-scoped working copy into PostgreSQL;
+the source file is not modified. Registry edits are recorded in PostgreSQL and
+can be exported as a new child SQLite revision, explicitly written back to the
+current source (with a backup and hash guard), or purged from PostgreSQL. The
+portable schema remains owned by the existing `oracle_data_contracts` package.
+Run at least one worker with `registry_load,registry_export,registry_generate` capabilities.
+
 ### Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) for Python and dependency management.

@@ -1187,6 +1187,63 @@ def auth_headers(client, *, username="ada", project_key="default"):
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+def test_registry_open_queues_project_scoped_transfer_job(tmp_path):
+    client, repository, _ = make_client()
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    source = tmp_path / "dataset.sqlite"
+    source.write_bytes(b"queued-validation-happens-in-worker")
+
+    response = client.post("/registry/dataset/open", json={"path": str(source)})
+
+    assert response.status_code == 202
+    assert response.json()["job"]["stage"] == PipelineStage.REGISTRY_LOAD.value
+    queued = repository.created_jobs[-1]
+    assert queued["project_id"] == "project-1"
+    assert queued["payload"]["source_path"] == str(source)
+    assert queued["payload"]["owner_username"] == "dev"
+
+
+def test_curation_registry_dataset_preview_and_generation_are_consistent(tmp_path, monkeypatch):
+    from Pelagia.api.routes import curation as curation_routes
+
+    client, repository, _ = make_client()
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    calls = []
+
+    def preview(repository_value, **values):
+        calls.append(values)
+        return {
+            "matching_count": 1001, "selected_count": 3, "payload_bytes": 900,
+            "estimated_sqlite_bytes": 1_055_000, "subsample_ratio": 500,
+        }
+
+    monkeypatch.setattr(curation_routes, "preview_registry_dataset", preview)
+    body = {
+        "selection": {
+            "annotation_state": "labeled", "review_state": "verified",
+            "evidence_state": "available", "min_area": 20, "max_area": 200,
+        },
+        "subsample_ratio": 500,
+    }
+    response = client.post("/curation/registry-datasets/preview", json=body)
+    assert response.status_code == 200
+    assert response.json()["selected_count"] == 3
+
+    destination = tmp_path / "curated.sqlite"
+    response = client.post(
+        "/curation/registry-datasets",
+        json={**body, "name": "Curated export", "path": str(destination)},
+    )
+    assert response.status_code == 202
+    assert response.json()["job"]["stage"] == PipelineStage.REGISTRY_GENERATE.value
+    queued = repository.created_jobs[-1]
+    assert queued["payload"]["selection"] == {**body["selection"], "asset_ids": []}
+    assert queued["payload"]["subsample_ratio"] == 500
+    assert queued["payload"]["selected_count"] == 3
+    assert queued["payload"]["destination_path"] == str(destination)
+    assert len(calls) == 2
+
+
 def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     client, repository, _ = make_client()
     label = {"id": "label-1", "name": "copepod", "display_name": "Copepod"}

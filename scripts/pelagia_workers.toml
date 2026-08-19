@@ -97,3 +97,7 @@ capabilities = ["roi_refinement", "classify"]
 [[worker]]
 name = "refine-2"
 capabilities = ["roi_refinement", "classify"]
+
+[[worker]]
+name = "registry-1"
+capabilities = ["registry_load", "registry_export", "registry_generate"]

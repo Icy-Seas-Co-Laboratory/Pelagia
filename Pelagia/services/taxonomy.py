@@ -54,3 +54,26 @@ def default_taxonomy_dictionary() -> dict[str, Any]:
         "selectable_count": sum(bool(node.get("selectable", True)) for node in nodes),
     }
 
+
+def default_registry_vocabulary() -> dict[str, Any]:
+    """Return the complete packaged vocabulary in Registry's public shape."""
+
+    data = deepcopy(_default_taxonomy())
+    metadata = data["vocabulary"]
+    data["catalog_key"] = f"{metadata['id']}@{metadata['version']}"
+    data["filename"] = DEFAULT_TAXONOMY_FILENAME
+    for group in ("taxonomy", "target_tags", "image_tags"):
+        data.setdefault(group, {"name": group.replace("_", " ").title(), "description": "", "nodes": []})
+    return data
+
+
+def default_registry_vocabulary_summary() -> dict[str, Any]:
+    vocabulary = default_registry_vocabulary()
+    return {
+        "key": vocabulary["catalog_key"],
+        "filename": vocabulary["filename"],
+        "vocabulary": vocabulary["vocabulary"],
+        "taxonomy_count": len(vocabulary["taxonomy"]["nodes"]),
+        "target_tag_count": len(vocabulary["target_tags"]["nodes"]),
+        "image_tag_count": len(vocabulary["image_tags"]["nodes"]),
+    }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
+import sqlite3
 import uuid
 
 import pytest
@@ -22,6 +23,9 @@ from Pelagia.domain import (
 from Pelagia.storage import postgres
 from Pelagia.storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository, hash_session_token
 from Pelagia.services.taxonomy import default_taxonomy_dictionary
+from Pelagia.services.registry_transfer import export_sqlite_workspace, load_sqlite_workspace
+from Pelagia.services.registry_workspace import RegistryWorkspaceService
+from oracle_data_contracts.datasets import initialize_database, validate_database
 
 
 POSTGRES_TEST_DSN = os.getenv(
@@ -58,6 +62,8 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0003_processing_status_summary_indexes",
         "0004_frame_flatfield_profiles",
         "0005_roi_curation",
+        "0006_registry_workspaces",
+        "0007_registry_generation",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -107,8 +113,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 5
-    assert status["migrations"]["applied_count"] == 5
+    assert status["migrations"]["available_count"] == 7
+    assert status["migrations"]["applied_count"] == 7
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -207,6 +213,74 @@ def test_postgres_imports_default_curation_labels_idempotently(postgres_repo):
     labels = {label["stable_concept_id"]: label for label in second["labels"]}
     assert labels["taxon_crustacea"]["parent_label_id"] == labels["taxon_arthropoda"]["id"]
     assert labels["taxon_copepoda"]["display_name"] == "Copepod"
+
+
+@pytest.mark.parametrize("dataset_type", ["classification", "mask_refinement"])
+def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path, dataset_type):
+    source = tmp_path / f"{dataset_type}-source.sqlite"
+    destination = tmp_path / f"{dataset_type}-export.sqlite"
+    with sqlite3.connect(source) as connection:
+        initialize_database(connection, dataset_type, name="registry-test")
+        connection.commit()
+    project = postgres_repo.create_project(f"registry-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "registry-tester"}
+
+    loaded = load_sqlite_workspace(postgres_repo, source, **scope)
+    workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
+    assert RegistryWorkspaceService(postgres_repo, scope["project_id"], "other-user").active_workspace() is None
+    label = workspace.add_label({"name": "copepod", "display_name": "Copepod"})
+    assert label["name"] == "copepod"
+
+    exported = export_sqlite_workspace(
+        postgres_repo, loaded["workspace_id"], destination, operation_id="export-job-1", **scope,
+    )
+    with sqlite3.connect(destination) as connection:
+        assert validate_database(connection)["valid"] is True
+        label_table = "classification_labels" if dataset_type == "classification" else "annotation_labels"
+        assert connection.execute(f"SELECT count(*) FROM {label_table}").fetchone()[0] == 1
+    assert exported["parent_revision_id"]
+    retried = export_sqlite_workspace(
+        postgres_repo, loaded["workspace_id"], destination, operation_id="export-job-1", **scope,
+    )
+    assert retried["reused"] is True
+    assert retried["revision_id"] == exported["revision_id"]
+
+    purged = workspace.purge()
+    assert purged["status"] == "purged"
+    reloaded = load_sqlite_workspace(postgres_repo, destination, **scope)
+    assert reloaded["reused"] is False
+    assert reloaded["workspace_id"] != loaded["workspace_id"]
+
+
+def test_registry_workspace_has_one_active_owner_project_workspace(postgres_repo):
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT indexdef FROM pg_indexes WHERE schemaname=%s
+            AND tablename='registry_workspaces' AND indexdef ILIKE 'CREATE UNIQUE INDEX%%'
+            AND indexdef LIKE '%%WHERE is_active%%'""",
+            (postgres_repo.schema,),
+        )
+        definition = cursor.fetchone()["indexdef"]
+    assert "UNIQUE" in definition
+    assert "WHERE is_active" in definition
+
+
+def test_registry_source_overwrite_rejects_changed_bytes(postgres_repo, tmp_path):
+    source = tmp_path / "source.sqlite"
+    with sqlite3.connect(source) as connection:
+        initialize_database(connection, "classification", name="hash-guard")
+        connection.commit()
+    project = postgres_repo.create_project(f"registry-hash-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "registry-tester"}
+    loaded = load_sqlite_workspace(postgres_repo, source, **scope)
+    with source.open("ab") as stream:
+        stream.write(b"externally-changed")
+
+    with pytest.raises(ValueError, match="changed after it was loaded"):
+        export_sqlite_workspace(postgres_repo, loaded["workspace_id"], source, replace_source=True, **scope)
+
+    workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
+    assert workspace.active_workspace()["status"] == "loaded"
 
 
 def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
