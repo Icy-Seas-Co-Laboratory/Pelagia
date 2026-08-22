@@ -309,6 +309,11 @@ class FrameContextResponse(FlexibleModel):
     detections: list[DetectionSummary]
     detection_count: int
     page: PageMetadata
+    # Temporal context is optional and is included when requested by the
+    # endpoint query flags.  Keep the value shape open because telemetry
+    # parameters and event types are project-defined.
+    telemetry: dict[str, Any] = Field(default_factory=dict)
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OptionsResponse(FlexibleModel):

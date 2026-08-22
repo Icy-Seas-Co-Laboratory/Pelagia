@@ -40,6 +40,7 @@ class AssetKind(str, Enum):
     IMAGE = "image"
     IMAGE_SEQUENCE = "image_sequence"
     INTERCHANGE = "interchange"
+    TELEMETRY = "telemetry"
 
 
 class PipelineStage(str, Enum):
@@ -53,6 +54,7 @@ class PipelineStage(str, Enum):
     PUBLISH = "publish"
     TRAIN_MODEL = "train_model"
     IO_IMPORT = "io_import"
+    TELEMETRY_IMPORT = "telemetry_import"
     IO_EXPORT = "io_export"
     IO_UPLOAD = "io_upload"
     IO_DOWNLOAD = "io_download"

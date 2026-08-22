@@ -1574,6 +1574,7 @@ def test_default_registry_includes_registry_transfer_handlers():
     assert PipelineStage.REGISTRY_LOAD in handlers._handlers
     assert PipelineStage.REGISTRY_EXPORT in handlers._handlers
     assert PipelineStage.REGISTRY_GENERATE in handlers._handlers
+    assert PipelineStage.TELEMETRY_IMPORT in handlers._handlers
 
 
 def test_default_registry_includes_background_frames_handler(monkeypatch):

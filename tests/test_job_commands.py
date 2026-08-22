@@ -15,6 +15,7 @@ from Pelagia.services.job_commands import (
     FrameSelection,
     ExtractFramesCommand,
     SegmentFramesCommand,
+    TelemetryImportCommand,
     command_from_payload,
 )
 
@@ -103,6 +104,22 @@ def test_classification_command_preserves_reproducible_target_selection():
     assert payload["selection"]["annotation_state"] == "unlabeled"
     assert payload["selection"]["evidence_state"] == "missing_model"
     assert payload["selection"]["min_area"] == 25.0
+
+
+def test_telemetry_import_command_preserves_parser_and_mapping():
+    command = TelemetryImportCommand.from_payload(
+        {
+            "path": "/data/ship.csv",
+            "timestamp_column": "time",
+            "parser_name": "shipboard.logger",
+            "parser_version": "2.4",
+            "streams": [{"column": "temp", "stream_key": "ctd.temperature"}],
+        }
+    )
+    payload = command.to_payload()
+    assert payload["command_type"] == "telemetry_import"
+    assert payload["parser_name"] == "shipboard.logger"
+    assert payload["streams"][0]["stream_key"] == "ctd.temperature"
 
 
 def test_codec_registry_normalizes_aliases_and_encodes_png():

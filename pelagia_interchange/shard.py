@@ -50,6 +50,7 @@ class ShardWriter:
         self.batch_size = batch_size
         self._pending = 0
         self._closed = False
+        self.created_at = utc_now()
         self._storage_ids: dict[tuple[Any, ...], int] = {}
         self._source_ids: set[int] = set()
         self.first_frame: int | None = None
@@ -69,12 +70,107 @@ class ShardWriter:
             self.connection.execute("PRAGMA cache_size=-131072")
             self.connection.execute("PRAGMA foreign_keys=ON")
             initialize(self.connection)
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO shard_metadata(key,value) VALUES (?,?)",
+                (("shard_uuid", json.dumps(str(self.shard_uuid))),
+                 ("format_version", json.dumps(FORMAT_VERSION)),
+                 ("schema_version", json.dumps(SCHEMA_VERSION)),
+                 ("created_at", json.dumps(self.created_at)),
+                 ("created_by", json.dumps("pelagia_interchange")),
+                 ("camera_or_stream_id", json.dumps(str(self.stream_uuid))),
+                 ("camera_or_stream_name", json.dumps(self.stream_name))),
+            )
             self.connection.commit()
             self.connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
             self.connection.close()
             self._closed = True
             raise FormatError(f"cannot initialize SQLite shard {self.partial_path}: {exc}") from exc
+
+    @classmethod
+    def resume(
+        cls, final_path: Path, *, stream_uuid: UUID, stream_name: str,
+        shard_uuid: UUID | None = None, batch_size: int = 1000,
+    ) -> "ShardWriter":
+        """Reopen a durable partial shard and continue its current transaction.
+
+        A partial may have been written by an older package version.  The
+        stream identity is therefore taken from its metadata when present and
+        otherwise supplied by the caller; the latter is the compatibility path
+        for the original partial-shard implementation.
+        """
+        partial_path = final_path.with_name(final_path.name + ".partial")
+        if not partial_path.is_file():
+            raise FileNotFoundError(partial_path)
+        if final_path.exists():
+            raise FileExistsError(final_path)
+        self = cls.__new__(cls)
+        self.final_path = final_path
+        self.partial_path = partial_path
+        self.stream_uuid = stream_uuid
+        self.stream_name = stream_name
+        self.batch_size = batch_size
+        self._pending = 0
+        self._closed = False
+        self._storage_ids = {}
+        self._source_ids = set()
+        self.first_frame = None
+        self.last_frame = None
+        self.first_timestamp = None
+        self.last_timestamp = None
+        self.frame_count = 0
+        self.encoded_bytes = 0
+        self.created_at = utc_now()
+        self.final_path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = _connect(partial_path)
+        try:
+            tables = {str(row[0]) for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            missing = REQUIRED_TABLES - tables
+            if missing:
+                raise FormatError(f"partial shard is missing tables: {sorted(missing)}")
+            metadata = {row["key"]: json.loads(row["value"]) for row in self.connection.execute(
+                "SELECT key,value FROM shard_metadata"
+            )}
+            stored_stream = metadata.get("camera_or_stream_id")
+            stored_name = metadata.get("camera_or_stream_name")
+            if stored_stream is not None and str(stored_stream) != str(stream_uuid):
+                raise FormatError(f"partial shard stream UUID {stored_stream!r} does not match {stream_uuid}")
+            if stored_name is not None and str(stored_name) != stream_name:
+                raise FormatError(f"partial shard stream name {stored_name!r} does not match {stream_name!r}")
+            self.shard_uuid = UUID(str(metadata.get("shard_uuid"))) if metadata.get("shard_uuid") else (shard_uuid or uuid4())
+            if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise IntegrityError(f"partial shard failed integrity_check: {partial_path}")
+            for row in self.connection.execute("SELECT source_file_id FROM source_files"):
+                self._source_ids.add(int(row[0]))
+            for row in self.connection.execute(
+                "SELECT storage_id,codec,codec_version,quality,pixel_format,bit_depth,encoder,encoder_version,parameters_json FROM storage_formats"
+            ):
+                key = (row["codec"].lower(), row["codec_version"], row["quality"], row["pixel_format"],
+                       row["bit_depth"], row["encoder"], row["encoder_version"], row["parameters_json"])
+                self._storage_ids[key] = int(row["storage_id"])
+            aggregate = self.connection.execute(
+                "SELECT count(*),min(frame_id),max(frame_id),min(timestamp_ns),max(timestamp_ns),coalesce(sum(byte_size),0) FROM frames"
+            ).fetchone()
+            self.frame_count = int(aggregate[0])
+            self.first_frame, self.last_frame = aggregate[1], aggregate[2]
+            self.first_timestamp, self.last_timestamp = aggregate[3], aggregate[4]
+            self.encoded_bytes = int(aggregate[5])
+            self.created_at = str(metadata.get("created_at") or self.created_at)
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            self.connection.execute("BEGIN IMMEDIATE")
+        except (sqlite3.Error, json.JSONDecodeError, ValueError, TypeError) as exc:
+            self.connection.close()
+            self._closed = True
+            if isinstance(exc, FormatError):
+                raise
+            raise FormatError(f"cannot reopen SQLite shard {partial_path}: {exc}") from exc
+        except (FormatError, IntegrityError):
+            self.connection.close()
+            self._closed = True
+            raise
+        return self
 
     def register_source(self, source: SourceFile) -> None:
         if source.source_file_id in self._source_ids:
@@ -147,7 +243,7 @@ class ShardWriter:
             raise RuntimeError("shard writer is closed")
         metadata = {
             "shard_uuid": str(self.shard_uuid), "format_version": FORMAT_VERSION,
-            "schema_version": SCHEMA_VERSION, "created_at": utc_now(),
+            "schema_version": SCHEMA_VERSION, "created_at": self.created_at,
             "created_by": "pelagia_interchange", "camera_or_stream_id": str(self.stream_uuid),
             "camera_or_stream_name": self.stream_name, "first_frame": self.first_frame,
             "last_frame": self.last_frame, "frame_count": self.frame_count,
@@ -285,6 +381,19 @@ class ShardReader:
                         "first_timestamp": row[3], "last_timestamp": row[4], "encoded_bytes": int(row[5])}
             except sqlite3.Error as exc:
                 raise FormatError(f"cannot aggregate shard {self.path}: {exc}") from exc
+
+    def source_progress(self, source_file_id: int) -> dict[str, int | None]:
+        """Return the durable prefix information for one source file."""
+        with self._connection() as connection:
+            try:
+                row = connection.execute(
+                    "SELECT count(*),min(source_frame_number),max(source_frame_number),max(frame_id) "
+                    "FROM frames WHERE source_file_id=?", (source_file_id,)
+                ).fetchone()
+                return {"frame_count": int(row[0]), "first_source_frame": row[1],
+                        "last_source_frame": row[2], "last_frame": row[3]}
+            except sqlite3.Error as exc:
+                raise FormatError(f"cannot inspect source progress in {self.path}: {exc}") from exc
 
     def summary_counts(self) -> tuple[dict[str, int], dict[str, int]]:
         """Return status/codec distributions without reading frame BLOBs."""

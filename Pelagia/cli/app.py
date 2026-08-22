@@ -102,6 +102,22 @@ if typer is not None:
     def _echo_json(payload: object) -> None:
         typer.echo(json.dumps(json_ready(payload), indent=2, sort_keys=True))
 
+    def _read_json_object(path: Path, *, option_name: str) -> dict:
+        """Load a JSON object supplied as a reproducible command configuration."""
+        resolved = path.expanduser().resolve()
+        try:
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise typer.BadParameter(f"Cannot read {resolved}: {exc}", param_hint=option_name) from exc
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(
+                f"Invalid JSON in {resolved}: {exc.msg} (line {exc.lineno}, column {exc.colno}).",
+                param_hint=option_name,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise typer.BadParameter("Configuration must be a JSON object.", param_hint=option_name)
+        return payload
+
     @environment_app.command("sync")
     def environment_sync(
         profile: str,
@@ -814,6 +830,95 @@ if typer is not None:
                 "frames": frames,
             }
         )
+
+    @app.command("import-telemetry")
+    def import_telemetry(
+        path: Path,
+        run_id: str,
+        mapping: Path = typer.Option(..., help="JSON CSV mapping; see docs/telemetry.md."),
+        project_key: Optional[str] = typer.Option(
+            None, help="Project key; defaults to the configured development project."
+        ),
+        collections: Optional[str] = typer.Option(
+            None, help="Comma-separated collection labels assigned to the source asset."
+        ),
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Import a delimited telemetry source using a versioned JSON mapping."""
+        from ..services.telemetry import TelemetryColumn, TelemetryCsvSpec, TelemetryIngestionService
+
+        config = _read_json_object(mapping, option_name="--mapping")
+        streams = config.pop("streams", None)
+        if not isinstance(streams, list):
+            raise typer.BadParameter("Mapping must contain a 'streams' array.", param_hint="--mapping")
+        try:
+            spec = TelemetryCsvSpec(
+                streams=[TelemetryColumn(**stream) for stream in streams],
+                **config,
+            )
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(f"Invalid telemetry mapping: {exc}", param_hint="--mapping") from exc
+
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        try:
+            project_id = _project_id_from_key(context, project_key)
+            result = TelemetryIngestionService(
+                context.repository, context.kvstore_for_project(project_id),
+            ).import_csv(
+                path,
+                project_id=project_id,
+                run_id=run_id,
+                spec=spec,
+                collections=_split_csv(collections),
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        finally:
+            context.close()
+        _echo_json(result)
+
+    @app.command("lookup-telemetry")
+    def lookup_telemetry(
+        run_id: str,
+        observed_at: str = typer.Option(..., help="ISO 8601 timestamp; use an explicit UTC offset."),
+        parameters: Optional[str] = typer.Option(
+            None, help="Comma-separated parameter keys; defaults to all selected streams."
+        ),
+        project_key: Optional[str] = typer.Option(
+            None, help="Project key; defaults to the configured development project."
+        ),
+        kvstore_root: Optional[Path] = None,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Resolve telemetry values for one instant using each stream's QC and gap rules."""
+        from ..services.telemetry import TelemetryResolver, normalize_observed_at
+
+        try:
+            iso_value = observed_at.strip()
+            if iso_value.endswith("Z"):
+                iso_value = f"{iso_value[:-1]}+00:00"
+            parsed = datetime.fromisoformat(iso_value)
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("timestamp must include a UTC offset")
+            target = normalize_observed_at(parsed)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise typer.BadParameter(f"Invalid timestamp: {exc}", param_hint="--observed-at") from exc
+
+        context = _context_from_options(kvstore_root, database_dsn, schema)
+        try:
+            project_id = _project_id_from_key(context, project_key)
+            result = TelemetryResolver(context.repository).at(
+                project_id=project_id,
+                run_id=run_id,
+                observed_at=target,
+                parameters=_split_csv(parameters) or None,
+            )
+        finally:
+            context.close()
+        _echo_json(result)
 
     @app.command("list_jobs")
     def list_jobs(

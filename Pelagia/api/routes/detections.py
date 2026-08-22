@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 try:
-    from fastapi import APIRouter, HTTPException, Request, Response
+    from fastapi import APIRouter, HTTPException, Query, Request, Response
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -15,6 +15,7 @@ if APIRouter is not None:
     from ..auth import scoped_project_id
     from ...processing.frame_codec import decode_array_payload
     from ...processing.codec_registry import image_extension
+    from ...services.telemetry import parse_telemetry_filters
     from ._common import as_response, detection_summary, get_repository, page_metadata
     from ._images import (
         add_scale_bar,
@@ -211,7 +212,12 @@ if APIRouter is not None:
         sort_dir: Literal["asc", "desc"] = "desc",
         limit: int | None = 100,
         offset: int = 0,
+        telemetry_filter: list[str] = Query(default=[]),
     ) -> dict:
+        try:
+            telemetry_filters = parse_telemetry_filters(telemetry_filter)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         detections = get_repository(request).list_detections(
             asset_id=asset_id,
             project_id=scoped_project_id(request),
@@ -243,6 +249,7 @@ if APIRouter is not None:
             sort_dir=sort_dir,
             limit=limit,
             offset=offset,
+            telemetry_filters=telemetry_filters,
         )
         summaries = [detection_summary(detection) for detection in detections]
         return {
@@ -361,6 +368,30 @@ if APIRouter is not None:
         if detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
         return {"detection": detection_summary(detection, include_payload=True)}
+
+    @router.get("/{detection_id}/context")
+    def get_detection_context(
+        request: Request,
+        detection_id: str,
+        parameters: list[str] | None = Query(default=None),
+    ) -> dict:
+        repository = get_repository(request)
+        project_id = scoped_project_id(request)
+        detection = repository.get_detection(detection_id, project_id=project_id)
+        if detection is None:
+            raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
+        frame = repository.get_frame(str(detection["frame_id"]), project_id=project_id)
+        if frame is None:
+            raise HTTPException(status_code=404, detail="The detection's parent frame was not found.")
+        from ...services.telemetry import frame_context
+
+        return as_response(
+            {
+                "detection": detection_summary(detection),
+                "frame": frame,
+                **frame_context(repository, project_id=project_id, frame=frame, parameters=parameters),
+            }
+        )
 
     @router.head("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)
     @router.get("/{detection_id}/framedata", responses=_IMAGE_RESPONSES)

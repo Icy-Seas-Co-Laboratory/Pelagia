@@ -43,7 +43,7 @@ include = ["Pelagia*", "pelagia_interchange*"]
     "default.config.toml",
     "assets/**/*",
 ]
-"Pelagia.storage" = ["sql/*.sql"]
+"Pelagia.storage" = ["sql/*.sql", "sql/migrations/*.sql"]
 "pelagia_interchange.bundled_tools" = ["README.md"]
 
 [tool.setuptools.exclude-package-data]

@@ -32,6 +32,9 @@ class FakeRepository:
     schema = "pelagia"
 
     def __init__(self):
+        self.telemetry = self
+        self.telemetry_imports = []
+        self.timeline_events = {}
         self.created_jobs = []
         self.registered_runs = []
         self.shutdown_requests = []
@@ -97,6 +100,90 @@ class FakeRepository:
             "det-no-roi": "project-1",
             "job-1": "project-1",
         }
+
+    def list_telemetry_parameters(self, *, project_id):
+        return [{"parameter_key": "temperature", "canonical_unit": "degC", "project_id": project_id}]
+
+    def list_telemetry_sensors(self, *, project_id):
+        return [{"sensor_key": "sbe45", "project_id": project_id}]
+
+    def list_telemetry_sources(self, *, project_id, run_id=None):
+        return [{"id": "source-1", "project_id": project_id, "run_id": run_id}]
+
+    def list_telemetry_streams(self, *, project_id, run_id=None, parameter_keys=None):
+        return []
+
+    def list_telemetry_observations(self, **kwargs):
+        return [
+            {
+                "stream_id": 1,
+                "observed_at": "2026-08-21T00:00:00+00:00",
+                "value": 1.25,
+                "qc_flag": 0,
+                **kwargs,
+            }
+        ]
+
+    def ingest_telemetry(self, **payload):
+        observations = list(payload.pop("observations", ()))
+        self.telemetry_imports.append(payload)
+        return {"source": {"id": "source-1", "observation_count": len(observations)}}
+
+    def list_timeline_event_types(self, *, project_id):
+        return []
+
+    def create_timeline_event_type(self, *, project_id, event_type_key, **kwargs):
+        return {"id": "event-type-1", "project_id": project_id, "event_type_key": event_type_key, **kwargs}
+
+    def create_timeline_event(self, *, project_id, run_id, event_type_id, **kwargs):
+        event_id = f"event-{len(self.timeline_events) + 1}"
+        row = {
+            "id": event_id,
+            "project_id": project_id,
+            "run_id": run_id,
+            "event_type_id": event_type_id,
+            **kwargs,
+        }
+        self.timeline_events[event_id] = row
+        return dict(row)
+
+    def get_timeline_event(self, *, project_id, run_id, event_id):
+        row = self.timeline_events.get(event_id)
+        if row is None or row["project_id"] != project_id or row["run_id"] != run_id:
+            return None
+        return dict(row)
+
+    def list_timeline_events(self, *, project_id, run_id, start_at=None, end_at=None, event_type_id=None, source_id=None):
+        rows = [
+            row for row in self.timeline_events.values()
+            if row["project_id"] == project_id and row["run_id"] == run_id
+        ]
+        if start_at is not None:
+            rows = [row for row in rows if (row.get("end_at") or row["start_at"]) >= start_at]
+        if end_at is not None:
+            rows = [row for row in rows if row["start_at"] <= end_at]
+        if event_type_id is not None:
+            rows = [row for row in rows if row["event_type_id"] == event_type_id]
+        if source_id is not None:
+            rows = [row for row in rows if row.get("source_id") == source_id]
+        return [dict(row) for row in rows]
+
+    def update_timeline_event(self, *, project_id, run_id, event_id, updates):
+        row = self.get_timeline_event(project_id=project_id, run_id=run_id, event_id=event_id)
+        if row is None:
+            return None
+        row.update(updates)
+        self.timeline_events[event_id] = row
+        return dict(row)
+
+    def delete_timeline_event(self, *, project_id, run_id, event_id):
+        row = self.get_timeline_event(project_id=project_id, run_id=run_id, event_id=event_id)
+        if row is not None:
+            del self.timeline_events[event_id]
+        return row
+
+    def list_timeline_events_at(self, **_kwargs):
+        return []
 
     def _visible(self, resource_id, project_id):
         return project_id is None or self.resource_projects.get(resource_id) == project_id
@@ -3326,6 +3413,249 @@ def test_api_frame_context_handles_missing_frame_and_missing_preprocessed_image(
     assert body["page"] == {"limit": 500, "offset": 0, "count": 0, "next_offset": None}
 
 
+def test_api_frame_context_reports_missing_timestamp_for_requested_telemetry():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/frames/frame-1/context?include_detections=false&include_telemetry=true&telemetry_parameters=temperature"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["telemetry"]["temperature"]["missing_reason"] == "frame_timestamp_missing"
+
+
+def test_api_telemetry_catalog_and_import(tmp_path):
+    source = tmp_path / "telemetry.csv"
+    source.write_text(
+        "time,temp\n2026-08-21T00:00:00Z,1.25\n",
+        encoding="utf-8",
+    )
+    client, repository, _ = make_client()
+    client.app.state.config.file_browser.allowed_root_paths = [tmp_path]
+
+    parameters = client.get("/telemetry/parameters")
+    imported = client.post(
+        "/runs/run-1/telemetry/import",
+        json={
+            "path": str(source),
+            "timestamp_column": "time",
+            "parser_name": "shipboard.logger",
+            "parser_version": "2.4",
+            "streams": [
+                {
+                    "column": "temp",
+                    "stream_key": "sbe45.temperature",
+                    "sensor_key": "sbe45",
+                    "parameter_key": "temperature",
+                    "native_unit": "degC",
+                    "canonical_unit": "degC",
+                    "interpolation": "linear",
+                    "max_gap_seconds": 5,
+                }
+            ],
+        },
+    )
+
+    assert parameters.status_code == 200
+    assert parameters.json()["parameters"][0]["parameter_key"] == "temperature"
+    assert imported.status_code == 202
+    assert imported.json()["job"]["stage"] == PipelineStage.TELEMETRY_IMPORT.value
+    queued = repository.created_jobs[-1]
+    assert queued["project_id"] == "project-1"
+    assert queued["payload"]["parser_name"] == "shipboard.logger"
+    assert queued["payload"]["parser_version"] == "2.4"
+
+
+def test_api_can_create_project_scoped_telemetry_run():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/runs",
+        json={"run_key": "telemetry-only-2026", "instrument": "SBE45"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["run"]["id"]
+    assert repository.registered_runs[-1].manifest.source_type == "telemetry"
+
+
+def test_api_telemetry_catalog_and_analyze(tmp_path):
+    source = tmp_path / "sensor.csv"
+    source.write_text(
+        "Time,Temperature,Pressure\n"
+        "3741300934.0,12.2,2.8\n"
+        "3741300934.5,12.3,2.9\n",
+        encoding="utf-8",
+    )
+    client, _, _ = make_client()
+    client.app.state.config.file_browser.allowed_root_paths = [tmp_path]
+
+    catalog = client.get("/telemetry/catalog")
+    analyzed = client.post(
+        "/telemetry/analyze",
+        json={"path": str(source), "timestamp_format": "auto", "sample_limit": 20},
+    )
+
+    assert catalog.status_code == 200
+    assert catalog.json()["unit_registry"]["version"] == "1"
+    assert any(unit["canonical_unit"] == "degC" for unit in catalog.json()["unit_registry"]["units"])
+    assert analyzed.status_code == 200
+    body = analyzed.json()
+    assert body["timestamp_column"] == "Time"
+    assert body["timestamp_format"] == "unix_seconds"
+    assert body["row_count"] == 2
+    assert body["timestamp_diagnostics"]["valid"] is True
+    assert body["preview_rows"][0]["timestamp"].endswith("+00:00")
+
+
+def test_api_telemetry_analyze_counts_all_invalid_timestamps(tmp_path):
+    source = tmp_path / "invalid.csv"
+    source.write_text(
+        "time,temp\n" + "".join(f"not-a-time-{index},1\n" for index in range(25)),
+        encoding="utf-8",
+    )
+    client, _, _ = make_client()
+    client.app.state.config.file_browser.allowed_root_paths = [tmp_path]
+
+    response = client.post("/telemetry/analyze", json={"path": str(source), "sample_limit": 20})
+
+    assert response.status_code == 200
+    diagnostics = response.json()["timestamp_diagnostics"]
+    assert diagnostics["invalid_count"] == 25
+    assert len(diagnostics["invalid_examples"]) == 20
+    assert diagnostics["valid"] is False
+
+
+def test_api_telemetry_import_rejects_paths_outside_allowed_roots(tmp_path):
+    source = tmp_path / "private.csv"
+    source.write_text("time,temp\n2026-08-21T00:00:00Z,1.25\n", encoding="utf-8")
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/runs/run-1/telemetry/import",
+        json={
+            "path": str(source),
+            "timestamp_column": "time",
+            "streams": [
+                {
+                    "column": "temp", "stream_key": "temperature", "sensor_key": "sensor",
+                    "parameter_key": "temperature", "native_unit": "degC", "canonical_unit": "degC",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_api_telemetry_observations_are_paginated_and_timestamp_scoped():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/runs/run-1/telemetry/observations?stream_id=1"
+        "&start_at=2026-08-21T00%3A00%3A00Z&limit=1"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stream_id"] == "1"
+    assert body["limit"] == 1
+    assert body["next_offset"] == 1
+    assert body["observations"][0]["value"] == 1.25
+
+
+def test_api_telemetry_lookup_and_timeline_event_surfaces():
+    client, _, _ = make_client()
+
+    lookup = client.get(
+        "/runs/run-1/telemetry/lookup?observed_at=2026-08-21T00%3A00%3A00Z&parameters=temperature"
+    )
+    event_type = client.post(
+        "/timeline-event-types", json={"event_type_key": "station"},
+    )
+    event = client.post(
+        "/runs/run-1/events",
+        json={
+            "event_type_id": "event-type-1",
+            "start_at": "2026-08-21T00:00:00Z",
+            "end_at": "2026-08-21T00:10:00Z",
+            "value": "DBO3.4",
+        },
+    )
+
+    assert lookup.status_code == 200
+    assert lookup.json()["telemetry"]["temperature"]["missing_reason"] == "stream_not_found"
+    assert event_type.status_code == 200
+    assert event_type.json()["event_type"]["event_type_key"] == "station"
+    assert event.status_code == 200
+    assert event.json()["event"]["value"] == "DBO3.4"
+
+    naive_event = client.post(
+        "/runs/run-1/events",
+        json={"event_type_id": "event-type-1", "start_at": "2026-08-21T00:00:00"},
+    )
+    assert naive_event.status_code == 422
+
+
+def test_api_timeline_events_preserve_authenticated_provenance_and_support_crud():
+    client, repository, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+
+    created = client.post(
+        "/runs/run-1/events",
+        headers=headers,
+        json={
+            "event_type_id": "event-type-1",
+            "source_id": "source-1",
+            "start_at": "2026-08-21T00:00:00-08:00",
+            "end_at": "2026-08-21T00:10:00-08:00",
+            "value": "before",
+        },
+    )
+
+    assert created.status_code == 200
+    event = created.json()["event"]
+    assert event["source_id"] == "source-1"
+    assert event["created_by"] == "user-1"
+    assert event["start_at"] == "2026-08-21T08:00:00+00:00"
+
+    listed = client.get(
+        "/runs/run-1/events?start_at=2026-08-21T08%3A05%3A00Z&end_at=2026-08-21T08%3A15%3A00Z",
+        headers=headers,
+    )
+    fetched = client.get("/runs/run-1/events/event-1", headers=headers)
+    updated = client.patch(
+        "/runs/run-1/events/event-1",
+        headers=headers,
+        json={"value": "after", "end_at": "2026-08-21T08:20:00Z"},
+    )
+    deleted = client.delete("/runs/run-1/events/event-1", headers=headers)
+
+    assert listed.status_code == 200
+    assert listed.json()["events"][0]["id"] == "event-1"
+    assert fetched.status_code == 200
+    assert updated.status_code == 200
+    assert updated.json()["event"]["value"] == "after"
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+    assert repository.timeline_events == {}
+
+    naive_range = client.get("/runs/run-1/events?start_at=2026-08-21T08%3A00%3A00", headers=headers)
+    assert naive_range.status_code == 422
+
+
+def test_api_detection_context_inherits_parent_frame_time_context():
+    client, _, _ = make_client()
+
+    response = client.get("/detections/det-1/context?parameters=temperature")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detection"]["id"] == "det-1"
+    assert body["frame"]["id"] == "frame-1"
+    assert body["telemetry"]["temperature"]["missing_reason"] == "frame_timestamp_missing"
+
+
 def test_api_direct_preprocess_accepts_frame_ids(monkeypatch):
     from Pelagia.api.routes import frame
 
@@ -3567,6 +3897,17 @@ def test_api_lists_global_detections_without_image_payloads():
     assert response.json()["page"] == {"limit": 100, "offset": 400, "count": 1, "next_offset": None}
 
 
+def test_api_rejects_invalid_telemetry_filter_ranges():
+    client, _, _ = make_client()
+
+    response = client.get(
+        "/detections?telemetry_filter=%7B%22parameter_key%22%3A%22temperature%22%2C%22min_value%22%3A5%2C%22max_value%22%3A2%7D"
+    )
+
+    assert response.status_code == 422
+    assert "minimum above its maximum" in response.json()["detail"]
+
+
 def test_api_get_detection_includes_payload_data():
     client, _, _ = make_client()
 
@@ -3798,6 +4139,13 @@ def test_openapi_documents_core_response_schemas_and_head_routes():
     assert "DetectionsListResponse" in spec["components"]["schemas"]
     assert "DetectionSummary" in spec["components"]["schemas"]
     assert "FrameContextResponse" in spec["components"]["schemas"]
+    frame_context_schema = spec["components"]["schemas"]["FrameContextResponse"]
+    telemetry_schema = frame_context_schema["properties"]["telemetry"]
+    assert telemetry_schema["type"] == "object"
+    assert telemetry_schema["additionalProperties"] is True
+    events_schema = frame_context_schema["properties"]["events"]
+    assert events_schema["type"] == "array"
+    assert events_schema["items"] == {"additionalProperties": True, "type": "object"}
     assert "SystemCapabilitiesResponse" in spec["components"]["schemas"]
     assert "head" in spec["paths"]["/detections/{detection_id}/roi"]
     assert "head" in spec["paths"]["/detections/{detection_id}/mask"]

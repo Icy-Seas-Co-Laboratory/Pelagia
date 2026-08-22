@@ -13,7 +13,14 @@ A model prediction is never written as human ground truth. Selecting **Accept pr
 1. Start Oracle Builder with a classification bundle registered under the selector configured by `oracle.default_classification_model`.
 2. Run at least one Pelagia worker with the `classify` capability. The standard worker TOML assigns this capability to the existing refinement workers, so a separate process is optional.
 3. Open **Curation** in PelagiaView. Choose **Run selected** or **Run all** to enqueue inference.
-4. Filter and sort the queue by human state, review state, evidence availability, confidence, or disagreement. Assign a project label, then verify, reject, or flag the assertion.
+4. Filter and sort the queue by human state, review state, evidence availability, confidence, disagreement, or telemetry ranges. Assign a project label, then verify, reject, or flag the assertion.
+
+When a refined ROI is focused, the inspector shows telemetry resolved at its
+frame timestamp when the project has an applicable stream. Use the `+` button
+under **Telemetry criteria** to choose any catalog parameter and enter an
+inclusive minimum, maximum, or both. Values use the parameter's canonical unit;
+multiple criteria are combined with AND and are evaluated server-side before
+pagination.
 
 The Curation model panel follows active classification jobs and the most recent
 result across page reloads. Pelagia resolves the exact number of eligible ROIs
@@ -49,5 +56,10 @@ KNN neighbor identity, class, rank, and similarity are retained. The current Ora
 - `POST /curation/annotations` — explicit human assertion
 - `POST /curation/annotations/remove` — retire the current assertion while retaining history
 - `POST /curation/reviews` — human verification state
+
+`GET /curation/rois` accepts repeated `telemetry_filter` JSON query values,
+for example `{"parameter_key":"temperature","min_value":2,"max_value":8}`.
+The global detection endpoint accepts the same filter shape through
+`GET /detections`.
 
 Schema migration `0005_roi_curation.sql` installs the curation tables. The older generic `models` and `classification_results` records are not used by this workflow.

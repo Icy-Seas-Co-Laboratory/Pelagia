@@ -147,7 +147,10 @@ if APIRouter is not None:
     def delete_asset(request: Request, asset_id: str) -> dict:
         auth = require_project_write(request)
         context = get_context(request).for_project(auth.project_id)
-        result = get_repository(request).delete_asset(asset_id, project_id=auth.project_id)
+        try:
+            result = get_repository(request).delete_asset(asset_id, project_id=auth.project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if result is None:
             raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} was not found.")
         deleted = [_delete_unreferenced_payload(context, str(key)) for key in result.get("unreferenced_kvstore_keys", [])]

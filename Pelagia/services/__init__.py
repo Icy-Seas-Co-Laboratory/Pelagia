@@ -7,6 +7,7 @@ from .pipeline import PipelineService
 from .processing_queue import ProcessingQueueService
 from .runs import RunService
 from .stores import StoreService
+from .telemetry import TelemetryIngestionService, TelemetryResolver
 
 __all__ = [
     "AppContext",
@@ -16,4 +17,6 @@ __all__ = [
     "ProcessingQueueService",
     "RunService",
     "StoreService",
+    "TelemetryIngestionService",
+    "TelemetryResolver",
 ]

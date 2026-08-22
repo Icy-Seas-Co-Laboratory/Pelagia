@@ -23,7 +23,12 @@ EXPORT_FORMATS = {"sqlite", "xlsx"}
 DATASET_EXPORTS = {"frame_metadata", "roi_metadata"}
 AUTH_TABLES = {"users", "project_memberships", "user_sessions"}
 GLOBAL_TABLES = AUTH_TABLES | {"worker_sessions"}
-TABLE_EXPORTS = tuple(REQUIRED_SCHEMA_TABLES)
+# High-volume telemetry has a purpose-built, filtered export surface. Keep the
+# legacy generic table exporter limited to tables it understands.
+TABLE_EXPORTS = tuple(
+    table for table in REQUIRED_SCHEMA_TABLES
+    if not table.startswith("telemetry_") and not table.startswith("timeline_event")
+)
 DEFAULT_EXPORT_LIMIT = 10_000
 MAX_EXPORT_LIMIT = 100_000
 

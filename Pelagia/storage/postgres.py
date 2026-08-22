@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..config import CoreConfig
-from ..domain import ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
+from ..domain import AssetKind, ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
 from ..utils.serialization import json_ready
 from ..utils.validation import validate_schema_name
 
@@ -38,6 +38,13 @@ REQUIRED_SCHEMA_TABLES = (
     "runs",
     "raw_assets",
     "frames",
+    "telemetry_sources",
+    "telemetry_sensors",
+    "telemetry_parameters",
+    "telemetry_streams",
+    "telemetry_observations",
+    "timeline_event_types",
+    "timeline_events",
     "detection_candidate",
     "detections_refined",
     "models",
@@ -255,12 +262,13 @@ class PostgresRepository:
         )
         # Scoped views are the preferred application-facing dependencies.  Keep
         # this facade intact while the underlying SQL moves out incrementally.
-        from .scoped import CatalogRepository, FrameRepository, IdentityRepository, JobRepository
+        from .scoped import CatalogRepository, FrameRepository, IdentityRepository, JobRepository, TelemetryRepository
 
         self.identity = IdentityRepository(self)
         self.catalog = CatalogRepository(self)
         self.frames = FrameRepository(self)
         self.jobs = JobRepository(self)
+        self.telemetry = TelemetryRepository(self)
 
     def connect(self):
         """Borrow a bounded, reusable connection for one repository operation."""
@@ -1879,6 +1887,11 @@ class PostgresRepository:
                 if asset is None:
                     connection.rollback()
                     return None
+                if str(asset.get("kind")) == AssetKind.TELEMETRY.value:
+                    connection.rollback()
+                    raise ValueError(
+                        "Telemetry source assets are immutable; archive or remove the telemetry source explicitly."
+                    )
 
                 status_params: list[Any] = [resolved_collections, str(asset["id"])]
                 status_clauses = ["asset_id = %s"]
@@ -2934,6 +2947,7 @@ class PostgresRepository:
         mask_format: str | None = None,
         has_roi_payload: bool | None = None,
         refinement_state: str | None = None,
+        telemetry_filters: Sequence[Mapping[str, Any]] | None = None,
         sort_by: str = "asset_frame",
         sort_dir: str = "desc",
         limit: int | None = 100,
@@ -2965,6 +2979,15 @@ class PostgresRepository:
         if roi_index is not None:
             clauses.append("detections.roi_index = %s")
             params.append(roi_index)
+
+        telemetry_clauses, telemetry_params = self._telemetry_filter_clauses(
+            telemetry_filters,
+            timestamp_sql="frames.captured_at",
+            run_sql="detections.run_id",
+            project_sql="assets.project_id",
+        )
+        clauses.extend(telemetry_clauses)
+        params.extend(telemetry_params)
 
         range_filters = [
             ("detections.bbox_x", ">=", min_bbox_x),
@@ -3074,6 +3097,124 @@ class PostgresRepository:
                     tuple(params),
                 )
                 return cursor.fetchall()
+
+    def _telemetry_filter_clauses(
+        self,
+        telemetry_filters: Sequence[Any] | None,
+        *,
+        timestamp_sql: str,
+        run_sql: str,
+        project_sql: str,
+    ) -> tuple[list[str], list[Any]]:
+        """Build correlated range predicates using configured telemetry lookup rules."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        for index, telemetry_filter in enumerate(telemetry_filters or ()):
+            if isinstance(telemetry_filter, Mapping):
+                parameter_key = str(
+                    telemetry_filter.get("parameter_key")
+                    or telemetry_filter.get("parameter")
+                    or ""
+                )
+                min_value = telemetry_filter.get("min_value", telemetry_filter.get("min"))
+                max_value = telemetry_filter.get("max_value", telemetry_filter.get("max"))
+            else:
+                parameter_key = str(getattr(telemetry_filter, "parameter_key", ""))
+                min_value = getattr(telemetry_filter, "min_value", None)
+                max_value = getattr(telemetry_filter, "max_value", None)
+            stream_alias = f"telemetry_stream_{index}"
+            previous_alias = f"telemetry_previous_{index}"
+            next_alias = f"telemetry_next_{index}"
+            value_alias = f"telemetry_value_{index}"
+            resolved_value = f"{value_alias}.value"
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT streams.id, streams.interpolation, streams.max_gap, streams.metadata
+                        FROM {self.schema}.telemetry_streams streams
+                        JOIN {self.schema}.telemetry_parameters parameters
+                          ON parameters.id = streams.parameter_id
+                        WHERE streams.project_id = {project_sql}
+                          AND streams.run_id = {run_sql}
+                          AND parameters.parameter_key = %s
+                        ORDER BY streams.is_default DESC, streams.priority ASC, streams.id ASC
+                        LIMIT 1
+                    ) {stream_alias}
+                    LEFT JOIN LATERAL (
+                        SELECT observations.observed_at, observations.value
+                        FROM {self.schema}.telemetry_observations observations
+                        WHERE observations.stream_id = {stream_alias}.id
+                          AND observations.observed_at <= {timestamp_sql}
+                          AND NOT COALESCE(
+                              {stream_alias}.metadata->'excluded_qc_flags'
+                              @> to_jsonb(observations.qc_flag), false
+                          )
+                        ORDER BY observations.observed_at DESC
+                        LIMIT 1
+                    ) {previous_alias} ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT observations.observed_at, observations.value
+                        FROM {self.schema}.telemetry_observations observations
+                        WHERE observations.stream_id = {stream_alias}.id
+                          AND observations.observed_at > {timestamp_sql}
+                          AND NOT COALESCE(
+                              {stream_alias}.metadata->'excluded_qc_flags'
+                              @> to_jsonb(observations.qc_flag), false
+                          )
+                        ORDER BY observations.observed_at ASC
+                        LIMIT 1
+                    ) {next_alias} ON TRUE
+                    CROSS JOIN LATERAL (
+                        SELECT CASE
+                            WHEN {timestamp_sql} IS NULL THEN NULL
+                            WHEN {previous_alias}.observed_at = {timestamp_sql}
+                                THEN {previous_alias}.value
+                            WHEN {stream_alias}.interpolation = 'none'
+                                THEN NULL
+                            WHEN {stream_alias}.interpolation = 'previous'
+                                AND {previous_alias}.observed_at IS NOT NULL
+                                AND ({stream_alias}.max_gap IS NULL OR {timestamp_sql} - {previous_alias}.observed_at <= {stream_alias}.max_gap)
+                                THEN {previous_alias}.value
+                            WHEN {stream_alias}.interpolation = 'nearest'
+                                AND (
+                                    {stream_alias}.max_gap IS NULL
+                                    OR LEAST(
+                                        COALESCE({timestamp_sql} - {previous_alias}.observed_at, interval '100000 years'),
+                                        COALESCE({next_alias}.observed_at - {timestamp_sql}, interval '100000 years')
+                                    ) <= {stream_alias}.max_gap
+                                )
+                                THEN CASE
+                                    WHEN {previous_alias}.observed_at IS NULL THEN {next_alias}.value
+                                    WHEN {next_alias}.observed_at IS NULL THEN {previous_alias}.value
+                                    WHEN {timestamp_sql} - {previous_alias}.observed_at <= {next_alias}.observed_at - {timestamp_sql}
+                                        THEN {previous_alias}.value
+                                    ELSE {next_alias}.value
+                                END
+                            WHEN {stream_alias}.interpolation = 'linear'
+                                AND {previous_alias}.observed_at IS NOT NULL
+                                AND {next_alias}.observed_at IS NOT NULL
+                                AND ({stream_alias}.max_gap IS NULL OR {next_alias}.observed_at - {previous_alias}.observed_at <= {stream_alias}.max_gap)
+                                THEN {previous_alias}.value
+                                    + EXTRACT(EPOCH FROM ({timestamp_sql} - {previous_alias}.observed_at))
+                                    / NULLIF(EXTRACT(EPOCH FROM ({next_alias}.observed_at - {previous_alias}.observed_at)), 0)
+                                    * ({next_alias}.value - {previous_alias}.value)
+                            ELSE NULL
+                        END AS value
+                    ) {value_alias}
+                    WHERE {resolved_value} IS NOT NULL
+                      {f"AND {resolved_value} >= %s" if min_value is not None else ""}
+                      {f"AND {resolved_value} <= %s" if max_value is not None else ""}
+                )
+                """
+            )
+            params.append(parameter_key)
+            if min_value is not None:
+                params.append(min_value)
+            if max_value is not None:
+                params.append(max_value)
+        return clauses, params
 
     def get_detections(
         self,
@@ -4729,6 +4870,7 @@ class PostgresRepository:
         label_source: str = "any",
         evidence_state: str = "all",
         search: str | None = None,
+        telemetry_filters: Sequence[Mapping[str, Any]] | None = None,
         sort_by: str = "oldest",
         limit: int = 120,
         offset: int = 0,
@@ -4772,6 +4914,14 @@ class PostgresRepository:
             )
             token = f"%{search}%"
             params.extend([token, token, token])
+        telemetry_clauses, telemetry_params = self._telemetry_filter_clauses(
+            telemetry_filters,
+            timestamp_sql="frames.captured_at",
+            run_sql="refined.run_id",
+            project_sql="assets.project_id",
+        )
+        clauses.extend(telemetry_clauses)
+        params.extend(telemetry_params)
         order = {
             "oldest": "refined.created_at ASC, refined.id ASC",
             "newest": "refined.created_at DESC, refined.id DESC",
@@ -7289,3 +7439,709 @@ class PostgresRepository:
                 run_row = cursor.fetchone()
             connection.commit()
         return run_row
+
+    def ingest_telemetry(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        asset: Mapping[str, Any],
+        source: Mapping[str, Any],
+        parameters: Sequence[Mapping[str, Any]],
+        sensors: Sequence[Mapping[str, Any]],
+        streams: Sequence[Mapping[str, Any]],
+        observations: Iterable[tuple[str, datetime, float, int | None]] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically publish one standardized telemetry source and its observations."""
+        resolved_project_id = self._required_project_id(project_id, "ingest_telemetry")
+        import_key = str(source.get("import_key") or "").strip()
+        source_payload_key = str(source.get("source_payload_key") or "").strip()
+        if not import_key:
+            raise ValueError("Telemetry source import key must not be blank.")
+        if not source_payload_key:
+            raise ValueError("Telemetry source payload key must not be blank.")
+        schema = self.schema
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT id FROM {schema}.runs WHERE id = %s AND project_id = %s",
+                    (run_id, resolved_project_id),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError(f"Run {run_id!r} was not found in the selected project.")
+
+                # Serialize exact retries before creating any catalog rows. The
+                # content-addressed source snapshot is safe to write before this
+                # database transaction and is reused by every contender.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"telemetry:{resolved_project_id}:{run_id}:{import_key}",),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {schema}.telemetry_sources
+                        WHERE project_id = %s AND run_id = %s AND import_key = %s""",
+                    (resolved_project_id, run_id, import_key),
+                )
+                existing_source = cursor.fetchone()
+                if existing_source is not None:
+                    cursor.execute(
+                        f"SELECT * FROM {schema}.raw_assets WHERE id = %s AND project_id = %s",
+                        (existing_source["raw_asset_id"], resolved_project_id),
+                    )
+                    existing_asset = cursor.fetchone()
+                    cursor.execute(
+                        f"SELECT * FROM {schema}.telemetry_streams WHERE source_id = %s ORDER BY id",
+                        (existing_source["id"],),
+                    )
+                    return {
+                        "asset": existing_asset,
+                        "source": existing_source,
+                        "streams": cursor.fetchall(),
+                    }
+
+                cursor.execute(
+                    f"""
+                    INSERT INTO {schema}.raw_assets
+                    (id, project_id, run_id, filename, path, kind, checksum, size_bytes,
+                     collections, media_count, metadata)
+                    VALUES (%s, %s, %s, %s, %s, 'telemetry'::{schema}.asset_kind, %s, %s,
+                            %s, 1, %s::jsonb)
+                    RETURNING *
+                    """,
+                    (
+                        asset["id"], resolved_project_id, run_id, asset["filename"], asset["path"],
+                        asset["checksum"], int(asset["size_bytes"]),
+                        normalize_collections(asset.get("collections")),
+                        json.dumps(json_ready(asset.get("metadata") or {})),
+                    ),
+                )
+                asset_row = cursor.fetchone()
+
+                parameter_ids: dict[str, str] = {}
+                for item in sorted(parameters, key=lambda value: str(value["parameter_key"])):
+                    key = str(item["parameter_key"])
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {schema}.telemetry_parameters
+                        (project_id, parameter_key, display_name, definition, standard_name,
+                         canonical_unit, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (project_id, parameter_key) DO NOTHING
+                        RETURNING id, canonical_unit
+                        """,
+                        (
+                            resolved_project_id, key, item.get("display_name"), item.get("definition"),
+                            item.get("standard_name"), item["canonical_unit"],
+                            json.dumps(json_ready(item.get("metadata") or {})),
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        cursor.execute(
+                            f"""SELECT id, canonical_unit, definition, standard_name
+                                FROM {schema}.telemetry_parameters
+                                WHERE project_id = %s AND parameter_key = %s""",
+                            (resolved_project_id, key),
+                        )
+                        row = cursor.fetchone()
+                    if row["canonical_unit"] != item["canonical_unit"]:
+                        raise ValueError(
+                            f"Parameter {key!r} already uses canonical unit {row['canonical_unit']!r}."
+                        )
+                    for field in ("definition", "standard_name"):
+                        if row.get(field) and item.get(field) and row[field] != item[field]:
+                            raise ValueError(
+                                f"Parameter {key!r} already has a different {field.replace('_', ' ')}."
+                            )
+                    parameter_ids[key] = str(row["id"])
+
+                sensor_ids: dict[str, str] = {}
+                for item in sorted(sensors, key=lambda value: str(value["sensor_key"])):
+                    key = str(item["sensor_key"])
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {schema}.telemetry_sensors
+                        (project_id, sensor_key, display_name, manufacturer, model, serial_number, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (project_id, sensor_key) DO NOTHING
+                        RETURNING id
+                        """,
+                        (
+                            resolved_project_id, key, item.get("display_name"), item.get("manufacturer"),
+                            item.get("model"), item.get("serial_number"),
+                            json.dumps(json_ready(item.get("metadata") or {})),
+                        ),
+                    )
+                    sensor_row = cursor.fetchone()
+                    if sensor_row is None:
+                        cursor.execute(
+                            f"""SELECT id, manufacturer, model, serial_number
+                                FROM {schema}.telemetry_sensors
+                                WHERE project_id = %s AND sensor_key = %s
+                                FOR UPDATE""",
+                            (resolved_project_id, key),
+                        )
+                        sensor_row = cursor.fetchone()
+                    if sensor_row is None:
+                        raise ValueError(f"Sensor {key!r} could not be created.")
+                    for field in ("manufacturer", "model", "serial_number"):
+                        if (
+                            sensor_row.get(field) and item.get(field)
+                            and sensor_row[field] != item[field]
+                        ):
+                            raise ValueError(
+                                f"Sensor {key!r} already has a different {field.replace('_', ' ')}."
+                            )
+                    sensor_ids[key] = str(sensor_row["id"])
+
+                default_streams: dict[str, list[str]] = {}
+                for item in streams:
+                    parameter_key = str(item["parameter_key"])
+                    if parameter_key not in parameter_ids:
+                        raise ValueError(
+                            f"Telemetry stream {item['stream_key']!r} references unknown "
+                            f"parameter {parameter_key!r}."
+                        )
+                    if bool(item.get("is_default", False)):
+                        default_streams.setdefault(parameter_key, []).append(str(item["stream_key"]))
+
+                for parameter_key in sorted(default_streams):
+                    requested = default_streams[parameter_key]
+                    if len(requested) > 1:
+                        raise ValueError(
+                            f"Parameter {parameter_key!r} cannot define more than one default "
+                            "telemetry stream for this run."
+                        )
+                    # A partial unique index is the final integrity boundary, but
+                    # serializing selection here turns a concurrent contender into
+                    # a stable domain conflict instead of a driver-level unique
+                    # violation. Lock keys are acquired in sorted order above.
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (
+                            f"telemetry-default:{resolved_project_id}:{run_id}:"
+                            f"{parameter_key}",
+                        ),
+                    )
+                    cursor.execute(
+                        f"""SELECT stream_key FROM {schema}.telemetry_streams
+                            WHERE project_id = %s AND run_id = %s AND parameter_id = %s
+                              AND is_default
+                            LIMIT 1""",
+                        (resolved_project_id, run_id, parameter_ids[parameter_key]),
+                    )
+                    existing_default = cursor.fetchone()
+                    if existing_default is not None:
+                        raise ValueError(
+                            f"Parameter {parameter_key!r} already has default telemetry stream "
+                            f"{existing_default['stream_key']!r} for this run."
+                        )
+
+                cursor.execute(
+                    f"""
+                    INSERT INTO {schema}.telemetry_sources
+                    (project_id, run_id, raw_asset_id, format, parser_name, parser_version,
+                     import_key, source_payload_key, import_status, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'importing', %s::jsonb)
+                    RETURNING *
+                    """,
+                    (
+                        resolved_project_id, run_id, asset["id"], source["format"],
+                        source["parser_name"], source["parser_version"],
+                        import_key, source_payload_key,
+                        json.dumps(json_ready(source.get("metadata") or {})),
+                    ),
+                )
+                source_row = cursor.fetchone()
+
+                stream_rows = []
+                stream_ids: dict[str, int] = {}
+                for item in streams:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {schema}.telemetry_streams
+                        (project_id, run_id, source_id, sensor_id, parameter_id, stream_key,
+                         native_unit, sampling_rate_hz, interpolation, max_gap, priority,
+                         is_default, qc_scheme, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s * interval '1 second', %s, %s, %s, %s::jsonb)
+                        RETURNING *
+                        """,
+                        (
+                            resolved_project_id, run_id, source_row["id"],
+                            sensor_ids[str(item["sensor_key"])],
+                            parameter_ids[str(item["parameter_key"])], item["stream_key"],
+                            item["native_unit"], item.get("sampling_rate_hz"),
+                            item.get("interpolation", "none"), item.get("max_gap_seconds"),
+                            int(item.get("priority", 100)), bool(item.get("is_default", False)),
+                            item.get("qc_scheme"), json.dumps(json_ready(item.get("metadata") or {})),
+                        ),
+                    )
+                    stream_row = cursor.fetchone()
+                    stream_rows.append(stream_row)
+                    stream_ids[str(item["stream_key"])] = int(stream_row["id"])
+
+                source_observations = observations
+                if source_observations is None:
+                    source_observations = (
+                        (str(item["stream_key"]), observed_at, float(value), qc_flag)
+                        for item in streams
+                        for observed_at, value, qc_flag in item.get("observations", ())
+                    )
+                observation_count = 0
+                observed_start_at: datetime | None = None
+                observed_end_at: datetime | None = None
+                if streams:
+                    copy_sql = f"COPY {schema}.telemetry_observations (stream_id, observed_at, value, qc_flag) FROM STDIN"
+                    with cursor.copy(copy_sql) as copy:
+                        for stream_key, observed_at, value, qc_flag in source_observations:
+                            if stream_key not in stream_ids:
+                                raise ValueError(f"Unknown stream key {stream_key!r} in observations.")
+                            copy.write_row((stream_ids[stream_key], observed_at, float(value), qc_flag))
+                            observation_count += 1
+                            observed_start_at = (
+                                observed_at if observed_start_at is None else min(observed_start_at, observed_at)
+                            )
+                            observed_end_at = (
+                                observed_at if observed_end_at is None else max(observed_end_at, observed_at)
+                            )
+
+                cursor.execute(
+                    f"""
+                    UPDATE {schema}.telemetry_sources
+                    SET import_status = 'ready', observed_start_at = %s, observed_end_at = %s,
+                        observation_count = %s, imported_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (observed_start_at, observed_end_at, observation_count, source_row["id"]),
+                )
+                source_row = cursor.fetchone()
+            connection.commit()
+        return {"asset": asset_row, "source": source_row, "streams": stream_rows}
+
+    def get_telemetry_import(
+        self, *, project_id: str, run_id: str, import_key: str,
+    ) -> dict[str, Any] | None:
+        """Return a ready import scoped to one project and run."""
+        resolved_project_id = self._required_project_id(project_id, "get_telemetry_import")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT * FROM {self.schema}.telemetry_sources
+                    WHERE project_id = %s AND run_id = %s AND import_key = %s
+                      AND import_status = 'ready'""",
+                (resolved_project_id, run_id, import_key),
+            )
+            source_row = cursor.fetchone()
+            if source_row is None:
+                return None
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.raw_assets WHERE id = %s AND project_id = %s",
+                (source_row["raw_asset_id"], resolved_project_id),
+            )
+            asset_row = cursor.fetchone()
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.telemetry_streams WHERE source_id = %s ORDER BY id",
+                (source_row["id"],),
+            )
+            return {"asset": asset_row, "source": source_row, "streams": cursor.fetchall()}
+
+    def list_telemetry_sources(self, *, project_id: str, run_id: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["sources.project_id = %s"]
+        params: list[Any] = [project_id]
+        if run_id is not None:
+            clauses.append("sources.run_id = %s")
+            params.append(run_id)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT sources.*, assets.filename, assets.path, assets.checksum, assets.size_bytes
+                    FROM {self.schema}.telemetry_sources sources
+                    JOIN {self.schema}.raw_assets assets ON assets.id = sources.raw_asset_id
+                    WHERE {' AND '.join(clauses)} ORDER BY sources.created_at DESC""",
+                tuple(params),
+            )
+            return cursor.fetchall()
+
+    def list_telemetry_parameters(self, *, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.telemetry_parameters WHERE project_id = %s ORDER BY parameter_key",
+                (project_id,),
+            )
+            return cursor.fetchall()
+
+    def list_telemetry_sensors(self, *, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.telemetry_sensors WHERE project_id = %s ORDER BY sensor_key",
+                (project_id,),
+            )
+            return cursor.fetchall()
+
+    def list_telemetry_streams(
+        self, *, project_id: str, run_id: str | None = None, parameter_keys: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["streams.project_id = %s"]
+        params: list[Any] = [project_id]
+        if run_id is not None:
+            clauses.append("streams.run_id = %s")
+            params.append(run_id)
+        if parameter_keys:
+            clauses.append("parameters.parameter_key = ANY(%s)")
+            params.append(list(parameter_keys))
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT streams.*, parameters.parameter_key, parameters.canonical_unit,
+                           sensors.sensor_key, sensors.display_name AS sensor_display_name
+                    FROM {self.schema}.telemetry_streams streams
+                    JOIN {self.schema}.telemetry_parameters parameters ON parameters.id = streams.parameter_id
+                    JOIN {self.schema}.telemetry_sensors sensors ON sensors.id = streams.sensor_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY streams.priority, parameters.parameter_key, streams.stream_key""",
+                tuple(params),
+            )
+            return cursor.fetchall()
+
+    def get_telemetry_stream(
+        self, stream_id: str | int, *, project_id: str, run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        identifier = str(stream_id)
+        if identifier.isdecimal():
+            identifier_clause = "streams.id = %s"
+            identifier_value: Any = int(identifier)
+        else:
+            try:
+                import uuid
+
+                identifier_value = uuid.UUID(identifier)
+            except ValueError:
+                return None
+            identifier_clause = "streams.public_id = %s"
+        with self.connect() as connection, connection.cursor() as cursor:
+            run_clause = " AND streams.run_id = %s" if run_id is not None else ""
+            cursor.execute(
+                f"""SELECT streams.*, parameters.parameter_key, parameters.canonical_unit,
+                           sensors.sensor_key
+                    FROM {self.schema}.telemetry_streams streams
+                    JOIN {self.schema}.telemetry_parameters parameters ON parameters.id = streams.parameter_id
+                    JOIN {self.schema}.telemetry_sensors sensors ON sensors.id = streams.sensor_id
+                    WHERE streams.project_id = %s AND {identifier_clause}{run_clause}""",
+                (project_id, identifier_value, run_id) if run_id is not None else (project_id, identifier_value),
+            )
+            return cursor.fetchone()
+
+    def telemetry_observations_around(
+        self, *, project_id: str, stream_id: int, observed_at: datetime,
+        excluded_qc_flags: Sequence[int] | None = None,
+    ) -> dict[str, dict[str, Any] | None]:
+        stream = self.get_telemetry_stream(stream_id, project_id=project_id)
+        if stream is None:
+            return {"previous": None, "next": None}
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""(SELECT * FROM {self.schema}.telemetry_observations
+                       WHERE stream_id = %s AND observed_at <= %s ORDER BY observed_at DESC LIMIT 1)
+                    UNION ALL
+                    (SELECT * FROM {self.schema}.telemetry_observations
+                     WHERE stream_id = %s AND observed_at > %s ORDER BY observed_at ASC LIMIT 1)""",
+                (stream["id"], observed_at, stream["id"], observed_at),
+            )
+            rows = cursor.fetchall()
+        previous = next((row for row in rows if row["observed_at"] <= observed_at), None)
+        following = next((row for row in rows if row["observed_at"] > observed_at), None)
+        # Fetching the valid brackets separately keeps QC filtering out of the
+        # raw bracket query: an exact excluded observation must remain visible
+        # to callers, while previous/nearest interpolation can skip over it.
+        excluded_qc_flags = tuple(excluded_qc_flags or ())
+        valid = {"previous": previous, "next": following}
+        if excluded_qc_flags:
+            with self.connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    f"""(SELECT * FROM {self.schema}.telemetry_observations
+                           WHERE stream_id = %s AND observed_at <= %s
+                             AND (qc_flag IS NULL OR NOT (qc_flag = ANY(%s)))
+                           ORDER BY observed_at DESC LIMIT 1)
+                        UNION ALL
+                        (SELECT * FROM {self.schema}.telemetry_observations
+                         WHERE stream_id = %s AND observed_at > %s
+                           AND (qc_flag IS NULL OR NOT (qc_flag = ANY(%s)))
+                         ORDER BY observed_at ASC LIMIT 1)""",
+                    (stream["id"], observed_at, list(excluded_qc_flags),
+                     stream["id"], observed_at, list(excluded_qc_flags)),
+                )
+                valid_rows = cursor.fetchall()
+            valid["previous_valid"] = next(
+                (row for row in valid_rows if row["observed_at"] <= observed_at), None
+            )
+            valid["next_valid"] = next(
+                (row for row in valid_rows if row["observed_at"] > observed_at), None
+            )
+        return {"previous": previous, "next": following, **valid}
+
+    def list_telemetry_observations(
+        self, *, project_id: str, stream_id: int, start_at: datetime | None = None,
+        end_at: datetime | None = None, run_id: str | None = None,
+        limit: int | None = None, offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and limit < 1:
+            raise ValueError("Telemetry observation limit must be positive.")
+        if offset < 0:
+            raise ValueError("Telemetry observation offset must not be negative.")
+        stream = self.get_telemetry_stream(stream_id, project_id=project_id, run_id=run_id)
+        if stream is None:
+            return []
+        clauses = ["stream_id = %s"]
+        params: list[Any] = [stream["id"]]
+        if start_at is not None:
+            clauses.append("observed_at >= %s")
+            params.append(start_at)
+        if end_at is not None:
+            clauses.append("observed_at <= %s")
+            params.append(end_at)
+        with self.connect() as connection, connection.cursor() as cursor:
+            pagination = ""
+            if limit is not None:
+                pagination = " LIMIT %s OFFSET %s"
+                params.extend([limit, offset])
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.telemetry_observations WHERE {' AND '.join(clauses)} ORDER BY observed_at{pagination}",
+                tuple(params),
+            )
+            return cursor.fetchall()
+
+    def create_timeline_event_type(
+        self, *, project_id: str, event_type_key: str, display_name: str | None = None,
+        description: str | None = None, metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {self.schema}.timeline_event_types
+                    (project_id, event_type_key, display_name, description, metadata)
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (project_id, event_type_key) DO NOTHING
+                    RETURNING *""",
+                (project_id, event_type_key, display_name, description, json.dumps(json_ready(metadata or {}))),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.timeline_event_types
+                        WHERE project_id = %s AND event_type_key = %s""",
+                    (project_id, event_type_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("Timeline event type could not be created.")
+                for field_name in ("display_name", "description"):
+                    supplied = locals()[field_name]
+                    if supplied is not None and row.get(field_name) not in (None, supplied):
+                        raise ValueError(
+                            f"Timeline event type {event_type_key!r} already has a different {field_name}."
+                        )
+                if metadata and dict(row.get("metadata") or {}) != dict(metadata):
+                    raise ValueError(
+                        f"Timeline event type {event_type_key!r} already has different metadata."
+                    )
+            connection.commit()
+            return row
+
+    def list_timeline_event_types(self, *, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.timeline_event_types WHERE project_id = %s ORDER BY event_type_key",
+                (project_id,),
+            )
+            return cursor.fetchall()
+
+    def create_timeline_event(
+        self, *, project_id: str, run_id: str, event_type_id: str, start_at: datetime,
+        end_at: datetime | None = None, source_id: str | None = None,
+        value: str | None = None, created_by: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if start_at.tzinfo is None or start_at.utcoffset() is None:
+            raise ValueError("Timeline event start_at must include a timezone.")
+        if end_at is not None and (end_at.tzinfo is None or end_at.utcoffset() is None):
+            raise ValueError("Timeline event end_at must include a timezone.")
+        start_at = start_at.astimezone(timezone.utc)
+        end_at = None if end_at is None else end_at.astimezone(timezone.utc)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {self.schema}.timeline_events
+                    (project_id, run_id, event_type_id, start_at, end_at, source_id, value, created_by, metadata)
+                    SELECT %s, runs.id, types.id, %s, %s, %s, %s, %s, %s::jsonb
+                    FROM {self.schema}.runs runs
+                    JOIN {self.schema}.timeline_event_types types ON types.id = %s AND types.project_id = runs.project_id
+                    LEFT JOIN {self.schema}.telemetry_sources sources
+                        ON sources.id = %s AND sources.project_id = runs.project_id AND sources.run_id = runs.id
+                    WHERE runs.id = %s AND runs.project_id = %s
+                      AND (%s::uuid IS NULL OR sources.id IS NOT NULL)
+                    RETURNING *""",
+                (
+                    project_id, start_at, end_at, source_id, value, created_by,
+                    json.dumps(json_ready(metadata or {})), event_type_id, source_id, run_id, project_id,
+                    source_id,
+                ),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError("Run or event type was not found in the selected project.")
+            connection.commit()
+            return row
+
+    def get_timeline_event(
+        self, *, project_id: str, run_id: str, event_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT events.*, types.event_type_key, types.display_name
+                    FROM {self.schema}.timeline_events events
+                    JOIN {self.schema}.timeline_event_types types ON types.id = events.event_type_id
+                    WHERE events.id = %s AND events.project_id = %s AND events.run_id = %s""",
+                (event_id, project_id, run_id),
+            )
+            return cursor.fetchone()
+
+    def list_timeline_events(
+        self, *, project_id: str, run_id: str, start_at: datetime | None = None,
+        end_at: datetime | None = None, event_type_id: str | None = None,
+        source_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["events.project_id = %s", "events.run_id = %s"]
+        params: list[Any] = [project_id, run_id]
+        if start_at is not None and end_at is not None:
+            clauses.append(
+                "tstzrange(events.start_at, COALESCE(events.end_at, events.start_at), '[]') "
+                "&& tstzrange(%s::timestamptz, %s::timestamptz, '[]')"
+            )
+            params.extend((start_at, end_at))
+        elif start_at is not None:
+            clauses.append(
+                "tstzrange(events.start_at, COALESCE(events.end_at, events.start_at), '[]') "
+                "&& tstzrange(%s::timestamptz, NULL, '[)')"
+            )
+            params.append(start_at)
+        elif end_at is not None:
+            clauses.append(
+                "tstzrange(events.start_at, COALESCE(events.end_at, events.start_at), '[]') "
+                "&& tstzrange(NULL, %s::timestamptz, '(]')"
+            )
+            params.append(end_at)
+        if event_type_id is not None:
+            clauses.append("events.event_type_id = %s")
+            params.append(event_type_id)
+        if source_id is not None:
+            clauses.append("events.source_id = %s")
+            params.append(source_id)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT events.*, types.event_type_key, types.display_name
+                    FROM {self.schema}.timeline_events events
+                    JOIN {self.schema}.timeline_event_types types ON types.id = events.event_type_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY events.start_at, types.event_type_key, events.id""",
+                tuple(params),
+            )
+            return cursor.fetchall()
+
+    def update_timeline_event(
+        self, *, project_id: str, run_id: str, event_id: str,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        allowed = {"event_type_id", "source_id", "start_at", "end_at", "value", "metadata"}
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported timeline event fields: {', '.join(sorted(unknown))}.")
+        if not updates:
+            raise ValueError("Provide at least one timeline event field to update.")
+
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT * FROM {self.schema}.timeline_events
+                    WHERE id = %s AND project_id = %s AND run_id = %s FOR UPDATE""",
+                (event_id, project_id, run_id),
+            )
+            current = cursor.fetchone()
+            if current is None:
+                return None
+
+            resolved = dict(updates)
+            start_at = resolved.get("start_at", current["start_at"])
+            end_at = resolved.get("end_at", current["end_at"])
+            if start_at.tzinfo is None or start_at.utcoffset() is None:
+                raise ValueError("Timeline event start_at must include a timezone.")
+            if end_at is not None and (end_at.tzinfo is None or end_at.utcoffset() is None):
+                raise ValueError("Timeline event end_at must include a timezone.")
+            if end_at is not None and end_at < start_at:
+                raise ValueError("Timeline event end_at must not precede start_at.")
+            if "event_type_id" in resolved:
+                cursor.execute(
+                    f"""SELECT 1 FROM {self.schema}.timeline_event_types
+                        WHERE id = %s AND project_id = %s""",
+                    (resolved["event_type_id"], project_id),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("Timeline event type was not found in the selected project.")
+            if resolved.get("source_id") is not None:
+                cursor.execute(
+                    f"""SELECT 1 FROM {self.schema}.telemetry_sources
+                        WHERE id = %s AND project_id = %s AND run_id = %s""",
+                    (resolved["source_id"], project_id, run_id),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("Telemetry source was not found for the selected run and project.")
+
+            assignments: list[str] = []
+            params: list[Any] = []
+            for field_name in ("event_type_id", "source_id", "start_at", "end_at", "value", "metadata"):
+                if field_name not in resolved:
+                    continue
+                if field_name == "metadata":
+                    assignments.append("metadata = %s::jsonb")
+                    params.append(json.dumps(json_ready(resolved[field_name] or {})))
+                else:
+                    assignments.append(f"{field_name} = %s")
+                    params.append(resolved[field_name])
+            assignments.append("updated_at = NOW()")
+            params.extend([event_id, project_id, run_id])
+            cursor.execute(
+                f"""UPDATE {self.schema}.timeline_events
+                    SET {', '.join(assignments)}
+                    WHERE id = %s AND project_id = %s AND run_id = %s
+                    RETURNING *""",
+                tuple(params),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+            return row
+
+    def delete_timeline_event(
+        self, *, project_id: str, run_id: str, event_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""DELETE FROM {self.schema}.timeline_events
+                    WHERE id = %s AND project_id = %s AND run_id = %s
+                    RETURNING *""",
+                (event_id, project_id, run_id),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+            return row
+
+    def list_timeline_events_at(
+        self, *, project_id: str, run_id: str, observed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT events.*, types.event_type_key, types.display_name
+                    FROM {self.schema}.timeline_events events
+                    JOIN {self.schema}.timeline_event_types types ON types.id = events.event_type_id
+                    WHERE events.project_id = %s AND events.run_id = %s
+                      AND tstzrange(
+                            events.start_at, COALESCE(events.end_at, events.start_at), '[]'
+                          ) @> %s::timestamptz
+                    ORDER BY events.start_at, types.event_type_key""",
+                (project_id, run_id, observed_at),
+            )
+            return cursor.fetchall()

@@ -127,6 +127,8 @@ stage_aliases = {
     "preprocess": "preprocess_frames",
     "preprocess_frame": "preprocess_frames",
     "preprocess_frames": "preprocess_frames",
+    "telemetry": "telemetry_import",
+    "telemetry_import": "telemetry_import",
     "segment": "segment",
     "segmentation": "segment",
     "roi_detection": "segment",

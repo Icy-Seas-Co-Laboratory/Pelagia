@@ -91,3 +91,16 @@ class JobRepository(RepositoryScope):
             "cancel_jobs", "delete_jobs",
         }
     )
+
+
+class TelemetryRepository(RepositoryScope):
+    operations = frozenset(
+        {
+            "ingest_telemetry", "get_telemetry_import", "list_telemetry_sources", "list_telemetry_parameters",
+            "list_telemetry_sensors", "list_telemetry_streams", "get_telemetry_stream",
+            "telemetry_observations_around", "list_telemetry_observations",
+            "create_timeline_event_type", "list_timeline_event_types",
+            "create_timeline_event", "get_timeline_event", "list_timeline_events",
+            "update_timeline_event", "delete_timeline_event", "list_timeline_events_at",
+        }
+    )

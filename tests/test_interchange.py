@@ -12,12 +12,13 @@ import pytest
 
 from pelagia_interchange import (
     CompatibilityError, Dataset, DatasetBuilder, DatasetStateError, FrameStatus,
-    Manifest, Metadata, StorageFormat, Validator,
+    Manifest, Metadata, ShardWriter, StorageFormat, Validator,
 )
 from pelagia_interchange.cli import main
 from pelagia_interchange.extraction import extract_frames
 from pelagia_interchange.ingestion import (
     VideoIngestionError,
+    VideoProbe,
     _passthrough_timing_arguments,
     discover_videos,
     ingest_video_directory,
@@ -296,6 +297,82 @@ def test_interrupted_builder_preserves_partial_and_is_not_openable(tmp_path: Pat
     moved = DatasetBuilder.quarantine_partials(path, quarantine)
     assert len(moved) == 1 and moved[0].is_file()
     assert not DatasetBuilder.partials(path)
+
+
+def test_builder_resume_reopens_durable_partial_and_preserves_manifest(tmp_path: Path) -> None:
+    path = tmp_path / "dataset"
+    fmt = StorageFormat("jpeg")
+    builder = DatasetBuilder(path, title="Resumable")
+    source = builder.register_source_file(original_filename="x", frame_count=1001)
+    for number in range(1001):
+        builder.add_frame(stream="camera", source_file=source, frame_id=number,
+                          source_frame_number=number, encoded_bytes=JPEG, storage_format=fmt)
+    builder.abort(message="simulated interruption")
+    # Versions before resumable partials did not persist stream identity in
+    # shard_metadata; recovery must still use the deterministic legacy name.
+    partial = DatasetBuilder.partials(path)[0]
+    with sqlite3.connect(partial) as connection:
+        connection.execute("DELETE FROM shard_metadata WHERE key IN ('shard_uuid', 'camera_or_stream_id', 'camera_or_stream_name')")
+
+    resumed = DatasetBuilder.resume(path, shard_target_size="10GB")
+    recovered_source = resumed.find_source_file(original_relative_path=None)
+    assert recovered_source is not None
+    progress = resumed.source_progress("camera", recovered_source.source_file_id)
+    assert progress["frame_count"] == 1000 and progress["last_source_frame"] == 999
+    for number in range(1000, 1001):
+        resumed.add_frame(stream="camera", source_file=recovered_source, frame_id=resumed.next_frame_id("camera"),
+                          source_frame_number=number, encoded_bytes=JPEG, storage_format=fmt)
+    dataset = resumed.finalize()
+    assert dataset.frame_count == 1001
+    assert dataset.manifest.dataset_uuid == json.loads((path / "manifest.json").read_text())["dataset_uuid"]
+    assert any(event["operation"] == "dataset_resumed" for event in dataset.history)
+
+
+def test_video_ingestion_resume_skips_durable_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    videos = tmp_path / "videos"; videos.mkdir(); video = videos / "sample.mp4"; video.write_bytes(b"source")
+    output = tmp_path / "dataset"
+    payloads = [JPEG + bytes([number]) for number in range(3)]
+    failing = True
+
+    class FakeProcess:
+        stdout = object()
+
+        def wait(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    monkeypatch.setattr("pelagia_interchange.ingestion._executable", lambda value, label: value)
+    monkeypatch.setattr("pelagia_interchange.ingestion._ffmpeg_version", lambda executable: "test")
+    monkeypatch.setattr("pelagia_interchange.ingestion._passthrough_timing_arguments", lambda executable: ([], "test"))
+    monkeypatch.setattr("pelagia_interchange.ingestion.probe_video",
+                        lambda path, ffprobe: VideoProbe(Path(path), "mp4", "test", "yuv420p", 2, 2, (1, 1), 3, None))
+    monkeypatch.setattr("pelagia_interchange.ingestion.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr("pelagia_interchange.ingestion._thumbnail", lambda payload, ffmpeg, width: JPEG)
+    original_writer_init = ShardWriter.__init__
+
+    def durable_writer_init(self, *args, **kwargs):
+        kwargs["batch_size"] = 1
+        original_writer_init(self, *args, **kwargs)
+
+    monkeypatch.setattr("pelagia_interchange.builder.ShardWriter.__init__", durable_writer_init)
+
+    def frames(stream: object):
+        nonlocal failing
+        for number, payload in enumerate(payloads):
+            if failing and number == 2:
+                raise VideoIngestionError("simulated interruption")
+            yield payload
+
+    monkeypatch.setattr("pelagia_interchange.ingestion._iter_mjpeg", frames)
+    with pytest.raises(VideoIngestionError):
+        ingest_video_directory(videos, output, generate_previews=False)
+    assert DatasetBuilder.partials(output)
+    failing = False
+    result = ingest_video_directory(videos, output, generate_previews=False, resume=True)
+    assert result.dataset.frame_count == 3
+    assert [frame.record.source_frame_number for frame in result.dataset.iter_frames()] == [0, 1, 2]
 
 
 def test_compatibility_checks(tmp_path: Path) -> None:

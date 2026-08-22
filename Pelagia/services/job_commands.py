@@ -388,6 +388,66 @@ class ClassificationCommand(JobCommand):
         }
 
 
+@dataclass(frozen=True, slots=True)
+class TelemetryImportCommand(JobCommand):
+    """Versioned payload for worker-owned telemetry source imports."""
+
+    command_type = "telemetry_import"
+    stage = PipelineStage.TELEMETRY_IMPORT
+
+    path: str
+    timestamp_column: str
+    streams: tuple[dict[str, Any], ...]
+    timestamp_format: str = "iso8601"
+    source_timezone: str = "UTC"
+    delimiter: str = ","
+    parser_name: str = "pelagia.delimited"
+    parser_version: str = "1"
+    collections: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "TelemetryImportCommand":
+        cls._validate_payload(payload)
+        path = str(payload.get("path") or "").strip()
+        timestamp_column = str(payload.get("timestamp_column") or "").strip()
+        raw_streams = payload.get("streams")
+        if not isinstance(raw_streams, (list, tuple)) or any(
+            not isinstance(item, Mapping) for item in raw_streams
+        ):
+            raise ValueError("Telemetry import streams must be a list of objects.")
+        streams = tuple(dict(item) for item in raw_streams)
+        if not path or not timestamp_column or not streams:
+            raise ValueError("Telemetry import jobs require path, timestamp_column, and streams.")
+        return cls(
+            path=path,
+            timestamp_column=timestamp_column,
+            streams=streams,
+            timestamp_format=str(payload.get("timestamp_format") or "iso8601"),
+            source_timezone=str(payload.get("source_timezone") or "UTC"),
+            delimiter=str(payload.get("delimiter") or ","),
+            parser_name=str(payload.get("parser_name") or "pelagia.delimited"),
+            parser_version=str(payload.get("parser_version") or "1"),
+            collections=tuple(str(value) for value in payload.get("collections") or () if value),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            **self._payload_header(),
+            "path": self.path,
+            "timestamp_column": self.timestamp_column,
+            "streams": [dict(item) for item in self.streams],
+            "timestamp_format": self.timestamp_format,
+            "source_timezone": self.source_timezone,
+            "delimiter": self.delimiter,
+            "parser_name": self.parser_name,
+            "parser_version": self.parser_version,
+            "collections": list(self.collections),
+            "metadata": self.metadata,
+        }
+
+
 def command_model(stage: PipelineStage | str) -> type[JobCommand] | None:
     return {
         PipelineStage.EXTRACT_FRAMES: ExtractFramesCommand,
@@ -396,6 +456,7 @@ def command_model(stage: PipelineStage | str) -> type[JobCommand] | None:
         PipelineStage.BACKGROUND_FRAMES: FrameBackgroundCommand,
         PipelineStage.ROI_REFINEMENT: RoiRefinementCommand,
         PipelineStage.CLASSIFY: ClassificationCommand,
+        PipelineStage.TELEMETRY_IMPORT: TelemetryImportCommand,
     }.get(PipelineStage(stage))
 
 

@@ -54,6 +54,10 @@ name = "ingest-1"
 capabilities = ["ingest"]
 
 [[worker]]
+name = "telemetry-1"
+capabilities = ["telemetry_import"]
+
+[[worker]]
 name = "preprocess-1"
 capabilities = ["preprocess"]
 

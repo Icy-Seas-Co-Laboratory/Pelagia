@@ -35,6 +35,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--no-source-hash", action="store_true"); create.add_argument("--source-file-boundary", action="store_true")
     create.add_argument("--no-previews", action="store_true"); create.add_argument("--preview-count", type=int, default=12)
     create.add_argument("--preview-width", type=int, default=512); create.add_argument("--require-previews", action="store_true")
+    create.add_argument("--resume", action="store_true", help="resume an incomplete video ingestion")
     inspect = commands.add_parser("inspect", help="summarize a dataset")
     inspect.add_argument("path", type=Path); inspect.add_argument("--json", action="store_true")
     verify = commands.add_parser("verify", help="verify package integrity")
@@ -120,9 +121,12 @@ def main(argv: list[str] | None = None) -> int:
                                                 generate_previews=not args.no_previews,
                                                 preview_count=args.preview_count, preview_width=args.preview_width,
                                                 require_previews=args.require_previews,
+                                                resume=args.resume,
                                                 progress=lambda message: print(message, file=sys.stderr))
                 print(f"Created {args.output}: {result.source_files} source file(s), {result.frames} frame(s), {result.previews} representative preview(s)")
                 return 0
+            if args.resume:
+                raise ValueError("--resume requires --from-videos")
             DatasetBuilder(args.output, title=args.title, description=args.description, shard_target_size=args.shard_target_size).finalize()
             print(f"Created {args.output}"); return 0
         if args.command == "verify":

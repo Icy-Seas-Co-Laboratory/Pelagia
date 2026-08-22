@@ -4,7 +4,7 @@ from typing import Literal
 from urllib.parse import urlencode
 
 try:
-    from fastapi import APIRouter, HTTPException, Request, Response
+    from fastapi import APIRouter, HTTPException, Query, Request, Response
     from pydantic import BaseModel, ConfigDict
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
@@ -342,6 +342,9 @@ if APIRouter is not None:
         height: int | None = None,
         scale: float = 1.0,
         include_detections: bool = True,
+        include_telemetry: bool = False,
+        include_events: bool = False,
+        telemetry_parameters: list[str] | None = Query(default=None),
         detection_limit: int = 500,
         detection_offset: int = 0,
         frame_payload_kind: Literal["original", "preprocessed"] = "preprocessed",
@@ -386,23 +389,35 @@ if APIRouter is not None:
                 else None
             ),
         }
-        return as_response(
-            {
-                "frame": frame_summary(row),
-                "asset": asset,
-                "image_urls": image_urls,
-                "frame_payload_kind": (
-                    frame_payload_kind if frame_payload_kind == "original" or image_urls["preprocessed"] else "original"
-                ),
-                "detections": detection_summaries,
-                "detection_count": len(detection_summaries),
-                "page": page_metadata(
-                    limit=detection_limit,
-                    offset=detection_offset,
-                    count=len(detection_summaries),
-                ),
-            }
-        )
+        response_payload = {
+            "frame": frame_summary(row),
+            "asset": asset,
+            "image_urls": image_urls,
+            "frame_payload_kind": (
+                frame_payload_kind if frame_payload_kind == "original" or image_urls["preprocessed"] else "original"
+            ),
+            "detections": detection_summaries,
+            "detection_count": len(detection_summaries),
+            "page": page_metadata(
+                limit=detection_limit,
+                offset=detection_offset,
+                count=len(detection_summaries),
+            ),
+        }
+        if include_telemetry or include_events:
+            from ...services.telemetry import frame_context
+
+            temporal_context = frame_context(
+                repository, project_id=project_id, frame=row,
+                parameters=telemetry_parameters,
+                include_telemetry=include_telemetry,
+                include_events=include_events,
+            )
+            if include_telemetry:
+                response_payload["telemetry"] = temporal_context["telemetry"]
+            if include_events:
+                response_payload["events"] = temporal_context["events"]
+        return as_response(response_payload)
 
     @router.head("/original")
     @router.get("/original")

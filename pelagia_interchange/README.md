@@ -160,6 +160,7 @@ The `pii` command offers `create`, `inspect`, `extract`, `verify`, `metadata`, `
 
 ```bash
 pii create deployment_042 --from-videos /acquisition/deployment_042 --stream port
+pii create deployment_042 --from-videos /acquisition/deployment_042 --stream port --resume
 pii create --interactive
 pii inspect deployment_042
 pii inspect deployment_042 --json
@@ -197,5 +198,7 @@ Interrupted `.sqlite.partial` shards remain non-authoritative and are preserved.
 pii shards deployment_042 --partials
 pii shards deployment_042 --quarantine-partials ./partial-recovery
 ```
+
+An interrupted video ingestion can be resumed in place with `pii create --from-videos ... --resume`. The source files are checked against the incomplete package, finalized shards remain immutable, and only the durable source-frame prefix is skipped/replayed.
 
 The detailed [usage guide](../docs/interchange-usage.md), [normative specification](../docs/interchange-specification.md), and [annotated metadata example](../docs/metadata.example.toml) are in the repository. Every generated dataset also includes a durable README and dependency-free scripts under `tools/`.

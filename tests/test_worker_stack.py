@@ -95,6 +95,34 @@ capabilities = ["ingest", "roi_refinement"]
     assert f"profile=cpu stages=extract_frames,roi_refinement python={cpu_venv}/bin/python" in result.stdout
 
 
+def test_stack_validate_accepts_telemetry_capability(tmp_path):
+    cpu_venv = _venv_path(tmp_path, "cpu")
+    config_path = _write_stack_config(
+        tmp_path,
+        f'''
+[stack]
+name = "pytest-worker-stack"
+run_dir = "{tmp_path / "run"}"
+
+[[worker]]
+name = "telemetry"
+capabilities = ["telemetry_import"]
+''',
+    )
+
+    result = subprocess.run(
+        [str(STACK_SCRIPT), "validate", str(config_path)],
+        cwd=ROOT_DIR,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PELAGIA_CPU_VENV": str(cpu_venv)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"worker-telemetry profile=cpu stages=telemetry_import python={cpu_venv}/bin/python" in result.stdout
+
+
 def test_stack_start_refuses_an_api_port_owned_by_another_service(tmp_path):
     cpu_venv = _venv_path(tmp_path, "cpu")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:

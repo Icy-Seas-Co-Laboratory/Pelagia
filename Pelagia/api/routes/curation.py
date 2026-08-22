@@ -19,6 +19,7 @@ if APIRouter is not None:
     from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
     from ...services.pipeline import PipelineService
     from ...services.registry_generation import preview_registry_dataset
+    from ...services.telemetry import parse_telemetry_filters
     from ...services.taxonomy import default_taxonomy_dictionary
     from ._common import as_response, get_context, get_repository
 
@@ -321,8 +322,13 @@ if APIRouter is not None:
         sort_by: str = "oldest",
         limit: int = Query(120, ge=1, le=500),
         offset: int = Query(0, ge=0),
+        telemetry_filter: list[str] = Query(default=[]),
     ) -> dict:
         auth = require_project_read(request)
+        try:
+            telemetry_filters = parse_telemetry_filters(telemetry_filter)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         result = get_repository(request).list_curation_rois(
             project_id=auth.project_id,
             annotation_state=annotation_state,
@@ -334,6 +340,7 @@ if APIRouter is not None:
             sort_by=sort_by,
             limit=limit,
             offset=offset,
+            telemetry_filters=telemetry_filters,
         )
         result["items"] = [_with_urls(item) for item in result["items"]]
         return as_response(result)

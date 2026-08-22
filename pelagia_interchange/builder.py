@@ -9,12 +9,12 @@ from uuid import UUID, uuid4, uuid5
 
 from .constants import FORMAT_NAME, FORMAT_VERSION
 from .dataset import Dataset
-from .exceptions import DatasetStateError
+from .exceptions import DatasetStateError, FormatError
 from .history import History
 from .manifest import Manifest
 from .metadata import Metadata, default_metadata
 from .models import FrameRecord, HashRecord, SourceFile, StorageFormat, new_uuid
-from .shard import ShardWriter
+from .shard import ShardReader, ShardWriter
 from .tool_scripts import TOOL_FILES
 from .util import hash_file, parse_size, safe_relative_path, utc_now
 
@@ -25,6 +25,7 @@ class DatasetBuilder:
         shard_target_bytes: int | str = 10_000_000_000, shard_target_size: int | str | None = None,
         maximum_frame_count: int | None = None, source_file_boundary: bool = False,
         dataset_uuid: UUID | str | None = None, metadata: Metadata | Mapping[str, Any] | None = None,
+        resume: bool = False,
     ) -> None:
         self.output = Path(output)
         self.shard_target_bytes = parse_size(shard_target_size or shard_target_bytes)
@@ -46,9 +47,12 @@ class DatasetBuilder:
         self._shard_numbers: dict[str, int] = {}
         self._last_source_per_stream: dict[str, int] = {}
         self._closed = False
-        self._initialize()
+        self._initialize(resume=resume)
 
-    def _initialize(self) -> None:
+    def _initialize(self, *, resume: bool = False) -> None:
+        if resume:
+            self._resume_existing()
+            return
         if self.output.exists() and any(self.output.iterdir()):
             raise FileExistsError(f"output directory is not empty: {self.output}")
         self.output.mkdir(parents=True, exist_ok=True)
@@ -57,6 +61,64 @@ class DatasetBuilder:
         self.manifest.write(self.output / "manifest.json")
         self.metadata.write(self.output / "metadata.toml")
         self.history.append(operation="dataset_created", outputs=[{"dataset_uuid": str(self.dataset_uuid)}])
+
+    @classmethod
+    def resume(cls, output: str | Path, **kwargs: Any) -> "DatasetBuilder":
+        """Open an incomplete package for append/resume processing."""
+        kwargs["resume"] = True
+        return cls(output, **kwargs)
+
+    def _resume_existing(self) -> None:
+        if not self.output.is_dir():
+            raise FormatError(f"cannot resume missing dataset directory: {self.output}")
+        self.manifest = Manifest.read(self.output / "manifest.json")
+        if self.manifest.state not in {"building", "finalizing"}:
+            raise DatasetStateError(f"dataset state is {self.manifest.state!r}; only incomplete datasets can be resumed")
+        self.dataset_uuid = UUID(self.manifest.dataset_uuid)
+        self.metadata = Metadata.read(self.output / "metadata.toml")
+        for directory in ("data", "calibration", "preview", "tools"):
+            (self.output / directory).mkdir(parents=True, exist_ok=True)
+        self._load_sources()
+        self._load_streams_and_shard_numbers()
+        previous_state = self.manifest.state
+        self.manifest.state = "building"
+        self.manifest.write(self.output / "manifest.json")
+        self.history.append(operation="dataset_resumed", parameters={"previous_state": previous_state},
+                            outputs=[{"dataset_uuid": str(self.dataset_uuid)}])
+
+    def _load_sources(self) -> None:
+        for record in self.manifest.source_files:
+            file_hash = record.get("file_hash")
+            hash_record = HashRecord(file_hash["algorithm"], "source_file", file_hash["value"]) if file_hash else None
+            frame_rate = record.get("frame_rate") or (None, None)
+            source = SourceFile(
+                int(record["source_file_id"]), UUID(str(record["source_uuid"])), record["original_filename"],
+                record.get("original_relative_path"), record.get("original_absolute_path"), record.get("byte_size"),
+                hash_record, record.get("container"), record.get("codec"), record.get("pixel_format"),
+                record.get("width"), record.get("height"), frame_rate[0], frame_rate[1], record.get("frame_count"),
+                record.get("start_timestamp"), record.get("end_timestamp"),
+            )
+            self._sources[source.source_file_id] = source
+            self._sources_by_uuid[source.source_uuid] = source
+
+    def _load_streams_and_shard_numbers(self) -> None:
+        for record in self.manifest.shards:
+            self.register_stream(record["stream_name"], stream_uuid=record["stream_uuid"])
+            self._record_shard_number(record["stream_name"], record["relative_path"])
+        for path in self.partials(self.output):
+            self._record_shard_number(self._slug_from_partial(path), path.name)
+
+    def _record_shard_number(self, stream: str, relative_path: str) -> None:
+        stem = Path(relative_path).name.removesuffix(".sqlite.partial").removesuffix(".sqlite")
+        prefix, separator, number = stem.rpartition("_")
+        if separator and number.isdigit() and prefix == self._slug(stream):
+            self._shard_numbers[stream] = max(self._shard_numbers.get(stream, 0), int(number))
+
+    @classmethod
+    def _slug_from_partial(cls, path: Path) -> str:
+        stem = path.name.removesuffix(".sqlite.partial")
+        prefix, separator, number = stem.rpartition("_")
+        return prefix if separator and number.isdigit() else stem
 
     def __enter__(self) -> "DatasetBuilder":
         return self
@@ -89,7 +151,11 @@ class DatasetBuilder:
             raise ValueError("source file hash target must be 'source_file'")
         if original_absolute_path is None and source_path is not None and source_path.is_absolute():
             original_absolute_path = str(source_path)
-        identifier = len(self._sources) + 1
+        if source_uuid is not None:
+            existing = self._sources_by_uuid.get(new_uuid(source_uuid))
+            if existing is not None:
+                return existing
+        identifier = max(self._sources, default=0) + 1
         source = SourceFile(identifier, new_uuid(source_uuid), original_filename, original_relative_path,
                             original_absolute_path, byte_size, file_hash, container, codec, pixel_format,
                             width, height, frame_rate[0] if frame_rate else None, frame_rate[1] if frame_rate else None,
@@ -141,12 +207,39 @@ class DatasetBuilder:
     def _new_writer(self, stream: str) -> ShardWriter:
         if stream not in self._stream_uuids:
             self.register_stream(stream)
-        number = self._shard_numbers.get(stream, 0) + 1
+        partial = self._partial_for_stream(stream)
+        if partial is not None:
+            stem = partial.name.removesuffix(".sqlite.partial")
+            _, _, number_text = stem.rpartition("_")
+            number = int(number_text) if number_text.isdigit() else self._shard_numbers.get(stream, 0) + 1
+        else:
+            number = self._shard_numbers.get(stream, 0) + 1
         self._shard_numbers[stream] = number
         filename = f"{self._slug(stream)}_{number:06d}.sqlite"
-        writer = ShardWriter(self.output / "data" / filename, stream_uuid=self._stream_uuid(stream), stream_name=stream)
+        final_path = self.output / "data" / filename
+        writer = (ShardWriter.resume(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream)
+                  if partial is not None else
+                  ShardWriter(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream))
         self._writers[stream] = writer
         return writer
+
+    def _partial_for_stream(self, stream: str) -> Path | None:
+        candidates: list[Path] = []
+        for path in self.partials(self.output):
+            try:
+                metadata = ShardReader(path).metadata()
+            except (FormatError, OSError):
+                metadata = {}
+            matches_identity = metadata.get("camera_or_stream_name") == stream or metadata.get(
+                "camera_or_stream_id") == str(self._stream_uuid(stream))
+            matches_legacy_name = (not metadata.get("camera_or_stream_name") and
+                                   not metadata.get("camera_or_stream_id") and
+                                   self._slug_from_partial(path) == self._slug(stream))
+            if matches_identity or matches_legacy_name:
+                candidates.append(path)
+        if len(candidates) > 1:
+            raise FormatError(f"multiple partial shards are candidates for stream {stream!r}")
+        return candidates[0] if candidates else None
 
     def _finalize_writer(self, stream: str) -> None:
         writer = self._writers.pop(stream, None)
@@ -172,6 +265,8 @@ class DatasetBuilder:
 
     def boundary(self, stream: str | None = None) -> None:
         for name in [stream] if stream is not None else list(self._writers):
+            if name not in self._writers and self._partial_for_stream(name) is not None:
+                self._new_writer(name)
             self._finalize_writer(name)
 
     def add_frame(
@@ -224,27 +319,36 @@ class DatasetBuilder:
         record = {"relative_path": destination.relative_to(self.output).as_posix(), "byte_size": destination.stat().st_size,
                   "file_hash": {"algorithm": "sha256", "target": "package_file", "value": hash_file(destination)},
                   "description": description, "authoritative": False if kind == "preview" else None}
-        getattr(self.manifest, "previews" if kind == "preview" else "calibration").append(record)
+        records = getattr(self.manifest, "previews" if kind == "preview" else "calibration")
+        records[:] = [item for item in records if item.get("relative_path") != record["relative_path"]]
+        records.append(record)
+        self.manifest.write(self.output / "manifest.json")
         return record
 
     def add_resource_bytes(self, data: bytes, *, kind: str, relative_name: str,
-                           description: str | None = None, attributes: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                           description: str | None = None, attributes: Mapping[str, Any] | None = None,
+                           replace: bool = False) -> dict[str, Any]:
         """Add an in-memory package resource without an intermediate source file."""
         if kind not in {"calibration", "preview"}:
             raise ValueError("resource kind must be calibration or preview")
         relative = safe_relative_path(relative_name)
         destination = self.output / kind / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
+        if destination.exists() and not replace:
             raise FileExistsError(destination)
-        destination.write_bytes(data)
+        temporary = destination.with_name(destination.name + ".tmp")
+        temporary.write_bytes(data)
+        temporary.replace(destination)
         record: dict[str, Any] = {
             "relative_path": destination.relative_to(self.output).as_posix(), "byte_size": len(data),
             "file_hash": {"algorithm": "sha256", "target": "package_file", "value": hash_file(destination)},
             "description": description, "authoritative": False if kind == "preview" else None,
         }
         record.update(dict(attributes or {}))
-        getattr(self.manifest, "previews" if kind == "preview" else "calibration").append(record)
+        records = getattr(self.manifest, "previews" if kind == "preview" else "calibration")
+        records[:] = [item for item in records if item.get("relative_path") != record["relative_path"]]
+        records.append(record)
+        self.manifest.write(self.output / "manifest.json")
         return record
 
     def _write_tools(self) -> None:
@@ -286,7 +390,7 @@ Frame and timestamp ranges are inclusive. JPEG and PNG payloads are written with
 
 Verification levels become progressively more expensive: `quick` checks the package inventory and file hashes; `structural` also checks every SQLite database and its declared structure; `full` streams all frame records and hashes; `archival` adds strict source-count and completion-provenance requirements. An archival success is a mechanical integrity result, not authorization to delete original acquisitions. Retention policy, backups, scientific acceptance, and responsible-person approval remain separate decisions. These tools never delete source data.
 
-An interrupted writer leaves `data/*.sqlite.partial` files unlisted by the manifest. With the package installed, list them using `pii shards . --partials` or move them intact to a recovery directory using `pii shards . --quarantine-partials RECOVERY_DIR`. They are never deleted automatically.
+An interrupted writer leaves `data/*.sqlite.partial` files unlisted by the manifest. Video ingestion can resume these files with `pii create --from-videos INPUT --resume`; lower-level callers can use `DatasetBuilder.resume(output)`. With the package installed, list them using `pii shards . --partials` or move them intact to a recovery directory using `pii shards . --quarantine-partials RECOVERY_DIR`. They are never deleted automatically.
 
 Hashes always have an algorithm and semantic target. Frame hashes cover exact stored BLOB bytes; shard hashes cover complete finalized SQLite files. The checksum file covers every regular finalized package file except itself, so there is no self-reference. Editing the manifest, metadata, or history therefore requires checksum regeneration. Manifest shard hashes remain authoritative for shard-file integrity.
 
@@ -336,6 +440,57 @@ The normative reference is **Scientific Image Interchange Format 1.0**, maintain
     @staticmethod
     def partials(path: str | Path) -> list[Path]:
         return sorted(Path(path).glob("data/*.sqlite.partial"))
+
+    def find_source_file(self, *, original_relative_path: str | None = None,
+                         source_uuid: UUID | str | None = None) -> SourceFile | None:
+        if source_uuid is not None:
+            return self._sources_by_uuid.get(UUID(str(source_uuid)))
+        return next((source for source in self._sources.values()
+                     if source.original_relative_path == original_relative_path), None)
+
+    def _partial_matches_stream(self, path: Path, stream: str) -> bool:
+        try:
+            metadata = ShardReader(path).metadata()
+        except (FormatError, OSError):
+            metadata = {}
+        return (metadata.get("camera_or_stream_name") == stream or
+                metadata.get("camera_or_stream_id") == str(self._stream_uuid(stream)) or
+                (not metadata.get("camera_or_stream_name") and
+                 not metadata.get("camera_or_stream_id") and
+                 self._slug_from_partial(path) == self._slug(stream)))
+
+    def source_progress(self, stream: str, source_file_id: int) -> dict[str, int | None]:
+        """Inspect finalized and partial shards to find the durable source prefix."""
+        total = 0; first = None; last = None; last_frame = None
+        paths: list[Path] = [self.output / record["relative_path"] for record in self.manifest.shards
+                             if record.get("stream_name") == stream]
+        paths.extend(path for path in self.partials(self.output) if self._partial_matches_stream(path, stream))
+        for path in paths:
+            progress = ShardReader(path).source_progress(source_file_id)
+            total += int(progress["frame_count"] or 0)
+            if progress["first_source_frame"] is not None:
+                first = progress["first_source_frame"] if first is None else min(first, progress["first_source_frame"])
+            if progress["last_source_frame"] is not None:
+                last = progress["last_source_frame"] if last is None else max(last, progress["last_source_frame"])
+            if progress["last_frame"] is not None:
+                last_frame = progress["last_frame"] if last_frame is None else max(last_frame, progress["last_frame"])
+        if first not in {None, 0} or (last is not None and total != int(last) - int(first or 0) + 1):
+            raise FormatError(f"source {source_file_id} does not have a durable contiguous prefix")
+        return {"frame_count": total, "first_source_frame": first, "last_source_frame": last, "last_frame": last_frame}
+
+    def next_frame_id(self, stream: str) -> int:
+        maximum: int | None = None
+        paths = [self.output / record["relative_path"] for record in self.manifest.shards
+                 if record.get("stream_name") == stream]
+        paths.extend(path for path in self.partials(self.output) if self._partial_matches_stream(path, stream))
+        for path in paths:
+            value = ShardReader(path).aggregate_metadata()["last_frame"]
+            if value is not None:
+                maximum = value if maximum is None else max(maximum, int(value))
+        writer = self._writers.get(stream)
+        if writer is not None and writer.last_frame is not None:
+            maximum = writer.last_frame if maximum is None else max(maximum, writer.last_frame)
+        return 0 if maximum is None else int(maximum) + 1
 
     @staticmethod
     def quarantine_partials(path: str | Path, destination: str | Path) -> list[Path]:

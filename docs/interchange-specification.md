@@ -66,6 +66,8 @@ Finalized shards MUST be treated as immutable. Repair SHOULD create a replacemen
 
 Implementations SHOULD provide a read-only partial-file inventory and a user-directed, recoverable quarantine operation. The reference commands are `pii shards DATASET --partials` and `pii shards DATASET --quarantine-partials RECOVERY_DIR`; neither interprets a partial as authoritative.
 
+An implementation MAY resume an incomplete package in `building` or `finalizing` state. Resume MUST preserve finalized manifest shards, reopen only a structurally valid `.sqlite.partial`, and continue after the last durable source-frame row. A partial written by an older implementation MAY lack stream identity metadata; readers MAY infer its stream from the deterministic shard filename when unambiguous. Rows in an uncommitted SQLite transaction are not considered durable and MAY be replayed.
+
 Non-normative implementation profile: 64 KiB pages, DELETE journal mode, FULL synchronous, a bounded negative `cache_size`, large transactions, `ANALYZE` at finalization, and no automatic `VACUUM` provide portable bulk behavior. Target shards of 5–20 GB are practical; boundaries MAY be driven by byte target, maximum rows, source boundary, or an explicit request. An individual BLOB MUST NOT be split.
 
 ## 7. Images and extraction
@@ -86,7 +88,7 @@ Multiple investigators, instruments, deployments, streams, and funding sources M
 
 `history.jsonl` is UTF-8 JSON Lines. Every nonblank line MUST independently parse as a JSON object. Public APIs MUST append and MUST NOT rewrite existing events. Each version-1 event contains `event_schema_version`, event UUID, timestamp, operation, software/version, optional git commit/operator, parameters, input/output identifier-and-hash records, environment, status, and optional message. Hash records MUST state algorithm, semantic target, and value.
 
-Operations include `dataset_created`, `source_ingested`, `frames_transcoded`, `shard_created`, `shard_finalized`, `dataset_finalized`, `metadata_modified`, `dataset_verified`, `dataset_repaired`, and `dataset_exported`. New operation names MAY be added.
+Operations include `dataset_created`, `dataset_resumed`, `source_ingested`, `frames_transcoded`, `shard_created`, `shard_finalized`, `dataset_finalized`, `metadata_modified`, `dataset_verified`, `dataset_repaired`, and `dataset_exported`. New operation names MAY be added.
 
 ## 11. Integrity
 
@@ -102,6 +104,6 @@ Archival validation includes full validation and MUST require: every source has 
 
 ## 13. Lifecycle and extensions
 
-Image additions occur only while building. `finalizing` is transient; `complete` means construction completed; `verified` MAY record a successful verification snapshot; `modified` signals package-level changes since a prior validation. Ordinary metadata edits MAY be allowed but MUST cause checksum regeneration and SHOULD append `metadata_modified`. Authoritative payload changes require explicit repair/rewrite provenance.
+Image additions occur only while building. `finalizing` is transient but recoverable; `complete` means construction completed; `verified` MAY record a successful verification snapshot; `modified` signals package-level changes since a prior validation. Ordinary metadata edits MAY be allowed but MUST cause checksum regeneration and SHOULD append `metadata_modified`. Authoritative payload changes require explicit repair/rewrite provenance.
 
 New optional tables, manifest fields, metadata extension tables, status/timestamp vocabulary values, and storage codecs MAY be introduced compatibly. Existing meanings MUST NOT change within format major version 1. Readers MUST ignore compatible unknowns where safe and preserve them when rewriting their containing document.

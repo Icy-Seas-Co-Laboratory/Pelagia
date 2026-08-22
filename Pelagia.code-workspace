@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../PelagiaView"
+		},
+		{
+			"path": "../oracle-builder"
 		}
 	],
 	"settings": {}

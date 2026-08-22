@@ -122,7 +122,7 @@ pii create deployment_042 \
   --ffmpeg-qscale 2
 ```
 
-The importer uses FFmpeg's error-exit behavior and reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap.
+The importer uses FFmpeg's error-exit behavior and reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap. Retry with `--resume` to reopen that package. The retry verifies source identity, re-decodes the input to the last durable source-frame prefix, and appends the remaining frames without changing finalized shards.
 
 ### Automatic previews
 
@@ -764,7 +764,18 @@ pii shards deployment_042 --partials
 pii shards deployment_042 --quarantine-partials ./partial-recovery
 ```
 
-The quarantine command moves each partial file intact to the requested directory. It fails rather than overwriting a file with the same name. Review partial databases independently before deciding whether to resume, salvage, or remove them.
+For video ingestion, resume in place after confirming that the source directory is unchanged:
+
+```bash
+pii create deployment_042 \
+  --from-videos /acquisition/deployment_042 \
+  --stream port \
+  --resume
+```
+
+The resume operation accepts `building` and `finalizing` packages, validates source hashes and probed frame counts where available, and keeps finalized shards immutable. SQLite rows committed before the interruption are durable; an interrupted batch may be replayed safely. It is intentionally conservative and stops when the input source or package state cannot be matched.
+
+For manual recovery, the quarantine command still moves each partial file intact to the requested directory. It fails rather than overwriting a file with the same name. Review partial databases independently before deciding whether to resume, salvage, or remove them.
 
 In Python:
 
@@ -783,6 +794,12 @@ To inspect an incomplete package without treating it as complete:
 ```python
 dataset = Dataset.open("deployment_042", allow_incomplete=True)
 print(dataset.manifest.state)
+
+# Resume a package produced by an interrupted DatasetBuilder.
+with DatasetBuilder.resume("deployment_042") as builder:
+    source = builder.find_source_file(original_relative_path="frames/source-01")
+    # Add only records after builder.source_progress("camera", source.source_file_id)
+    # and let the builder reopen the matching partial on the first add_frame().
 ```
 
 ## Use a dataset without installing the package

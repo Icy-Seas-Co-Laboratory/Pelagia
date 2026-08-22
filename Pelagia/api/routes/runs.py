@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import uuid
+
 try:
     from fastapi import APIRouter, HTTPException, Request
+    from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -9,6 +13,7 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..schemas import AssetsListResponse, JobsListResponse, RunDetailResponse, RunsListResponse
     from ..auth import require_project_write, scoped_project_id
+    from ...domain import PlannedRun, RunManifest
     from ._common import as_response, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -18,6 +23,40 @@ if APIRouter is not None:
         return max(0, 0 if offset is None else offset)
 
     router = APIRouter(prefix="/runs", tags=["runs"])
+
+    class CreateRunRequest(BaseModel):
+        run_key: str
+        instrument: str = "telemetry"
+        source_path: str = ""
+        source_type: str = "telemetry"
+        metadata: dict = Field(default_factory=dict)
+
+    @router.post("", response_model=RunDetailResponse, status_code=201)
+    def create_run(request: Request, body: CreateRunRequest) -> dict:
+        auth = require_project_write(request)
+        run_key = body.run_key.strip()
+        if not run_key:
+            raise HTTPException(status_code=422, detail="run_key must not be blank.")
+        run_id = str(uuid.uuid4())
+        registration = get_repository(request).register_planned_run(
+            PlannedRun(
+                manifest=RunManifest(
+                    run_id=run_id,
+                    run_key=run_key,
+                    instrument=body.instrument.strip() or "telemetry",
+                    source_path=body.source_path.strip(),
+                    source_type=body.source_type.strip() or "telemetry",
+                    created_at=datetime.now(timezone.utc),
+                    metadata={
+                        **dict(body.metadata or {}),
+                        "project_id": str(auth.project_id),
+                        "api_endpoint": "POST /runs",
+                    },
+                )
+            ),
+            project_id=str(auth.project_id),
+        )
+        return {"run": as_response(registration.get("run") or {"id": run_id, "run_key": run_key})}
 
     @router.get("", response_model=RunsListResponse)
     def list_runs(

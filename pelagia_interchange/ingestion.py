@@ -183,9 +183,14 @@ def ingest_video_directory(
     grayscale: bool = False, hash_sources: bool = True, source_file_boundary: bool = False,
     generate_previews: bool = True, preview_count: int = 12, preview_width: int = 512,
     require_previews: bool = False,
+    resume: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> VideoIngestionResult:
-    """Discover, probe, transcode, and archive all supported videos in a directory."""
+    """Discover, probe, transcode, and archive all supported videos in a directory.
+
+    With ``resume=True``, an incomplete package is reopened. Already durable
+    source-frame prefixes are skipped and finalized shards remain untouched.
+    """
     root = Path(input_directory).resolve()
     videos = discover_videos(root, recursive=recursive)
     if not videos:
@@ -225,7 +230,7 @@ def ingest_video_directory(
     preview_warnings: list[str] = []
     with DatasetBuilder(output, title=title or Path(output).name, description=description,
                         shard_target_size=shard_target_size, source_file_boundary=source_file_boundary,
-                        metadata=metadata) as builder:
+                        metadata=metadata, resume=resume) as builder:
         if metadata is not None:
             if title:
                 builder.metadata.data.setdefault("dataset", {})["title"] = title
@@ -242,17 +247,52 @@ def ingest_video_directory(
             existing_stream.setdefault("stream_uuid", str(stream_uuid))
             existing_stream.setdefault("storage_description", storage.description)
             existing_stream.setdefault("timestamp", {"source": "unknown", "interpolated": False})
-        next_frame_id = 0
+        if resume:
+            for record in builder.manifest.previews:
+                if record.get("preview_kind") != "representative_thumbnail":
+                    continue
+                entry = {key: record[key] for key in ("relative_path", "stream_uuid", "frame_id",
+                                                       "source_uuid", "source_frame_number") if key in record}
+                entry.setdefault("timestamp_ns", None)
+                if entry.get("frame_id") not in {item.get("frame_id") for item in preview_entries}:
+                    preview_entries.append(entry)
+                resource = builder.output / str(record["relative_path"])
+                if resource.is_file():
+                    thumbnail_payloads.append(resource.read_bytes())
+        next_frame_id = builder.next_frame_id(stream) if resume else 0
         for index, (video, probe) in enumerate(zip(videos, probes), 1):
             if progress:
                 progress(f"[{index}/{len(videos)}] hashing {video.relative_to(root)}")
             source_hash = hash_file(video) if hash_sources else None
-            source = builder.register_source_file(
-                path=video, original_relative_path=video.relative_to(root).as_posix(), sha256=source_hash,
-                container=probe.container, codec=probe.codec, pixel_format=probe.pixel_format,
-                width=probe.width, height=probe.height, frame_rate=probe.frame_rate,
-                frame_count=probe.frame_count, start_timestamp=probe.creation_time,
-            )
+            relative_path = video.relative_to(root).as_posix()
+            source = builder.find_source_file(original_relative_path=relative_path) if resume else None
+            if source is None:
+                source = builder.register_source_file(
+                    path=video, original_relative_path=relative_path, sha256=source_hash,
+                    container=probe.container, codec=probe.codec, pixel_format=probe.pixel_format,
+                    width=probe.width, height=probe.height, frame_rate=probe.frame_rate,
+                    frame_count=probe.frame_count, start_timestamp=probe.creation_time,
+                )
+            else:
+                if source.file_hash is not None and source_hash is not None and source.file_hash.value != source_hash:
+                    raise VideoIngestionError(f"source file changed since the incomplete package was created: {video}")
+                if source.frame_count is not None and source.frame_count != probe.frame_count:
+                    raise VideoIngestionError(f"probed frame count changed for source {video}: package has {source.frame_count}, input has {probe.frame_count}")
+                if source.width is not None and source.width != probe.width or source.height is not None and source.height != probe.height:
+                    raise VideoIngestionError(f"probed dimensions changed for source {video}")
+            progress_state = builder.source_progress(stream, source.source_file_id) if resume else {
+                "frame_count": 0, "last_source_frame": None, "last_frame": None,
+            }
+            durable_frames = int(progress_state["frame_count"] or 0)
+            resume_source_frame = int(progress_state["last_source_frame"] or -1) + 1
+            if durable_frames > probe.frame_count:
+                raise VideoIngestionError(f"incomplete package contains too many frames for source {video}")
+            if durable_frames == probe.frame_count:
+                if progress:
+                    progress(f"[{index}/{len(videos)}] already retained {probe.frame_count:,} frames from {video.name}")
+                if source_file_boundary:
+                    builder.boundary(stream)
+                continue
             if progress:
                 progress(f"[{index}/{len(videos)}] transcoding {probe.frame_count:,} frames from {video.name}")
             with tempfile.TemporaryFile(mode="w+b") as errors:
@@ -263,8 +303,13 @@ def ingest_video_directory(
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
                 assert process.stdout is not None
                 decoded = 0
+                retained = 0
+                first_retained_frame_id = next_frame_id
                 try:
                     for source_frame_number, payload in enumerate(_iter_mjpeg(process.stdout)):
+                        if source_frame_number < resume_source_frame:
+                            decoded += 1
+                            continue
                         frame_id = next_frame_id
                         builder.add_frame(stream=stream, source_file=source, frame_id=next_frame_id,
                                           source_frame_number=source_frame_number, encoded_bytes=payload,
@@ -282,6 +327,7 @@ def ingest_video_directory(
                                                 "source_frame_number": source_frame_number,
                                                 "selection_method": "evenly_spaced_retained_frame_ids",
                                                 "preview_width_max": preview_width},
+                                    replace=resume,
                                 )
                                 preview_entries.append({"relative_path": f"preview/{relative_name}",
                                                         "stream_uuid": str(stream_uuid), "frame_id": frame_id,
@@ -293,7 +339,7 @@ def ingest_video_directory(
                                 if require_previews:
                                     raise
                                 preview_warnings.append(str(exc))
-                        next_frame_id += 1; decoded += 1; total_frames += 1
+                        next_frame_id += 1; decoded += 1; retained += 1; total_frames += 1
                         if progress and decoded % 10_000 == 0:
                             progress(f"[{index}/{len(videos)}] {video.name}: {decoded:,}/{probe.frame_count:,} frames")
                 except BaseException:
@@ -309,8 +355,9 @@ def ingest_video_directory(
                                                "source_file_boundary": source_file_boundary,
                                                "frame_sync_mode": timing_mode},
                                    inputs=[{"source_uuid": str(source.source_uuid)}],
-                                   outputs=[{"stream_uuid": str(stream_uuid), "first_frame": next_frame_id - decoded,
-                                             "last_frame": next_frame_id - 1, "frame_count": decoded}])
+                                   outputs=[{"stream_uuid": str(stream_uuid), "first_frame": first_retained_frame_id,
+                                             "last_frame": next_frame_id - 1, "frame_count": retained,
+                                             "skipped_durable_frames": resume_source_frame}])
         if generate_previews and preview_entries:
             index_document = {"preview_schema_version": "1", "authoritative": False,
                               "selection_method": "evenly_spaced_retained_frame_ids",
@@ -319,14 +366,16 @@ def ingest_video_directory(
             builder.add_resource_bytes((json.dumps(index_document, indent=2, sort_keys=True) + "\n").encode(),
                                        kind="preview", relative_name="index.json",
                                        description="Mapping from non-authoritative previews to authoritative frame records",
-                                       attributes={"preview_kind": "preview_index", "stream_uuid": str(stream_uuid)})
+                                       attributes={"preview_kind": "preview_index", "stream_uuid": str(stream_uuid)},
+                                       replace=resume)
             try:
                 contact_sheet = _contact_sheet(thumbnail_payloads, ffmpeg=ffmpeg_path)
                 builder.add_resource_bytes(contact_sheet, kind="preview", relative_name=f"streams/{DatasetBuilder._slug(stream)}/contact_sheet.jpg",
                                            description="Non-authoritative contact sheet of evenly spaced representative frames",
                                            attributes={"preview_kind": "contact_sheet", "stream_uuid": str(stream_uuid),
                                                        "selection_method": "evenly_spaced_retained_frame_ids",
-                                                       "frame_ids": [entry["frame_id"] for entry in preview_entries]})
+                                                       "frame_ids": [entry["frame_id"] for entry in preview_entries]},
+                                           replace=resume)
             except VideoIngestionError as exc:
                 if require_previews:
                     raise
@@ -343,4 +392,5 @@ def ingest_video_directory(
                                    "thumbnail_width_max": preview_width, "selection_method": "evenly_spaced_retained_frame_ids"},
                                    outputs=[{"preview_count": 0, "stream_uuid": str(stream_uuid)}], status="warning",
                                    message="; ".join(preview_warnings) or "no previews were generated")
-    return VideoIngestionResult(Dataset.open(output), len(videos), total_frames, len(preview_entries))
+    dataset = Dataset.open(output)
+    return VideoIngestionResult(dataset, len(videos), dataset.frame_count, len(preview_entries))

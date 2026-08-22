@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import hashlib
 import os
 import sqlite3
+from threading import Barrier
 import uuid
 
 import pytest
@@ -26,6 +28,7 @@ from Pelagia.storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository, has
 from Pelagia.services.taxonomy import default_taxonomy_dictionary
 from Pelagia.services.registry_transfer import export_sqlite_workspace, load_sqlite_workspace
 from Pelagia.services.registry_workspace import RegistryWorkspaceService
+from Pelagia.services.telemetry import TelemetryColumn, TelemetryCsvSpec, TelemetryIngestionService, TelemetryResolver
 from oracle_data_contracts.datasets import initialize_database, validate_database
 
 
@@ -33,6 +36,20 @@ POSTGRES_TEST_DSN = os.getenv(
     "PELAGIA_TEST_DATABASE_DSN",
     "postgresql://postgres:postgres@localhost:5432/pelagia",
 )
+
+
+class _MemoryBlobStore:
+    def __init__(self):
+        self.payloads = {}
+
+    def put_store(self, payload):
+        payload = bytes(payload)
+        key = hashlib.sha256(payload).hexdigest()
+        self.payloads[key] = payload
+        return key
+
+    def get_store(self, key):
+        return self.payloads[key]
 
 
 def test_render_schema_loads_sql_resource():
@@ -45,6 +62,7 @@ def test_render_schema_loads_sql_resource():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.schema_migrations" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frames" in rendered
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.logs" in rendered
+    assert "'telemetry_import'" in rendered
     assert "project_id uuid" in rendered
     assert "payload_ref text" in rendered
     assert "project_id uuid REFERENCES pelagia_unit.projects(id) ON DELETE CASCADE" in rendered
@@ -67,6 +85,12 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0007_registry_generation",
         "0008_registry_item_geometry",
         "0009_interchange_ingestion",
+        "0010_telemetry",
+        "0011_telemetry_ingest_durability",
+        "0012_telemetry_reference_indexes",
+        "0013_telemetry_timeline_overlap",
+        "0014_telemetry_reference_index_names",
+        "0015_telemetry_import_stage",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -85,6 +109,28 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.classification_evidence" in curation_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.roi_label_annotations" in curation_schema
     assert "{schema}" not in curation_schema
+    telemetry_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.telemetry_observations" in telemetry_schema
+    assert "PARTITION BY HASH (stream_id)" in telemetry_schema
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.timeline_events" in telemetry_schema
+    assert "{schema}" not in telemetry_schema
+    durability_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
+    assert "ADD COLUMN IF NOT EXISTS import_key text" in durability_schema
+    assert "telemetry_sources_import_key" in durability_schema
+    assert "{schema}" not in durability_schema
+    index_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
+    assert "telemetry_streams_sensor_project" in index_schema
+    assert "{schema}" not in index_schema
+    overlap_schema = postgres.render_migration(migrations[-3], "pelagia_unit")
+    assert "USING gist" in overlap_schema
+    assert "tstzrange(start_at, COALESCE(end_at, start_at), '[]')" in overlap_schema
+    assert "{schema}" not in overlap_schema
+    reference_name_schema = postgres.render_migration(migrations[-2], "pelagia_unit")
+    assert "telemetry_streams_sensor_project_idx" in reference_name_schema
+    assert "{schema}" not in reference_name_schema
+    telemetry_stage_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    assert "ADD VALUE IF NOT EXISTS 'telemetry_import'" in telemetry_stage_schema
+    assert "{schema}" not in telemetry_stage_schema
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -116,10 +162,310 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 9
-    assert status["migrations"]["applied_count"] == 9
+    assert status["migrations"]["available_count"] == 15
+    assert status["migrations"]["applied_count"] == 15
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_postgres_telemetry_import_lookup_events_and_project_scope(postgres_repo, tmp_path):
+    project = postgres_repo.create_project(f"telemetry-{uuid.uuid4().hex}")
+    other_project = postgres_repo.create_project(f"telemetry-other-{uuid.uuid4().hex}")
+    event_author = postgres_repo.create_user(f"telemetry-author-{uuid.uuid4().hex}")
+    run_id = str(uuid.uuid4())
+    postgres_repo.register_planned_run(
+        PlannedRun(
+            manifest=RunManifest(
+                run_id=run_id,
+                run_key=f"telemetry-run-{uuid.uuid4().hex}",
+                instrument="shipboard",
+                source_path=str(tmp_path),
+                source_type="telemetry",
+                created_at=datetime.now(timezone.utc),
+            )
+        ),
+        project_id=str(project["id"]),
+    )
+    source = tmp_path / "telemetry.csv"
+    source.write_text(
+        "time,temp\n"
+        "2026-08-21T00:00:00Z,10\n"
+        "2026-08-21T00:00:02Z,14\n",
+        encoding="utf-8",
+    )
+
+    blob_store = _MemoryBlobStore()
+    service = TelemetryIngestionService(postgres_repo, blob_store)
+    imported = service.import_csv(
+        source,
+        project_id=str(project["id"]),
+        run_id=run_id,
+        spec=TelemetryCsvSpec(
+            timestamp_column="time",
+            streams=[
+                TelemetryColumn(
+                    column="temp", stream_key="sensor.temperature", sensor_key="sensor",
+                    parameter_key="temperature", native_unit="degC", canonical_unit="degC",
+                    interpolation="linear", max_gap_seconds=5,
+                )
+            ],
+        ),
+    )
+
+    assert imported["source"]["observation_count"] == 2
+    assert blob_store.get_store(imported["source"]["source_payload_key"]) == source.read_bytes()
+    retried = service.import_csv(
+        source,
+        project_id=str(project["id"]),
+        run_id=run_id,
+        spec=TelemetryCsvSpec(
+            timestamp_column="time",
+            streams=[
+                TelemetryColumn(
+                    column="temp", stream_key="sensor.temperature", sensor_key="sensor",
+                    parameter_key="temperature", native_unit="degC", canonical_unit="degC",
+                    interpolation="linear", max_gap_seconds=5,
+                )
+            ],
+        ),
+    )
+    assert retried["source"]["id"] == imported["source"]["id"]
+    assert len(postgres_repo.telemetry.list_telemetry_sources(
+        project_id=str(project["id"]), run_id=run_id,
+    )) == 1
+    assert postgres_repo.telemetry.get_telemetry_import(
+        project_id=str(other_project["id"]), run_id=run_id,
+        import_key=imported["source"]["import_key"],
+    ) is None
+    resolved = TelemetryResolver(postgres_repo).at(
+        project_id=str(project["id"]), run_id=run_id,
+        observed_at=datetime(2026, 8, 21, 0, 0, 1, tzinfo=timezone.utc),
+    )
+    assert resolved["telemetry"]["temperature"]["value"] == pytest.approx(12.0)
+    assert postgres_repo.telemetry.list_telemetry_streams(
+        project_id=str(other_project["id"]), run_id=run_id,
+    ) == []
+
+    secondary_source = tmp_path / "telemetry-secondary.csv"
+    secondary_source.write_text(
+        "time,temp\n2026-08-21T00:00:00Z,9\n2026-08-21T00:00:02Z,13\n",
+        encoding="utf-8",
+    )
+    TelemetryIngestionService(postgres_repo, blob_store).import_csv(
+        secondary_source,
+        project_id=str(project["id"]),
+        run_id=run_id,
+        spec=TelemetryCsvSpec(
+            timestamp_column="time",
+            streams=[
+                TelemetryColumn(
+                    column="temp", stream_key="secondary.temperature", sensor_key="secondary",
+                    parameter_key="temperature", native_unit="degC", canonical_unit="degC",
+                    interpolation="linear", max_gap_seconds=5,
+                )
+            ],
+        ),
+    )
+    streams = postgres_repo.telemetry.list_telemetry_streams(
+        project_id=str(project["id"]), run_id=run_id,
+    )
+    assert len(streams) == 2
+    assert sum(stream["is_default"] for stream in streams) == 1
+
+    event_type = postgres_repo.telemetry.create_timeline_event_type(
+        project_id=str(project["id"]), event_type_key="station",
+    )
+    event = postgres_repo.telemetry.create_timeline_event(
+        project_id=str(project["id"]), run_id=run_id, event_type_id=str(event_type["id"]),
+        start_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        end_at=datetime(2026, 8, 21, 0, 10, tzinfo=timezone.utc), value="DBO3.4",
+        source_id=str(imported["source"]["id"]), created_by=str(event_author["id"]),
+    )
+    assert event["value"] == "DBO3.4"
+    assert str(event["source_id"]) == str(imported["source"]["id"])
+    assert str(event["created_by"]) == str(event_author["id"])
+    assert postgres_repo.telemetry.get_timeline_event(
+        project_id=str(project["id"]), run_id=run_id, event_id=str(event["id"]),
+    )["id"] == event["id"]
+    assert postgres_repo.telemetry.list_timeline_events(
+        project_id=str(project["id"]), run_id=run_id,
+        start_at=datetime(2026, 8, 21, 0, 5, tzinfo=timezone.utc),
+        end_at=datetime(2026, 8, 21, 0, 15, tzinfo=timezone.utc),
+    )[0]["id"] == event["id"]
+    updated = postgres_repo.telemetry.update_timeline_event(
+        project_id=str(project["id"]), run_id=run_id, event_id=str(event["id"]),
+        updates={"value": "DBO3.5", "source_id": None},
+    )
+    assert updated["value"] == "DBO3.5"
+    assert updated["source_id"] is None
+    assert postgres_repo.telemetry.list_timeline_events_at(
+        project_id=str(project["id"]), run_id=run_id,
+        observed_at=datetime(2026, 8, 21, 0, 5, tzinfo=timezone.utc),
+    )[0]["event_type_key"] == "station"
+
+    point_type = postgres_repo.telemetry.create_timeline_event_type(
+        project_id=str(project["id"]), event_type_key="camera_cleaned",
+    )
+    point_at = datetime(2026, 8, 21, 0, 20, tzinfo=timezone.utc)
+    postgres_repo.telemetry.create_timeline_event(
+        project_id=str(project["id"]), run_id=run_id,
+        event_type_id=str(point_type["id"]), start_at=point_at,
+    )
+    assert any(
+        row["event_type_key"] == "camera_cleaned"
+        for row in postgres_repo.telemetry.list_timeline_events_at(
+            project_id=str(project["id"]), run_id=run_id, observed_at=point_at,
+        )
+    )
+    assert not any(
+        row["event_type_key"] == "camera_cleaned"
+        for row in postgres_repo.telemetry.list_timeline_events_at(
+            project_id=str(project["id"]), run_id=run_id,
+            observed_at=point_at + timedelta(milliseconds=1),
+        )
+    )
+
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT indexdef FROM pg_indexes
+                WHERE schemaname = %s AND indexname = %s""",
+            (
+                postgres_repo.schema,
+                f"idx_tl_period_{postgres_repo.schema}",
+            ),
+        )
+        overlap_index = cursor.fetchone()
+        assert overlap_index is not None
+        assert "USING gist" in overlap_index["indexdef"]
+        cursor.execute("SET LOCAL enable_seqscan = off")
+        cursor.execute(
+            f"""EXPLAIN (FORMAT JSON)
+                SELECT id FROM {postgres_repo.schema}.timeline_events
+                WHERE tstzrange(start_at, COALESCE(end_at, start_at), '[]')
+                      @> %s::timestamptz""",
+            (datetime(2026, 8, 21, 0, 5, tzinfo=timezone.utc),),
+        )
+        plan = cursor.fetchone()["QUERY PLAN"]
+        assert f"idx_tl_period_{postgres_repo.schema}" in str(plan)
+
+    with pytest.raises(postgres.psycopg.errors.ForeignKeyViolation):
+        with postgres_repo.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.telemetry_sources SET project_id = %s WHERE id = %s",
+                (other_project["id"], imported["source"]["id"]),
+            )
+            connection.commit()
+
+    failed_asset_id = str(uuid.uuid4())
+
+    def failing_observations():
+        yield "failed.temperature", datetime(2026, 8, 21, tzinfo=timezone.utc), 1.0, None
+        raise ValueError("simulated parser failure")
+
+    with pytest.raises(ValueError, match="simulated parser failure"):
+        postgres_repo.telemetry.ingest_telemetry(
+            project_id=str(project["id"]),
+            run_id=run_id,
+            asset={
+                "id": failed_asset_id, "filename": "failed.csv", "path": "/tmp/failed.csv",
+                "checksum": "sha256:failed", "size_bytes": 1,
+            },
+            source={
+                "format": "delimited", "parser_name": "test", "parser_version": "1",
+                "import_key": "failed-import", "source_payload_key": "failed-payload",
+            },
+            parameters=[{"parameter_key": "temperature", "canonical_unit": "degC"}],
+            sensors=[{"sensor_key": "failed-sensor"}],
+            streams=[
+                {
+                    "stream_key": "failed.temperature", "sensor_key": "failed-sensor",
+                    "parameter_key": "temperature", "native_unit": "degC",
+                    "interpolation": "none", "is_default": False,
+                }
+            ],
+            observations=failing_observations(),
+        )
+    assert postgres_repo.get_asset(failed_asset_id, project_id=str(project["id"])) is None
+    assert postgres_repo.telemetry.get_telemetry_import(
+        project_id=str(project["id"]), run_id=run_id, import_key="failed-import",
+    ) is None
+
+
+def test_postgres_concurrent_telemetry_defaults_return_domain_conflict(postgres_repo, tmp_path):
+    project = postgres_repo.create_project(f"telemetry-default-race-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    run_id = str(uuid.uuid4())
+    postgres_repo.register_planned_run(
+        PlannedRun(
+            manifest=RunManifest(
+                run_id=run_id,
+                run_key=f"telemetry-default-race-{uuid.uuid4().hex}",
+                instrument="shipboard",
+                source_path=str(tmp_path),
+                source_type="telemetry",
+                created_at=datetime.now(timezone.utc),
+            )
+        ),
+        project_id=project_id,
+    )
+
+    barrier = Barrier(2)
+
+    def ingest_contender(suffix: str):
+        barrier.wait(timeout=5)
+        return postgres_repo.telemetry.ingest_telemetry(
+            project_id=project_id,
+            run_id=run_id,
+            asset={
+                "id": str(uuid.uuid4()),
+                "filename": f"{suffix}.csv",
+                "path": f"/tmp/{suffix}.csv",
+                "checksum": f"sha256:{suffix}",
+                "size_bytes": 1,
+            },
+            source={
+                "format": "delimited",
+                "parser_name": "test",
+                "parser_version": "1",
+                "import_key": f"import-{suffix}",
+                "source_payload_key": f"payload-{suffix}",
+            },
+            parameters=[{"parameter_key": "temperature", "canonical_unit": "degC"}],
+            sensors=[{"sensor_key": f"sensor-{suffix}"}],
+            streams=[
+                {
+                    "stream_key": f"{suffix}.temperature",
+                    "sensor_key": f"sensor-{suffix}",
+                    "parameter_key": "temperature",
+                    "native_unit": "degC",
+                    "interpolation": "none",
+                    "is_default": True,
+                }
+            ],
+        )
+
+    results = []
+    errors = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(ingest_contender, suffix) for suffix in ("primary", "secondary")]
+        for future in futures:
+            try:
+                results.append(future.result(timeout=15))
+            except ValueError as exc:
+                errors.append(exc)
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert "already has default telemetry stream" in str(errors[0])
+    sources = postgres_repo.telemetry.list_telemetry_sources(
+        project_id=project_id, run_id=run_id,
+    )
+    streams = postgres_repo.telemetry.list_telemetry_streams(
+        project_id=project_id, run_id=run_id,
+    )
+    assert len(sources) == 1
+    assert len(streams) == 1
+    assert streams[0]["is_default"] is True
 
 
 def test_postgres_worker_can_start_without_any_projects(postgres_repo):

@@ -369,6 +369,7 @@ docs/assets/             documentation images and branding assets
 Current and planned capabilities are organized around an ROI-centered pipeline:
 
 - **Video, image, and interchange ingestion**: register source assets, extract or directly import frames, store full-frame payloads in cold storage, and record searchable metadata.
+- **Telemetry and timeline context**: preserve native-resolution sensor observations and point/interval events, then resolve them against frame and ROI timestamps without duplicating values into image records. See [Telemetry ingestion and lookup](docs/telemetry.md).
 - **Frame correction**: apply image normalization such as flatfield correction before storage or analysis.
 - **Segmentation**: detect candidate ROIs from extracted frames, store ROI crops, masks, geometry, and image statistics.
 - **Segmentation refinement**: support learned mask refinement models such as U-Net-style models for better ROI boundaries.
@@ -591,6 +592,7 @@ For storage maintenance, migration, and recovery procedures, use:
 - [Migrating Pelagia](docs/migration.md)
 - [Backup And Restore](docs/backup.md)
 - [ROI Curation And Classification Evidence](docs/curation.md)
+- [Telemetry Ingestion And Lookup](docs/telemetry.md)
 
 ## Python Environment
 

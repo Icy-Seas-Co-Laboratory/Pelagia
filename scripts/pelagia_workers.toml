@@ -47,6 +47,10 @@ name = "fio-1"
 capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate"]
 
 [[worker]]
+name = "telemetry-1"
+capabilities = ["telemetry_import"]
+
+[[worker]]
 name = "fio-2"
 capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate"]
 
