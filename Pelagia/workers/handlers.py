@@ -1150,6 +1150,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     target_count = context.repository.count_classification_targets(
         project_id=project_id,
         model_ref=command.model_ref,
+        evidence_kind=command.evidence_kind,
         roi_ids=command.roi_ids,
         selection=command.selection.to_payload(),
     )
@@ -1157,10 +1158,12 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
         project_id=project_id,
         job_id=None if job.get("id") is None else str(job["id"]),
         model_selector=command.model_ref,
+        evidence_kind=command.evidence_kind,
         parameters={
             "roi_ids": list(command.roi_ids),
             "selection": command.selection.to_payload(),
             "target_count": target_count,
+            "evidence_kind": command.evidence_kind,
             "input_crop_policy": CLASSIFICATION_CROP_POLICY,
         },
     )
@@ -1185,6 +1188,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     batch_count = (target_count + batch_size - 1) // batch_size if target_count else 0
     batch_number = 0
     evidence_context = None
+    clustering_context = None
     oracle_execution_ms = 0.0
     oracle_execution_count = 0
     try:
@@ -1204,6 +1208,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 targets = context.repository.list_classification_targets(
                     project_id=project_id,
                     model_ref=command.model_ref,
+                    evidence_kind=command.evidence_kind,
                     roi_ids=command.roi_ids,
                     selection=command.selection.to_payload(),
                     limit=batch_size,
@@ -1268,16 +1273,26 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
             if evidence_context is None:
                 first_result = responses[0].result
                 first_output = dict(first_result.get("output") or {})
-                if first_output.get("type") != "classification":
-                    raise RuntimeError("Oracle Builder model did not return classification output")
-                with measure_phase("classification.evidence_context_database_write"):
-                    evidence_context = context.repository.prepare_classification_evidence_context(
-                        project_id=project_id,
-                        inference_run_id=str(inference_run["id"]),
-                        model=dict(first_result.get("model") or {}),
-                        probabilities=list(first_output.get("probabilities") or []),
-                    )
+                expected_type = "clustering" if command.evidence_kind == "clustering" else "classification"
+                if first_output.get("type") != expected_type:
+                    raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
+                if command.evidence_kind == "classification":
+                    with measure_phase("classification.evidence_context_database_write"):
+                        evidence_context = context.repository.prepare_classification_evidence_context(
+                            project_id=project_id,
+                            inference_run_id=str(inference_run["id"]),
+                            model=dict(first_result.get("model") or {}),
+                            probabilities=list(first_output.get("probabilities") or []),
+                        )
+                else:
+                    with measure_phase("clustering.evidence_context_database_write"):
+                        clustering_context = context.repository.prepare_clustering_evidence_context(
+                            project_id=project_id,
+                            inference_run_id=str(inference_run["id"]),
+                            model=dict(first_result.get("model") or {}),
+                        )
             evidence_records: list[dict[str, Any]] = []
+            clustering_records: list[dict[str, Any]] = []
             for target, response in zip(targets, responses, strict=True):
                 row = response.result
                 execution = row.get("execution") or {}
@@ -1287,9 +1302,13 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     oracle_execution_count += 1
                 with measure_phase("classification.evidence_prepare"):
                     output = dict(row.get("output") or {})
-                    if output.get("type") != "classification":
-                        raise RuntimeError("Oracle Builder model did not return classification output")
+                    expected_type = "clustering" if command.evidence_kind == "clustering" else "classification"
+                    if output.get("type") != expected_type:
+                        raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
                     embedding = output.pop("embedding", None)
+                    clustering_packet = output.pop("clustering_evidence", None)
+                    if command.evidence_kind == "clustering":
+                        clustering_packet = output.pop("evidence", None)
                     embedding_ref = None
                     embedding_dtype = None
                     embedding_shape = None
@@ -1306,28 +1325,55 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     if kvstore is not None:
                         with measure_phase("classification.embedding_store"):
                             embedding_ref = kvstore.put_store(payload)
-                evidence_records.append(
-                    {
-                        "refined_detection_id": str(target["id"]),
-                        "output": output,
-                        "oracle_result": {
-                            "result_id": row.get("result_id"),
-                            "result_set_id": row.get("result_set_id"),
-                            "input_sha256": row.get("input_sha256"),
-                            "execution": row.get("execution"),
-                            "transport_request_id": response.transport_request_id,
-                        },
-                        "embedding_payload_ref": embedding_ref,
-                        "embedding_dtype": embedding_dtype,
-                        "embedding_shape": embedding_shape,
-                        "embedding_sha256": embedding_sha256,
-                    }
-                )
-            with measure_phase("classification.evidence_database_batch_write"):
-                context.repository.store_classification_evidence_batch(
-                    evidence_context=evidence_context,
-                    records=evidence_records,
-                )
+                oracle_result = {
+                    "result_id": row.get("result_id"),
+                    "result_set_id": row.get("result_set_id"),
+                    "input_sha256": row.get("input_sha256"),
+                    "execution": row.get("execution"),
+                    "transport_request_id": response.transport_request_id,
+                }
+                if command.evidence_kind == "classification":
+                    evidence_records.append(
+                        {
+                            "refined_detection_id": str(target["id"]),
+                            "output": output,
+                            "oracle_result": oracle_result,
+                            "embedding_payload_ref": embedding_ref,
+                            "embedding_dtype": embedding_dtype,
+                            "embedding_shape": embedding_shape,
+                            "embedding_sha256": embedding_sha256,
+                        }
+                    )
+                if clustering_packet is not None:
+                    if clustering_context is None:
+                        clustering_context = context.repository.prepare_clustering_evidence_context(
+                            project_id=project_id,
+                            inference_run_id=str(inference_run["id"]),
+                            model=dict(row.get("model") or {}),
+                        )
+                    clustering_records.append(
+                        {
+                            "refined_detection_id": str(target["id"]),
+                            "evidence_packet": clustering_packet,
+                            "oracle_result": oracle_result,
+                            "embedding_payload_ref": embedding_ref,
+                            "embedding_dtype": embedding_dtype,
+                            "embedding_shape": embedding_shape,
+                            "embedding_sha256": embedding_sha256,
+                        }
+                    )
+            if evidence_records:
+                with measure_phase("classification.evidence_database_batch_write"):
+                    context.repository.store_classification_evidence_batch(
+                        evidence_context=evidence_context,
+                        records=evidence_records,
+                    )
+            if clustering_records:
+                with measure_phase("clustering.evidence_database_batch_write"):
+                    context.repository.store_clustering_evidence_batch(
+                        evidence_context=clustering_context,
+                        records=clustering_records,
+                    )
             completed += len(evidence_records)
             progress.update(
                 completed,
@@ -1367,6 +1413,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
             "project_id": project_id,
             "inference_run_id": str(inference_run["id"]),
             "model_ref": command.model_ref,
+            "evidence_kind": command.evidence_kind,
             "selection": command.selection.to_payload(),
             "input_crop_policy": CLASSIFICATION_CROP_POLICY,
             "detection_count": completed,

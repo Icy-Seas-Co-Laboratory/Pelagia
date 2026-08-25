@@ -91,6 +91,9 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0013_telemetry_timeline_overlap",
         "0014_telemetry_reference_index_names",
         "0015_telemetry_import_stage",
+        "0016_processing_series",
+        "0017_processing_series_snapshots",
+        "0018_roi_clustering_evidence",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -109,28 +112,36 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.classification_evidence" in curation_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.roi_label_annotations" in curation_schema
     assert "{schema}" not in curation_schema
-    telemetry_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
+    telemetry_schema = postgres.render_migration(migrations[-9], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.telemetry_observations" in telemetry_schema
     assert "PARTITION BY HASH (stream_id)" in telemetry_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.timeline_events" in telemetry_schema
     assert "{schema}" not in telemetry_schema
-    durability_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
+    durability_schema = postgres.render_migration(migrations[-8], "pelagia_unit")
     assert "ADD COLUMN IF NOT EXISTS import_key text" in durability_schema
     assert "telemetry_sources_import_key" in durability_schema
     assert "{schema}" not in durability_schema
-    index_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
+    index_schema = postgres.render_migration(migrations[-7], "pelagia_unit")
     assert "telemetry_streams_sensor_project" in index_schema
     assert "{schema}" not in index_schema
-    overlap_schema = postgres.render_migration(migrations[-3], "pelagia_unit")
+    overlap_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
     assert "USING gist" in overlap_schema
     assert "tstzrange(start_at, COALESCE(end_at, start_at), '[]')" in overlap_schema
     assert "{schema}" not in overlap_schema
-    reference_name_schema = postgres.render_migration(migrations[-2], "pelagia_unit")
+    reference_name_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
     assert "telemetry_streams_sensor_project_idx" in reference_name_schema
     assert "{schema}" not in reference_name_schema
-    telemetry_stage_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    telemetry_stage_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
     assert "ADD VALUE IF NOT EXISTS 'telemetry_import'" in telemetry_stage_schema
     assert "{schema}" not in telemetry_stage_schema
+    series_schema = postgres.render_migration(migrations[-3], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_series" in series_schema
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_work_units" in series_schema
+    assert "{schema}" not in series_schema
+    clustering_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.clustering_evidence" in clustering_schema
+    assert "evidence_kind" in clustering_schema
+    assert "{schema}" not in clustering_schema
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -162,10 +173,56 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 15
-    assert status["migrations"]["applied_count"] == 15
+    assert status["migrations"]["available_count"] == 18
+    assert status["migrations"]["applied_count"] == 18
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_processing_series_is_project_scoped_and_advances_terminal_steps(postgres_repo):
+    project = postgres_repo.create_project(f"series-{uuid.uuid4().hex}")
+    other_project = postgres_repo.create_project(f"series-other-{uuid.uuid4().hex}")
+    series = postgres_repo.create_processing_series(
+        project_id=str(project["id"]),
+        steps=[
+            {"stage": PipelineStage.SEGMENT.value, "filters": {}, "options": {}},
+            {"stage": PipelineStage.ROI_REFINEMENT.value, "filters": {}, "options": {}},
+        ],
+        failure_policy="continue",
+    )
+    assert postgres_repo.get_processing_series(str(series["id"]), project_id=str(other_project["id"])) is None
+    first = postgres_repo.claim_processing_series_step(str(series["id"]), project_id=str(project["id"]))
+    assert first is not None
+    job = postgres_repo.create_job(PipelineStage.SEGMENT, project_id=str(project["id"]))
+    postgres_repo.attach_processing_work_units(series_id=str(series["id"]), step_id=str(first["id"]), job_ids=[str(job["id"])], matched_count=1)
+    postgres_repo.complete_job(str(job["id"]))
+    advanced = postgres_repo.advance_processing_series_for_job(str(job["id"]))
+    assert advanced is not None and advanced["ready"] is True
+    steps = postgres_repo.list_processing_series_steps(str(series["id"]), project_id=str(project["id"]))
+    assert steps[0]["status"] == "succeeded"
+    second = postgres_repo.claim_processing_series_step(str(series["id"]), project_id=str(project["id"]))
+    assert second is not None
+    postgres_repo.attach_processing_work_units(series_id=str(series["id"]), step_id=str(second["id"]), job_ids=[], matched_count=0)
+    assert postgres_repo.get_processing_series(str(series["id"]), project_id=str(project["id"]))["status"] == "succeeded"
+
+
+def test_processing_series_failure_policy_and_retry(postgres_repo):
+    project = postgres_repo.create_project(f"series-failure-{uuid.uuid4().hex}")
+    def failed_series(policy):
+        series = postgres_repo.create_processing_series(project_id=str(project["id"]), steps=[{"stage": PipelineStage.SEGMENT.value}], failure_policy=policy)
+        step = postgres_repo.claim_processing_series_step(str(series["id"]), project_id=str(project["id"]))
+        job = postgres_repo.create_job(PipelineStage.SEGMENT, project_id=str(project["id"]))
+        postgres_repo.attach_processing_work_units(series_id=str(series["id"]), step_id=str(step["id"]), job_ids=[str(job["id"])], matched_count=1)
+        postgres_repo.fail_job(str(job["id"]), "fixture failure")
+        postgres_repo.advance_processing_series_for_job(str(job["id"]))
+        return series, step, job
+
+    fail_fast, _, job = failed_series("fail_fast")
+    assert postgres_repo.get_processing_series(str(fail_fast["id"]), project_id=str(project["id"]))["status"] == "failed"
+    postgres_repo.retry_processing_series(str(fail_fast["id"]), project_id=str(project["id"]))
+    assert postgres_repo.get_job(str(job["id"]), project_id=str(project["id"]))["status"] == "queued"
+    continuing, _, _ = failed_series("continue")
+    assert postgres_repo.get_processing_series(str(continuing["id"]), project_id=str(project["id"]))["status"] == "succeeded"
 
 
 def test_postgres_telemetry_import_lookup_events_and_project_scope(postgres_repo, tmp_path):
@@ -826,6 +883,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
                 height=3,
                 preview_thumbhash=frame_payload,
                 kvstore_hash="kvstore-key-1",
+                captured_at=datetime(2026, 8, 21, 18, 4, 5, 125000, tzinfo=timezone.utc),
                 source_ref="/tmp/example.avi",
                 bbox_x=7,
                 bbox_y=8,
@@ -968,6 +1026,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert detection_lookup is not None
     assert detection_lookup["roi_payload"] == b"roi-bytes"
     assert str(detection_lookup["asset_id"]) == asset_id
+    assert detection_lookup["captured_at"] == datetime(2026, 8, 21, 18, 4, 5, 125000, tzinfo=timezone.utc)
     bulk_detection_lookup = postgres_repo.get_detections(
         [
             str(detections[1]["id"]),
@@ -1075,6 +1134,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     latest_refined = postgres_repo.get_refined_detection_for_candidate(str(filtered_detections[0]["id"]))
     assert latest_refined is not None
     assert latest_refined["candidate_detection_id"] == filtered_detections[0]["id"]
+    assert latest_refined["captured_at"] == datetime(2026, 8, 21, 18, 4, 5, 125000, tzinfo=timezone.utc)
 
     detection_stats = postgres_repo.list_asset_detection_stats(collection="test", limit=10)
     assert detection_stats["summary"] == {

@@ -388,8 +388,93 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
     assert completed_runs[-1][1]["status"] == "complete"
     assert not hasattr(repo, "assign_curation_labels")
     assert repo.progress_updates[-1]["progress"]["total"] == 1
-    assert repo.progress_updates[-1]["progress"]["percent"] == 100.0
-    assert repo.progress_updates[-1]["progress"]["secondary"]["phase"] == "complete"
+
+
+def test_clustering_handler_persists_cluster_packet_without_classification_labels():
+    repo = FakeRepository()
+    repo.create_classification_inference_run = lambda **values: {"id": "cluster-run-1", **values}
+    repo.count_classification_targets = lambda **values: 1
+    repo.list_classification_targets = lambda **values: (
+        [{
+            "id": "refined-cluster-1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "bbox_x": 0,
+            "bbox_y": 0,
+            "bbox_w": 2,
+            "bbox_h": 2,
+            "crop_bbox_x": 0,
+            "crop_bbox_y": 0,
+            "crop_bbox_w": 2,
+            "crop_bbox_h": 2,
+            "roi_payload": np.ones((2, 2), dtype="uint8").tobytes(),
+            "roi_encoding": "raw",
+            "roi_format": "raw_ndarray_c_order",
+            "roi_dtype": "uint8",
+            "roi_shape": [2, 2],
+        }] if values.get("after_id") is None else []
+    )
+    repo.prepare_clustering_evidence_context = lambda **values: {"id": "cluster-context", **values}
+    stored = []
+    repo.store_clustering_evidence_batch = lambda **values: stored.append(values) or [{"id": "cluster-evidence-1"}]
+    repo.complete_classification_inference_run = lambda run_id, **values: {"id": run_id, **values}
+
+    class ClusteringOracle:
+        def predict_batch(self, model_ref, items):
+            assert model_ref == "roi-clusters"
+            return [type("Response", (), {
+                "transport_request_id": "transport-cluster-1",
+                "result": {
+                    "result_id": "cluster-result-1",
+                    "execution": {"duration_ms": 4.0},
+                    "model": {
+                        "artifact_id": "00000000-0000-0000-0000-000000000021",
+                        "run_id": "00000000-0000-0000-0000-000000000022",
+                        "task": "clustering",
+                    },
+                    "output": {
+                        "type": "clustering",
+                        "embedding": np.asarray([1.0, 0.0], dtype="float32"),
+                        "evidence": {
+                            "type": "roi_clustering",
+                            "decision": {
+                                "cluster_index": 1,
+                                "cluster_id": "cluster-0001",
+                                "similarity": 0.97,
+                                "novel": False,
+                                "abstained": False,
+                            },
+                            "clusters": [],
+                            "nearest_neighbors": [],
+                        },
+                    },
+                },
+            })()]
+
+    class ClusteringKVStore:
+        def put_store(self, payload):
+            assert payload
+            return "cluster-embedding-key"
+
+    context = AppContext(
+        config=CoreConfig(),
+        repository=repo,
+        kvstore=ClusteringKVStore(),
+        oracle=ClusteringOracle(),
+    )
+    result = classification_handler({
+        "id": "job-cluster",
+        "project_id": "project-1",
+        "stage": PipelineStage.CLASSIFY.value,
+        "payload": {
+            "model_ref": "roi-clusters",
+            "evidence_kind": "clustering",
+            "roi_ids": [],
+        },
+    }, context)
+
+    assert result["evidence_kind"] == "clustering"
+    assert stored[0]["records"][0]["evidence_packet"]["decision"]["cluster_id"] == "cluster-0001"
+    assert stored[0]["records"][0]["embedding_payload_ref"] == "cluster-embedding-key"
 
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):

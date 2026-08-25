@@ -52,12 +52,16 @@ REQUIRED_SCHEMA_TABLES = (
     "classification_labels",
     "classification_inference_runs",
     "classification_evidence",
+    "clustering_evidence",
     "roi_label_annotations",
     "roi_annotation_reviews",
     "registry_workspaces",
     "registry_items",
     "processing_jobs",
     "processing_job_dependencies",
+    "processing_series",
+    "processing_series_steps",
+    "processing_work_units",
     "project_processing_status_snapshots",
     "frame_processing_status",
     "worker_sessions",
@@ -95,6 +99,15 @@ class ClassificationEvidenceContext:
     inference_run_id: str
     model_artifact_id: str
     class_label_ids: Mapping[int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ClusteringEvidenceContext:
+    """Run-scoped identifiers required to persist cluster evidence."""
+
+    project_id: str
+    inference_run_id: str
+    model_artifact_id: str
 
 
 def _initial_job_progress(
@@ -3082,6 +3095,7 @@ class PostgresRepository:
                         detections.*,
                         frames.asset_id,
                         frames.frame_index,
+                        frames.captured_at AS captured_at,
                         assets.filename AS asset_filename,
                         refined.id AS refined_detection_id,
                         refined.refinement_method AS refined_detection_method
@@ -3241,6 +3255,7 @@ class PostgresRepository:
                         detections.*,
                         frames.asset_id,
                         frames.frame_index,
+                        frames.captured_at AS captured_at,
                         assets.filename AS asset_filename,
                         refined.id AS refined_detection_id,
                         refined.refinement_method AS refined_detection_method
@@ -3285,6 +3300,7 @@ class PostgresRepository:
                         refined.candidate_detection_id,
                         frames.asset_id,
                         frames.frame_index,
+                        frames.captured_at AS captured_at,
                         assets.filename AS asset_filename
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
@@ -3317,6 +3333,7 @@ class PostgresRepository:
                         refined.candidate_detection_id,
                         frames.asset_id,
                         frames.frame_index,
+                        frames.captured_at AS captured_at,
                         assets.filename AS asset_filename
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
@@ -3776,6 +3793,7 @@ class PostgresRepository:
         run_id: str | None = None,
         asset_id: str | None = None,
         asset_ids: Sequence[str] | None = None,
+        frame_ids: Sequence[str] | None = None,
         collection: str | None = None,
         collections: Sequence[str] | None = None,
         preprocessing_status: Sequence[str] | None = None,
@@ -3798,6 +3816,9 @@ class PostgresRepository:
         if asset_ids:
             clauses.append("status.asset_id = ANY(%s::uuid[])")
             params.append(list(dict.fromkeys(str(value) for value in asset_ids if value)))
+        if frame_ids:
+            clauses.append("status.frame_id = ANY(%s::uuid[])")
+            params.append(list(dict.fromkeys(str(value) for value in frame_ids if value)))
         if collection:
             clauses.append("status.collections @> ARRAY[%s]::text[]")
             params.append(collection)
@@ -4943,7 +4964,8 @@ class PostgresRepository:
                            refined.crop_bbox_w, refined.crop_bbox_h,
                            refined.area, refined.perimeter, refined.roi_shape,
                            refined.roi_encoding, refined.created_at,
-                           frames.frame_index, assets.id AS asset_id,
+                           frames.frame_index, frames.captured_at AS captured_at,
+                           assets.id AS asset_id,
                            assets.filename AS asset_filename,
                            annotation.id AS annotation_id,
                            annotation.label_id, annotation.status AS annotation_status,
@@ -4959,6 +4981,13 @@ class PostgresRepository:
                            evidence.prototype_margin, evidence.knn_class_index,
                            evidence.knn_agreement, evidence.knn_weighted_support,
                            evidence.knn_margin, evidence.inference_run_id,
+                           cluster_evidence.id AS clustering_evidence_id,
+                           cluster_evidence.cluster_index,
+                           cluster_evidence.cluster_id,
+                           cluster_evidence.similarity AS cluster_similarity,
+                           cluster_evidence.novel AS cluster_novel,
+                           cluster_evidence.abstained AS cluster_abstained,
+                           cluster_evidence.inference_run_id AS clustering_inference_run_id,
                            count(*) OVER() AS total_count
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
@@ -4984,6 +5013,12 @@ class PostgresRepository:
                         ORDER BY latest_evidence.created_at DESC, latest_evidence.id DESC
                         LIMIT 1
                     ) evidence ON true
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.clustering_evidence latest_cluster_evidence
+                        WHERE latest_cluster_evidence.refined_detection_id = refined.id
+                        ORDER BY latest_cluster_evidence.created_at DESC, latest_cluster_evidence.id DESC
+                        LIMIT 1
+                    ) cluster_evidence ON true
                     WHERE {where}
                     ORDER BY {order}
                     LIMIT %s OFFSET %s
@@ -5047,11 +5082,484 @@ class PostgresRepository:
                     GROUP BY evidence.id, runs.model_selector, artifacts.artifact_id,
                              artifacts.run_id, artifacts.artifact_fingerprint
                     ORDER BY evidence.created_at DESC, evidence.id DESC
-                    """,
+                """,
                     (roi_id,),
                 )
                 row["evidence"] = list(cursor.fetchall())
+                cursor.execute(
+                    f"""
+                    SELECT evidence.*, runs.model_selector,
+                           artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint
+                    FROM {self.schema}.clustering_evidence evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = evidence.model_artifact_id
+                    WHERE evidence.refined_detection_id = %s
+                    ORDER BY evidence.created_at DESC, evidence.id DESC
+                    """,
+                    (roi_id,),
+                )
+                row["clustering_evidence"] = list(cursor.fetchall())
         return row
+
+    def list_feature_space_sources(self, *, project_id: str) -> list[dict[str, Any]]:
+        """List persisted embedding spaces without treating them as interchangeable.
+
+        Every row is tied to one inference run and model artifact.  Callers must
+        select one source before comparing vectors.
+        """
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT 'classification' AS source_kind,
+                           runs.id AS inference_run_id,
+                           runs.model_selector,
+                           artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint,
+                           count(*) AS evidence_count,
+                           count(evidence.embedding_payload_ref) AS embedding_count,
+                           (jsonb_agg(evidence.embedding_shape)
+                              FILTER (WHERE evidence.embedding_shape IS NOT NULL))->0
+                              AS embedding_shape,
+                           max(evidence.created_at) AS latest_evidence_at
+                    FROM {self.schema}.classification_inference_runs runs
+                    JOIN {self.schema}.classification_evidence evidence
+                      ON evidence.inference_run_id = runs.id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = runs.model_artifact_id
+                    WHERE runs.project_id = %s
+                    GROUP BY runs.id, runs.model_selector, artifacts.artifact_id,
+                             artifacts.run_id, artifacts.artifact_fingerprint
+                    HAVING count(evidence.embedding_payload_ref) > 0
+                    UNION ALL
+                    SELECT 'clustering' AS source_kind,
+                           runs.id AS inference_run_id,
+                           runs.model_selector,
+                           artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint,
+                           count(*) AS evidence_count,
+                           count(evidence.embedding_payload_ref) AS embedding_count,
+                           (jsonb_agg(evidence.embedding_shape)
+                              FILTER (WHERE evidence.embedding_shape IS NOT NULL))->0
+                              AS embedding_shape,
+                           max(evidence.created_at) AS latest_evidence_at
+                    FROM {self.schema}.classification_inference_runs runs
+                    JOIN {self.schema}.clustering_evidence evidence
+                      ON evidence.inference_run_id = runs.id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = evidence.model_artifact_id
+                    WHERE runs.project_id = %s
+                    GROUP BY runs.id, runs.model_selector, artifacts.artifact_id,
+                             artifacts.run_id, artifacts.artifact_fingerprint
+                    HAVING count(evidence.embedding_payload_ref) > 0
+                    ORDER BY latest_evidence_at DESC, source_kind, model_selector
+                    """,
+                    (project_id, project_id),
+                )
+                return list(cursor.fetchall())
+
+    def list_feature_space_embeddings(
+        self,
+        *,
+        project_id: str,
+        source_kind: str,
+        inference_run_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return embedding references for one immutable evidence source."""
+
+        if source_kind not in {"classification", "clustering"}:
+            raise ValueError(f"Unsupported feature-space source kind: {source_kind}")
+        table = "classification_evidence" if source_kind == "classification" else "clustering_evidence"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT evidence.refined_detection_id,
+                           evidence.embedding_payload_ref,
+                           evidence.embedding_dtype,
+                           evidence.embedding_shape,
+                           evidence.embedding_sha256
+                    FROM {self.schema}.{table} evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    WHERE evidence.project_id = %s
+                      AND evidence.inference_run_id = %s
+                      AND runs.project_id = %s
+                      AND evidence.embedding_payload_ref IS NOT NULL
+                    ORDER BY evidence.refined_detection_id
+                    LIMIT %s
+                    """,
+                    (project_id, inference_run_id, project_id, limit),
+                )
+                return list(cursor.fetchall())
+
+    def count_feature_space_embeddings(
+        self,
+        *,
+        project_id: str,
+        source_kind: str,
+        inference_run_id: str,
+    ) -> int:
+        """Count persisted ROI vectors for one immutable feature-space source."""
+
+        if source_kind not in {"classification", "clustering"}:
+            raise ValueError(f"Unsupported feature-space source kind: {source_kind}")
+        table = "classification_evidence" if source_kind == "classification" else "clustering_evidence"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT count(*) AS total
+                    FROM {self.schema}.{table} evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    WHERE evidence.project_id = %s
+                      AND evidence.inference_run_id = %s
+                      AND runs.project_id = %s
+                      AND evidence.embedding_payload_ref IS NOT NULL
+                    """,
+                    (project_id, inference_run_id, project_id),
+                )
+                row = cursor.fetchone()
+        return int(row["total"] if row else 0)
+
+    def list_feature_space_roi_summaries(
+        self, *, project_id: str, roi_ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        """Return compact, project-scoped ROI cards for feature-space results."""
+
+        resolved_ids = list(dict.fromkeys(str(value) for value in roi_ids if value))
+        if not resolved_ids:
+            return []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           refined.roi_shape, refined.created_at,
+                           assets.id AS asset_id, assets.filename AS asset_filename,
+                           coalesce(labels.display_name, labels.name) AS label_display_name,
+                           review.decision AS review_decision
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_label_annotations annotation
+                        WHERE annotation.refined_detection_id = refined.id
+                          AND annotation.is_current
+                        ORDER BY annotation.created_at DESC, annotation.id DESC
+                        LIMIT 1
+                    ) annotation ON true
+                    LEFT JOIN {self.schema}.classification_labels labels
+                      ON labels.id = annotation.label_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_annotation_reviews latest_review
+                        WHERE latest_review.annotation_id = annotation.id
+                        ORDER BY latest_review.created_at DESC, latest_review.id DESC
+                        LIMIT 1
+                    ) review ON true
+                    WHERE assets.project_id = %s
+                      AND refined.id = ANY(%s::uuid[])
+                    """,
+                    (project_id, resolved_ids),
+                )
+                return list(cursor.fetchall())
+
+    def list_feature_space_clusters(
+        self, *, project_id: str, inference_run_id: str
+    ) -> list[dict[str, Any]]:
+        """Summarize run-local clusters with their strongest Pelagia ROI card."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH assigned AS (
+                        SELECT *
+                        FROM {self.schema}.clustering_evidence
+                        WHERE project_id = %s
+                          AND inference_run_id = %s
+                          AND cluster_id IS NOT NULL
+                    ), counts AS (
+                        SELECT cluster_id, min(cluster_index) AS cluster_index,
+                               count(*) AS roi_count,
+                               avg(similarity) AS mean_similarity,
+                               min(similarity) AS min_similarity,
+                               max(similarity) AS max_similarity,
+                               count(*) FILTER (WHERE novel OR abstained) AS novelty_count
+                        FROM assigned
+                        GROUP BY cluster_id
+                    ), representatives AS (
+                        SELECT DISTINCT ON (cluster_id)
+                               cluster_id, refined_detection_id AS representative_detection_id,
+                               similarity AS representative_similarity
+                        FROM assigned
+                        ORDER BY cluster_id, similarity DESC NULLS LAST, refined_detection_id
+                    )
+                    SELECT counts.*, representatives.representative_detection_id,
+                           representatives.representative_similarity
+                    FROM counts
+                    JOIN representatives USING (cluster_id)
+                    ORDER BY counts.roi_count DESC, counts.cluster_id
+                    """,
+                    (project_id, inference_run_id),
+                )
+                return list(cursor.fetchall())
+
+    def list_feature_space_label_prototypes(
+        self, *, project_id: str, inference_run_id: str
+    ) -> list[dict[str, Any]]:
+        """Summarize a classification run by its recorded label prototypes.
+
+        These are model-provided prototype assignments, not self-supervised
+        clusters and not human taxonomy assertions.  They remain scoped to the
+        inference run and artifact that generated the classification evidence.
+        """
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH assigned AS (
+                        SELECT evidence.refined_detection_id,
+                               evidence.prototype_class_index,
+                               evidence.prototype_similarity,
+                               coalesce(labels.display_name, labels.name,
+                                        mappings.oracle_label_name,
+                                        'Class ' || evidence.prototype_class_index::text)
+                                   AS cluster_name
+                        FROM {self.schema}.classification_evidence evidence
+                        JOIN {self.schema}.classification_inference_runs runs
+                          ON runs.id = evidence.inference_run_id
+                        LEFT JOIN {self.schema}.model_class_mappings mappings
+                          ON mappings.model_artifact_id = runs.model_artifact_id
+                         AND mappings.class_index = evidence.prototype_class_index
+                        LEFT JOIN {self.schema}.classification_labels labels
+                          ON labels.id = mappings.project_label_id
+                        WHERE evidence.project_id = %s
+                          AND evidence.inference_run_id = %s
+                          AND runs.project_id = %s
+                          AND evidence.prototype_class_index IS NOT NULL
+                    ), counts AS (
+                        SELECT prototype_class_index,
+                               max(cluster_name) AS cluster_name,
+                               count(*) AS roi_count,
+                               avg(prototype_similarity) AS mean_similarity,
+                               min(prototype_similarity) AS min_similarity,
+                               max(prototype_similarity) AS max_similarity
+                        FROM assigned
+                        GROUP BY prototype_class_index
+                    ), representatives AS (
+                        SELECT DISTINCT ON (prototype_class_index)
+                               prototype_class_index,
+                               refined_detection_id AS representative_detection_id,
+                               prototype_similarity AS representative_similarity
+                        FROM assigned
+                        ORDER BY prototype_class_index,
+                                 prototype_similarity DESC NULLS LAST,
+                                 refined_detection_id
+                    )
+                    SELECT 'label-prototype:' || counts.prototype_class_index::text AS cluster_id,
+                           counts.prototype_class_index AS cluster_index,
+                           counts.cluster_name,
+                           counts.roi_count,
+                           counts.mean_similarity,
+                           counts.min_similarity,
+                           counts.max_similarity,
+                           0::bigint AS novelty_count,
+                           representatives.representative_detection_id,
+                           representatives.representative_similarity
+                    FROM counts
+                    JOIN representatives USING (prototype_class_index)
+                    ORDER BY counts.roi_count DESC, counts.prototype_class_index
+                    """,
+                    (project_id, inference_run_id, project_id),
+                )
+                return list(cursor.fetchall())
+
+    def list_feature_space_cluster_members(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        cluster_id: str,
+        limit: int,
+        offset: int,
+        minimum: float = -1.0,
+    ) -> dict[str, Any]:
+        """Page one run-local cluster without collapsing it into a taxonomy label."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           refined.roi_shape, refined.created_at,
+                           assets.id AS asset_id, assets.filename AS asset_filename,
+                           coalesce(labels.display_name, labels.name) AS label_display_name,
+                           review.decision AS review_decision,
+                           evidence.cluster_id, evidence.cluster_index,
+                           evidence.similarity, evidence.novel, evidence.abstained,
+                           count(*) OVER() AS total_count
+                    FROM {self.schema}.clustering_evidence evidence
+                    JOIN {self.schema}.detections_refined refined
+                      ON refined.id = evidence.refined_detection_id
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_label_annotations annotation
+                        WHERE annotation.refined_detection_id = refined.id
+                          AND annotation.is_current
+                        ORDER BY annotation.created_at DESC, annotation.id DESC
+                        LIMIT 1
+                    ) annotation ON true
+                    LEFT JOIN {self.schema}.classification_labels labels
+                      ON labels.id = annotation.label_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_annotation_reviews latest_review
+                        WHERE latest_review.annotation_id = annotation.id
+                        ORDER BY latest_review.created_at DESC, latest_review.id DESC
+                        LIMIT 1
+                    ) review ON true
+                    WHERE evidence.project_id = %s
+                      AND evidence.inference_run_id = %s
+                      AND evidence.cluster_id = %s
+                      AND evidence.similarity >= %s
+                      AND assets.project_id = %s
+                    ORDER BY evidence.similarity DESC NULLS LAST, refined.id
+                    LIMIT %s OFFSET %s
+                    """,
+                    (project_id, inference_run_id, cluster_id, minimum, project_id, limit, offset),
+                )
+                rows = list(cursor.fetchall())
+        return {
+            "items": rows,
+            "total": int(rows[0]["total_count"]) if rows else 0,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def list_feature_space_label_prototype_members(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        prototype_id: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        """Page one run-local classification label-prototype group."""
+
+        prefix = "label-prototype:"
+        if not prototype_id.startswith(prefix):
+            raise ValueError("Label prototype ID must use the label-prototype:<class-index> form")
+        try:
+            prototype_class_index = int(prototype_id.removeprefix(prefix))
+        except ValueError as exc:
+            raise ValueError("Label prototype ID has an invalid class index") from exc
+        if prototype_class_index < 0:
+            raise ValueError("Label prototype class index must be non-negative")
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           refined.roi_shape, refined.created_at,
+                           assets.id AS asset_id, assets.filename AS asset_filename,
+                           coalesce(annotations_labels.display_name, annotations_labels.name)
+                               AS label_display_name,
+                           review.decision AS review_decision,
+                           'label-prototype:' || evidence.prototype_class_index::text AS cluster_id,
+                           evidence.prototype_class_index AS cluster_index,
+                           coalesce(prototype_labels.display_name, prototype_labels.name,
+                                    mappings.oracle_label_name,
+                                    'Class ' || evidence.prototype_class_index::text)
+                               AS cluster_name,
+                           evidence.prototype_similarity AS similarity,
+                           false AS novel,
+                           false AS abstained,
+                           count(*) OVER() AS total_count
+                    FROM {self.schema}.classification_evidence evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    JOIN {self.schema}.detections_refined refined
+                      ON refined.id = evidence.refined_detection_id
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    LEFT JOIN {self.schema}.model_class_mappings mappings
+                      ON mappings.model_artifact_id = runs.model_artifact_id
+                     AND mappings.class_index = evidence.prototype_class_index
+                    LEFT JOIN {self.schema}.classification_labels prototype_labels
+                      ON prototype_labels.id = mappings.project_label_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_label_annotations annotation
+                        WHERE annotation.refined_detection_id = refined.id
+                          AND annotation.is_current
+                        ORDER BY annotation.created_at DESC, annotation.id DESC
+                        LIMIT 1
+                    ) annotation ON true
+                    LEFT JOIN {self.schema}.classification_labels annotations_labels
+                      ON annotations_labels.id = annotation.label_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.roi_annotation_reviews latest_review
+                        WHERE latest_review.annotation_id = annotation.id
+                        ORDER BY latest_review.created_at DESC, latest_review.id DESC
+                        LIMIT 1
+                    ) review ON true
+                    WHERE evidence.project_id = %s
+                      AND evidence.inference_run_id = %s
+                      AND runs.project_id = %s
+                      AND evidence.prototype_class_index = %s
+                      AND assets.project_id = %s
+                    ORDER BY evidence.prototype_similarity DESC NULLS LAST, refined.id
+                    LIMIT %s OFFSET %s
+                    """,
+                    (
+                        project_id,
+                        inference_run_id,
+                        project_id,
+                        prototype_class_index,
+                        project_id,
+                        limit,
+                        offset,
+                    ),
+                )
+                rows = list(cursor.fetchall())
+        return {
+            "items": rows,
+            "total": int(rows[0]["total_count"]) if rows else 0,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_feature_space_cluster_assignment(
+        self, *, project_id: str, inference_run_id: str, refined_detection_id: str
+    ) -> dict[str, Any] | None:
+        """Return the recorded run-local cluster for one ROI."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT cluster_id
+                    FROM {self.schema}.clustering_evidence
+                    WHERE project_id = %s
+                      AND inference_run_id = %s
+                      AND refined_detection_id = %s
+                      AND cluster_id IS NOT NULL
+                    """,
+                    (project_id, inference_run_id, refined_detection_id),
+                )
+                return cursor.fetchone()
 
     def assign_curation_labels(
         self,
@@ -5221,10 +5729,19 @@ class PostgresRepository:
         *,
         project_id: str,
         model_ref: str,
+        evidence_kind: str = "classification",
         roi_ids: Sequence[str] = (),
         selection: Mapping[str, Any] | None = None,
     ) -> tuple[str, str, list[Any]]:
         """Build the shared target query used by previews, counts, and workers."""
+
+        if evidence_kind not in {"classification", "clustering"}:
+            raise ValueError(f"Unsupported evidence kind: {evidence_kind}")
+        evidence_table = (
+            "classification_evidence"
+            if evidence_kind == "classification"
+            else "clustering_evidence"
+        )
 
         filters = dict(selection or {})
         clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
@@ -5256,6 +5773,8 @@ class PostgresRepository:
 
         label_id = filters.get("label_id")
         if label_id:
+            if evidence_kind != "classification" and str(filters.get("label_source") or "any") != "human":
+                raise ValueError("Clustering evidence queries cannot filter by predicted label")
             label_source = str(filters.get("label_source") or "any")
             if label_source == "human":
                 clauses.append("annotation.label_id = %s")
@@ -5276,15 +5795,17 @@ class PostgresRepository:
             clauses.append("model_evidence.id IS NOT NULL")
         elif evidence_state == "missing_any":
             clauses.append(
-                f"NOT EXISTS (SELECT 1 FROM {self.schema}.classification_evidence any_evidence "
+                f"NOT EXISTS (SELECT 1 FROM {self.schema}.{evidence_table} any_evidence "
                 "WHERE any_evidence.refined_detection_id = refined.id)"
             )
         elif evidence_state == "available_any":
             clauses.append(
-                f"EXISTS (SELECT 1 FROM {self.schema}.classification_evidence any_evidence "
+                f"EXISTS (SELECT 1 FROM {self.schema}.{evidence_table} any_evidence "
                 "WHERE any_evidence.refined_detection_id = refined.id)"
             )
         elif evidence_state == "disagreement":
+            if evidence_kind != "classification":
+                raise ValueError("Clustering evidence does not have classification disagreement state")
             clauses.append(
                 "model_evidence.id IS NOT NULL AND ((model_evidence.prototype_class_index IS NOT NULL AND "
                 "model_evidence.prototype_class_index <> model_evidence.predicted_class_index) OR "
@@ -5324,7 +5845,7 @@ class PostgresRepository:
             ) review ON true
             LEFT JOIN LATERAL (
                 SELECT evidence.*
-                FROM {self.schema}.classification_evidence evidence
+                FROM {self.schema}.{evidence_table} evidence
                 JOIN {self.schema}.classification_inference_runs inference_run
                   ON inference_run.id = evidence.inference_run_id
                 WHERE evidence.refined_detection_id = refined.id
@@ -5340,6 +5861,7 @@ class PostgresRepository:
         *,
         project_id: str,
         model_ref: str,
+        evidence_kind: str = "classification",
         roi_ids: Sequence[str] = (),
         selection: Mapping[str, Any] | None = None,
         after_created_at: datetime | None = None,
@@ -5350,6 +5872,7 @@ class PostgresRepository:
         joins, where, params = self._classification_target_query(
             project_id=project_id,
             model_ref=model_ref,
+            evidence_kind=evidence_kind,
             roi_ids=roi_ids,
             selection=selection,
         )
@@ -5378,6 +5901,7 @@ class PostgresRepository:
         *,
         project_id: str,
         model_ref: str,
+        evidence_kind: str = "classification",
         roi_ids: Sequence[str] = (),
         selection: Mapping[str, Any] | None = None,
     ) -> int:
@@ -5386,6 +5910,7 @@ class PostgresRepository:
         joins, where, params = self._classification_target_query(
             project_id=project_id,
             model_ref=model_ref,
+            evidence_kind=evidence_kind,
             roi_ids=roi_ids,
             selection=selection,
         )
@@ -5411,6 +5936,7 @@ class PostgresRepository:
         project_id: str,
         job_id: str | None,
         model_selector: str,
+        evidence_kind: str = "classification",
         parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.connect() as connection:
@@ -5418,11 +5944,17 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.classification_inference_runs
-                        (project_id, job_id, model_selector, parameters)
-                    VALUES (%s, %s, %s, %s::jsonb)
+                        (project_id, job_id, model_selector, evidence_kind, parameters)
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
                     RETURNING *
                     """,
-                    (project_id, job_id, model_selector, json.dumps(json_ready(parameters or {}))),
+                    (
+                        project_id,
+                        job_id,
+                        model_selector,
+                        evidence_kind,
+                        json.dumps(json_ready(parameters or {})),
+                    ),
                 )
                 row = cursor.fetchone()
             connection.commit()
@@ -5537,6 +6069,147 @@ class PostgresRepository:
             model_artifact_id=artifact_row_id,
             class_label_ids=mappings,
         )
+
+    def _ensure_clustering_artifact(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        model: dict[str, Any],
+    ) -> str:
+        """Register a clustering or hybrid model without inventing labels."""
+
+        cursor.execute(
+            f"""
+            INSERT INTO {self.schema}.model_artifacts
+                (project_id, artifact_id, run_id, artifact_fingerprint,
+                 task, architecture, contract_version, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, artifact_id) DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                artifact_fingerprint = EXCLUDED.artifact_fingerprint,
+                architecture = EXCLUDED.architecture,
+                contract_version = EXCLUDED.contract_version,
+                metadata = {self.schema}.model_artifacts.metadata || EXCLUDED.metadata
+            RETURNING id
+            """,
+            (
+                project_id,
+                model["artifact_id"],
+                model.get("run_id"),
+                model.get("artifact_fingerprint"),
+                model.get("task", "clustering"),
+                model.get("architecture"),
+                model.get("contract_version"),
+                json.dumps(json_ready(model)),
+            ),
+        )
+        return str(cursor.fetchone()["id"])
+
+    def prepare_clustering_evidence_context(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        model: dict[str, Any],
+    ) -> ClusteringEvidenceContext:
+        """Resolve the immutable Oracle artifact for a clustering run."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                artifact_row_id = self._ensure_clustering_artifact(
+                    cursor, project_id=project_id, model=model
+                )
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.classification_inference_runs
+                    SET model_artifact_id = %s
+                    WHERE id = %s
+                    """,
+                    (artifact_row_id, inference_run_id),
+                )
+            connection.commit()
+        return ClusteringEvidenceContext(
+            project_id=project_id,
+            inference_run_id=inference_run_id,
+            model_artifact_id=artifact_row_id,
+        )
+
+    def store_clustering_evidence_batch(
+        self,
+        *,
+        evidence_context: ClusteringEvidenceContext,
+        records: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist Oracle Builder's per-ROI clustering packets idempotently."""
+
+        if not records:
+            return []
+        values: list[tuple[Any, ...]] = []
+        for record in records:
+            packet = dict(record.get("evidence_packet") or {})
+            decision = dict(packet.get("decision") or {})
+            values.append(
+                (
+                    evidence_context.project_id,
+                    str(record["refined_detection_id"]),
+                    evidence_context.inference_run_id,
+                    evidence_context.model_artifact_id,
+                    record.get("embedding_payload_ref"),
+                    record.get("embedding_dtype"),
+                    json.dumps(list(record.get("embedding_shape") or [])),
+                    record.get("embedding_sha256"),
+                    decision.get("cluster_index"),
+                    decision.get("cluster_id"),
+                    decision.get("similarity"),
+                    decision.get("similarity_floor"),
+                    decision.get("novelty_similarity_threshold"),
+                    decision.get("novel"),
+                    decision.get("abstained"),
+                    json.dumps(json_ready(packet.get("clusters") or [])),
+                    json.dumps(json_ready(packet.get("nearest_neighbors") or [])),
+                    json.dumps(json_ready(packet)),
+                    json.dumps(json_ready(record.get("oracle_result") or {})),
+                )
+            )
+        columns = """
+            project_id, refined_detection_id, inference_run_id, model_artifact_id,
+            embedding_payload_ref, embedding_dtype, embedding_shape, embedding_sha256,
+            cluster_index, cluster_id, similarity, similarity_floor,
+            novelty_similarity_threshold, novel, abstained, candidate_clusters,
+            nearest_neighbors, evidence_packet, oracle_result
+        """
+        placeholders = "(" + ", ".join(
+            ["%s"] * 6 + ["%s::jsonb"] + ["%s"] * 8 + ["%s::jsonb"] * 4
+        ) + ")"
+        sql_text = f"""
+            INSERT INTO {self.schema}.clustering_evidence ({columns})
+            VALUES {", ".join(placeholders for _ in values)}
+            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
+                model_artifact_id = EXCLUDED.model_artifact_id,
+                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
+                embedding_dtype = EXCLUDED.embedding_dtype,
+                embedding_shape = EXCLUDED.embedding_shape,
+                embedding_sha256 = EXCLUDED.embedding_sha256,
+                cluster_index = EXCLUDED.cluster_index,
+                cluster_id = EXCLUDED.cluster_id,
+                similarity = EXCLUDED.similarity,
+                similarity_floor = EXCLUDED.similarity_floor,
+                novelty_similarity_threshold = EXCLUDED.novelty_similarity_threshold,
+                novel = EXCLUDED.novel,
+                abstained = EXCLUDED.abstained,
+                candidate_clusters = EXCLUDED.candidate_clusters,
+                nearest_neighbors = EXCLUDED.nearest_neighbors,
+                evidence_packet = EXCLUDED.evidence_packet,
+                oracle_result = EXCLUDED.oracle_result
+            RETURNING id, refined_detection_id
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql_text, tuple(value for row in values for value in row))
+                rows = cursor.fetchall()
+            connection.commit()
+        return rows
 
     def store_classification_evidence_batch(
         self,
@@ -5975,6 +6648,284 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    # Processing series deliberately wrap, rather than alter, ordinary jobs.  This
+    # keeps historical queue rows and direct job APIs compatible with series work.
+    def create_processing_series(
+        self,
+        *,
+        project_id: str,
+        steps: Sequence[dict[str, Any]],
+        selection: dict[str, Any] | None = None,
+        preset_snapshot: dict[str, Any] | None = None,
+        failure_policy: str = "fail_fast",
+        priority: int | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+    ) -> dict[str, Any]:
+        if failure_policy not in {"fail_fast", "continue"}:
+            raise ValueError("failure_policy must be one of: fail_fast, continue.")
+        if not steps:
+            raise ValueError("A processing series requires at least one step.")
+        resolved_project_id = self._required_project_id(project_id, "create_processing_series")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""INSERT INTO {self.schema}.processing_series
+                    (project_id, failure_policy, priority, submitted_by_user_id, submitted_by_username, selection, preset_snapshot)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb) RETURNING *""",
+                    (resolved_project_id, failure_policy, priority if priority is not None else self.config.queue.default_priority,
+                     submitted_by_user_id, submitted_by_username,
+                     json.dumps(json_ready(selection or {})), json.dumps(json_ready(preset_snapshot or {}))),
+                )
+                series = cursor.fetchone()
+                for index, step in enumerate(steps):
+                    stage = str(step["stage"])
+                    cursor.execute(
+                        f"""INSERT INTO {self.schema}.processing_series_steps
+                        (series_id, step_index, stage, filters, options, failure_policy)
+                        VALUES (%s, %s, %s::{self.schema}.stage_name, %s::jsonb, %s::jsonb, %s)
+                        RETURNING *""",
+                        (series["id"], index, stage, json.dumps(json_ready(step.get("filters") or {})),
+                         json.dumps(json_ready(step.get("options") or {})), step.get("failure_policy")),
+                    )
+            connection.commit()
+        return self.get_processing_series(str(series["id"]), project_id=resolved_project_id) or series
+
+    def get_processing_series(self, series_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+        clauses, params = ["id = %s"], [series_id]
+        if project_id is not None:
+            clauses.append("project_id = %s")
+            params.append(project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {self.schema}.processing_series WHERE {' AND '.join(clauses)}", tuple(params))
+                series = cursor.fetchone()
+        if series is None:
+            return None
+        steps = self.list_processing_series_steps(series_id, project_id=project_id)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT
+                        COUNT(units.id)::bigint AS total_jobs,
+                        COUNT(units.id) FILTER (WHERE jobs.status = 'succeeded')::bigint AS succeeded_jobs,
+                        COUNT(units.id) FILTER (WHERE jobs.status IN ('failed', 'dead_lettered'))::bigint AS failed_jobs,
+                        COUNT(units.id) FILTER (WHERE jobs.status = 'cancelled')::bigint AS cancelled_jobs,
+                        COUNT(*) FILTER (WHERE steps.status = 'skipped')::bigint AS skipped_steps
+                    FROM {self.schema}.processing_series_steps steps
+                    LEFT JOIN {self.schema}.processing_work_units units ON units.step_id = steps.id
+                    LEFT JOIN {self.schema}.processing_jobs jobs ON jobs.id = units.job_id
+                    WHERE steps.series_id = %s""",
+                    (series_id,),
+                )
+                counts = cursor.fetchone() or {}
+        total = int(counts.get("total_jobs") or 0) + int(counts.get("skipped_steps") or 0)
+        completed = int(counts.get("succeeded_jobs") or 0) + int(counts.get("skipped_steps") or 0)
+        failed = int(counts.get("failed_jobs") or 0)
+        return {
+            **series,
+            "steps": steps,
+            "progress": {
+                "unit": "jobs",
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "skipped": int(counts.get("skipped_steps") or 0) + int(counts.get("cancelled_jobs") or 0),
+                "percent": (completed / total * 100) if total else None,
+            },
+        }
+
+    def list_processing_series(
+        self,
+        *,
+        project_id: str,
+        status: Sequence[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        resolved_project_id = self._required_project_id(project_id, "list_processing_series")
+        bounded_limit = min(max(1, int(limit)), 1000)
+        clauses = ["project_id = %s"]
+        params: list[Any] = [resolved_project_id]
+        statuses = [str(value) for value in (status or []) if value]
+        if statuses:
+            clauses.append("status = ANY(%s::text[])")
+            params.append(statuses)
+        params.extend([bounded_limit, max(0, int(offset))])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT id FROM {self.schema}.processing_series
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s""",
+                    tuple(params),
+                )
+                ids = [str(row["id"]) for row in cursor.fetchall()]
+        return [self.get_processing_series(series_id, project_id=resolved_project_id) for series_id in ids]
+
+    def list_processing_series_steps(self, series_id: str, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT steps.* FROM {self.schema}.processing_series_steps steps
+                    JOIN {self.schema}.processing_series series ON series.id = steps.series_id
+                    WHERE steps.series_id = %s AND (%s::uuid IS NULL OR series.project_id = %s::uuid)
+                    ORDER BY steps.step_index""", (series_id, project_id, project_id))
+                return cursor.fetchall()
+
+    def list_processing_work_units(self, series_id: str, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT units.*, jobs.status AS job_status, jobs.stage, jobs.error_message, jobs.result
+                    FROM {self.schema}.processing_work_units units
+                    JOIN {self.schema}.processing_series series ON series.id = units.series_id
+                    JOIN {self.schema}.processing_jobs jobs ON jobs.id = units.job_id
+                    WHERE units.series_id = %s AND (%s::uuid IS NULL OR series.project_id = %s::uuid)
+                    ORDER BY units.created_at, units.id""", (series_id, project_id, project_id))
+                return cursor.fetchall()
+
+    def claim_processing_series_step(self, series_id: str, *, project_id: str) -> dict[str, Any] | None:
+        """Atomically grant one director the next step; callers may safely retry."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH candidate AS (
+                        SELECT steps.id FROM {self.schema}.processing_series_steps steps
+                        JOIN {self.schema}.processing_series series ON series.id = steps.series_id
+                        WHERE steps.series_id = %s AND series.project_id = %s
+                          AND series.status IN ('queued', 'active') AND steps.status = 'queued'
+                        ORDER BY steps.step_index FOR UPDATE SKIP LOCKED LIMIT 1
+                    ) UPDATE {self.schema}.processing_series_steps steps
+                    SET status = 'planning', started_at = COALESCE(started_at, NOW())
+                    FROM candidate WHERE steps.id = candidate.id
+                    RETURNING steps.*, (SELECT priority FROM {self.schema}.processing_series WHERE id = steps.series_id) AS series_priority,
+                    (SELECT submitted_by_user_id FROM {self.schema}.processing_series WHERE id = steps.series_id) AS submitted_by_user_id,
+                    (SELECT submitted_by_username FROM {self.schema}.processing_series WHERE id = steps.series_id) AS submitted_by_username""", (series_id, project_id))
+                step = cursor.fetchone()
+                if step is not None:
+                    cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'active', updated_at = NOW() WHERE id = %s", (series_id,))
+            connection.commit()
+        return step
+
+    def attach_processing_work_units(self, *, series_id: str, step_id: str, job_ids: Sequence[str], matched_count: int) -> None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if job_ids:
+                    cursor.executemany(
+                        f"INSERT INTO {self.schema}.processing_work_units (series_id, step_id, job_id) VALUES (%s, %s, %s) ON CONFLICT (job_id) DO NOTHING",
+                        [(series_id, step_id, job_id) for job_id in job_ids],
+                    )
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_series_steps SET status = %s, matched_count = %s, job_count = %s,
+                        skip_reason = CASE WHEN %s = 'skipped' THEN 'no_eligible_units' ELSE NULL END,
+                        finished_at = CASE WHEN %s = 'skipped' THEN NOW() ELSE NULL END WHERE id = %s""",
+                    ('active' if job_ids else 'skipped', matched_count, len(job_ids),
+                     'active' if job_ids else 'skipped', 'active' if job_ids else 'skipped', step_id))
+                if not job_ids:
+                    cursor.execute(f"""SELECT 1 FROM {self.schema}.processing_series_steps
+                        WHERE series_id = %s AND status IN ('queued', 'planning', 'active') LIMIT 1""", (series_id,))
+                    if cursor.fetchone() is None:
+                        cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'succeeded', finished_at = NOW(), updated_at = NOW() WHERE id = %s", (series_id,))
+            connection.commit()
+
+    def finish_processing_series_step(self, step_id: str, *, failed: bool, failure_policy: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT steps.*, series.project_id, series.failure_policy AS series_failure_policy
+                    FROM {self.schema}.processing_series_steps steps JOIN {self.schema}.processing_series series ON series.id = steps.series_id
+                    WHERE steps.id = %s FOR UPDATE""", (step_id,))
+                step = cursor.fetchone()
+                if step is None or step['status'] != 'active':
+                    return step
+                policy = step.get('failure_policy') or failure_policy or step['series_failure_policy']
+                terminal_status = 'failed' if failed and policy == 'fail_fast' else 'succeeded'
+                cursor.execute(f"UPDATE {self.schema}.processing_series_steps SET status = %s, finished_at = NOW() WHERE id = %s", (terminal_status, step_id))
+                if terminal_status == 'failed':
+                    cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'failed', finished_at = NOW(), updated_at = NOW() WHERE id = %s", (step['series_id'],))
+                    cursor.execute(f"""UPDATE {self.schema}.processing_jobs jobs SET status = 'cancelled', finished_at = NOW(),
+                        control_reason = 'series_fail_fast', updated_at = NOW()
+                        FROM {self.schema}.processing_work_units units
+                        WHERE units.job_id = jobs.id AND units.series_id = %s AND jobs.status IN ('queued', 'leased', 'working', 'paused')""", (step['series_id'],))
+                    cursor.execute(f"UPDATE {self.schema}.processing_series_steps SET status = 'cancelled', finished_at = NOW() WHERE series_id = %s AND status IN ('queued', 'planning', 'active')", (step['series_id'],))
+                else:
+                    cursor.execute(f"SELECT 1 FROM {self.schema}.processing_series_steps WHERE series_id = %s AND status IN ('queued', 'planning', 'active') LIMIT 1", (step['series_id'],))
+                    if cursor.fetchone() is None:
+                        cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'succeeded', finished_at = NOW(), updated_at = NOW() WHERE id = %s", (step['series_id'],))
+            connection.commit()
+        return step
+
+    def advance_processing_series_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Mark a series step terminal only after every attached job is terminal.
+
+        The conditional step update makes duplicate worker completion notifications harmless.
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT step_id, series_id FROM {self.schema}.processing_work_units WHERE job_id = %s", (job_id,))
+                unit = cursor.fetchone()
+                if unit is None:
+                    return None
+                cursor.execute(f"""SELECT COUNT(*) FILTER (WHERE jobs.status IN ('queued','leased','working','paused')) AS active,
+                    COUNT(*) FILTER (WHERE jobs.status IN ('failed','dead_lettered','cancelled')) AS failed
+                    FROM {self.schema}.processing_work_units units JOIN {self.schema}.processing_jobs jobs ON jobs.id = units.job_id
+                    WHERE units.step_id = %s""", (unit['step_id'],))
+                counts = cursor.fetchone()
+                if int(counts['active']) > 0:
+                    return {**unit, 'ready': False}
+                cursor.execute(f"SELECT failure_policy FROM {self.schema}.processing_series WHERE id = %s", (unit['series_id'],))
+                series = cursor.fetchone()
+        if series is None:
+            return None
+        self.finish_processing_series_step(unit['step_id'], failed=bool(counts['failed']), failure_policy=series['failure_policy'])
+        return {**unit, 'ready': True, 'failed': bool(counts['failed'])}
+
+    def _set_processing_series_status(self, series_id: str, *, project_id: str, status: str, reason: str | None) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"UPDATE {self.schema}.processing_series SET status = %s, control_reason = %s, updated_at = NOW(), finished_at = CASE WHEN %s = 'cancelled' THEN NOW() ELSE finished_at END WHERE id = %s AND project_id = %s RETURNING *", (status, reason, status, series_id, project_id))
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def pause_processing_series(self, series_id: str, *, project_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        row = self._set_processing_series_status(series_id, project_id=project_id, status='paused', reason=reason)
+        if row is not None:
+            self.pause_jobs(project_id=project_id, job_ids=[str(unit['job_id']) for unit in self.list_processing_work_units(series_id, project_id=project_id)], reason=reason)
+        return row
+
+    def resume_processing_series(self, series_id: str, *, project_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        row = self._set_processing_series_status(series_id, project_id=project_id, status='active', reason=reason)
+        if row is not None:
+            self.resume_jobs(project_id=project_id, job_ids=[str(unit['job_id']) for unit in self.list_processing_work_units(series_id, project_id=project_id)], reason=reason)
+        return row
+
+    def cancel_processing_series(self, series_id: str, *, project_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        row = self._set_processing_series_status(series_id, project_id=project_id, status='cancelled', reason=reason)
+        if row is not None:
+            self.cancel_jobs(project_id=project_id, job_ids=[str(unit['job_id']) for unit in self.list_processing_work_units(series_id, project_id=project_id)], reason=reason)
+        return row
+
+    def retry_processing_series(self, series_id: str, *, project_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        """Requeue failed/cancelled units without changing the recorded plan."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {self.schema}.processing_series WHERE id = %s AND project_id = %s FOR UPDATE", (series_id, project_id))
+                series = cursor.fetchone()
+                if series is None:
+                    return None
+                cursor.execute(f"""UPDATE {self.schema}.processing_jobs jobs SET status = 'queued', lease_expires_at = NULL,
+                    worker_id = NULL, error_message = NULL, finished_at = NULL, control_reason = %s, updated_at = NOW()
+                    FROM {self.schema}.processing_work_units units WHERE units.job_id = jobs.id AND units.series_id = %s
+                    AND jobs.status IN ('failed', 'dead_lettered', 'cancelled')""", (reason, series_id))
+                cursor.execute(f"""UPDATE {self.schema}.processing_series_steps SET status = 'active', finished_at = NULL
+                    WHERE series_id = %s AND status IN ('failed', 'cancelled')""", (series_id,))
+                cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'active', finished_at = NULL, control_reason = %s, updated_at = NOW() WHERE id = %s RETURNING *", (reason, series_id))
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
     def plan_preprocess_frames(
         self,
         *,
@@ -5987,6 +6938,8 @@ class PostgresRepository:
             project_id=resolved_project_id,
             run_id=filters.get("run_id"),
             asset_id=filters.get("asset_id"),
+            asset_ids=filters.get("asset_ids"),
+            frame_ids=filters.get("frame_ids"),
             collection=None,
             preprocessing_status=filters.get("preprocessing_status"),
             start_frame=filters.get("start_frame"),
@@ -6016,6 +6969,7 @@ class PostgresRepository:
         resolved_project_id = self._required_project_id(project_id, "plan_segment_frames")
         clauses, params = self._frame_status_filters(
             project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
+            asset_ids=filters.get("asset_ids"), frame_ids=filters.get("frame_ids"),
             collection=None, candidate_detection_status=filters.get("candidate_detection_status"),
             preprocessing_status=filters.get("preprocessing_status"), start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
         )
@@ -6034,7 +6988,8 @@ class PostgresRepository:
     def plan_roi_refinement_detections(self, *, project_id: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
         resolved_project_id = self._required_project_id(project_id, "plan_roi_refinement_detections")
         clauses, params = self._frame_status_filters(
-            project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"), collection=None,
+            project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
+            asset_ids=filters.get("asset_ids"), frame_ids=filters.get("frame_ids"), collection=None,
             roi_refinement_status=filters.get("roi_refinement_status"), start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
         )
         collections = [str(value) for value in filters.get("collection") or [] if value]

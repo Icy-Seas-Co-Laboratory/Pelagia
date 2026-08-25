@@ -254,6 +254,7 @@ class ExportService:
                 assets.collections AS asset_collections,
                 runs.run_key,
                 frames.frame_index,
+                frames.captured_at AS captured_at,
                 detections.roi_index,
                 detections.bbox_x,
                 detections.bbox_y,

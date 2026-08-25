@@ -7,6 +7,7 @@ from Pelagia.services.processing_queue import (
     ROI_REFINEMENT_DETECTIONS_PER_JOB,
     SEGMENT_FRAMES_PER_JOB,
     PreprocessQueueRequest,
+    ProcessingSeriesRequest,
     ProcessingQueueService,
 )
 from Pelagia.storage.postgres import PostgresRepository, _initial_job_progress
@@ -220,3 +221,116 @@ def test_initial_job_progress_counts_queued_frame_and_roi_units():
     assert roi_progress["unit"] == "rois"
     assert roi_progress["total"] == 2
     assert roi_progress["completed"] == 0
+
+
+class SeriesRepository(QueueRepository):
+    def __init__(self, *, empty_first=False):
+        super().__init__()
+        self.empty_first = empty_first
+        self.series = None
+        self.steps = []
+        self.attached = []
+        self.claims = 0
+        self.project_ids = []
+
+    def create_processing_series(self, *, project_id, steps, **kwargs):
+        self.project_ids.append(project_id)
+        self.steps = [dict(step, id=f"step-{index}", series_id="series-1", status="queued") for index, step in enumerate(steps)]
+        self.series = {"id": "series-1", "project_id": project_id, "status": "queued", "failure_policy": kwargs["failure_policy"]}
+        return {**self.series, "steps": self.steps}
+
+    def get_processing_series(self, series_id, *, project_id=None):
+        if self.series is None or series_id != "series-1" or (project_id and project_id != self.series["project_id"]):
+            return None
+        return {**self.series, "steps": self.steps}
+
+    def claim_processing_series_step(self, series_id, *, project_id):
+        self.project_ids.append(project_id)
+        if project_id != self.series["project_id"]:
+            return None
+        for step in self.steps:
+            if step["status"] == "queued":
+                step["status"] = "planning"
+                self.claims += 1
+                return step
+        return None
+
+    def attach_processing_work_units(self, *, series_id, step_id, job_ids, matched_count):
+        self.attached.append((step_id, list(job_ids), matched_count))
+        step = next(step for step in self.steps if step["id"] == step_id)
+        step["status"] = "active" if job_ids else "skipped"
+
+    def advance_processing_series_for_job(self, job_id):
+        return {"series_id": "series-1", "step_id": "step-0", "ready": True, "failed": False}
+
+
+def test_series_plans_first_step_and_preserves_project_scope():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    series = service.create_series(
+        ProcessingSeriesRequest(steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},)),
+        project_id="project-1",
+    )
+
+    assert series["id"] == "series-1"
+    assert repository.project_ids == ["project-1", "project-1"]
+    assert repository.attached == [("step-0", ["job-1"], 3)]
+    assert service.advance_series("series-1", project_id="other-project") is None
+
+
+def test_series_no_candidate_step_is_skipped_and_next_step_is_planned():
+    class EmptyPreprocessSeriesRepository(SeriesRepository):
+        def plan_preprocess_frames(self, *, project_id, filters):
+            return []
+
+    repository = EmptyPreprocessSeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+    service.create_series(
+        ProcessingSeriesRequest(steps=(
+            {"stage": "preprocess_frames", "filters": {}, "options": {}},
+            {"stage": "segment", "filters": {}, "options": {}},
+        )), project_id="project-1",
+    )
+
+    assert repository.attached[0] == ("step-0", [], 0)
+    assert repository.attached[1][0] == "step-1"
+    assert repository.steps[0]["status"] == "skipped"
+
+
+def test_series_rejects_noncanonical_processing_order():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    with pytest.raises(ValueError, match="canonical Pelagia order"):
+        service.create_series(
+            ProcessingSeriesRequest(steps=(
+                {"stage": "segment", "filters": {}, "options": {}},
+                {"stage": "preprocess_frames", "filters": {}, "options": {}},
+            )),
+            project_id="project-1",
+        )
+
+
+def test_completion_director_is_idempotent_after_a_series_job():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+    service.create_series(ProcessingSeriesRequest(steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},)), project_id="project-1")
+
+    service.advance_series_for_job("job-1")
+    service.advance_series_for_job("job-1")
+
+    assert repository.claims == 1
+
+
+def test_series_request_validates_failure_policy_and_dry_run_plans_without_writes():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+    result = service.create_series(
+        ProcessingSeriesRequest(steps=({"stage": "segment", "filters": {}, "options": {}},), dry_run=True, failure_policy="continue"),
+        project_id="project-1",
+    )
+    assert result["dry_run"] is True
+    assert repository.series is None
+    with pytest.raises(ValueError, match="failure_policy"):
+        service.create_series(ProcessingSeriesRequest(steps=({"stage": "segment"},), failure_policy="ignore"), project_id="project-1")

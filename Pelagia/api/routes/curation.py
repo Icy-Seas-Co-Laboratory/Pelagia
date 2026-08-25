@@ -18,6 +18,7 @@ if APIRouter is not None:
     from ...domain import PipelineStage
     from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
     from ...services.pipeline import PipelineService
+    from ...services.feature_space import FeatureSpaceError, FeatureSpaceService
     from ...services.registry_generation import preview_registry_dataset
     from ...services.telemetry import parse_telemetry_filters
     from ...services.taxonomy import default_taxonomy_dictionary
@@ -75,6 +76,7 @@ if APIRouter is not None:
         model_config = ConfigDict(extra="forbid", protected_namespaces=())
         roi_ids: list[str] = Field(default_factory=list)
         model_ref: str | None = None
+        evidence_kind: Literal["classification", "clustering"] = "classification"
         selection: ClassificationTargetSelectionRequest | None = None
         priority: int | None = None
 
@@ -82,6 +84,7 @@ if APIRouter is not None:
         model_config = ConfigDict(extra="forbid", protected_namespaces=())
         roi_ids: list[str] = Field(default_factory=list)
         model_ref: str | None = None
+        evidence_kind: Literal["classification", "clustering"] = "classification"
         selection: ClassificationTargetSelectionRequest | None = None
 
     class RegistryDatasetSelectionRequest(BaseModel):
@@ -121,6 +124,10 @@ if APIRouter is not None:
         value.pop("total_count", None)
         return value
 
+    def _feature_space_service(request: Request) -> FeatureSpaceService:
+        auth = require_project_read(request)
+        return FeatureSpaceService(get_context(request), project_id=auth.project_id)
+
     def _registry_root(request: Request) -> Path:
         return Path(get_context(request).config.file_browser.root_path_import_dir).expanduser().resolve()
 
@@ -147,14 +154,20 @@ if APIRouter is not None:
         request: Request,
         *,
         model_ref: str | None,
+        evidence_kind: str = "classification",
         roi_ids: list[str],
         selection: ClassificationTargetSelectionRequest | None,
     ) -> tuple[str, dict, int]:
         resolved_model_ref = (
-            model_ref or get_context(request).config.oracle.default_classification_model
+            model_ref
+            or (
+                get_context(request).config.oracle.default_classification_model
+                if evidence_kind == "classification"
+                else ""
+            )
         ).strip()
         if not resolved_model_ref:
-            raise HTTPException(status_code=422, detail="A classification model is required.")
+            raise HTTPException(status_code=422, detail=f"A {evidence_kind} model is required.")
         if selection is None:
             resolved_selection = {"evidence_state": "all" if roi_ids else "missing_model"}
         else:
@@ -167,6 +180,7 @@ if APIRouter is not None:
         target_count = get_repository(request).count_classification_targets(
             project_id=auth.project_id,
             model_ref=resolved_model_ref,
+            evidence_kind=evidence_kind,
             roi_ids=roi_ids,
             selection=resolved_selection,
         )
@@ -181,17 +195,25 @@ if APIRouter is not None:
         owns_client = not callable(getattr(client, "list_models", None))
         if owns_client:
             client = OracleInferenceClient(context.config.oracle)
+        clustering_models = []
         try:
             models = client.list_models(task="classification")
+            clustering_models = client.list_models(task="clustering")
+            all_models = [*models, *clustering_models]
             available_count = sum(model.get("available") is not False for model in models)
+            clustering_available_count = sum(
+                model.get("available") is not False for model in clustering_models
+            )
             oracle = {
                 "enabled": True,
-                "status": "ready" if available_count else "unavailable",
+                "status": "ready" if all_models and (available_count or clustering_available_count) else "unavailable",
                 "registered_model_count": len(models),
                 "available_model_count": available_count,
+                "registered_clustering_model_count": len(clustering_models),
+                "available_clustering_model_count": clustering_available_count,
             }
-            if models and not available_count:
-                oracle["error"] = "Oracle Builder has no usable classification models."
+            if all_models and not (available_count or clustering_available_count):
+                oracle["error"] = "Oracle Builder has no usable evidence models."
         except OracleInferenceError as exc:
             models = []
             oracle = {
@@ -209,6 +231,7 @@ if APIRouter is not None:
             {
                 "oracle": oracle,
                 "models": models,
+                "clustering_models": clustering_models,
                 "default_model_ref": get_context(request).config.oracle.default_classification_model,
                 "labels": repository.list_curation_labels(project_id=auth.project_id),
                 "assets": [
@@ -353,6 +376,62 @@ if APIRouter is not None:
             raise HTTPException(status_code=404, detail="Curatable ROI was not found")
         return {"roi": as_response(_with_urls(row))}
 
+    @router.get("/feature-space/sources")
+    def feature_space_sources(request: Request) -> dict:
+        return {"sources": as_response(_feature_space_service(request).sources())}
+
+    @router.get("/feature-space/rois")
+    def feature_space_rois(
+        request: Request,
+        source_key: str,
+        limit: int = Query(120, ge=1, le=250),
+    ) -> dict:
+        try:
+            result = _feature_space_service(request).browse_rois(source_key=source_key, limit=limit)
+        except FeatureSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return as_response({**result, "items": [_with_urls(item) for item in result["items"]]})
+
+    @router.get("/feature-space/similar/{roi_id}")
+    def feature_space_similar(
+        request: Request,
+        roi_id: str,
+        source_key: str,
+        limit: int = Query(80, ge=1, le=250),
+        minimum: float = Query(-1.0, ge=-1.0, le=1.0),
+    ) -> dict:
+        try:
+            result = _feature_space_service(request).similar_rois(
+                roi_id=roi_id, source_key=source_key, limit=limit, minimum=minimum
+            )
+        except FeatureSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return as_response({**result, "items": [_with_urls(item) for item in result["items"]]})
+
+    @router.get("/feature-space/clusters")
+    def feature_space_clusters(request: Request, source_key: str) -> dict:
+        try:
+            result = _feature_space_service(request).clusters(source_key=source_key)
+        except FeatureSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return as_response(result)
+
+    @router.get("/feature-space/clusters/{cluster_id}/rois")
+    def feature_space_cluster_members(
+        request: Request,
+        cluster_id: str,
+        source_key: str,
+        limit: int = Query(120, ge=1, le=250),
+        offset: int = Query(0, ge=0),
+    ) -> dict:
+        try:
+            result = _feature_space_service(request).cluster_members(
+                source_key=source_key, cluster_id=cluster_id, limit=limit, offset=offset
+            )
+        except FeatureSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return as_response({**result, "items": [_with_urls(item) for item in result["items"]]})
+
     @router.post("/annotations")
     def annotate(request: Request, body: AnnotationRequest) -> dict:
         auth = require_project_write(request)
@@ -403,28 +482,35 @@ if APIRouter is not None:
         return {"annotations": as_response(rows)}
 
     @router.post("/classification-targets/preview")
+    @router.post("/clustering-targets/preview")
     def preview_classification_targets(
         request: Request, body: ClassificationPreviewRequest
     ) -> dict:
+        evidence_kind = "clustering" if request.url.path.endswith("/clustering-targets/preview") else body.evidence_kind
         model_ref, selection, target_count = _classification_request(
             request,
             model_ref=body.model_ref,
+            evidence_kind=evidence_kind,
             roi_ids=body.roi_ids,
             selection=body.selection,
         )
         return {
             "model_ref": model_ref,
+            "evidence_kind": evidence_kind,
             "selection": selection,
             "target_count": target_count,
             "explicit_roi_count": len(set(body.roi_ids)),
         }
 
     @router.post("/classification-jobs", status_code=202)
+    @router.post("/clustering-jobs", status_code=202)
     def queue_classification(request: Request, body: ClassificationJobRequest) -> dict:
         auth = require_project_write(request)
+        evidence_kind = "clustering" if request.url.path.endswith("/clustering-jobs") else body.evidence_kind
         model_ref, selection, target_count = _classification_request(
             request,
             model_ref=body.model_ref,
+            evidence_kind=evidence_kind,
             roi_ids=body.roi_ids,
             selection=body.selection,
         )
@@ -436,6 +522,7 @@ if APIRouter is not None:
             payload={
                 "roi_ids": body.roi_ids,
                 "model_ref": model_ref,
+                "evidence_kind": evidence_kind,
                 "selection": selection,
             },
             priority=body.priority,
@@ -446,6 +533,7 @@ if APIRouter is not None:
         return {
             "job": as_response(job),
             "model_ref": model_ref,
+            "evidence_kind": evidence_kind,
             "selection": selection,
             "target_count": target_count,
             "explicit_roi_count": len(set(body.roi_ids)),

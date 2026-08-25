@@ -4,6 +4,7 @@ import io
 import sqlite3
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -450,6 +451,7 @@ class FakeRepository:
             "asset_filename": "sample.mkv",
             "frame_id": "frame-1",
             "frame_index": 2,
+            "captured_at": datetime(2026, 8, 21, 18, 4, 5, 125000, tzinfo=timezone.utc),
             "roi_index": 1,
             "bbox_x": 3,
             "bbox_y": 4,
@@ -1362,6 +1364,7 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "predicted_label_id": "label-1",
         "predicted_label_name": "Copepod",
         "confidence": 0.91,
+        "captured_at": "2026-08-21T18:04:05.125000Z",
         "total_count": 1,
     }
     actions = []
@@ -1427,6 +1430,14 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
             },
         },
     )
+    clustering_job = client.post(
+        "/curation/clustering-jobs",
+        json={"roi_ids": ["refined-det-1"], "model_ref": "roi-clusters"},
+    )
+    clustering_preview = client.post(
+        "/curation/clustering-targets/preview",
+        json={"model_ref": "roi-clusters", "roi_ids": ["refined-det-1"]},
+    )
 
     assert options.status_code == 200
     assert options.json()["oracle"]["available_model_count"] == 1
@@ -1440,6 +1451,7 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "review_interface": "pelagiaview",
     }
     assert listing.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
+    assert listing.json()["items"][0]["captured_at"] == "2026-08-21T18:04:05.125000Z"
     assert listing_calls[0]["label_id"] == "label-1"
     assert listing_calls[0]["label_source"] == "prediction"
     assert annotation.status_code == review.status_code == removal.status_code == 200
@@ -1451,8 +1463,91 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     assert queued.json()["selection"]["evidence_state"] == "all"
     assert preview.status_code == 200
     assert preview.json()["target_count"] == 1
-    assert target_calls[-1]["selection"]["evidence_state"] == "missing_model"
-    assert target_calls[-1]["selection"]["asset_ids"] == ["asset-1"]
+    assert target_calls[1]["selection"]["evidence_state"] == "missing_model"
+    assert target_calls[1]["selection"]["asset_ids"] == ["asset-1"]
+    assert clustering_job.status_code == 202
+    assert clustering_job.json()["evidence_kind"] == "clustering"
+    assert clustering_preview.status_code == 200
+    assert clustering_preview.json()["evidence_kind"] == "clustering"
+    assert target_calls[-1]["evidence_kind"] == "clustering"
+
+
+def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(monkeypatch):
+    from Pelagia.api.routes import curation as curation_routes
+
+    client, _, _ = make_client()
+    calls = []
+
+    class FakeFeatureSpaceService:
+        def __init__(self, context, *, project_id):
+            assert project_id == "project-1"
+
+        def sources(self):
+            return [{"source_key": "classification:run-1", "source_kind": "classification"}]
+
+        def browse_rois(self, **values):
+            calls.append(("browse", values))
+            return {"items": [{"id": "refined-det-1"}], **values}
+
+        def similar_rois(self, **values):
+            calls.append(("similar", values))
+            return {
+                "items": [{"id": "refined-det-1", "similarity": 1.0, "is_reference": True}],
+                "reference_roi_id": values["roi_id"],
+                "source_key": values["source_key"],
+                "comparison": "cosine_similarity",
+                "minimum": values["minimum"],
+                "candidate_count": 1,
+                "total_vector_count": 1,
+                "scanned_vector_count": 1,
+                "search_scope": "full_source",
+                "readable_embedding_count": 1,
+                "unreadable_embedding_count": 0,
+                "limit": values["limit"],
+            }
+
+        def clusters(self, **values):
+            calls.append(("clusters", values))
+            return {
+                "items": [{"cluster_id": "cluster-a", "roi_count": 1}],
+                **values,
+                "organization_kind": "self_supervised_clusters",
+                "group_ids": "run_local",
+            }
+
+        def cluster_members(self, **values):
+            calls.append(("members", values))
+            return {
+                "items": [{"id": "refined-det-1", "cluster_id": values["cluster_id"]}],
+                "total": 1,
+                **values,
+                "organization_kind": "self_supervised_clusters",
+                "group_ids": "run_local",
+            }
+
+    monkeypatch.setattr(curation_routes, "FeatureSpaceService", FakeFeatureSpaceService)
+
+    sources = client.get("/curation/feature-space/sources")
+    browse = client.get("/curation/feature-space/rois?source_key=classification:run-1")
+    similar = client.get(
+        "/curation/feature-space/similar/refined-det-1?source_key=classification:run-1&minimum=0.5"
+    )
+    clusters = client.get("/curation/feature-space/clusters?source_key=clustering:run-2")
+    members = client.get(
+        "/curation/feature-space/clusters/cluster-a/rois?source_key=clustering:run-2"
+    )
+
+    assert sources.json()["sources"][0]["source_key"] == "classification:run-1"
+    assert browse.status_code == similar.status_code == clusters.status_code == members.status_code == 200
+    assert browse.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
+    assert similar.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
+    assert members.json()["items"][0]["roi_url"].startswith("/refined-detections/")
+    assert calls == [
+        ("browse", {"source_key": "classification:run-1", "limit": 120}),
+        ("similar", {"roi_id": "refined-det-1", "source_key": "classification:run-1", "limit": 80, "minimum": 0.5}),
+        ("clusters", {"source_key": "clustering:run-2"}),
+        ("members", {"source_key": "clustering:run-2", "cluster_id": "cluster-a", "limit": 120, "offset": 0}),
+    ]
 
 
 def test_io_export_options_are_discoverable():
@@ -3819,6 +3914,7 @@ def test_api_asset_views_summarize_payload_bytes():
     assert "preview_thumbhash" not in frame_response.json()["frames"][0]
     assert detection_response.json()["detections"][0]["roi_payload_bytes"] == 4
     assert detection_response.json()["detections"][0]["mask_payload_bytes"] == 4
+    assert detection_response.json()["detections"][0]["captured_at"] == "2026-08-21T18:04:05.125000Z"
 
 
 def test_api_asset_detail_includes_frame_count():
@@ -3916,6 +4012,7 @@ def test_api_get_detection_includes_payload_data():
     assert response.status_code == 200
     detection = response.json()["detection"]
     assert detection["id"] == "det-1"
+    assert detection["captured_at"] == "2026-08-21T18:04:05.125000Z"
     assert detection["roi_payload"] == "0080ff40"
     assert detection["mask_payload"] == "6d61736b"
 
@@ -3983,6 +4080,7 @@ def test_api_refined_detection_id_endpoints_return_contract_and_payloads():
     assert detail_response.status_code == 200
     refined = detail_response.json()["detection"]
     assert refined["id"] == "refined-det-1"
+    assert refined["captured_at"] == "2026-08-21T18:04:05.125000Z"
     assert refined["candidate_detection_id"] == "det-1"
     assert refined["primary_candidate_detection_id"] == "det-1"
     assert refined["candidate_detection_ids"] == ["det-1"]

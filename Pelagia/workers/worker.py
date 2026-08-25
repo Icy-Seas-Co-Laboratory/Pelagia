@@ -141,6 +141,11 @@ class Worker:
                 with self._maintain_job_lease(job_id):
                     result = self.handlers.handle(job, job_context)
                 self.context.repository.complete_job(job["id"], result=result)
+                # Series planning is a separate, idempotent director action so
+                # legacy jobs keep their existing completion semantics.
+                if hasattr(self.context.repository, "advance_processing_series_for_job"):
+                    from ..services.processing_queue import ProcessingQueueService
+                    ProcessingQueueService(self.context).advance_series_for_job(job_id)
                 duration_ms = (time.perf_counter() - started) * 1000
                 timings = (result or {}).get("timings")
                 if timings:
@@ -191,6 +196,9 @@ class Worker:
                         },
                     )
                 self.context.repository.record_failure(job["id"], str(exc), retryable=True)
+                if hasattr(self.context.repository, "advance_processing_series_for_job"):
+                    from ..services.processing_queue import ProcessingQueueService
+                    ProcessingQueueService(self.context).advance_series_for_job(job_id)
             finally:
                 self._touch("idle", stages=stages)
         return len(jobs)

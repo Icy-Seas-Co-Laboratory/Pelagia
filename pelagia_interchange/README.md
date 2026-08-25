@@ -28,7 +28,7 @@ pii inspect deployment_042
 pii verify deployment_042 --level structural
 ```
 
-FFprobe discovers source properties and frame counts; source files are SHA-256 hashed; FFmpeg streams JPEG frames into immutable SQLite shards; and the builder records provenance, generates standalone tools, previews, and package checksums. FFmpeg and FFprobe are only needed for creation. Consecutive videos fill the current shard by default; use `--source-file-boundary` only when every video should start a new shard. Other controls include `--recursive`, `--grayscale`, `--ffmpeg-qscale`, and `--no-source-hash`.
+FFprobe discovers source properties and frame counts; source files are SHA-256 hashed concurrently; FFmpeg streams raw decoded frames; and libjpeg-turbo encodes bounded batches of JPEG payloads into immutable SQLite shards. One ordered SQLite writer owns each active shard while JPEG workers run in parallel. FFmpeg, FFprobe, and libjpeg-turbo are only needed for creation. Consecutive videos fill the current shard by default; use `--source-file-boundary` only when every video should start a new shard. Other controls include `--recursive`, `--grayscale`, `--jpeg-quality`, `--jpeg-workers`, and `--no-source-hash`.
 
 Creation also produces up to 12 evenly spaced 512-pixel thumbnails, a contact sheet, and `preview/index.json` mapping derivatives to authoritative frame/source identities. Control this with `--preview-count`, `--preview-width`, `--no-previews`, and `--require-previews`. Previews are checksummed but explicitly non-authoritative.
 
@@ -199,6 +199,6 @@ pii shards deployment_042 --partials
 pii shards deployment_042 --quarantine-partials ./partial-recovery
 ```
 
-An interrupted video ingestion can be resumed in place with `pii create --from-videos ... --resume`. The source files are checked against the incomplete package, finalized shards remain immutable, and only the durable source-frame prefix is skipped/replayed.
+An interrupted video ingestion can be resumed in place with `pii create --from-videos ... --resume`. SQLite recovers any stale rollback journal while reopening the partial shard, waits briefly for a live writer lock, and then continues only after the durable contiguous source-frame prefix. Finalized shards remain immutable. A lock held by another live process is reported rather than forcibly broken.
 
 The detailed [usage guide](../docs/interchange-usage.md), [normative specification](../docs/interchange-specification.md), and [annotated metadata example](../docs/metadata.example.toml) are in the repository. Every generated dataset also includes a durable README and dependency-free scripts under `tools/`.

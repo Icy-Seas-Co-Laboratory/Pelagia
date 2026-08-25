@@ -24,6 +24,18 @@ class PreprocessQueueRequest:
     submitted_by_username: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessingSeriesRequest:
+    steps: tuple[dict[str, Any], ...]
+    selection: dict[str, Any] | None = None
+    preset_snapshot: dict[str, Any] | None = None
+    failure_policy: str = "fail_fast"
+    priority: int | None = None
+    dry_run: bool = False
+    submitted_by_user_id: str | None = None
+    submitted_by_username: str | None = None
+
+
 class ProcessingQueueService:
     """Resolve work units and create efficiently ordered processing jobs."""
 
@@ -90,6 +102,99 @@ class ProcessingQueueService:
             project_id=project_id,
             max_units=ROI_REFINEMENT_DETECTIONS_PER_JOB,
         )
+
+    def create_series(self, request: ProcessingSeriesRequest, *, project_id: str) -> dict[str, Any]:
+        """Persist a staged plan, then let the director materialize only its first step."""
+        self._validate_series_steps(request.steps)
+        if request.failure_policy not in {"fail_fast", "continue"}:
+            raise ValueError("failure_policy must be one of: fail_fast, continue.")
+        if request.dry_run:
+            planned_steps = [self._plan_step(step, project_id=project_id, dry_run=True) for step in request.steps]
+            return {
+                "dry_run": True,
+                "failure_policy": request.failure_policy,
+                "steps": planned_steps,
+                "eligibility": self._eligibility(planned_steps),
+            }
+        series = self.repository.create_processing_series(
+            project_id=project_id, steps=request.steps, selection=request.selection or {},
+            preset_snapshot=request.preset_snapshot or {}, failure_policy=request.failure_policy,
+            priority=request.priority, submitted_by_user_id=request.submitted_by_user_id,
+            submitted_by_username=request.submitted_by_username,
+        )
+        return self.advance_series(str(series["id"]), project_id=project_id) or series
+
+    @staticmethod
+    def _eligibility(planned_steps: list[dict[str, Any]]) -> dict[str, Any]:
+        rows = []
+        total = 0
+        for step in planned_steps:
+            matched = int(step.get("matched_count") or 0)
+            total += matched
+            rows.append({
+                "stage": step.get("stage"),
+                "eligible_count": matched,
+                "ineligible_count": 0,
+                "job_count": int(step.get("job_count") or 0),
+                "reasons": {},
+            })
+        return {"eligible_count": total, "ineligible_count": 0, "by_step": rows}
+
+    def advance_series_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Completion hook used by workers; it is safe to call more than once."""
+        advanced = self.repository.advance_processing_series_for_job(job_id)
+        if advanced is None or not advanced.get("ready"):
+            return advanced
+        series = self.repository.get_processing_series(str(advanced["series_id"]))
+        if series is None or series.get("status") in {"failed", "cancelled", "paused"}:
+            return advanced
+        self.advance_series(str(advanced["series_id"]), project_id=str(series["project_id"]))
+        return advanced
+
+    def advance_series(self, series_id: str, *, project_id: str) -> dict[str, Any] | None:
+        """Plan queued steps one at a time, recursively passing empty selections."""
+        while True:
+            step = self.repository.claim_processing_series_step(series_id, project_id=project_id)
+            if step is None:
+                return self.repository.get_processing_series(series_id, project_id=project_id)
+            result = self._plan_step(step, project_id=project_id, dry_run=False)
+            self.repository.attach_processing_work_units(
+                series_id=series_id, step_id=str(step["id"]), job_ids=result.get("job_ids", []),
+                matched_count=int(result["matched_count"]),
+            )
+            # An empty selection is explicitly recorded as skipped and the next
+            # stage can be evaluated immediately.  Nonempty work awaits workers.
+            if result.get("job_ids"):
+                return self.repository.get_processing_series(series_id, project_id=project_id)
+
+    def _plan_step(self, step: dict[str, Any], *, project_id: str, dry_run: bool) -> dict[str, Any]:
+        request = PreprocessQueueRequest(
+            filters=dict(step.get("filters") or {}), options=dict(step.get("options") or {}),
+            priority=step.get("priority", step.get("series_priority")), dry_run=dry_run,
+            submitted_by_user_id=step.get("submitted_by_user_id"),
+            submitted_by_username=step.get("submitted_by_username"),
+        )
+        stage = str(step["stage"])
+        if stage == "preprocess_frames":
+            return self.queue_preprocess(request, project_id=project_id)
+        if stage == "segment":
+            return self.queue_segment(request, project_id=project_id)
+        if stage == "roi_refinement":
+            return self.queue_roi_refinement(request, project_id=project_id)
+        raise ValueError(f"Unsupported processing series stage: {stage}.")
+
+    @staticmethod
+    def _validate_series_steps(steps: tuple[dict[str, Any], ...]) -> None:
+        if not steps:
+            raise ValueError("A processing series requires at least one step.")
+        canonical_order = ("preprocess_frames", "segment", "roi_refinement")
+        allowed = set(canonical_order)
+        invalid = [str(step.get("stage")) for step in steps if str(step.get("stage")) not in allowed]
+        if invalid:
+            raise ValueError(f"Unsupported processing series stage(s): {', '.join(invalid)}.")
+        stages = tuple(str(step["stage"]) for step in steps)
+        if len(set(stages)) != len(stages) or tuple(sorted(stages, key=canonical_order.index)) != stages:
+            raise ValueError("Processing series stages must use the canonical Pelagia order.")
 
     def _queue_frame_stage(
         self,

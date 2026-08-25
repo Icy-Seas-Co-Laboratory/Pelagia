@@ -787,6 +787,36 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_job_dependencies (
     PRIMARY KEY (job_id, depends_on_job_id)
 );
 
+CREATE TABLE IF NOT EXISTS {schema}.processing_series (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
+    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'active', 'paused', 'succeeded', 'failed', 'cancelled')),
+    failure_policy text NOT NULL DEFAULT 'fail_fast' CHECK (failure_policy IN ('fail_fast', 'continue')),
+    priority integer NOT NULL DEFAULT 100,
+    submitted_by_user_id text,
+    submitted_by_username text,
+    selection jsonb NOT NULL DEFAULT '{}'::jsonb,
+    preset_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+    control_reason text,
+    created_at timestamptz NOT NULL DEFAULT NOW(), updated_at timestamptz NOT NULL DEFAULT NOW(), finished_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS {schema}.processing_series_steps (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(), series_id uuid NOT NULL REFERENCES {schema}.processing_series(id) ON DELETE CASCADE,
+    step_index integer NOT NULL CHECK (step_index >= 0), stage {schema}.stage_name NOT NULL,
+    filters jsonb NOT NULL DEFAULT '{}'::jsonb, options jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'planning', 'active', 'skipped', 'succeeded', 'failed', 'cancelled')),
+    matched_count bigint NOT NULL DEFAULT 0, job_count bigint NOT NULL DEFAULT 0,
+    failure_policy text CHECK (failure_policy IN ('fail_fast', 'continue')),
+    skip_reason text,
+    started_at timestamptz, finished_at timestamptz, UNIQUE (series_id, step_index)
+);
+CREATE TABLE IF NOT EXISTS {schema}.processing_work_units (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(), series_id uuid NOT NULL REFERENCES {schema}.processing_series(id) ON DELETE CASCADE,
+    step_id uuid NOT NULL REFERENCES {schema}.processing_series_steps(id) ON DELETE CASCADE,
+    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE RESTRICT, created_at timestamptz NOT NULL DEFAULT NOW(),
+    UNIQUE (job_id), UNIQUE (step_id, job_id)
+);
+
 CREATE TABLE IF NOT EXISTS {schema}.project_processing_status_snapshots (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,

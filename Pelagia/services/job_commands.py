@@ -361,6 +361,7 @@ class ClassificationCommand(JobCommand):
 
     roi_ids: tuple[str, ...] = ()
     model_ref: str = ""
+    evidence_kind: str = "classification"
     selection: ClassificationTargetSelection = field(default_factory=ClassificationTargetSelection)
 
     @classmethod
@@ -369,6 +370,9 @@ class ClassificationCommand(JobCommand):
         model_ref = str(payload.get("model_ref") or "").strip()
         if not model_ref:
             raise ValueError("Classification jobs require model_ref.")
+        evidence_kind = str(payload.get("evidence_kind") or "classification").strip()
+        if evidence_kind not in {"classification", "clustering"}:
+            raise ValueError("Classification jobs require a supported evidence_kind.")
         roi_ids = tuple(str(value) for value in payload.get("roi_ids") or () if value)
         selection_payload = payload.get("selection")
         if selection_payload is None and roi_ids:
@@ -376,6 +380,7 @@ class ClassificationCommand(JobCommand):
         return cls(
             roi_ids=roi_ids,
             model_ref=model_ref,
+            evidence_kind=evidence_kind,
             selection=ClassificationTargetSelection.from_payload(selection_payload),
         )
 
@@ -384,6 +389,7 @@ class ClassificationCommand(JobCommand):
             **self._payload_header(),
             "roi_ids": list(self.roi_ids),
             "model_ref": self.model_ref,
+            "evidence_kind": self.evidence_kind,
             "selection": self.selection.to_payload(),
         }
 

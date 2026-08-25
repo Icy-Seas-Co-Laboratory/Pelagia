@@ -255,8 +255,10 @@ Validate the resolved worker profiles before starting services:
 See [Oracle Builder inference](docs/oracle-builder.md) for service setup and
 failure behavior.
 
-See [ROI curation and classification evidence](docs/curation.md) for the
+See [ROI curation and ML evidence](docs/curation.md) for the
 human-review workflow, storage boundaries, and classification worker setup.
+That workflow also accepts Oracle Builder self-supervised clustering models and
+retains their run-local feature-space evidence separately from project labels.
 
 ### Verify The API
 
@@ -491,6 +493,11 @@ Useful endpoint groups:
 - `GET /io/export/table/{table_name}`, `GET /io/export/tables`
 - `GET /io/export/datasets/frame-metadata`, `/roi-metadata`
 
+Detection list and detail responses expose the parent frame's nullable
+`captured_at` timestamp. ROI metadata exports and curation ROI responses expose
+the same value; ROI processing and classification timestamps remain separate
+operational `created_at` fields.
+
 Ingestion requests can generate aligned fields while decoded frames are already
 in memory. Area-scan ingestion normally uses `generate_backgrounds=true`, while
 line-scan ingestion normally uses `generate_flatfield_profiles=true`; callers
@@ -591,7 +598,7 @@ For storage maintenance, migration, and recovery procedures, use:
 - [Resetting Pelagia](docs/reset-system.md)
 - [Migrating Pelagia](docs/migration.md)
 - [Backup And Restore](docs/backup.md)
-- [ROI Curation And Classification Evidence](docs/curation.md)
+- [ROI Curation And ML Evidence](docs/curation.md)
 - [Telemetry Ingestion And Lookup](docs/telemetry.md)
 
 ## Python Environment

@@ -19,6 +19,7 @@ from pelagia_interchange.extraction import extract_frames
 from pelagia_interchange.ingestion import (
     VideoIngestionError,
     VideoProbe,
+    _iter_raw_frames,
     _passthrough_timing_arguments,
     discover_videos,
     ingest_video_directory,
@@ -95,6 +96,19 @@ def test_ffmpeg_frame_passthrough_uses_supported_syntax(
 
     assert arguments == expected_arguments
     assert mode == expected_mode
+
+
+def test_raw_frame_reader_handles_short_reads_and_rejects_truncation() -> None:
+    class Stream:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = chunks
+
+        def read(self, size: int) -> bytes:
+            return self.chunks.pop(0) if self.chunks else b""
+
+    assert list(_iter_raw_frames(Stream([b"ab", b"cd", b"ef", b"gh"]), 4)) == [b"abcd", b"efgh"]
+    with pytest.raises(VideoIngestionError, match="truncated raw frame"):
+        list(_iter_raw_frames(Stream([b"abc"]), 4))
 
 
 def test_interactive_video_create_collects_and_confirms_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -336,6 +350,19 @@ def test_video_ingestion_resume_skips_durable_prefix(tmp_path: Path, monkeypatch
 
     class FakeProcess:
         stdout = object()
+        args: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def communicate(self, *args, **kwargs):
+            return (b"", b"")
+
+        def poll(self) -> int:
+            return 0
 
         def wait(self) -> int:
             return 0
@@ -348,7 +375,11 @@ def test_video_ingestion_resume_skips_durable_prefix(tmp_path: Path, monkeypatch
     monkeypatch.setattr("pelagia_interchange.ingestion._passthrough_timing_arguments", lambda executable: ([], "test"))
     monkeypatch.setattr("pelagia_interchange.ingestion.probe_video",
                         lambda path, ffprobe: VideoProbe(Path(path), "mp4", "test", "yuv420p", 2, 2, (1, 1), 3, None))
-    monkeypatch.setattr("pelagia_interchange.ingestion.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    original_popen = subprocess.Popen
+    monkeypatch.setattr(
+        "pelagia_interchange.ingestion.subprocess.Popen",
+        lambda command, *args, **kwargs: FakeProcess() if command[0] == "ffmpeg" else original_popen(command, *args, **kwargs),
+    )
     monkeypatch.setattr("pelagia_interchange.ingestion._thumbnail", lambda payload, ffmpeg, width: JPEG)
     original_writer_init = ShardWriter.__init__
 
@@ -361,11 +392,13 @@ def test_video_ingestion_resume_skips_durable_prefix(tmp_path: Path, monkeypatch
     def frames(stream: object):
         nonlocal failing
         for number, payload in enumerate(payloads):
-            if failing and number == 2:
+            # Interrupt after the sole durable frame.  This guards the
+            # frame-zero resume frontier: 0 is a valid last frame, not false.
+            if failing and number == 1:
                 raise VideoIngestionError("simulated interruption")
             yield payload
 
-    monkeypatch.setattr("pelagia_interchange.ingestion._iter_mjpeg", frames)
+    monkeypatch.setattr("pelagia_interchange.ingestion._iter_raw_frames", lambda stream, frame_bytes: frames(stream))
     with pytest.raises(VideoIngestionError):
         ingest_video_directory(videos, output, generate_previews=False)
     assert DatasetBuilder.partials(output)

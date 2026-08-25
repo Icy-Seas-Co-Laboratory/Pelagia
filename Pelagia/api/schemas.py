@@ -52,6 +52,7 @@ class DetectionSummary(FlexibleModel):
     asset_id: str | None = None
     frame_id: str | None = None
     frame_index: int | None = None
+    captured_at: datetime | None = None
     roi_index: int | None = None
     bbox_x: int | None = None
     bbox_y: int | None = None

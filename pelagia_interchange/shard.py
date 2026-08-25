@@ -14,13 +14,18 @@ from .schema import REQUIRED_TABLES, initialize
 from .util import canonical_json, hash_bytes, utc_now
 
 
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
 def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     try:
         if read_only:
-            connection = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+            connection = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True,
+                                         timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
             connection.execute("PRAGMA query_only=ON")
         else:
-            connection = sqlite3.connect(path)
+            connection = sqlite3.connect(path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
+        connection.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         connection.row_factory = sqlite3.Row
         return connection
     except sqlite3.Error as exc:
@@ -124,6 +129,13 @@ class ShardWriter:
         self.final_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = _connect(partial_path)
         try:
+            # Opening a rollback-journal database lets SQLite recover a prior
+            # interrupted transaction.  Explicitly close any transaction this
+            # connection could have inherited before validating and acquiring
+            # the sole writer lock below.  A live external writer is allowed to
+            # finish for ``busy_timeout``; it is never forcibly broken.
+            self.connection.rollback()
+            self.connection.execute("PRAGMA journal_mode=DELETE")
             tables = {str(row[0]) for row in self.connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}

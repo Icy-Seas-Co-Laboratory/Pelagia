@@ -71,15 +71,15 @@ This workflow automatically:
 - probes the first video stream in each file with FFprobe;
 - records container, codec, pixel format, dimensions, rational frame rate, frame count, creation time when available, file size, relative source path, and source UUID;
 - calculates a streaming SHA-256 hash of every source video;
-- transcodes frames to standalone JPEG payloads with FFmpeg;
+- streams raw decoded frames from FFmpeg and transcodes them to standalone JPEG payloads with libjpeg-turbo worker threads;
 - numbers source frames from zero within each acquisition file and assigns continuous retained frame IDs across the stream;
 - fills each SQLite shard across consecutive source videos until the configured target size is reached, then rolls over deterministically;
 - creates persistent shard and stream UUIDs;
-- records the FFmpeg operation and parameters in `history.jsonl`;
+- records the FFmpeg decoder and libjpeg-turbo encoder parameters in `history.jsonl`;
 - generates a bounded representative preview set, contact sheet, and provenance index;
 - finalizes the manifest, generated README, standalone tools, and package checksums.
 
-FFmpeg and FFprobe must be installed and available on `PATH` for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset. The importer probes FFmpeg's supported options and uses either modern `-fps_mode passthrough` or the equivalent legacy `-vsync 0`; the selected frame-synchronization mode is recorded in dataset provenance.
+FFmpeg, FFprobe, and libjpeg-turbo must be installed for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset. The importer probes FFmpeg's supported options and uses either modern `-fps_mode passthrough` or the equivalent legacy `-vsync 0`; the selected frame-synchronization mode is recorded in dataset provenance. Use `--jpeg-quality`, `--jpeg-subsampling`, `--jpeg-workers`, and `--queue-depth` to control JPEG encoding and bounded in-flight work.
 
 Supported discovery extensions are `.avi`, `.mov`, `.mp4`, `.m4v`, `.mkv`, `.mpg`, `.mpeg`, `.mts`, and `.m2ts`. Add `--recursive` to search subdirectories:
 
@@ -112,14 +112,16 @@ pii create deployment_042 \
 
 The importer preserves the supplied metadata and uses a matching stream UUID when the TOML already contains a stream with the selected name. Command-line `--title` and `--description` values override those two fields when explicitly supplied. Without `--metadata`, creation writes a valid minimal document that can be reviewed later.
 
-The default output is color JPEG encoded by FFmpeg's MJPEG encoder at qscale 2. Use `--grayscale` for a documented grayscale transform or choose another FFmpeg qscale from 2 (highest quality/largest) through 31:
+The default output is color JPEG encoded by libjpeg-turbo at quality 90 with 4:4:4 subsampling. Use `--grayscale` for a documented grayscale transform or choose a JPEG quality from 1 through 100:
 
 ```bash
 pii create deployment_042 \
   --from-videos /acquisition/deployment_042 \
   --stream port \
   --grayscale \
-  --ffmpeg-qscale 2
+  --jpeg-quality 90 \
+  --jpeg-subsampling 444 \
+  --jpeg-workers 4
 ```
 
 The importer uses FFmpeg's error-exit behavior and reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap. Retry with `--resume` to reopen that package. The retry verifies source identity, re-decodes the input to the last durable source-frame prefix, and appends the remaining frames without changing finalized shards.

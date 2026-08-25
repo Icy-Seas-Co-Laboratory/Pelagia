@@ -89,6 +89,11 @@ class JobRepository(RepositoryScope):
             "request_worker_shutdown", "heartbeat", "requeue_expired_jobs",
             "claim_jobs", "complete_job", "record_failure", "fail_job", "retry_job",
             "cancel_jobs", "delete_jobs",
+            "create_processing_series", "get_processing_series", "list_processing_series_steps",
+            "list_processing_work_units", "claim_processing_series_step", "finish_processing_series_step",
+            "attach_processing_work_units", "advance_processing_series_for_job",
+            "pause_processing_series", "resume_processing_series", "cancel_processing_series",
+            "retry_processing_series",
         }
     )
 

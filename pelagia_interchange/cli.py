@@ -31,7 +31,15 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--recursive", action="store_true"); create.add_argument("--stream", default="camera")
     create.add_argument("--metadata", type=Path, metavar="TOML"); create.add_argument("--interactive", action="store_true")
     create.add_argument("--ffmpeg", default="ffmpeg"); create.add_argument("--ffprobe", default="ffprobe")
-    create.add_argument("--ffmpeg-qscale", type=int, default=DEFAULT_FFMPEG_QSCALE); create.add_argument("--grayscale", action="store_true")
+    create.add_argument("--ffmpeg-qscale", type=int, default=DEFAULT_FFMPEG_QSCALE,
+                        help="deprecated compatibility option; use --jpeg-quality")
+    create.add_argument("--jpeg-quality", type=int, default=90)
+    create.add_argument("--jpeg-subsampling", choices=("444", "422", "420"), default="444")
+    create.add_argument("--jpeg-workers", type=int, default=None)
+    create.add_argument("--preflight-workers", type=int, default=None)
+    create.add_argument("--queue-depth", type=int, default=None)
+    create.add_argument("--turbojpeg-library", type=Path, metavar="PATH")
+    create.add_argument("--grayscale", action="store_true")
     create.add_argument("--no-source-hash", action="store_true"); create.add_argument("--source-file-boundary", action="store_true")
     create.add_argument("--no-previews", action="store_true"); create.add_argument("--preview-count", type=int, default=12)
     create.add_argument("--preview-width", type=int, default=512); create.add_argument("--require-previews", action="store_true")
@@ -116,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
                                                 recursive=args.recursive, shard_target_size=args.shard_target_size,
                                                 metadata=metadata, ffmpeg=args.ffmpeg, ffprobe=args.ffprobe,
                                                 ffmpeg_qscale=args.ffmpeg_qscale, grayscale=args.grayscale,
+                                                jpeg_quality=args.jpeg_quality, jpeg_subsampling=args.jpeg_subsampling,
+                                                jpeg_workers=args.jpeg_workers,
+                                                preflight_workers=args.preflight_workers,
+                                                queue_depth=args.queue_depth,
+                                                turbojpeg_library=args.turbojpeg_library,
                                                 hash_sources=not args.no_source_hash,
                                                 source_file_boundary=args.source_file_boundary,
                                                 generate_previews=not args.no_previews,

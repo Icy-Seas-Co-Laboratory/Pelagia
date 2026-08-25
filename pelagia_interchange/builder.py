@@ -465,16 +465,27 @@ The normative reference is **Scientific Image Interchange Format 1.0**, maintain
         paths: list[Path] = [self.output / record["relative_path"] for record in self.manifest.shards
                              if record.get("stream_name") == stream]
         paths.extend(path for path in self.partials(self.output) if self._partial_matches_stream(path, stream))
+        ranges: list[tuple[int, int, int, int | None]] = []
         for path in paths:
             progress = ShardReader(path).source_progress(source_file_id)
-            total += int(progress["frame_count"] or 0)
-            if progress["first_source_frame"] is not None:
-                first = progress["first_source_frame"] if first is None else min(first, progress["first_source_frame"])
-            if progress["last_source_frame"] is not None:
-                last = progress["last_source_frame"] if last is None else max(last, progress["last_source_frame"])
+            count = int(progress["frame_count"] or 0)
+            if count:
+                start = int(progress["first_source_frame"])
+                end = int(progress["last_source_frame"])
+                if count != end - start + 1:
+                    raise FormatError(f"source {source_file_id} has a gap inside {path.name}")
+                ranges.append((start, end, count, progress["last_frame"]))
             if progress["last_frame"] is not None:
                 last_frame = progress["last_frame"] if last_frame is None else max(last_frame, progress["last_frame"])
-        if first not in {None, 0} or (last is not None and total != int(last) - int(first or 0) + 1):
+        expected = 0
+        for start, end, count, _ in sorted(ranges):
+            if start != expected:
+                raise FormatError(f"source {source_file_id} does not have a durable contiguous prefix")
+            total += count
+            first = 0 if first is None else first
+            last = end
+            expected = end + 1
+        if first not in {None, 0}:
             raise FormatError(f"source {source_file_id} does not have a durable contiguous prefix")
         return {"frame_count": total, "first_source_frame": first, "last_source_frame": last, "last_frame": last_frame}
 

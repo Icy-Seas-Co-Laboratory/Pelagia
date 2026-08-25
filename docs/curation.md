@@ -1,8 +1,8 @@
-# ROI curation and classification evidence
+# ROI curation and ML evidence
 
 Pelagia's curation workflow keeps three responsibilities explicit:
 
-- **Oracle Builder** executes classification models and owns model artifacts, embeddings, prototype calculations, and K-nearest-neighbor calculations.
+- **Oracle Builder** executes classification and self-supervised clustering models and owns model artifacts, embeddings, prototype calculations, K-nearest-neighbor calculations, and cluster fitting.
 - **Pelagia** owns the project label vocabulary, human annotations and reviews, immutable model provenance, evidence records, and classification jobs.
 - **PelagiaView** presents the review queue and turns an explicit reviewer action into a human assertion.
 
@@ -12,8 +12,9 @@ A model prediction is never written as human ground truth. Selecting **Accept pr
 
 1. Start Oracle Builder with a classification bundle registered under the selector configured by `oracle.default_classification_model`.
 2. Run at least one Pelagia worker with the `classify` capability. The standard worker TOML assigns this capability to the existing refinement workers, so a separate process is optional.
-3. Open **Curation** in PelagiaView. Choose **Run selected** or **Run all** to enqueue inference.
-4. Filter and sort the queue by human state, review state, evidence availability, confidence, disagreement, or telemetry ranges. Assign a project label, then verify, reject, or flag the assertion.
+3. Open **ML Evidence** in PelagiaView. Select one or more ready classification and/or self-supervised clustering models, constrain the refined ROI target query, review the per-model workload, and queue the resulting evidence jobs.
+4. Open **Curation** to inspect the resulting evidence in context, explore feature-space outputs, and make explicit human annotation or review decisions. Curation does not enqueue ML inference.
+5. Filter and sort the queue by human state, review state, evidence availability, confidence, disagreement, or telemetry ranges. Assign a project label, then verify, reject, or flag the assertion.
 
 When a refined ROI is focused, the inspector shows telemetry resolved at its
 frame timestamp when the project has an applicable stream. Use the `+` button
@@ -41,7 +42,15 @@ Useful keyboard actions in the gallery are `1`–`0` for the first ten labels, a
 
 ## Evidence storage
 
-`detections_refined` is the canonical curatable ROI. Each classification job creates one `classification_inference_runs` row and one `classification_evidence` row per successfully evaluated ROI. Probability, prototype, and KNN summary values are indexed in Postgres for review queues. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
+`detections_refined` is the canonical curatable ROI. Each evidence job creates one `classification_inference_runs` row (the legacy table name is retained for compatibility) and one per-ROI evidence row. Classification jobs write `classification_evidence`; clustering jobs write `clustering_evidence`. Probability, prototype, KNN, cluster assignment, similarity, and novelty/abstention summaries are indexed or retained in Postgres. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
+
+The clustering packet is evidence about location in a model-defined feature space, not a Pelagia label or biological taxonomy. Cluster IDs are run-local and must be interpreted together with the Oracle artifact, embedding contract, clustering method, and run provenance. A classification artifact may also return a secondary clustering packet; Pelagia stores that packet alongside the classification evidence without converting it into a human assertion.
+
+## Feature-space exploration
+
+PelagiaView's **Clusters** analysis page is a project-scoped ROI browser for feature-space evidence. A reviewer first selects one persisted evidence source, which is always one inference run and its recorded model artifact. Its **Similar ROIs** view performs exact cosine comparison against that source's NPY ROI vectors; it never compares vectors from different runs or artifacts. For runs above 100,000 vectors, the API returns a deterministic exact ranking of the first 100,000 vectors in stable ROI-ID order and reports that coverage to the UI rather than failing. A provenance-compatible, materialized per-run vector index remains the required path for full-source search at larger scale.
+
+The **Clusters** view organizes both supported evidence types without conflating them. Self-supervised clustering evidence presents run-local cluster size, centroid similarity, novelty/abstention count, and members. Classification evidence presents the model's recorded **label prototypes**, grouped by `prototype_class_index` and ranked by `prototype_similarity`; these are model-defined prototype assignments, not self-supervised clusters or human taxonomy assertions. Both group types remain scoped to the model artifact and inference run that created them. A group identifier is not a reusable biological category.
 
 The label mapping from an immutable Oracle artifact and class index to a Pelagia project label is stored in `model_class_mappings`. Labels first encountered from an Oracle result are imported into the project vocabulary and remain owned by Pelagia thereafter.
 
@@ -52,7 +61,12 @@ KNN neighbor identity, class, rank, and similarity are retained. The current Ora
 - `GET /curation/options` — ownership, labels, and classification model catalog
 - `GET|POST /curation/labels` — project label vocabulary
 - `GET /curation/rois` and `GET /curation/rois/{id}` — queue and detailed evidence
+- `GET /curation/feature-space/sources` — project embedding spaces, scoped to inference runs
+- `GET /curation/feature-space/similar/{roi_id}` — exact bounded cosine neighbors in one source
+- `GET /curation/feature-space/clusters` and `GET /curation/feature-space/clusters/{cluster_id}/rois` — run-local clustering browser
 - `POST /curation/classification-jobs` — asynchronous Oracle classification
+- `POST /curation/clustering-jobs` — asynchronous Oracle self-supervised clustering evidence
+- `POST /curation/clustering-targets/preview` — preview clustering targets
 - `POST /curation/annotations` — explicit human assertion
 - `POST /curation/annotations/remove` — retire the current assertion while retaining history
 - `POST /curation/reviews` — human verification state
