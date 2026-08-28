@@ -137,6 +137,8 @@ stage_aliases = {
     "roi_refinement": "roi_refinement",
     "classify": "classify",
     "classification": "classify",
+    "analysis": "feature_space_analysis",
+    "feature_space_analysis": "feature_space_analysis",
     "registry": "registry_load",
     "registry_load": "registry_load",
     "registry_export": "registry_export",
@@ -227,6 +229,10 @@ else:
 capability_venvs.setdefault(
     "roi_refinement",
     managed_venv("cpu", label="ROI refinement environment"),
+)
+capability_venvs.setdefault(
+    "feature_space_analysis",
+    managed_venv("cpu", label="Feature-space analysis environment"),
 )
 
 control_python, _ = venv_path(control_venv, label="worker control environment")

@@ -50,15 +50,16 @@ class Dataset:
 
     def iter_frames(
         self, *, camera: str | None = None, frame_start: int | None = None,
-        frame_end: int | None = None, source_file_id: int | None = None,
-        source_uuid: str | None = None, shard: str | None = None,
+        frame_end: int | None = None, acquisition_segment_id: int | None = None,
+        acquisition_segment_uuid: str | None = None, shard: str | None = None,
         timestamp_start: int | None = None, timestamp_end: int | None = None,
     ) -> Iterator[Frame]:
-        if source_uuid is not None:
-            source = next((item for item in self.manifest.source_files if item.get("source_uuid") == source_uuid), None)
-            if source is None:
+        if acquisition_segment_uuid is not None:
+            segment = next((item for item in self.manifest.acquisition_segments
+                            if item.get("acquisition_segment_uuid") == acquisition_segment_uuid), None)
+            if segment is None:
                 return
-            source_file_id = int(source["source_file_id"])
+            acquisition_segment_id = int(segment["acquisition_segment_id"])
         for record, reader in self.iter_shards(camera=camera, shard=shard):
             first, last = record.get("first_frame"), record.get("last_frame")
             if frame_start is not None and last is not None and int(last) < frame_start:
@@ -66,7 +67,7 @@ class Dataset:
             if frame_end is not None and first is not None and int(first) > frame_end:
                 continue
             yield from reader.iter_frames(frame_start=frame_start, frame_end=frame_end,
-                                          source_file_id=source_file_id, timestamp_start=timestamp_start,
+                                          acquisition_segment_id=acquisition_segment_id, timestamp_start=timestamp_start,
                                           timestamp_end=timestamp_end)
 
     def get_frame(self, *, camera: str, frame_number: int) -> Frame:
@@ -96,7 +97,7 @@ class Dataset:
             "collection": self.metadata.data.get("collection", {}),
             "instruments": self.metadata.data.get("instruments", []),
             "streams": self.metadata.data.get("streams", []),
-            "source_files": len(self.manifest.source_files),
+            "acquisition_segments": len(self.manifest.acquisition_segments),
             "shards": len(self.manifest.shards),
             "total_frames": self.frame_count,
             "encoded_image_bytes": self.encoded_bytes,

@@ -3,7 +3,7 @@
 import argparse, hashlib, json, sqlite3, sys
 from pathlib import Path
 REQUIRED=("manifest.json","metadata.toml","history.jsonl","README.md","checksums.sha256")
-TABLES={"frames","source_files","storage_formats","shard_metadata"}
+TABLES={"frames","acquisition_segments","storage_formats","shard_metadata"}
 def digest(path):
     h=hashlib.sha256()
     with path.open("rb") as f:
@@ -21,7 +21,7 @@ def main():
         if not (root/name).is_file(): errors.append(f"missing required file: {name}")
     try: manifest=json.loads((root/"manifest.json").read_text(encoding="utf-8"))
     except Exception as exc: manifest={}; errors.append(f"manifest: {exc}")
-    source_expected={x.get("source_file_id"):x.get("frame_count") for x in manifest.get("source_files",[])}; source_observed={x:0 for x in source_expected}; previous={}; previous_source={}
+    source_expected={x.get("acquisition_segment_id"):x.get("expected_frame_count") for x in manifest.get("acquisition_segments",[])}; source_observed={x:0 for x in source_expected}; previous={}; previous_source={}
     for item in sorted(manifest.get("shards",[]),key=lambda x:(str(x.get("stream_uuid")),x.get("first_frame") if x.get("first_frame") is not None else -1)):
         try:
             path=safe(root,item["relative_path"])
@@ -40,11 +40,11 @@ def main():
                     aggregates=db.execute("SELECT count(*),min(frame_id),max(frame_id),min(timestamp_ns),max(timestamp_ns),coalesce(sum(byte_size),0) FROM frames").fetchone()
                     for key,value in zip(("frame_count","first_frame","last_frame","first_timestamp","last_timestamp","encoded_bytes"),aggregates):
                         if local.get(key)!=value or item.get(key)!=value: errors.append(f"shard metadata mismatch for {key}: {path}")
-                    for source_id,count in db.execute("SELECT source_file_id,count(*) FROM frames GROUP BY source_file_id"):
+                    for source_id,count in db.execute("SELECT acquisition_segment_id,count(*) FROM frames GROUP BY acquisition_segment_id"):
                         source_observed[source_id]=source_observed.get(source_id,0)+count
                     if a.level in ("full","archival"):
                         stream=str(item.get("stream_uuid"))
-                        for fid,source_id,source_number,blob,size,algorithm,expected,status in db.execute("SELECT frame_id,source_file_id,source_frame_number,blob,byte_size,hash_algorithm,hash,status FROM frames ORDER BY frame_id"):
+                        for fid,source_id,source_number,blob,size,algorithm,expected,status in db.execute("SELECT frame_id,acquisition_segment_id,acquisition_frame_number,blob,byte_size,hash_algorithm,hash,status FROM frames ORDER BY frame_id"):
                             frames+=1
                             if stream in previous and fid!=previous[stream]+1: errors.append(f"duplicate or unrepresented frame ID near {stream}:{fid}")
                             previous[stream]=fid; source_key=(stream,source_id)

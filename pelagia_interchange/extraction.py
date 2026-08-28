@@ -21,7 +21,7 @@ class ExtractionResult:
 def extract_frames(
     dataset: Dataset, output: str | Path, *, camera: str | None = None,
     frame_start: int | None = None, frame_end: int | None = None,
-    source_file_id: int | None = None, source_uuid: str | None = None,
+    acquisition_segment_id: int | None = None, acquisition_segment_uuid: str | None = None,
     shard: str | None = None, timestamp_start: int | None = None,
     timestamp_end: int | None = None, overwrite: str = "error",
     source_frame_names: bool = False, dry_run: bool = False,
@@ -34,7 +34,8 @@ def extract_frames(
         root.mkdir(parents=True, exist_ok=True)
     result = ExtractionResult()
     for frame in dataset.iter_frames(camera=camera, frame_start=frame_start, frame_end=frame_end,
-                                     source_file_id=source_file_id, source_uuid=source_uuid, shard=shard,
+                                     acquisition_segment_id=acquisition_segment_id,
+                                     acquisition_segment_uuid=acquisition_segment_uuid, shard=shard,
                                      timestamp_start=timestamp_start, timestamp_end=timestamp_end):
         payload = frame.encoded_bytes
         if payload is None:
@@ -42,7 +43,8 @@ def extract_frames(
             continue
         result.selected += 1
         record = frame.record
-        stem = f"source_{record.source_file_id:06d}_{record.source_frame_number:012d}" if source_frame_names else f"{record.frame_id:012d}"
+        stem = (f"acquisition_{record.source_file_id:06d}_{record.source_frame_number:012d}"
+                if source_frame_names else f"{record.frame_id:012d}")
         extension = record.storage_format.extension if record.storage_format else custom_extension
         if extension == ".bin" and custom_extension:
             extension = custom_extension if custom_extension.startswith(".") else "." + custom_extension
@@ -61,4 +63,3 @@ def extract_frames(
         if progress and result.written % 1000 == 0:
             progress(result.written)
     return result
-

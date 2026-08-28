@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,51 @@ from .job_commands import PreprocessFramesCommand, RoiRefinementCommand, Segment
 PREPROCESS_FRAMES_PER_JOB = 1_000
 SEGMENT_FRAMES_PER_JOB = 1_000
 ROI_REFINEMENT_DETECTIONS_PER_JOB = 10_000
+
+
+# Processing presets are a UI-facing flat document. Queue payloads are also
+# flat but stage-specific, so resolve only the documented preset fields here
+# rather than forwarding an opaque settings blob to workers.
+_PRESET_OPTION_KEYS = {
+    "preprocess_frames": {
+        "min_field_value", "max_field_value", "apply_mask", "crop_enabled", "crop_x", "crop_y", "crop_w", "crop_h",
+    },
+    "segment": {
+        "min_field_value", "max_field_value", "apply_mask", "crop_enabled", "crop_x", "crop_y", "crop_w", "crop_h",
+        "frame_payload_kind", "apply_preprocessing",
+        "threshold_method", "manual_threshold", "thresholding_maximum_value", "bounded_otsu_min_contrast",
+        "bounded_otsu_max_foreground_fraction", "canny_enabled", "canny_low_threshold", "canny_high_threshold",
+        "canny_blur_kernel", "adaptive_block_size", "adaptive_c", "percentile_background_percentile",
+        "percentile_min_contrast", "hysteresis_low_threshold", "hysteresis_high_threshold", "hysteresis_connectivity",
+        "sobel_percentile", "sobel_threshold", "sobel_kernel_size", "mask_augmentation_enabled",
+        "mask_augmentation_steps", "dilate_kernel_w", "dilate_kernel_h", "dilate_iterations", "erode_kernel_w",
+        "erode_kernel_h", "erode_iterations", "open_kernel_w", "open_kernel_h", "open_iterations", "close_kernel_w",
+        "close_kernel_h", "close_iterations", "fill_holes", "remove_small_components", "min_component_area",
+        "clear_border", "roi_assembly_method", "roi_assembly_connectivity", "min_area", "max_area", "min_perimeter",
+        "max_perimeter", "min_width", "max_width", "min_height", "max_height", "min_width_plus_height",
+        "max_width_plus_height", "padding", "store_roi_payload_min_area", "store_roi_payload_min_width",
+        "store_roi_payload_min_height", "store_roi_payload_min_width_plus_height",
+    },
+    "roi_refinement": {
+        "method", "model_ref", "max_iterations", "expansion_pixels", "edge_touch_margin", "encoding",
+        "allow_frame_expansion", "store",
+    },
+}
+_PRESET_KEY_ALIASES = {
+    "refinement_model_kind": "method",
+    "refinement_model_ref": "model_ref",
+    "refinement_max_iterations": "max_iterations",
+    "refinement_expansion_pixels": "expansion_pixels",
+    "refinement_edge_touch_margin": "edge_touch_margin",
+    "refinement_encoding": "encoding",
+    "refinement_allow_frame_expansion": "allow_frame_expansion",
+    "refinement_store": "store",
+}
+
+
+def _snake_case(value: str) -> str:
+    """Normalize the camelCase keys used by PelagiaView preset TOML files."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,10 +152,12 @@ class ProcessingQueueService:
     def create_series(self, request: ProcessingSeriesRequest, *, project_id: str) -> dict[str, Any]:
         """Persist a staged plan, then let the director materialize only its first step."""
         self._validate_series_steps(request.steps)
+        self._validate_series_selection(request.selection)
         if request.failure_policy not in {"fail_fast", "continue"}:
             raise ValueError("failure_policy must be one of: fail_fast, continue.")
+        steps = tuple(self._resolve_series_step_options(step, request.preset_snapshot) for step in request.steps)
         if request.dry_run:
-            planned_steps = [self._plan_step(step, project_id=project_id, dry_run=True) for step in request.steps]
+            planned_steps = [self._plan_step(step, project_id=project_id, dry_run=True) for step in steps]
             return {
                 "dry_run": True,
                 "failure_policy": request.failure_policy,
@@ -117,7 +165,7 @@ class ProcessingQueueService:
                 "eligibility": self._eligibility(planned_steps),
             }
         series = self.repository.create_processing_series(
-            project_id=project_id, steps=request.steps, selection=request.selection or {},
+            project_id=project_id, steps=steps, selection=request.selection or {},
             preset_snapshot=request.preset_snapshot or {}, failure_policy=request.failure_policy,
             priority=request.priority, submitted_by_user_id=request.submitted_by_user_id,
             submitted_by_username=request.submitted_by_username,
@@ -195,6 +243,38 @@ class ProcessingQueueService:
         stages = tuple(str(step["stage"]) for step in steps)
         if len(set(stages)) != len(stages) or tuple(sorted(stages, key=canonical_order.index)) != stages:
             raise ValueError("Processing series stages must use the canonical Pelagia order.")
+
+    @staticmethod
+    def _validate_series_selection(selection: dict[str, Any] | None) -> None:
+        """Series runs must name a bounded source scope; an empty filter is project-wide."""
+        selection = selection or {}
+        target_keys = ("asset_ids", "frame_ids", "collections", "collection")
+        if not any(selection.get(key) for key in target_keys):
+            raise ValueError("A processing series requires at least one asset, frame, or collection target.")
+
+    @classmethod
+    def _resolve_series_step_options(
+        cls, step: dict[str, Any], preset_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Merge recognized preset settings into a stage payload without losing explicit overrides."""
+        resolved = dict(step)
+        stage = str(step["stage"])
+        preset_options = cls._preset_options_for_stage(stage, preset_snapshot)
+        # Explicit step options are an intentional API override of the selected preset.
+        resolved["options"] = {**preset_options, **dict(step.get("options") or {})}
+        return resolved
+
+    @classmethod
+    def _preset_options_for_stage(cls, stage: str, preset_snapshot: dict[str, Any] | None) -> dict[str, Any]:
+        settings = (preset_snapshot or {}).get("settings") or {}
+        if not isinstance(settings, dict):
+            return {}
+        options: dict[str, Any] = {}
+        for key, value in settings.items():
+            normalized = _PRESET_KEY_ALIASES.get(_snake_case(str(key)), _snake_case(str(key)))
+            if normalized in _PRESET_OPTION_KEYS[stage] and value is not None:
+                options[normalized] = value
+        return options
 
     def _queue_frame_stage(
         self,

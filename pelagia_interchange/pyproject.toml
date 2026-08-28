@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pelagia-interchange"
-version = "0.1.0"
+version = "0.2.0"
 description = "Portable archival interchange for scientific image datasets"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,4 +32,3 @@ package-dir = {pelagia_interchange = ".", "pelagia_interchange.bundled_tools" = 
 
 [tool.setuptools.package-data]
 "pelagia_interchange.bundled_tools" = ["README.md"]
-

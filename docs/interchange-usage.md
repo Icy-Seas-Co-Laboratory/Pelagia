@@ -2,7 +2,7 @@
 
 This guide shows how to create, inspect, extract, and verify Scientific Image Interchange datasets. The format is generic: Pelagia can produce or consume it, but a dataset does not depend on Pelagia and remains readable with Python and SQLite.
 
-For normative requirements, see the [Scientific Image Interchange Format 1.0 specification](interchange-specification.md). For a complete scientific metadata template, see [metadata.example.toml](metadata.example.toml).
+For normative requirements, see the [Scientific Image Interchange Format 0.2 specification](interchange-specification.md). For a complete scientific metadata template, see [metadata.example.toml](metadata.example.toml).
 
 ## Install
 
@@ -38,7 +38,26 @@ SHA-256 requires no optional package and is the archival default.
 
 ## Create your first dataset
 
-The package does not decode video. The caller supplies already encoded image bytes and the provenance that connects each retained frame to its acquisition source. This keeps FFmpeg, PyAV, camera SDKs, and project-specific decoding outside the preservation format.
+The canonical profile accepts the exact encoded image bytes emitted by acquisition and groups them in contiguous acquisition segments. It does not model measurements, annotations, or analysis products. Video import is a separate legacy profile, not the definition of a raw frame.
+
+### Direct acquisition (canonical profile)
+
+```python
+from pelagia_interchange import DatasetBuilder, StorageFormat
+
+with DatasetBuilder("deployment_042", title="Deployment 042") as builder:
+    segment = builder.register_acquisition_segment(
+        segment_name="port-2026-08-25T120000Z",
+        capture_configuration={"camera": "port", "trigger": "free_run"},
+    )
+    jpeg = StorageFormat("jpeg", quality=90, encoder="camera firmware")
+    for frame_number, payload in camera_frames():
+        builder.add_frame(stream="port", acquisition_segment=segment,
+                          acquisition_frame_number=frame_number, frame_id=frame_number,
+                          encoded_bytes=payload, storage_format=jpeg)
+```
+
+The BLOB is canonical raw image data for the package. Add an explicit status row for every known missing/error position; do not renumber later frames.
 
 ### Create automatically from a directory of videos
 
@@ -189,7 +208,7 @@ result = ingest_video_directory(
     progress=print,
 )
 
-print(result.source_files, result.frames, result.dataset.frame_count)
+print(result.acquisition_segments, result.frames, result.dataset.frame_count)
 ```
 
 ### Use the interactive creator

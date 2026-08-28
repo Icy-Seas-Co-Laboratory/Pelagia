@@ -1,10 +1,12 @@
 """Version and format constants."""
 
-LIBRARY_VERSION = "0.1.0"
+LIBRARY_VERSION = "0.2.0"
 FORMAT_NAME = "Scientific Image Interchange"
 FORMAT_ID = "scientific-image-interchange"
-FORMAT_VERSION = "1.0"
-SCHEMA_VERSION = "1"
+# 0.x intentionally permits breaking revisions.  Format 0.2 changes the
+# authoritative lineage from imported source files to acquisition segments.
+FORMAT_VERSION = "0.2"
+SCHEMA_VERSION = "2"
 
 REQUIRED_PACKAGE_FILES = (
     "manifest.json",
@@ -13,4 +15,3 @@ REQUIRED_PACKAGE_FILES = (
     "README.md",
     "checksums.sha256",
 )
-

@@ -52,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
     extract = commands.add_parser("extract", help="stream retained images to ordinary files")
     extract.add_argument("path", type=Path); extract.add_argument("--output", type=Path, default=Path("frames"))
     extract.add_argument("--camera"); extract.add_argument("--frame", type=int); extract.add_argument("--frames", type=_range)
-    extract.add_argument("--source-file", type=int); extract.add_argument("--source-uuid"); extract.add_argument("--shard")
+    extract.add_argument("--acquisition-segment", type=int); extract.add_argument("--acquisition-segment-uuid"); extract.add_argument("--shard")
     extract.add_argument("--timestamps", type=_range); extract.add_argument("--overwrite", choices=("error", "skip", "replace"), default="error")
     extract.add_argument("--source-frame-names", action="store_true"); extract.add_argument("--dry-run", action="store_true")
     metadata = commands.add_parser("metadata", help="print parsed metadata")
@@ -62,7 +62,7 @@ def parser() -> argparse.ArgumentParser:
     shards = commands.add_parser("shards", help="list finalized or abandoned partial shards")
     shards.add_argument("path", type=Path); shards.add_argument("--json", action="store_true")
     shards.add_argument("--partials", action="store_true"); shards.add_argument("--quarantine-partials", type=Path)
-    sources = commands.add_parser("sources", help="list manifest sources")
+    sources = commands.add_parser("sources", help="list acquisition segments")
     sources.add_argument("path", type=Path); sources.add_argument("--json", action="store_true")
     return root
 
@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 require_previews=args.require_previews,
                                                 resume=args.resume,
                                                 progress=lambda message: print(message, file=sys.stderr))
-                print(f"Created {args.output}: {result.source_files} source file(s), {result.frames} frame(s), {result.previews} representative preview(s)")
+                print(f"Created {args.output}: {result.acquisition_segments} acquisition segment(s), {result.frames} frame(s), {result.previews} representative preview(s)")
                 return 0
             if args.resume:
                 raise ValueError("--resume requires --from-videos")
@@ -164,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
             start, end = args.frames or (args.frame, args.frame)
             time_start, time_end = args.timestamps or (None, None)
             result = extract_frames(dataset, args.output, camera=args.camera, frame_start=start, frame_end=end,
-                                    source_file_id=args.source_file, source_uuid=args.source_uuid, shard=args.shard,
+                                    acquisition_segment_id=args.acquisition_segment,
+                                    acquisition_segment_uuid=args.acquisition_segment_uuid, shard=args.shard,
                                     timestamp_start=time_start, timestamp_end=time_end, overwrite=args.overwrite,
                                     source_frame_names=args.source_frame_names, dry_run=args.dry_run,
                                     progress=lambda count: print(f"{count} frames", file=sys.stderr))
@@ -173,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             _pretty(dataset.metadata.data); return 0
         if args.command == "history":
             events = list(dataset.history); _pretty(events) if args.json else [print(json.dumps(item, sort_keys=True)) for item in events]; return 0
-        records = dataset.manifest.shards if args.command == "shards" else dataset.manifest.source_files
+        records = dataset.manifest.shards if args.command == "shards" else dataset.manifest.acquisition_segments
         _pretty(records) if args.json else [print(json.dumps(item, sort_keys=True)) for item in records]
         return 0
     except (InterchangeError, OSError, ValueError) as exc:

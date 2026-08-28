@@ -26,6 +26,7 @@ ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'telemetry_import';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_export';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_download';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'feature_space_analysis';
 
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'paused';
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'working';

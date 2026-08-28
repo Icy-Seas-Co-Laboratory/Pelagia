@@ -60,6 +60,17 @@ def test_processing_queue_api_request_rejects_client_batch_controls():
         ProcessingQueueRequest(stage="preprocess_frames", batch={"max_units": 1})
 
 
+def test_processing_series_api_request_rejects_nonexistent_auto_retry_policy():
+    from Pelagia.api.routes.processing import ProcessingSeriesRequest
+
+    with pytest.raises(ValueError, match="retry_failed"):
+        ProcessingSeriesRequest(
+            steps=[{"stage": "segment"}],
+            preset_snapshot={"preset_id": "preset-1"},
+            failure_policy="retry_failed",
+        )
+
+
 def test_processing_queue_refinement_state_filters_match_frontend_contract():
     refined = PostgresRepository._candidate_refinement_state_clause(
         schema="pelagia",
@@ -269,7 +280,10 @@ def test_series_plans_first_step_and_preserves_project_scope():
     service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
 
     series = service.create_series(
-        ProcessingSeriesRequest(steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},)),
+        ProcessingSeriesRequest(
+            steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},),
+            selection={"asset_ids": ["asset-1"]},
+        ),
         project_id="project-1",
     )
 
@@ -290,7 +304,7 @@ def test_series_no_candidate_step_is_skipped_and_next_step_is_planned():
         ProcessingSeriesRequest(steps=(
             {"stage": "preprocess_frames", "filters": {}, "options": {}},
             {"stage": "segment", "filters": {}, "options": {}},
-        )), project_id="project-1",
+        ), selection={"asset_ids": ["asset-1"]}), project_id="project-1",
     )
 
     assert repository.attached[0] == ("step-0", [], 0)
@@ -307,7 +321,7 @@ def test_series_rejects_noncanonical_processing_order():
             ProcessingSeriesRequest(steps=(
                 {"stage": "segment", "filters": {}, "options": {}},
                 {"stage": "preprocess_frames", "filters": {}, "options": {}},
-            )),
+            ), selection={"asset_ids": ["asset-1"]}),
             project_id="project-1",
         )
 
@@ -315,7 +329,13 @@ def test_series_rejects_noncanonical_processing_order():
 def test_completion_director_is_idempotent_after_a_series_job():
     repository = SeriesRepository()
     service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
-    service.create_series(ProcessingSeriesRequest(steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},)), project_id="project-1")
+    service.create_series(
+        ProcessingSeriesRequest(
+            steps=({"stage": "preprocess_frames", "filters": {}, "options": {}},),
+            selection={"asset_ids": ["asset-1"]},
+        ),
+        project_id="project-1",
+    )
 
     service.advance_series_for_job("job-1")
     service.advance_series_for_job("job-1")
@@ -327,10 +347,62 @@ def test_series_request_validates_failure_policy_and_dry_run_plans_without_write
     repository = SeriesRepository()
     service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
     result = service.create_series(
-        ProcessingSeriesRequest(steps=({"stage": "segment", "filters": {}, "options": {}},), dry_run=True, failure_policy="continue"),
+        ProcessingSeriesRequest(
+            steps=({"stage": "segment", "filters": {}, "options": {}},),
+            selection={"asset_ids": ["asset-1"]}, dry_run=True, failure_policy="continue",
+        ),
         project_id="project-1",
     )
     assert result["dry_run"] is True
     assert repository.series is None
     with pytest.raises(ValueError, match="failure_policy"):
-        service.create_series(ProcessingSeriesRequest(steps=({"stage": "segment"},), failure_policy="ignore"), project_id="project-1")
+        service.create_series(
+            ProcessingSeriesRequest(
+                steps=({"stage": "segment"},), selection={"asset_ids": ["asset-1"]}, failure_policy="ignore",
+            ),
+            project_id="project-1",
+        )
+
+
+def test_series_requires_a_bounded_selection():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    with pytest.raises(ValueError, match="asset, frame, or collection target"):
+        service.create_series(
+            ProcessingSeriesRequest(steps=({"stage": "segment", "filters": {}, "options": {}},)),
+            project_id="project-1",
+        )
+
+
+def test_series_resolves_recognized_preset_settings_into_stage_options():
+    repository = SeriesRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    service.create_series(
+        ProcessingSeriesRequest(
+            steps=(
+                {"stage": "preprocess_frames", "filters": {}, "options": {}},
+                {"stage": "segment", "filters": {}, "options": {"padding": 20}},
+                {"stage": "roi_refinement", "filters": {}, "options": {}},
+            ),
+            selection={"collections": ["tow-1"]},
+            # This is the flat ProcessingSettings payload captured by PelagiaView.
+            preset_snapshot={"settings": {
+                "minFieldValue": 25, "cropEnabled": True,
+                "framePayloadKind": "preprocessed", "applyPreprocessing": False,
+                "thresholdMethod": "manual", "manualThreshold": 100,
+                "minWidth": 12, "padding": 50, "unrecognized": "ignored",
+                "refinementModelKind": "identity", "refinementMaxIterations": 4, "refinementDryRun": True,
+            }},
+        ),
+        project_id="project-1",
+    )
+
+    assert repository.steps[0]["options"] == {"min_field_value": 25, "crop_enabled": True}
+    assert repository.steps[1]["options"] == {
+        "min_field_value": 25, "crop_enabled": True, "threshold_method": "manual",
+        "manual_threshold": 100, "frame_payload_kind": "preprocessed", "apply_preprocessing": False,
+        "min_width": 12, "padding": 20,
+    }
+    assert repository.steps[2]["options"] == {"method": "identity", "max_iterations": 4}

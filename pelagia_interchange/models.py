@@ -66,24 +66,80 @@ class StorageFormat:
 
 
 @dataclass(frozen=True, slots=True)
-class SourceFile:
-    source_file_id: int
-    source_uuid: UUID
-    original_filename: str
-    original_relative_path: str | None = None
-    original_absolute_path: str | None = None
-    byte_size: int | None = None
-    file_hash: HashRecord | None = None
-    container: str | None = None
-    codec: str | None = None
-    pixel_format: str | None = None
-    width: int | None = None
-    height: int | None = None
-    frame_rate_num: int | None = None
-    frame_rate_den: int | None = None
-    frame_count: int | None = None
-    start_timestamp: str | None = None
-    end_timestamp: str | None = None
+class AcquisitionSegment:
+    """One contiguous acquisition run whose frame payloads are canonical.
+
+    ``import_provenance`` is deliberately optional: it records an AVI or other
+    legacy carrier when one was used to create a package, but is never the
+    authoritative representation of a frame.
+    """
+    acquisition_segment_id: int
+    acquisition_segment_uuid: UUID
+    segment_name: str
+    acquisition_mode: str = "direct_frame_capture"
+    expected_frame_count: int | None = None
+    capture_configuration: Mapping[str, Any] = field(default_factory=dict)
+    started_at: str | None = None
+    ended_at: str | None = None
+    import_provenance: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.acquisition_segment_id < 1:
+            raise ValueError("acquisition_segment_id must be positive")
+        if not self.segment_name.strip():
+            raise ValueError("segment_name must not be empty")
+        if self.acquisition_mode not in {"direct_frame_capture", "imported_video"}:
+            raise ValueError("acquisition_mode must be direct_frame_capture or imported_video")
+        if self.expected_frame_count is not None and self.expected_frame_count < 0:
+            raise ValueError("expected_frame_count must be non-negative")
+        if self.acquisition_mode == "imported_video" and self.import_provenance is None:
+            raise ValueError("imported_video segments require import_provenance")
+
+    # Transitional read aliases.  They keep the Python API usable for legacy
+    # ingestion callers while the on-disk 0.2 vocabulary remains unambiguous.
+    @property
+    def source_file_id(self) -> int: return self.acquisition_segment_id
+    @property
+    def source_uuid(self) -> UUID: return self.acquisition_segment_uuid
+    @property
+    def original_filename(self) -> str: return self.segment_name
+    @property
+    def original_relative_path(self) -> str | None: return (self.import_provenance or {}).get("original_relative_path")
+    @property
+    def original_absolute_path(self) -> str | None: return (self.import_provenance or {}).get("original_absolute_path")
+    @property
+    def byte_size(self) -> int | None: return (self.import_provenance or {}).get("byte_size")
+    @property
+    def file_hash(self) -> HashRecord | None:
+        value = (self.import_provenance or {}).get("file_hash")
+        return HashRecord(value["algorithm"], "source_file", value["value"]) if value else None
+    @property
+    def container(self) -> str | None: return (self.import_provenance or {}).get("container")
+    @property
+    def codec(self) -> str | None: return (self.import_provenance or {}).get("codec")
+    @property
+    def pixel_format(self) -> str | None: return (self.import_provenance or {}).get("pixel_format")
+    @property
+    def width(self) -> int | None: return (self.import_provenance or {}).get("width")
+    @property
+    def height(self) -> int | None: return (self.import_provenance or {}).get("height")
+    @property
+    def frame_rate_num(self) -> int | None:
+        rate = (self.import_provenance or {}).get("frame_rate") or (None, None); return rate[0]
+    @property
+    def frame_rate_den(self) -> int | None:
+        rate = (self.import_provenance or {}).get("frame_rate") or (None, None); return rate[1]
+    @property
+    def frame_count(self) -> int | None: return self.expected_frame_count
+    @property
+    def start_timestamp(self) -> str | None: return self.started_at
+    @property
+    def end_timestamp(self) -> str | None: return self.ended_at
+
+
+# Kept as an import alias only; newly authored packages must use
+# AcquisitionSegment and register_acquisition_segment.
+SourceFile = AcquisitionSegment
 
 
 @dataclass(slots=True)
@@ -127,6 +183,14 @@ class FrameRecord:
             raise ValueError("decoded_pixel_hash target must be 'decoded_pixels'")
         if self.declared_byte_size is None:
             self.declared_byte_size = len(self.encoded_bytes or b"")
+
+    @property
+    def acquisition_segment_id(self) -> int:
+        return self.source_file_id
+
+    @property
+    def acquisition_frame_number(self) -> int:
+        return self.source_frame_number
 
 
 @dataclass(frozen=True, slots=True)

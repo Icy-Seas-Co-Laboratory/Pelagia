@@ -52,7 +52,7 @@ if APIRouter is not None:
         targets: dict[str, Any] = Field(default_factory=dict)
         selection: dict[str, Any] = Field(default_factory=dict)
         preset_snapshot: dict[str, Any] = Field(default_factory=dict)
-        failure_policy: Literal["fail_fast", "continue", "stop_series", "retry_failed"] = "fail_fast"
+        failure_policy: Literal["fail_fast", "continue"] = "fail_fast"
         priority: int | None = None
         dry_run: bool = False
 
@@ -105,11 +105,10 @@ if APIRouter is not None:
             filters = step.filters.model_dump() if hasattr(step.filters, "model_dump") else step.filters.dict()
             filters = {**common_filters, **{key: value for key, value in filters.items() if value not in (None, [], {})}}
             steps.append({"stage": step.stage, "filters": filters, "options": step.options, "failure_policy": step.failure_policy})
-        failure_policy = "fail_fast" if body.failure_policy in {"fail_fast", "stop_series"} else "continue"
         try:
             result = ProcessingQueueService(get_context(request)).create_series(
                 ProcessingSeriesServiceRequest(steps=tuple(steps), selection=selection, preset_snapshot=body.preset_snapshot,
-                                        failure_policy=failure_policy, priority=body.priority,
+                                        failure_policy=body.failure_policy, priority=body.priority,
                                         dry_run=body.dry_run, submitted_by_user_id=auth.user_id, submitted_by_username=auth.username),
                 project_id=auth.project_id,
             )
@@ -152,8 +151,6 @@ if APIRouter is not None:
         series = method(series_id, project_id=auth.project_id, reason=None if body is None else body.reason)
         if series is None:
             raise HTTPException(status_code=404, detail=f"Processing series {series_id!r} was not found.")
-        if action in {"resume", "retry"}:
-            ProcessingQueueService(get_context(request)).advance_series(series_id, project_id=auth.project_id)
         return as_response(series)
 else:
     router = None

@@ -7,6 +7,7 @@ import pytest
 
 from Pelagia.services.feature_space import (
     MAX_EXACT_VECTOR_SCAN,
+    MAX_UMAP_VECTOR_SCAN,
     FeatureSpaceError,
     FeatureSpaceService,
     parse_feature_space_source,
@@ -32,6 +33,11 @@ class _Repository:
         self.embedding_calls: list[dict] = []
         self.summary_calls: list[list[str]] = []
         self.vector_count = 3
+        self.embedding_rows = [
+            {"refined_detection_id": "roi-reference", "embedding_payload_ref": "reference"},
+            {"refined_detection_id": "roi-near", "embedding_payload_ref": "near"},
+            {"refined_detection_id": "roi-far", "embedding_payload_ref": "far"},
+        ]
 
     def list_feature_space_sources(self, *, project_id: str):
         assert project_id == "project-1"
@@ -39,11 +45,7 @@ class _Repository:
 
     def list_feature_space_embeddings(self, **values):
         self.embedding_calls.append(values)
-        return [
-            {"refined_detection_id": "roi-reference", "embedding_payload_ref": "reference"},
-            {"refined_detection_id": "roi-near", "embedding_payload_ref": "near"},
-            {"refined_detection_id": "roi-far", "embedding_payload_ref": "far"},
-        ]
+        return self.embedding_rows
 
     def count_feature_space_embeddings(self, **values):
         return self.vector_count
@@ -51,7 +53,17 @@ class _Repository:
     def list_feature_space_roi_summaries(self, *, project_id: str, roi_ids: list[str]):
         assert project_id == "project-1"
         self.summary_calls.append(roi_ids)
-        return [{"id": roi_id, "asset_filename": f"{roi_id}.png"} for roi_id in roi_ids]
+        return [
+            {
+                "id": roi_id,
+                "asset_filename": f"{roi_id}.png",
+                "bbox_w": 20,
+                "bbox_h": 10,
+                "roi_shape": [12, 24],
+                "area": 123,
+            }
+            for roi_id in roi_ids
+        ]
 
     def list_feature_space_clusters(self, **values):
         return [{"cluster_id": "cluster-a", "roi_count": 2, **values}]
@@ -178,6 +190,118 @@ def test_feature_space_clustering_similarity_uses_recorded_cluster_membership():
     assert result["candidate_count"] == 1
     assert result["items"][0]["id"] == "roi-near"
     assert context.repository.embedding_calls == []
+
+
+def test_feature_space_umap_returns_run_scoped_coordinates_and_hdbscan_assignments(monkeypatch):
+    context = _Context()
+    context.repository.vector_count = 5
+    context.repository.embedding_rows = [
+        {"refined_detection_id": f"roi-{index}", "embedding_payload_ref": f"pca-{index}"}
+        for index in range(5)
+    ]
+    context.store.blobs.update(
+        {f"pca-{index}": _npy_bytes(values) for index, values in enumerate([
+            [0, 0, 0, 0], [1, 0, 0, 0], [0, 2, 0, 0], [0, 0, 3, 0], [0, 0, 0, 4],
+        ])}
+    )
+
+    service = FeatureSpaceService(context, project_id="project-1")
+    monkeypatch.setattr(service, "_reduce_umap", lambda matrix: np.arange(len(matrix) * 10, dtype="float64").reshape(len(matrix), 10))
+    hdbscan_calls: list[dict[str, object]] = []
+
+    def cluster(coordinates, **kwargs):
+        hdbscan_calls.append(kwargs)
+        return np.array([0, 0, 1, -1, 1]), np.array([.9, .8, .7, 0, .6])
+
+    monkeypatch.setattr(service, "_cluster_hdbscan", cluster)
+    result = service.umap_rois(
+        source_key="classification:run-class",
+        min_cluster_size=7,
+        min_samples=3,
+        cluster_selection_epsilon=0.15,
+    )
+
+    assert result["source_key"] == "classification:run-class"
+    assert result["projection"] == "umap"
+    assert result["clustering"] == "hdbscan"
+    assert result["random_seed"] == 20_260_826
+    assert result["projection_scope"] == "full_source"
+    assert result["compatible_embedding_count"] == 5
+    assert len(result["items"]) == 5
+    assert len(result["items"][0]["umap_coordinates"]) == 10
+    assert result["items"][0]["hdbscan_cluster_id"] == "hdbscan:0"
+    assert result["items"][3]["hdbscan_cluster_id"] is None
+    assert result["cluster_count"] == 2
+    assert result["noise_count"] == 1
+    assert result["hdbscan_parameters"] == {
+        "min_cluster_size": 7,
+        "min_samples": 3,
+        "cluster_selection_epsilon": 0.15,
+        "metric": "euclidean",
+    }
+    assert hdbscan_calls == [{"min_cluster_size": 7, "min_samples": 3, "cluster_selection_epsilon": 0.15}]
+    assert len(result["component_ranges"]) == 10
+    assert result["items"][0]["bbox_w"] == 20
+    assert result["items"][0]["bbox_h"] == 10
+
+
+def test_feature_space_umap_excludes_incompatible_and_unreadable_embeddings(monkeypatch):
+    context = _Context()
+    context.repository.vector_count = 7
+    context.repository.embedding_rows = [
+        {"refined_detection_id": f"roi-{index}", "embedding_payload_ref": key}
+        for index, key in enumerate(["pca-0", "pca-1", "pca-2", "pca-3", "pca-4", "wrong-shape", "missing"])
+    ]
+    context.store.blobs.update(
+        {
+            "pca-0": _npy_bytes([0, 0, 0, 0]), "pca-1": _npy_bytes([1, 0, 0, 0]),
+            "pca-2": _npy_bytes([0, 1, 0, 0]), "pca-3": _npy_bytes([0, 0, 1, 0]),
+            "pca-4": _npy_bytes([0, 0, 0, 1]),
+            "wrong-shape": _npy_bytes([1, 2, 3]),
+        }
+    )
+
+    service = FeatureSpaceService(context, project_id="project-1")
+    monkeypatch.setattr(service, "_reduce_umap", lambda matrix: np.zeros((len(matrix), 10)))
+    monkeypatch.setattr(service, "_cluster_hdbscan", lambda coordinates, **kwargs: (np.full(len(coordinates), -1), np.zeros(len(coordinates))))
+    result = service.umap_rois(
+        source_key="classification:run-class"
+    )
+
+    assert result["compatible_embedding_count"] == 5
+    assert result["incompatible_embedding_count"] == 1
+    assert result["unreadable_embedding_count"] == 1
+    assert [item["id"] for item in result["items"]] == ["roi-0", "roi-1", "roi-2", "roi-3", "roi-4"]
+
+
+def test_feature_space_umap_uses_a_smaller_deterministic_projection_cap(monkeypatch):
+    context = _Context()
+    context.repository.vector_count = MAX_UMAP_VECTOR_SCAN + 1
+    context.repository.embedding_rows = [
+        {"refined_detection_id": f"roi-{index}", "embedding_payload_ref": f"pca-{index}"}
+        for index in range(5)
+    ]
+    context.store.blobs.update(
+        {f"pca-{index}": _npy_bytes([index, 0, 0, 0]) for index in range(5)}
+    )
+
+    service = FeatureSpaceService(context, project_id="project-1")
+    monkeypatch.setattr(service, "_reduce_umap", lambda matrix: np.zeros((len(matrix), 10)))
+    monkeypatch.setattr(service, "_cluster_hdbscan", lambda coordinates, **kwargs: (np.full(len(coordinates), -1), np.zeros(len(coordinates))))
+    result = service.umap_rois(
+        source_key="classification:run-class"
+    )
+
+    assert result["projection_scope"] == "deterministic_prefix"
+    assert context.repository.embedding_calls[-1]["limit"] == MAX_UMAP_VECTOR_SCAN
+
+
+def test_feature_space_umap_requires_five_compatible_vectors():
+    context = _Context()
+    with pytest.raises(FeatureSpaceError, match="at least five compatible"):
+        FeatureSpaceService(context, project_id="project-1").umap_rois(
+            source_key="classification:run-class"
+        )
 
 
 def test_feature_space_uses_label_prototypes_for_classification_runs():

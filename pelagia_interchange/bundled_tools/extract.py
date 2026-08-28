@@ -24,12 +24,12 @@ def main():
     if args.path.is_file(): root, shards, sources = args.path.parent, [{"relative_path": args.path.name}], []
     else:
         root = args.path
-        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8")); shards = manifest.get("shards", []); sources = manifest.get("source_files", [])
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8")); shards = manifest.get("shards", []); sources = manifest.get("acquisition_segments", [])
     source_id = args.source_file
     if args.source_uuid:
-        source = next((x for x in sources if x.get("source_uuid") == args.source_uuid), None)
+        source = next((x for x in sources if x.get("acquisition_segment_uuid") == args.source_uuid), None)
         if source is None: p.error("source UUID not found")
-        source_id = source["source_file_id"]
+        source_id = source["acquisition_segment_id"]
     start, end = args.frames or (args.frame, args.frame); ts0, ts1 = args.timestamps or (None, None)
     out = args.output.resolve()
     if not args.dry_run: out.mkdir(parents=True, exist_ok=True)
@@ -39,12 +39,12 @@ def main():
         if args.shard and args.shard not in (shard.get("shard_uuid"), shard.get("relative_path"), Path(shard.get("relative_path","")).name): continue
         path = safe(root, shard["relative_path"])
         clauses, values = [], []
-        for sql, value in (("f.frame_id>=?",start),("f.frame_id<=?",end),("f.source_file_id=?",source_id),("f.timestamp_ns>=?",ts0),("f.timestamp_ns<=?",ts1)):
+        for sql, value in (("f.frame_id>=?",start),("f.frame_id<=?",end),("f.acquisition_segment_id=?",source_id),("f.timestamp_ns>=?",ts0),("f.timestamp_ns<=?",ts1)):
             if value is not None: clauses.append(sql); values.append(value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         uri = "file:" + str(path.resolve()) + "?mode=ro"
         with sqlite3.connect(uri, uri=True) as db:
-            sql = "SELECT f.frame_id,f.source_file_id,f.source_frame_number,f.blob,s.codec FROM frames f LEFT JOIN storage_formats s USING(storage_id)" + where + " ORDER BY f.frame_id"
+            sql = "SELECT f.frame_id,f.acquisition_segment_id,f.acquisition_frame_number,f.blob,s.codec FROM frames f LEFT JOIN storage_formats s USING(storage_id)" + where + " ORDER BY f.frame_id"
             for frame_id, sid, source_frame, blob, codec in db.execute(sql, values):
                 if blob is None: skipped += 1; continue
                 ext = {"jpeg":".jpg","jpg":".jpg","png":".png"}.get((codec or "").lower(), ".bin")
@@ -59,4 +59,3 @@ def main():
                 if args.progress and written % args.progress == 0: print(f"{written} frames", file=sys.stderr)
     print(f"written={written} skipped={skipped} bytes={byte_count}")
 if __name__ == "__main__": main()
-

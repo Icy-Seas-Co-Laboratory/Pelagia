@@ -46,7 +46,7 @@ class VideoProbe:
 @dataclass(frozen=True, slots=True)
 class VideoIngestionResult:
     dataset: Dataset
-    source_files: int
+    acquisition_segments: int
     frames: int
     previews: int
 
@@ -692,14 +692,14 @@ def ingest_video_directory(
                         thumbnail, kind="preview", relative_name=relative_name,
                         description=f"Non-authoritative representative thumbnail for retained frame {candidate.frame_id}",
                         attributes={"preview_kind": "representative_thumbnail", "stream_uuid": str(stream_uuid),
-                                    "frame_id": candidate.frame_id, "source_uuid": str(source.source_uuid),
-                                    "source_frame_number": candidate.source_frame_number,
+                                    "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
+                                    "acquisition_frame_number": candidate.source_frame_number,
                                     "selection_method": "evenly_spaced_retained_frame_ids", "preview_width_max": preview_width},
                         replace=resume,
                     )
                     preview_entries.append({"relative_path": f"preview/{relative_name}", "stream_uuid": str(stream_uuid),
-                                            "frame_id": candidate.frame_id, "source_uuid": str(source.source_uuid),
-                                            "source_frame_number": candidate.source_frame_number, "timestamp_ns": None})
+                                            "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
+                                            "acquisition_frame_number": candidate.source_frame_number, "timestamp_ns": None})
                     thumbnail_payloads.append(thumbnail)
                 except VideoIngestionError as exc:
                     if require_previews:

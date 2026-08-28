@@ -13,7 +13,7 @@ from .exceptions import DatasetStateError, FormatError
 from .history import History
 from .manifest import Manifest
 from .metadata import Metadata, default_metadata
-from .models import FrameRecord, HashRecord, SourceFile, StorageFormat, new_uuid
+from .models import AcquisitionSegment, FrameRecord, HashRecord, SourceFile, StorageFormat, new_uuid
 from .shard import ShardReader, ShardWriter
 from .tool_scripts import TOOL_FILES
 from .util import hash_file, parse_size, safe_relative_path, utc_now
@@ -40,8 +40,8 @@ class DatasetBuilder:
             self.metadata = Metadata(dict(metadata))
         self.manifest = Manifest(str(self.dataset_uuid))
         self.history = History(self.output / "history.jsonl")
-        self._sources: dict[int, SourceFile] = {}
-        self._sources_by_uuid: dict[UUID, SourceFile] = {}
+        self._sources: dict[int, AcquisitionSegment] = {}
+        self._sources_by_uuid: dict[UUID, AcquisitionSegment] = {}
         self._writers: dict[str, ShardWriter] = {}
         self._stream_uuids: dict[str, UUID] = {}
         self._shard_numbers: dict[str, int] = {}
@@ -87,19 +87,15 @@ class DatasetBuilder:
                             outputs=[{"dataset_uuid": str(self.dataset_uuid)}])
 
     def _load_sources(self) -> None:
-        for record in self.manifest.source_files:
-            file_hash = record.get("file_hash")
-            hash_record = HashRecord(file_hash["algorithm"], "source_file", file_hash["value"]) if file_hash else None
-            frame_rate = record.get("frame_rate") or (None, None)
-            source = SourceFile(
-                int(record["source_file_id"]), UUID(str(record["source_uuid"])), record["original_filename"],
-                record.get("original_relative_path"), record.get("original_absolute_path"), record.get("byte_size"),
-                hash_record, record.get("container"), record.get("codec"), record.get("pixel_format"),
-                record.get("width"), record.get("height"), frame_rate[0], frame_rate[1], record.get("frame_count"),
-                record.get("start_timestamp"), record.get("end_timestamp"),
+        for record in self.manifest.acquisition_segments:
+            segment = AcquisitionSegment(
+                int(record["acquisition_segment_id"]), UUID(str(record["acquisition_segment_uuid"])),
+                record["segment_name"], record["acquisition_mode"], record.get("expected_frame_count"),
+                record.get("capture_configuration", {}), record.get("started_at"), record.get("ended_at"),
+                record.get("import_provenance"),
             )
-            self._sources[source.source_file_id] = source
-            self._sources_by_uuid[source.source_uuid] = source
+            self._sources[segment.source_file_id] = segment
+            self._sources_by_uuid[segment.source_uuid] = segment
 
     def _load_streams_and_shard_numbers(self) -> None:
         for record in self.manifest.shards:
@@ -138,6 +134,7 @@ class DatasetBuilder:
         width: int | None = None, height: int | None = None, frame_rate: tuple[int, int] | None = None,
         frame_count: int | None = None, start_timestamp: str | None = None, end_timestamp: str | None = None,
     ) -> SourceFile:
+        """Deprecated legacy-video adapter; use register_acquisition_segment."""
         source_path = Path(path) if path is not None else None
         if original_filename is None:
             if source_path is None:
@@ -155,32 +152,54 @@ class DatasetBuilder:
             existing = self._sources_by_uuid.get(new_uuid(source_uuid))
             if existing is not None:
                 return existing
-        identifier = max(self._sources, default=0) + 1
-        source = SourceFile(identifier, new_uuid(source_uuid), original_filename, original_relative_path,
-                            original_absolute_path, byte_size, file_hash, container, codec, pixel_format,
-                            width, height, frame_rate[0] if frame_rate else None, frame_rate[1] if frame_rate else None,
-                            frame_count, start_timestamp, end_timestamp)
-        self._sources[identifier] = source
-        self._sources_by_uuid[source.source_uuid] = source
-        record = self._source_manifest_record(source)
-        self.manifest.source_files.append(record)
-        self.manifest.write(self.output / "manifest.json")
-        self.history.append(operation="source_ingested", inputs=[record])
-        return source
+        provenance = {
+            "original_filename": original_filename, "original_relative_path": original_relative_path,
+            "original_absolute_path": original_absolute_path, "byte_size": byte_size,
+            "file_hash": file_hash.to_dict() if file_hash else None, "container": container, "codec": codec,
+            "pixel_format": pixel_format, "width": width, "height": height,
+            "frame_rate": list(frame_rate) if frame_rate else None,
+        }
+        return self.register_acquisition_segment(
+            segment_name=original_filename, acquisition_mode="imported_video", source_uuid=source_uuid,
+            expected_frame_count=frame_count, started_at=start_timestamp, ended_at=end_timestamp,
+            import_provenance=provenance,
+        )
 
     add_source_file = register_source_file
 
+    def register_acquisition_segment(
+        self, *, segment_name: str, acquisition_mode: str = "direct_frame_capture",
+        source_uuid: UUID | str | None = None, expected_frame_count: int | None = None,
+        capture_configuration: Mapping[str, Any] | None = None, started_at: str | None = None,
+        ended_at: str | None = None, import_provenance: Mapping[str, Any] | None = None,
+    ) -> AcquisitionSegment:
+        """Register an authoritative capture run before streaming its frames."""
+        if source_uuid is not None:
+            existing = self._sources_by_uuid.get(new_uuid(source_uuid))
+            if existing is not None:
+                return existing
+        identifier = max(self._sources, default=0) + 1
+        segment = AcquisitionSegment(identifier, new_uuid(source_uuid), segment_name, acquisition_mode,
+                                     expected_frame_count, dict(capture_configuration or {}), started_at,
+                                     ended_at, dict(import_provenance) if import_provenance is not None else None)
+        self._sources[identifier] = segment
+        self._sources_by_uuid[segment.source_uuid] = segment
+        record = self._segment_manifest_record(segment)
+        self.manifest.acquisition_segments.append(record)
+        self.manifest.write(self.output / "manifest.json")
+        self.history.append(operation="acquisition_segment_registered", inputs=[record])
+        return segment
+
     @staticmethod
-    def _source_manifest_record(source: SourceFile) -> dict[str, Any]:
+    def _segment_manifest_record(source: AcquisitionSegment) -> dict[str, Any]:
         return {
-            "source_file_id": source.source_file_id, "source_uuid": str(source.source_uuid),
-            "original_filename": source.original_filename, "original_relative_path": source.original_relative_path,
-            "original_absolute_path": source.original_absolute_path, "byte_size": source.byte_size,
-            "file_hash": source.file_hash.to_dict() if source.file_hash else None, "container": source.container,
-            "codec": source.codec, "pixel_format": source.pixel_format, "width": source.width, "height": source.height,
-            "frame_rate": [source.frame_rate_num, source.frame_rate_den] if source.frame_rate_num is not None else None,
-            "frame_count": source.frame_count, "start_timestamp": source.start_timestamp,
-            "end_timestamp": source.end_timestamp,
+            "acquisition_segment_id": source.acquisition_segment_id,
+            "acquisition_segment_uuid": str(source.acquisition_segment_uuid),
+            "segment_name": source.segment_name, "acquisition_mode": source.acquisition_mode,
+            "expected_frame_count": source.expected_frame_count,
+            "capture_configuration": dict(source.capture_configuration), "started_at": source.started_at,
+            "ended_at": source.ended_at,
+            "import_provenance": dict(source.import_provenance) if source.import_provenance is not None else None,
         }
 
     def _stream_uuid(self, stream: str) -> UUID:
@@ -270,12 +289,26 @@ class DatasetBuilder:
             self._finalize_writer(name)
 
     def add_frame(
-        self, *, stream: str, source_file: SourceFile, frame_id: int,
-        source_frame_number: int, encoded_bytes: bytes | None,
+        self, *, stream: str, acquisition_segment: AcquisitionSegment | None = None,
+        acquisition_frame_number: int | None = None, frame_id: int, encoded_bytes: bytes | None,
+        source_file: SourceFile | None = None, source_frame_number: int | None = None,
         storage_format: StorageFormat | None = None, **kwargs: Any,
     ) -> None:
+        """Append an authoritative frame to a registered acquisition segment.
+
+        ``source_file`` and ``source_frame_number`` are temporary compatibility
+        aliases for legacy AVI import callers and are not serialized in 0.2.
+        """
         if self._closed:
             raise DatasetStateError("builder is closed")
+        if acquisition_segment is None:
+            acquisition_segment = source_file
+        if acquisition_frame_number is None:
+            acquisition_frame_number = source_frame_number
+        if acquisition_segment is None or acquisition_frame_number is None:
+            raise ValueError("acquisition_segment and acquisition_frame_number are required")
+        source_file = acquisition_segment
+        source_frame_number = acquisition_frame_number
         if source_file.source_file_id not in self._sources:
             raise ValueError("source_file was not registered with this builder")
         if self.source_file_boundary and self._last_source_per_stream.get(stream) not in {None, source_file.source_file_id}:
@@ -293,10 +326,10 @@ class DatasetBuilder:
                                storage_format=storage_format, **kwargs), source_file)
         self._last_source_per_stream[stream] = source_file.source_file_id
 
-    def add_frames(self, records: Iterable[tuple[str, SourceFile, FrameRecord]]) -> None:
+    def add_frames(self, records: Iterable[tuple[str, AcquisitionSegment, FrameRecord]]) -> None:
         for stream, source, record in records:
-            self.add_frame(stream=stream, source_file=source, frame_id=record.frame_id,
-                           source_frame_number=record.source_frame_number, encoded_bytes=record.encoded_bytes,
+            self.add_frame(stream=stream, acquisition_segment=source, frame_id=record.frame_id,
+                           acquisition_frame_number=record.source_frame_number, encoded_bytes=record.encoded_bytes,
                            storage_format=record.storage_format,
                            timestamp_ns=record.timestamp_ns, source_timestamp_ns=record.source_timestamp_ns,
                            timestamp_source=record.timestamp_source, clock_source=record.clock_source,
@@ -373,7 +406,7 @@ This directory is a self-contained {FORMAT_NAME} {FORMAT_VERSION} dataset. Its S
 - `preview/`: non-authoritative derivatives
 - `tools/`: standard-library inspection, extraction, and verification scripts
 
-Each shard contains `frames`, `source_files`, `storage_formats`, and `shard_metadata`. The exact encoded image bytes are stored in `frames.blob`; ordinary extraction copies them without decoding or re-encoding. A null BLOB is an explicit missing/failed/removed record, never an implicit sequence collapse.
+Each shard contains `frames`, `acquisition_segments`, `storage_formats`, and `shard_metadata`. The exact encoded image bytes are stored in `frames.blob`; ordinary extraction copies them without decoding or re-encoding. A null BLOB is an explicit missing/failed/removed record, never an implicit sequence collapse.
 
 Inspect manually with `sqlite3 data/SHARD.sqlite '.tables'` or run:
 
@@ -396,7 +429,7 @@ Hashes always have an algorithm and semantic target. Frame hashes cover exact st
 
 Timestamp values do not imply accuracy: provenance fields record source, clock, timezone/UTC conversion, precision, synchronization, offset, drift, and interpolation where known. Scientific interpretation belongs in `metadata.toml`; processing actions belong in `history.jsonl`.
 
-The normative reference is **Scientific Image Interchange Format 1.0**, maintained with the `pelagia_interchange` source at `docs/interchange-specification.md`. These files use ordinary JSON, TOML, JSON Lines, SHA-256 text, and SQLite so they remain accessible without Pelagia.
+The normative reference is **Scientific Image Interchange Format 0.2**, maintained with the `pelagia_interchange` source at `docs/interchange-specification.md`. These files use ordinary JSON, TOML, JSON Lines, SHA-256 text, and SQLite so they remain accessible without Pelagia.
 """
         (self.output / "README.md").write_text(content, encoding="utf-8")
 

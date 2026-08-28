@@ -20,7 +20,7 @@ class Manifest:
     format_version: str = FORMAT_VERSION
     schema_version: str = SCHEMA_VERSION
     shards: list[dict[str, Any]] = field(default_factory=list)
-    source_files: list[dict[str, Any]] = field(default_factory=list)
+    acquisition_segments: list[dict[str, Any]] = field(default_factory=list)
     calibration: list[dict[str, Any]] = field(default_factory=list)
     previews: list[dict[str, Any]] = field(default_factory=list)
     software: dict[str, Any] = field(default_factory=lambda: {"name": "pelagia_interchange", "version": LIBRARY_VERSION})
@@ -35,18 +35,16 @@ class Manifest:
             raise FormatError("manifest dataset_uuid is invalid") from exc
         if self.format != FORMAT_ID:
             raise CompatibilityError(f"unsupported format {self.format!r}")
-        try:
-            major = int(self.format_version.split(".", 1)[0])
-        except (ValueError, IndexError) as exc:
-            raise FormatError("invalid format_version") from exc
-        if major > int(FORMAT_VERSION.split(".", 1)[0]):
-            raise CompatibilityError(f"format {self.format_version} is newer than supported {FORMAT_VERSION}")
+        if self.format_version != FORMAT_VERSION:
+            raise CompatibilityError(
+                f"format {self.format_version} is not supported by this pre-1.0 reader; expected {FORMAT_VERSION}"
+            )
         if self.schema_version != SCHEMA_VERSION:
             raise CompatibilityError(f"unsupported schema version {self.schema_version}")
         if self.state not in {"building", "finalizing", "complete", "verified", "modified"}:
             raise FormatError(f"invalid dataset state {self.state!r}")
-        if not isinstance(self.shards, list) or not isinstance(self.source_files, list):
-            raise FormatError("manifest shards and source_files must be arrays")
+        if not isinstance(self.shards, list) or not isinstance(self.acquisition_segments, list):
+            raise FormatError("manifest shards and acquisition_segments must be arrays")
         if not isinstance(self.calibration, list) or not isinstance(self.previews, list):
             raise FormatError("manifest calibration and previews must be arrays")
         shard_ids: set[str] = set()
@@ -80,24 +78,30 @@ class Manifest:
             hash_record = shard["file_hash"]
             if not isinstance(hash_record, dict) or not all(isinstance(hash_record.get(key), str) and hash_record[key] for key in ("algorithm", "target", "value")):
                 raise FormatError(f"shards[{number}] has an invalid file_hash")
-        source_ids: set[int] = set()
-        source_uuids: set[str] = set()
-        for number, source in enumerate(self.source_files):
-            if not isinstance(source, dict):
-                raise FormatError(f"source_files[{number}] must be an object")
-            if not all(key in source for key in ("source_file_id", "source_uuid", "original_filename")):
-                raise FormatError(f"source_files[{number}] is missing required identity fields")
+        segment_ids: set[int] = set()
+        segment_uuids: set[str] = set()
+        for number, segment in enumerate(self.acquisition_segments):
+            if not isinstance(segment, dict):
+                raise FormatError(f"acquisition_segments[{number}] must be an object")
+            if not all(key in segment for key in ("acquisition_segment_id", "acquisition_segment_uuid", "segment_name", "acquisition_mode")):
+                raise FormatError(f"acquisition_segments[{number}] is missing required identity fields")
             try:
-                UUID(str(source["source_uuid"]))
+                UUID(str(segment["acquisition_segment_uuid"]))
             except ValueError as exc:
-                raise FormatError(f"source_files[{number}] has an invalid UUID") from exc
-            identifier = source["source_file_id"]
+                raise FormatError(f"acquisition_segments[{number}] has an invalid UUID") from exc
+            identifier = segment["acquisition_segment_id"]
             if not isinstance(identifier, int) or identifier < 1:
-                raise FormatError(f"source_files[{number}] has an invalid source_file_id")
-            source_uuid = str(source["source_uuid"])
-            if identifier in source_ids or source_uuid in source_uuids:
-                raise FormatError(f"source_files[{number}] duplicates a source identity")
-            source_ids.add(identifier); source_uuids.add(source_uuid)
+                raise FormatError(f"acquisition_segments[{number}] has an invalid acquisition_segment_id")
+            segment_uuid = str(segment["acquisition_segment_uuid"])
+            if identifier in segment_ids or segment_uuid in segment_uuids:
+                raise FormatError(f"acquisition_segments[{number}] duplicates an acquisition identity")
+            if segment["acquisition_mode"] not in {"direct_frame_capture", "imported_video"}:
+                raise FormatError(f"acquisition_segments[{number}] has an invalid acquisition_mode")
+            if not isinstance(segment["segment_name"], str) or not segment["segment_name"].strip():
+                raise FormatError(f"acquisition_segments[{number}] has an invalid segment_name")
+            if segment["acquisition_mode"] == "imported_video" and not isinstance(segment.get("import_provenance"), dict):
+                raise FormatError(f"acquisition_segments[{number}] imported_video requires import_provenance")
+            segment_ids.add(identifier); segment_uuids.add(segment_uuid)
         for collection_name, records in (("calibration", self.calibration), ("previews", self.previews)):
             for number, record in enumerate(records):
                 if not isinstance(record, dict) or not all(key in record for key in ("relative_path", "byte_size", "file_hash")):
@@ -133,3 +137,24 @@ class Manifest:
             raise FormatError(f"invalid manifest fields: {exc}") from exc
         manifest.validate()
         return manifest
+
+    @property
+    def source_files(self) -> list[dict[str, Any]]:
+        """Deprecated in-memory alias for pre-0.2 integrations."""
+        legacy: list[dict[str, Any]] = []
+        for segment in self.acquisition_segments:
+            provenance = dict(segment.get("import_provenance") or {})
+            legacy.append({
+                "source_file_id": segment["acquisition_segment_id"],
+                "source_uuid": segment["acquisition_segment_uuid"],
+                "original_filename": provenance.get("original_filename", segment["segment_name"]),
+                "original_relative_path": provenance.get("original_relative_path"),
+                "original_absolute_path": provenance.get("original_absolute_path"),
+                "byte_size": provenance.get("byte_size"), "file_hash": provenance.get("file_hash"),
+                "container": provenance.get("container"), "codec": provenance.get("codec"),
+                "pixel_format": provenance.get("pixel_format"), "width": provenance.get("width"),
+                "height": provenance.get("height"), "frame_rate": provenance.get("frame_rate"),
+                "frame_count": segment.get("expected_frame_count"),
+                "start_timestamp": segment.get("started_at"), "end_timestamp": segment.get("ended_at"),
+            })
+        return legacy

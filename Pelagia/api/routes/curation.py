@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from hashlib import sha256
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -18,7 +20,11 @@ if APIRouter is not None:
     from ...domain import PipelineStage
     from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
     from ...services.pipeline import PipelineService
-    from ...services.feature_space import FeatureSpaceError, FeatureSpaceService
+    from ...services.feature_space import (
+        FeatureSpaceError,
+        FeatureSpaceService,
+        parse_feature_space_source,
+    )
     from ...services.registry_generation import preview_registry_dataset
     from ...services.telemetry import parse_telemetry_filters
     from ...services.taxonomy import default_taxonomy_dictionary
@@ -87,6 +93,16 @@ if APIRouter is not None:
         evidence_kind: Literal["classification", "clustering"] = "classification"
         selection: ClassificationTargetSelectionRequest | None = None
 
+    class FeatureSpaceAnalysisRequest(BaseModel):
+        """Parameters for one ephemeral, reproducible UMAP/HDBSCAN analysis."""
+
+        model_config = ConfigDict(extra="forbid")
+        source_key: str = Field(min_length=3, max_length=200)
+        min_cluster_size: int = Field(default=5, ge=2, le=1000)
+        min_samples: int | None = Field(default=None, ge=1, le=1000)
+        cluster_selection_epsilon: float = Field(default=0.0, ge=0.0, le=10.0)
+        force: bool = False
+
     class RegistryDatasetSelectionRequest(BaseModel):
         model_config = ConfigDict(extra="forbid")
         asset_ids: list[str] = Field(default_factory=list)
@@ -127,6 +143,22 @@ if APIRouter is not None:
     def _feature_space_service(request: Request) -> FeatureSpaceService:
         auth = require_project_read(request)
         return FeatureSpaceService(get_context(request), project_id=auth.project_id)
+
+    def _feature_space_analysis_payload(body: FeatureSpaceAnalysisRequest) -> dict:
+        """Build the stable cache identity consumed by the ephemeral worker."""
+
+        source = parse_feature_space_source(body.source_key)
+        parameters = {
+            "analysis_version": 1,
+            "source_key": source.key,
+            "min_cluster_size": body.min_cluster_size,
+            "min_samples": body.min_samples,
+            "cluster_selection_epsilon": body.cluster_selection_epsilon,
+        }
+        cache_key = sha256(
+            json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {**parameters, "cache_key": cache_key}
 
     def _registry_root(request: Request) -> Path:
         return Path(get_context(request).config.file_browser.root_path_import_dir).expanduser().resolve()
@@ -407,6 +439,48 @@ if APIRouter is not None:
         except FeatureSpaceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return as_response({**result, "items": [_with_urls(item) for item in result["items"]]})
+
+    @router.post("/feature-space/umap/analysis", status_code=202)
+    def queue_feature_space_umap_analysis(
+        request: Request, body: FeatureSpaceAnalysisRequest
+    ) -> dict:
+        """Queue or reuse a short-lived UMAP/HDBSCAN exploration result."""
+
+        auth = require_project_write(request)
+        try:
+            payload = _feature_space_analysis_payload(body)
+            job, disposition = get_repository(request).enqueue_feature_space_analysis(
+                project_id=str(auth.project_id),
+                payload=payload,
+                submitted_by_user_id=auth.user_id,
+                submitted_by_username=auth.username,
+                force=body.force,
+            )
+        except FeatureSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "job": as_response(job),
+            "disposition": disposition,
+            "cache_key": payload["cache_key"],
+            "ephemeral": True,
+        }
+
+    @router.get("/feature-space/umap", deprecated=True)
+    def feature_space_umap(request: Request) -> dict:
+        """Retired synchronous endpoint; analysis now belongs to dedicated workers."""
+
+        require_project_read(request)
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Synchronous UMAP/HDBSCAN analysis has been retired. "
+                "POST /curation/feature-space/umap/analysis and poll /jobs/{job_id}."
+            ),
+        )
 
     @router.get("/feature-space/clusters")
     def feature_space_clusters(request: Request, source_key: str) -> dict:

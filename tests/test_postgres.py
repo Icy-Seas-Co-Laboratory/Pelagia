@@ -94,6 +94,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0016_processing_series",
         "0017_processing_series_snapshots",
         "0018_roi_clustering_evidence",
+        "0019_feature_space_analysis",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -112,33 +113,36 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.classification_evidence" in curation_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.roi_label_annotations" in curation_schema
     assert "{schema}" not in curation_schema
-    telemetry_schema = postgres.render_migration(migrations[-9], "pelagia_unit")
+    telemetry_schema = postgres.render_migration(migrations[-10], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.telemetry_observations" in telemetry_schema
     assert "PARTITION BY HASH (stream_id)" in telemetry_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.timeline_events" in telemetry_schema
     assert "{schema}" not in telemetry_schema
-    durability_schema = postgres.render_migration(migrations[-8], "pelagia_unit")
+    durability_schema = postgres.render_migration(migrations[-9], "pelagia_unit")
     assert "ADD COLUMN IF NOT EXISTS import_key text" in durability_schema
     assert "telemetry_sources_import_key" in durability_schema
     assert "{schema}" not in durability_schema
-    index_schema = postgres.render_migration(migrations[-7], "pelagia_unit")
+    index_schema = postgres.render_migration(migrations[-8], "pelagia_unit")
     assert "telemetry_streams_sensor_project" in index_schema
     assert "{schema}" not in index_schema
-    overlap_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
+    overlap_schema = postgres.render_migration(migrations[-7], "pelagia_unit")
     assert "USING gist" in overlap_schema
     assert "tstzrange(start_at, COALESCE(end_at, start_at), '[]')" in overlap_schema
     assert "{schema}" not in overlap_schema
-    reference_name_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
+    reference_name_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
     assert "telemetry_streams_sensor_project_idx" in reference_name_schema
     assert "{schema}" not in reference_name_schema
-    telemetry_stage_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
+    telemetry_stage_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
     assert "ADD VALUE IF NOT EXISTS 'telemetry_import'" in telemetry_stage_schema
     assert "{schema}" not in telemetry_stage_schema
-    series_schema = postgres.render_migration(migrations[-3], "pelagia_unit")
+    series_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_series" in series_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_work_units" in series_schema
     assert "{schema}" not in series_schema
-    clustering_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    analysis_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    assert "ADD VALUE IF NOT EXISTS 'feature_space_analysis'" in analysis_schema
+    assert "{schema}" not in analysis_schema
+    clustering_schema = postgres.render_migration(migrations[-2], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.clustering_evidence" in clustering_schema
     assert "evidence_kind" in clustering_schema
     assert "{schema}" not in clustering_schema
@@ -173,8 +177,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 18
-    assert status["migrations"]["applied_count"] == 18
+    assert status["migrations"]["available_count"] == 19
+    assert status["migrations"]["applied_count"] == 19
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 

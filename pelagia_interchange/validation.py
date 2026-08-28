@@ -170,8 +170,9 @@ class Validator:
                 result.add_error("invalid_metadata", error, "metadata.toml")
         except FormatError as exc:
             result.add_error("invalid_metadata", str(exc), "metadata.toml")
-        sources_by_id = {int(source["source_file_id"]): source for source in manifest.source_files if "source_file_id" in source}
-        source_ids = set(sources_by_id)
+        segments_by_id = {int(segment["acquisition_segment_id"]): segment
+                          for segment in manifest.acquisition_segments if "acquisition_segment_id" in segment}
+        segment_ids = set(segments_by_id)
         for shard in manifest.shards:
             try:
                 path = confined_path(self.root, shard["relative_path"])
@@ -195,16 +196,17 @@ class Validator:
                 if counts["frames"] != int(shard.get("frame_count", -1)):
                     result.add_error("frame_count_mismatch", f"manifest declares {shard.get('frame_count')}, database has {counts['frames']}", path)
                 with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as connection:
-                    unknown = (connection.execute("SELECT count(*) FROM frames").fetchone()[0] if not source_ids else
-                               connection.execute("SELECT count(*) FROM frames WHERE source_file_id NOT IN (%s)" % ",".join("?" for _ in source_ids), tuple(source_ids)).fetchone()[0])
+                    unknown = (connection.execute("SELECT count(*) FROM frames").fetchone()[0] if not segment_ids else
+                               connection.execute("SELECT count(*) FROM frames WHERE acquisition_segment_id NOT IN (%s)" % ",".join("?" for _ in segment_ids), tuple(segment_ids)).fetchone()[0])
                     if unknown:
-                        result.add_error("unknown_source_mapping", f"{unknown} frames reference sources absent from manifest", path)
-                    for source_id, source_uuid, filename, frame_count, hash_value, hash_algorithm in connection.execute(
-                        "SELECT source_file_id,source_uuid,original_filename,frame_count,hash,hash_algorithm FROM source_files"):
-                        declared = sources_by_id.get(int(source_id))
-                        declared_hash = (declared or {}).get("file_hash") or {}
-                        if declared is None or source_uuid != declared.get("source_uuid") or filename != declared.get("original_filename") or frame_count != declared.get("frame_count") or hash_value != declared_hash.get("value") or hash_algorithm != declared_hash.get("algorithm"):
-                            result.add_error("source_record_mismatch", f"source {source_id} differs between manifest and shard", path)
+                        result.add_error("unknown_acquisition_mapping", f"{unknown} frames reference segments absent from manifest", path)
+                    for segment_id, segment_uuid, name, mode, expected_count in connection.execute(
+                        "SELECT acquisition_segment_id,acquisition_segment_uuid,segment_name,acquisition_mode,expected_frame_count FROM acquisition_segments"):
+                        declared = segments_by_id.get(int(segment_id))
+                        if (declared is None or segment_uuid != declared.get("acquisition_segment_uuid") or
+                            name != declared.get("segment_name") or mode != declared.get("acquisition_mode") or
+                            expected_count != declared.get("expected_frame_count")):
+                            result.add_error("acquisition_segment_mismatch", f"acquisition segment {segment_id} differs between manifest and shard", path)
                 result.checked_shards += 1
             except (FormatError, sqlite3.Error, OSError, KeyError, UnsafePathError) as exc:
                 result.add_error("shard_structure", str(exc), shard.get("relative_path"))
@@ -272,18 +274,19 @@ class Validator:
                 result.add_error("missing_history_event", "successful shard_finalized history event is required")
         except FormatError as exc:
             result.add_error("invalid_history", str(exc), "history.jsonl")
-        expected = {int(source["source_file_id"]): source.get("frame_count") for source in manifest.source_files}
+        expected = {int(segment["acquisition_segment_id"]): segment.get("expected_frame_count")
+                    for segment in manifest.acquisition_segments}
         observed = {identifier: 0 for identifier in expected}
         for shard in manifest.shards:
             try:
                 path = confined_path(self.root, shard["relative_path"])
                 with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as connection:
-                    for source_id, count in connection.execute("SELECT source_file_id,count(*) FROM frames GROUP BY source_file_id"):
+                    for source_id, count in connection.execute("SELECT acquisition_segment_id,count(*) FROM frames GROUP BY acquisition_segment_id"):
                         observed[source_id] = observed.get(source_id, 0) + count
             except (sqlite3.Error, OSError, UnsafePathError) as exc:
                 result.add_error("source_reconciliation", str(exc), shard.get("relative_path"))
         for source_id, frame_count in expected.items():
             if frame_count is None:
-                result.add_error("unknown_expected_frames", f"source {source_id} has no expected frame_count")
+                result.add_error("unknown_expected_frames", f"acquisition segment {source_id} has no expected_frame_count")
             elif observed.get(source_id, 0) != int(frame_count):
-                result.add_error("source_frame_count", f"source {source_id}: expected {frame_count}, represented {observed.get(source_id, 0)}")
+                result.add_error("acquisition_frame_count", f"acquisition segment {source_id}: expected {frame_count}, represented {observed.get(source_id, 0)}")

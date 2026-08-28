@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from .constants import FORMAT_VERSION, SCHEMA_VERSION
 from .exceptions import FormatError, FrameNotFoundError, IntegrityError
-from .models import Frame, FrameRecord, FrameStatus, HashRecord, SourceFile, StorageFormat
+from .models import AcquisitionSegment, Frame, FrameRecord, FrameStatus, HashRecord, SourceFile, StorageFormat
 from .schema import REQUIRED_TABLES, initialize
 from .util import canonical_json, hash_bytes, utc_now
 
@@ -154,7 +154,7 @@ class ShardWriter:
             self.shard_uuid = UUID(str(metadata.get("shard_uuid"))) if metadata.get("shard_uuid") else (shard_uuid or uuid4())
             if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise IntegrityError(f"partial shard failed integrity_check: {partial_path}")
-            for row in self.connection.execute("SELECT source_file_id FROM source_files"):
+            for row in self.connection.execute("SELECT acquisition_segment_id FROM acquisition_segments"):
                 self._source_ids.add(int(row[0]))
             for row in self.connection.execute(
                 "SELECT storage_id,codec,codec_version,quality,pixel_format,bit_depth,encoder,encoder_version,parameters_json FROM storage_formats"
@@ -184,18 +184,16 @@ class ShardWriter:
             raise
         return self
 
-    def register_source(self, source: SourceFile) -> None:
+    def register_source(self, source: AcquisitionSegment) -> None:
         if source.source_file_id in self._source_ids:
             return
         file_hash = source.file_hash
         self.connection.execute(
-            """INSERT INTO source_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (source.source_file_id, str(source.source_uuid), source.original_filename,
-             source.original_relative_path, source.original_absolute_path, source.byte_size,
-             file_hash.value if file_hash else None, file_hash.algorithm if file_hash else None,
-             source.container, source.codec, source.pixel_format, source.width, source.height,
-             source.frame_rate_num, source.frame_rate_den, source.frame_count,
-             source.start_timestamp, source.end_timestamp),
+            """INSERT INTO acquisition_segments VALUES (?,?,?,?,?,?,?,?,?)""",
+            (source.acquisition_segment_id, str(source.acquisition_segment_uuid), source.segment_name,
+             source.acquisition_mode, source.expected_frame_count,
+             canonical_json(dict(source.capture_configuration)), source.started_at, source.ended_at,
+             canonical_json(dict(source.import_provenance)) if source.import_provenance is not None else None),
         )
         self._source_ids.add(source.source_file_id)
 
@@ -211,7 +209,7 @@ class ShardWriter:
             self._storage_ids[key] = int(cursor.lastrowid)
         return self._storage_ids[key]
 
-    def add(self, record: FrameRecord, source: SourceFile) -> None:
+    def add(self, record: FrameRecord, source: AcquisitionSegment) -> None:
         if self._closed:
             raise RuntimeError("shard writer is closed")
         blob = record.encoded_bytes
@@ -326,13 +324,13 @@ class ShardReader:
 
     def iter_frames(
         self, *, frame_start: int | None = None, frame_end: int | None = None,
-        source_file_id: int | None = None, timestamp_start: int | None = None,
+        acquisition_segment_id: int | None = None, timestamp_start: int | None = None,
         timestamp_end: int | None = None,
     ) -> Iterator[Frame]:
         clauses: list[str] = []
         values: list[int] = []
         for sql, value in (("f.frame_id>=?", frame_start), ("f.frame_id<=?", frame_end),
-                           ("f.source_file_id=?", source_file_id), ("f.timestamp_ns>=?", timestamp_start),
+                           ("f.acquisition_segment_id=?", acquisition_segment_id), ("f.timestamp_ns>=?", timestamp_start),
                            ("f.timestamp_ns<=?", timestamp_end)):
             if value is not None:
                 clauses.append(sql); values.append(value)
@@ -354,8 +352,8 @@ class ShardReader:
                 blob_hash = HashRecord(row["hash_algorithm"], "stored_blob", row["hash"]) if row["hash"] else None
                 pixel_hash = HashRecord(row["decoded_pixel_hash_algorithm"], "decoded_pixels", row["decoded_pixel_hash"]) if row["decoded_pixel_hash"] else None
                 yield Frame(FrameRecord(
-                    frame_id=row["frame_id"], source_file_id=row["source_file_id"],
-                    source_frame_number=row["source_frame_number"], encoded_bytes=row["blob"],
+                    frame_id=row["frame_id"], source_file_id=row["acquisition_segment_id"],
+                    source_frame_number=row["acquisition_frame_number"], encoded_bytes=row["blob"],
                     storage_format=storage, timestamp_ns=row["timestamp_ns"], source_timestamp_ns=row["source_timestamp_ns"],
                     timestamp_source=row["timestamp_source"], clock_source=row["clock_source"], timezone=row["timezone"],
                     utc_conversion=row["utc_conversion"], timestamp_precision_ns=row["timestamp_precision_ns"],
@@ -395,12 +393,12 @@ class ShardReader:
                 raise FormatError(f"cannot aggregate shard {self.path}: {exc}") from exc
 
     def source_progress(self, source_file_id: int) -> dict[str, int | None]:
-        """Return the durable prefix information for one source file."""
+        """Return durable prefix information for one acquisition segment."""
         with self._connection() as connection:
             try:
                 row = connection.execute(
-                    "SELECT count(*),min(source_frame_number),max(source_frame_number),max(frame_id) "
-                    "FROM frames WHERE source_file_id=?", (source_file_id,)
+                    "SELECT count(*),min(acquisition_frame_number),max(acquisition_frame_number),max(frame_id) "
+                    "FROM frames WHERE acquisition_segment_id=?", (source_file_id,)
                 ).fetchone()
                 return {"frame_count": int(row[0]), "first_source_frame": row[1],
                         "last_source_frame": row[2], "last_frame": row[3]}

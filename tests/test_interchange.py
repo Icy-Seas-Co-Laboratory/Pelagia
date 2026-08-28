@@ -33,11 +33,12 @@ PNG = b"\x89PNG\r\n\x1a\nsynthetic"
 def build(path: Path, *, count: int = 5, target: int = 10_000, cameras: tuple[str, ...] = ("port",)) -> Dataset:
     jpeg = StorageFormat("jpeg", quality=90, pixel_format="gray8", encoder="test")
     with DatasetBuilder(path, title="Synthetic", shard_target_bytes=target) as builder:
-        sources = [builder.register_source_file(original_filename=f"source-{camera}.avi", frame_count=count) for camera in cameras]
+        sources = [builder.register_acquisition_segment(segment_name=f"capture-{camera}", expected_frame_count=count,
+                                                        capture_configuration={"stream": camera}) for camera in cameras]
         for camera, source in zip(cameras, sources):
             for number in range(count):
-                builder.add_frame(stream=camera, source_file=source, frame_id=number,
-                                  source_frame_number=number, encoded_bytes=JPEG,
+                builder.add_frame(stream=camera, acquisition_segment=source, frame_id=number,
+                                  acquisition_frame_number=number, encoded_bytes=JPEG,
                                   storage_format=jpeg, timestamp_ns=1_000_000_000 + number,
                                   timestamp_source="video PTS", timestamp_precision_ns=1_000_000)
     return Dataset.open(path)
@@ -118,7 +119,7 @@ def test_interactive_video_create_collects_and_confirms_options(tmp_path: Path, 
     captured: dict = {}
     def fake_ingest(input_directory, destination, **kwargs):
         captured.update(input=input_directory, output=destination, **kwargs)
-        return SimpleNamespace(source_files=1, frames=10, previews=8)
+        return SimpleNamespace(acquisition_segments=1, frames=10, previews=8)
     monkeypatch.setattr("pelagia_interchange.cli.ingest_video_directory", fake_ingest)
     assert main(["create", "--interactive"]) == 0
     assert captured["input"] == videos and captured["output"] == output
@@ -139,14 +140,14 @@ def test_ingest_video_directory_end_to_end(tmp_path: Path, monkeypatch: pytest.M
     assert completed.returncode == 0, completed.stderr
     shutil.copyfile(video, videos / "sample_2.mp4")
     result = ingest_video_directory(videos, tmp_path / "dataset", title="Automatic import")
-    assert result.source_files == 2 and result.frames == 6 and result.dataset.frame_count == 6
+    assert result.acquisition_segments == 2 and result.frames == 6 and result.dataset.frame_count == 6
     assert result.previews == 6
     assert len(result.dataset.manifest.shards) == 1
     assert len(result.dataset.manifest.previews) == 8
     preview_index = json.loads((result.dataset.root / "preview" / "index.json").read_text())
     assert [item["frame_id"] for item in preview_index["frames"]] == list(range(6))
-    assert all(item["source_uuid"] for item in preview_index["frames"])
-    assert result.dataset.manifest.source_files[0]["frame_count"] == 3
+    assert all(item["acquisition_segment_uuid"] for item in preview_index["frames"])
+    assert result.dataset.manifest.acquisition_segments[0]["expected_frame_count"] == 3
     assert Validator(result.dataset.root).verify("archival", image_signatures=True).valid
     aligned = ingest_video_directory(videos, tmp_path / "source_aligned", title="Source aligned",
                                      source_file_boundary=True, generate_previews=False)
@@ -164,10 +165,10 @@ def test_ingest_video_directory_end_to_end(tmp_path: Path, monkeypatch: pytest.M
 
 def test_multiple_sources_cameras_and_ranges(tmp_path: Path) -> None:
     ds = build(tmp_path / "dataset", count=4, cameras=("port", "starboard"))
-    assert len(ds.manifest.source_files) == 2
+    assert len(ds.manifest.acquisition_segments) == 2
     assert [f.record.frame_id for f in ds.iter_frames(camera="starboard", frame_start=1, frame_end=2)] == [1, 2]
-    source_uuid = ds.manifest.source_files[0]["source_uuid"]
-    assert len(list(ds.iter_frames(source_uuid=source_uuid))) == 4
+    segment_uuid = ds.manifest.acquisition_segments[0]["acquisition_segment_uuid"]
+    assert len(list(ds.iter_frames(acquisition_segment_uuid=segment_uuid))) == 4
 
 
 def test_shard_rollover_and_deterministic_names(tmp_path: Path) -> None:
@@ -292,7 +293,7 @@ def test_extraction_filters_naming_overwrite_and_dry_run(tmp_path: Path) -> None
     out = tmp_path / "out"
     result = extract_frames(ds, out, camera="port", frame_start=1, frame_end=2, source_frame_names=True)
     assert result.written == 2
-    assert sorted(p.name for p in out.iterdir()) == ["source_000001_000000000001.jpg", "source_000001_000000000002.jpg"]
+    assert sorted(p.name for p in out.iterdir()) == ["acquisition_000001_000000000001.jpg", "acquisition_000001_000000000002.jpg"]
     assert extract_frames(ds, out, frame_start=1, frame_end=2, source_frame_names=True, overwrite="skip").skipped == 2
     dry = extract_frames(ds, tmp_path / "dry", dry_run=True)
     assert dry.written == 3 and not (tmp_path / "dry").exists()
@@ -424,9 +425,10 @@ def test_standalone_tools_and_cli(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert json.loads(completed.stdout)["valid"]
 
 
-def test_new_minor_and_schema_compatibility(tmp_path: Path) -> None:
+def test_pre_1_format_revision_requires_exact_reader(tmp_path: Path) -> None:
     ds = build(tmp_path / "dataset", count=1); path = ds.root / "manifest.json"
     raw = json.loads(path.read_text()); raw["format_version"] = "1.99"; path.write_text(json.dumps(raw))
-    assert Dataset.open(ds.root).manifest.format_version == "1.99"
+    with pytest.raises(CompatibilityError):
+        Dataset.open(ds.root)
     raw["schema_version"] = "2"; path.write_text(json.dumps(raw))
     with pytest.raises(CompatibilityError): Dataset.open(ds.root)

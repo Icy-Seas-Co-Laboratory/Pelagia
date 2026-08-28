@@ -51,6 +51,7 @@ class PipelineStage(str, Enum):
     SEGMENT = "segment"
     ROI_REFINEMENT = "roi_refinement"
     CLASSIFY = "classify"
+    FEATURE_SPACE_ANALYSIS = "feature_space_analysis"
     PUBLISH = "publish"
     TRAIN_MODEL = "train_model"
     IO_IMPORT = "io_import"

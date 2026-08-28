@@ -1506,6 +1506,15 @@ def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(m
                 "limit": values["limit"],
             }
 
+        def umap_rois(self, **values):
+            calls.append(("umap", values))
+            return {
+                "items": [{"id": "refined-det-1", "umap_coordinates": [0.1] * 10}],
+                "source_key": values["source_key"],
+                "projection": "umap",
+                "component_count": 10,
+            }
+
         def clusters(self, **values):
             calls.append(("clusters", values))
             return {
@@ -1532,6 +1541,7 @@ def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(m
     similar = client.get(
         "/curation/feature-space/similar/refined-det-1?source_key=classification:run-1&minimum=0.5"
     )
+    umap = client.get("/curation/feature-space/umap?source_key=classification:run-1&min_cluster_size=7&min_samples=3&cluster_selection_epsilon=0.15")
     clusters = client.get("/curation/feature-space/clusters?source_key=clustering:run-2")
     members = client.get(
         "/curation/feature-space/clusters/cluster-a/rois?source_key=clustering:run-2"
@@ -1539,6 +1549,7 @@ def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(m
 
     assert sources.json()["sources"][0]["source_key"] == "classification:run-1"
     assert browse.status_code == similar.status_code == clusters.status_code == members.status_code == 200
+    assert umap.status_code == 410
     assert browse.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
     assert similar.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
     assert members.json()["items"][0]["roi_url"].startswith("/refined-detections/")
@@ -1548,6 +1559,87 @@ def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(m
         ("clusters", {"source_key": "clustering:run-2"}),
         ("members", {"source_key": "clustering:run-2", "cluster_id": "cluster-a", "limit": 120, "offset": 0}),
     ]
+
+
+def test_curation_feature_space_analysis_queues_a_stable_ephemeral_job():
+    client, repository, _ = make_client()
+    calls = []
+
+    def enqueue_feature_space_analysis(**values):
+        calls.append(values)
+        return (
+            {
+                "id": "analysis-job-1",
+                "project_id": values["project_id"],
+                "stage": PipelineStage.FEATURE_SPACE_ANALYSIS.value,
+                "status": "queued",
+                "payload": values["payload"],
+            },
+            "queued",
+        )
+
+    repository.enqueue_feature_space_analysis = enqueue_feature_space_analysis
+    payload = {
+        "source_key": "classification:run-1",
+        "min_cluster_size": 7,
+        "min_samples": 3,
+        "cluster_selection_epsilon": 0.15,
+    }
+
+    first = client.post("/curation/feature-space/umap/analysis", json=payload)
+    second = client.post("/curation/feature-space/umap/analysis", json=payload)
+
+    assert first.status_code == second.status_code == 202
+    assert first.json()["ephemeral"] is True
+    assert first.json()["disposition"] == "queued"
+    assert first.json()["job"]["stage"] == PipelineStage.FEATURE_SPACE_ANALYSIS.value
+    assert first.json()["cache_key"] == second.json()["cache_key"]
+    assert len(first.json()["cache_key"]) == 64
+    assert calls == [
+        {
+            "project_id": "project-1",
+            "payload": {
+                "analysis_version": 1,
+                "source_key": "classification:run-1",
+                "min_cluster_size": 7,
+                "min_samples": 3,
+                "cluster_selection_epsilon": 0.15,
+                "cache_key": first.json()["cache_key"],
+            },
+            "submitted_by_user_id": "dev",
+            "submitted_by_username": "dev",
+            "force": False,
+        },
+        {
+            "project_id": "project-1",
+            "payload": {
+                "analysis_version": 1,
+                "source_key": "classification:run-1",
+                "min_cluster_size": 7,
+                "min_samples": 3,
+                "cluster_selection_epsilon": 0.15,
+                "cache_key": first.json()["cache_key"],
+            },
+            "submitted_by_user_id": "dev",
+            "submitted_by_username": "dev",
+            "force": False,
+        },
+    ]
+
+
+def test_curation_feature_space_analysis_validates_source_and_queue_limit():
+    client, repository, _ = make_client()
+
+    invalid = client.post("/curation/feature-space/umap/analysis", json={"source_key": "not-a-source"})
+    assert invalid.status_code == 422
+
+    def queue_full(**_values):
+        raise RuntimeError("At most two active feature-space analysis jobs are allowed per project.")
+
+    repository.enqueue_feature_space_analysis = queue_full
+    full = client.post("/curation/feature-space/umap/analysis", json={"source_key": "clustering:run-2"})
+    assert full.status_code == 429
+    assert "At most two" in full.json()["detail"]
 
 
 def test_io_export_options_are_discoverable():

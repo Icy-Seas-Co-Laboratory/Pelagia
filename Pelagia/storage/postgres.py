@@ -134,6 +134,9 @@ def _initial_job_progress(
     elif stage == PipelineStage.CLASSIFY.value:
         total = len(dict.fromkeys(str(value) for value in payload.get("roi_ids") or [] if value))
         unit = "rois"
+    elif stage == PipelineStage.FEATURE_SPACE_ANALYSIS.value:
+        total = 1
+        unit = "analysis"
 
     if total <= 0:
         return {}
@@ -5244,7 +5247,7 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
-                           refined.roi_shape, refined.created_at,
+                           refined.bbox_w, refined.bbox_h, refined.roi_shape, refined.created_at,
                            assets.id AS asset_id, assets.filename AS asset_filename,
                            coalesce(labels.display_name, labels.name) AS label_display_name,
                            review.decision AS review_decision
@@ -6648,6 +6651,72 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    def enqueue_feature_space_analysis(
+        self,
+        *,
+        project_id: str,
+        payload: dict[str, Any],
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+        force: bool = False,
+    ) -> tuple[dict[str, Any], str]:
+        """Return a reusable short-lived analysis cache entry or queue one job.
+
+        The project-row lock makes the two-active-analysis limit atomic without
+        introducing a permanent analysis-results table.
+        """
+        cache_key = str(payload["cache_key"])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT id FROM {self.schema}.projects WHERE id = %s FOR UPDATE", (project_id,))
+                if cursor.fetchone() is None:
+                    raise ValueError("Project was not found.")
+                cursor.execute(
+                    f"""DELETE FROM {self.schema}.processing_jobs
+                    WHERE project_id = %s AND stage = 'feature_space_analysis'::{self.schema}.stage_name
+                      AND status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                      AND COALESCE(finished_at, created_at) < NOW() - INTERVAL '30 minutes'""",
+                    (project_id,),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.processing_jobs
+                    WHERE project_id = %s AND stage = 'feature_space_analysis'::{self.schema}.stage_name
+                      AND payload ->> 'cache_key' = %s
+                    ORDER BY created_at DESC LIMIT 1""",
+                    (project_id, cache_key),
+                )
+                existing = cursor.fetchone()
+                if existing is not None and existing["status"] in {"queued", "leased", "working", "paused"}:
+                    connection.commit()
+                    return existing, "active"
+                if not force and existing is not None and existing["status"] == "succeeded" and existing.get("finished_at"):
+                    cursor.execute("SELECT %s::timestamptz >= NOW() - INTERVAL '15 minutes' AS cache_fresh", (existing["finished_at"],))
+                    if cursor.fetchone()["cache_fresh"]:
+                        connection.commit()
+                        return existing, "cached"
+                cursor.execute(
+                    f"""SELECT COUNT(*) AS count FROM {self.schema}.processing_jobs
+                    WHERE project_id = %s AND stage = 'feature_space_analysis'::{self.schema}.stage_name
+                      AND status IN ('queued', 'leased', 'working', 'paused')""",
+                    (project_id,),
+                )
+                if int(cursor.fetchone()["count"]) >= 2:
+                    raise RuntimeError("At most two active feature-space analysis jobs are allowed per project.")
+                progress = _initial_job_progress("feature_space_analysis", "queued", payload)
+                cursor.execute(
+                    f"""INSERT INTO {self.schema}.processing_jobs
+                    (project_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary,
+                     submitted_by_user_id, submitted_by_username)
+                    VALUES (%s, 'feature_space_analysis'::{self.schema}.stage_name, 'queued'::{self.schema}.job_status,
+                            %s, 0, 1, %s::jsonb, %s::jsonb, %s, %s, %s) RETURNING *""",
+                    (project_id, self.config.queue.default_priority, json.dumps(json_ready(payload)), json.dumps(json_ready(progress)),
+                     "Ephemeral UMAP/HDBSCAN analysis", submitted_by_user_id, submitted_by_username),
+                )
+                row = cursor.fetchone()
+                self._append_job_event(cursor, row["id"], "job.created", {"stage": "feature_space_analysis", "cache_key": cache_key})
+            connection.commit()
+        return row, "queued"
+
     # Processing series deliberately wrap, rather than alter, ordinary jobs.  This
     # keeps historical queue rows and direct job APIs compatible with series work.
     def create_processing_series(
@@ -6724,6 +6793,7 @@ class PostgresRepository:
         failed = int(counts.get("failed_jobs") or 0)
         return {
             **series,
+            "targets": series.get("selection") or {},
             "steps": steps,
             "progress": {
                 "unit": "jobs",
@@ -6795,6 +6865,12 @@ class PostgresRepository:
                         JOIN {self.schema}.processing_series series ON series.id = steps.series_id
                         WHERE steps.series_id = %s AND series.project_id = %s
                           AND series.status IN ('queued', 'active') AND steps.status = 'queued'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM {self.schema}.processing_series_steps earlier
+                              WHERE earlier.series_id = steps.series_id
+                                AND earlier.step_index < steps.step_index
+                                AND earlier.status IN ('queued', 'planning', 'active')
+                          )
                         ORDER BY steps.step_index FOR UPDATE SKIP LOCKED LIMIT 1
                     ) UPDATE {self.schema}.processing_series_steps steps
                     SET status = 'planning', started_at = COALESCE(started_at, NOW())
@@ -6919,8 +6995,12 @@ class PostgresRepository:
                     worker_id = NULL, error_message = NULL, finished_at = NULL, control_reason = %s, updated_at = NOW()
                     FROM {self.schema}.processing_work_units units WHERE units.job_id = jobs.id AND units.series_id = %s
                     AND jobs.status IN ('failed', 'dead_lettered', 'cancelled')""", (reason, series_id))
-                cursor.execute(f"""UPDATE {self.schema}.processing_series_steps SET status = 'active', finished_at = NULL
-                    WHERE series_id = %s AND status IN ('failed', 'cancelled')""", (series_id,))
+                cursor.execute(f"""UPDATE {self.schema}.processing_series_steps steps SET status = 'active', finished_at = NULL
+                    WHERE steps.series_id = %s AND steps.status IN ('failed', 'cancelled')
+                      AND EXISTS (
+                          SELECT 1 FROM {self.schema}.processing_work_units units
+                          WHERE units.step_id = steps.id
+                      )""", (series_id,))
                 cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'active', finished_at = NULL, control_reason = %s, updated_at = NOW() WHERE id = %s RETURNING *", (reason, series_id))
                 row = cursor.fetchone()
             connection.commit()

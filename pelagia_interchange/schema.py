@@ -18,30 +18,22 @@ CREATE TABLE storage_formats (
  description TEXT,
  UNIQUE(codec, codec_version, quality, pixel_format, bit_depth, encoder, encoder_version, parameters_json)
 );
-CREATE TABLE source_files (
- source_file_id INTEGER PRIMARY KEY,
- source_uuid TEXT NOT NULL UNIQUE,
- original_filename TEXT NOT NULL,
- original_relative_path TEXT,
- original_absolute_path TEXT,
- byte_size INTEGER,
- hash TEXT,
- hash_algorithm TEXT,
- container TEXT,
- codec TEXT,
- pixel_format TEXT,
- width INTEGER,
- height INTEGER,
- frame_rate_num INTEGER,
- frame_rate_den INTEGER,
- frame_count INTEGER,
- start_timestamp TEXT,
- end_timestamp TEXT
+CREATE TABLE acquisition_segments (
+ acquisition_segment_id INTEGER PRIMARY KEY,
+ acquisition_segment_uuid TEXT NOT NULL UNIQUE,
+ segment_name TEXT NOT NULL,
+ acquisition_mode TEXT NOT NULL CHECK(acquisition_mode IN ('direct_frame_capture','imported_video')),
+ expected_frame_count INTEGER,
+ capture_configuration_json TEXT NOT NULL DEFAULT '{}',
+ started_at TEXT,
+ ended_at TEXT,
+ import_provenance_json TEXT,
+ CHECK(expected_frame_count IS NULL OR expected_frame_count >= 0)
 );
 CREATE TABLE frames (
  frame_id INTEGER PRIMARY KEY,
- source_file_id INTEGER NOT NULL REFERENCES source_files(source_file_id),
- source_frame_number INTEGER NOT NULL,
+ acquisition_segment_id INTEGER NOT NULL REFERENCES acquisition_segments(acquisition_segment_id),
+ acquisition_frame_number INTEGER NOT NULL,
  timestamp_ns INTEGER,
  source_timestamp_ns INTEGER,
  timestamp_source TEXT,
@@ -63,10 +55,10 @@ CREATE TABLE frames (
  decoded_pixel_hash TEXT,
  decoded_pixel_hash_algorithm TEXT,
  status TEXT NOT NULL CHECK(status IN ('valid','missing','decode_failed','duplicate','intentionally_removed','timestamp_invalid','corrupt')),
- UNIQUE(source_file_id, source_frame_number),
+ UNIQUE(acquisition_segment_id, acquisition_frame_number),
  CHECK((blob IS NOT NULL AND storage_id IS NOT NULL) OR (blob IS NULL AND status != 'valid'))
 );
-CREATE INDEX frames_source_number ON frames(source_file_id, source_frame_number);
+CREATE INDEX frames_acquisition_number ON frames(acquisition_segment_id, acquisition_frame_number);
 CREATE INDEX frames_timestamp ON frames(timestamp_ns);
 CREATE TABLE shard_metadata (
  key TEXT PRIMARY KEY,
@@ -74,7 +66,7 @@ CREATE TABLE shard_metadata (
 );
 """
 
-REQUIRED_TABLES = {"frames", "source_files", "storage_formats", "shard_metadata"}
+REQUIRED_TABLES = {"frames", "acquisition_segments", "storage_formats", "shard_metadata"}
 
 
 def initialize(connection: sqlite3.Connection) -> None:
@@ -83,4 +75,3 @@ def initialize(connection: sqlite3.Connection) -> None:
         "INSERT INTO shard_metadata(key, value) VALUES (?, ?)",
         (("format_version", FORMAT_VERSION), ("schema_version", SCHEMA_VERSION)),
     )
-

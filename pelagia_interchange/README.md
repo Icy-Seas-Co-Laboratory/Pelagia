@@ -15,7 +15,7 @@ The package has no required third-party runtime dependencies. Optional BLAKE3 an
 
 ## Create your first dataset
 
-Create a complete dataset from a directory of videos:
+Create a complete dataset from a directory of videos (the legacy import profile):
 
 ```bash
 pii create deployment_042 \
@@ -28,9 +28,9 @@ pii inspect deployment_042
 pii verify deployment_042 --level structural
 ```
 
-FFprobe discovers source properties and frame counts; source files are SHA-256 hashed concurrently; FFmpeg streams raw decoded frames; and libjpeg-turbo encodes bounded batches of JPEG payloads into immutable SQLite shards. One ordered SQLite writer owns each active shard while JPEG workers run in parallel. FFmpeg, FFprobe, and libjpeg-turbo are only needed for creation. Consecutive videos fill the current shard by default; use `--source-file-boundary` only when every video should start a new shard. Other controls include `--recursive`, `--grayscale`, `--jpeg-quality`, `--jpeg-workers`, and `--no-source-hash`.
+FFprobe discovers import properties and frame counts; files are SHA-256 hashed concurrently; FFmpeg streams raw decoded frames; and libjpeg-turbo encodes bounded batches of JPEG payloads into immutable SQLite shards. The result is explicitly an `imported_video` acquisition segment: its retained BLOBs are canonical for that package, but the package does not claim they were direct camera outputs. One ordered SQLite writer owns each active shard while JPEG workers run in parallel. FFmpeg, FFprobe, and libjpeg-turbo are only needed for this legacy import path.
 
-Creation also produces up to 12 evenly spaced 512-pixel thumbnails, a contact sheet, and `preview/index.json` mapping derivatives to authoritative frame/source identities. Control this with `--preview-count`, `--preview-width`, `--no-previews`, and `--require-previews`. Previews are checksummed but explicitly non-authoritative.
+Creation also produces up to 12 evenly spaced 512-pixel thumbnails, a contact sheet, and `preview/index.json` mapping derivatives to authoritative frame/acquisition identities. Previews are checksummed but explicitly non-authoritative.
 
 For a guided workflow:
 
