@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Pelagia job workflow supervisor regularly
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+RandomizedDelaySec=10s
+Persistent=true
+Unit=pelagia-job-supervisor.service
+
+[Install]
+WantedBy=timers.target

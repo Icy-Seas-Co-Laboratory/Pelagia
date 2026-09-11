@@ -143,6 +143,7 @@ stage_aliases = {
     "registry_load": "registry_load",
     "registry_export": "registry_export",
     "registry_generate": "registry_generate",
+    "export_bundle": "export_bundle",
     "refine_rois": "roi_refinement",
 }
 

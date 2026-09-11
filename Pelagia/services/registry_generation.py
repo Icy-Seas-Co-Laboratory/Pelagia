@@ -73,6 +73,11 @@ def _selection_sql(repository, project_id: str, selection: Mapping[str, Any]) ->
         clauses.append("assets.id = ANY(%s::uuid[])")
         params.append(list(dict.fromkeys(asset_ids)))
 
+    roi_ids = [str(value) for value in selection.get("roi_ids") or () if value]
+    if roi_ids:
+        clauses.append("refined.id = ANY(%s::uuid[])")
+        params.append(list(dict.fromkeys(roi_ids)))
+
     annotation_state = str(selection.get("annotation_state") or "all")
     if annotation_state == "labeled":
         clauses.append("annotation.id IS NOT NULL AND annotation.status <> 'deprecated'")

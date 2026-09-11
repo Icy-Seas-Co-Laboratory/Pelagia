@@ -423,6 +423,27 @@ when they cannot safely be converted to `captured_at`.
 
 Pelagia uses Postgres-backed jobs to coordinate long-running processing. Workers are independent processes that claim jobs for specific stages, heartbeat while active, write job events, and can be stopped through worker-session state.
 
+Each claim carries a rotated lease token. Workers use that token when renewing a
+lease, reporting progress, or finishing work, so a worker that loses a lease
+cannot overwrite a newer claimant's state. For multi-stage processing series,
+run `reconcile_processing_series` from one scheduled supervisor; it
+idempotently resumes terminal-ready series and conservatively returns abandoned
+empty planning steps to the director queue. The command takes a PostgreSQL
+advisory lock, requeues expired leases, materializes durable successor
+dispatches, and reports `retry_scheduled`, `dead_lettered`, `expired_leases`,
+`pending_dispatches`, and `failed_dispatches` counters. Schedule it frequently
+enough for the desired recovery time and alert on non-zero dead letters, failed
+dispatches, and persistently increasing lease-expiry counts.
+
+For a systemd deployment, install
+`scripts/systemd/pelagia-job-supervisor.service` and
+`scripts/systemd/pelagia-job-supervisor.timer`, adjust the user, paths, and
+`/etc/pelagia/pelagia.env`, then run `systemctl enable --now
+pelagia-job-supervisor.timer`. The timer invokes a short-lived supervisor every
+minute; the database advisory lock remains the singleton guard across manual
+invocations and multiple hosts. Inspect each run with `systemctl status
+pelagia-job-supervisor.service` and use the command's JSON counters for alerts.
+
 Example worker roles:
 
 ```text
@@ -489,9 +510,7 @@ Useful endpoint groups:
 - `GET /frames/{frame_id}/context`
 - `GET /detections`, `/detections/{detection_id}/framedata`, `/mask`, `/refined-roi`, `/refined-mask`
 - `GET /logs`
-- `GET /io/export/options`
-- `GET /io/export/table/{table_name}`, `GET /io/export/tables`
-- `GET /io/export/datasets/frame-metadata`, `/roi-metadata`
+- `GET /exports/options`, `POST /exports`, `GET /exports/{export_id}`, `/download`
 
 Detection list and detail responses expose the parent frame's nullable
 `captured_at` timestamp. ROI metadata exports and curation ROI responses expose

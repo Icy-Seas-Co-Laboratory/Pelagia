@@ -5,6 +5,7 @@ import hmac
 import json
 import math
 import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
@@ -53,12 +54,15 @@ REQUIRED_SCHEMA_TABLES = (
     "classification_inference_runs",
     "classification_evidence",
     "clustering_evidence",
+    "embedding_evidence",
     "roi_label_annotations",
     "roi_annotation_reviews",
     "registry_workspaces",
     "registry_items",
     "processing_jobs",
+    "export_artifacts",
     "processing_job_dependencies",
+    "processing_job_dispatches",
     "processing_series",
     "processing_series_steps",
     "processing_work_units",
@@ -104,6 +108,15 @@ class ClassificationEvidenceContext:
 @dataclass(frozen=True, slots=True)
 class ClusteringEvidenceContext:
     """Run-scoped identifiers required to persist cluster evidence."""
+
+    project_id: str
+    inference_run_id: str
+    model_artifact_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingEvidenceContext:
+    """Run-scoped identifiers required to persist embedding evidence."""
 
     project_id: str
     inference_run_id: str
@@ -1366,6 +1379,9 @@ class PostgresRepository:
                 "priority",
                 "attempt_count",
                 "max_attempts",
+                "available_at",
+                "failure_category",
+                "idempotency_key",
                 "lease_expires_at",
                 "worker_id",
                 "summary",
@@ -1600,6 +1616,18 @@ class PostgresRepository:
             **row,
             "progress": progress,
         }
+
+    def _retry_delay_seconds(self, attempt_count: int) -> int:
+        """Return a bounded exponential retry delay for a completed attempt."""
+        queue = self.config.queue
+        exponent = max(0, attempt_count - 1)
+        delay = min(
+            max(0, int(queue.retry_backoff_max_seconds)),
+            max(0, int(queue.retry_backoff_base_seconds)) * (2 ** exponent),
+        )
+        # Deterministic jitter avoids a dependency on process-local randomness
+        # while spreading retries with the same attempt count slightly.
+        return delay + min(max(0, int(queue.retry_backoff_jitter_seconds)), max(0, delay // 4))
 
     def get_job(self, job_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -3350,6 +3378,65 @@ class PostgresRepository:
     def list_detection_records(self, asset_id: str) -> list[DetectionRecord]:
         return [DetectionRecord.from_row(row) for row in self.list_detections(asset_id)]
 
+    def list_refined_detections_for_continuity(
+        self, asset_id: str, *, project_id: str, start_frame: int | None = None, end_frame: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["frames.asset_id = %s", "assets.project_id = %s"]
+        params: list[Any] = [asset_id, project_id]
+        if start_frame is not None:
+            clauses.append("frames.frame_index >= %s")
+            params.append(start_frame)
+        if end_frame is not None:
+            clauses.append("frames.frame_index <= %s")
+            params.append(end_frame)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT refined.*, frames.asset_id, frames.frame_index, frames.width AS frame_width,
+                           frames.height AS frame_height
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY frames.frame_index ASC, refined.roi_index ASC, refined.id ASC
+                """, tuple(params))
+                return cursor.fetchall()
+
+    def record_roi_continuity(
+        self, *, project_id: str, asset_id: str, run_id: str | None, job_id: str | None,
+        method: str, parameters: Mapping[str, Any], assemblies: Sequence[Mapping[str, Any]],
+        decisions: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                self._ensure_project_scope(cursor, project_id, asset_id=asset_id)
+                cursor.execute(f"""INSERT INTO {self.schema}.roi_continuity_runs
+                    (project_id, job_id, run_id, asset_id, method, parameters, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb) RETURNING *""", (
+                    project_id, job_id, run_id, asset_id, method, json.dumps(json_ready(parameters)),
+                    json.dumps(json_ready(metadata or {}))))
+                continuity_run = cursor.fetchone()
+                assembly_ids: dict[str, str] = {}
+                for assembly in assemblies:
+                    cursor.execute(f"""INSERT INTO {self.schema}.roi_continuity_assemblies
+                        (continuity_run_id, assembly_key, metadata) VALUES (%s, %s, %s::jsonb) RETURNING id""", (
+                        continuity_run["id"], assembly["assembly_id"], json.dumps(json_ready(assembly))))
+                    assembly_ids[str(assembly["assembly_id"])] = str(cursor.fetchone()["id"])
+                pair_assemblies = {
+                    pair: assembly["assembly_id"] for assembly in assemblies
+                    for pair in assembly.get("link_pairs", [])
+                }
+                for decision in decisions:
+                    pair = [decision["source_segment_id"], decision["target_segment_id"]]
+                    cursor.execute(f"""INSERT INTO {self.schema}.roi_continuity_links
+                        (continuity_run_id, assembly_id, source_refined_detection_id, target_refined_detection_id,
+                         score, accepted, reason, features) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)""", (
+                        continuity_run["id"], assembly_ids.get(str(pair_assemblies.get(tuple(pair)))),
+                        *pair, decision["score"], decision["accepted"], decision.get("reason"),
+                        json.dumps(json_ready(decision.get("features") or {}))))
+            connection.commit()
+        return continuity_run
+
     def list_asset_detection_stats(
         self,
         *,
@@ -4921,9 +5008,15 @@ class PostgresRepository:
                 clauses.append("(annotation.label_id = %s OR evidence.predicted_label_id = %s)")
                 params.extend([label_id, label_id])
         if evidence_state == "available":
-            clauses.append("evidence.id IS NOT NULL")
+            clauses.append(
+                "(evidence.id IS NOT NULL OR cluster_evidence.id IS NOT NULL "
+                "OR embedding_evidence.id IS NOT NULL)"
+            )
         elif evidence_state == "missing":
-            clauses.append("evidence.id IS NULL")
+            clauses.append(
+                "evidence.id IS NULL AND cluster_evidence.id IS NULL "
+                "AND embedding_evidence.id IS NULL"
+            )
         elif evidence_state == "disagreement":
             clauses.append(
                 "evidence.id IS NOT NULL AND ((evidence.prototype_class_index IS NOT NULL AND "
@@ -4968,6 +5061,7 @@ class PostgresRepository:
                            refined.area, refined.perimeter, refined.roi_shape,
                            refined.roi_encoding, refined.created_at,
                            frames.frame_index, frames.captured_at AS captured_at,
+                           frames.width AS frame_width, frames.height AS frame_height,
                            assets.id AS asset_id,
                            assets.filename AS asset_filename,
                            annotation.id AS annotation_id,
@@ -4991,6 +5085,10 @@ class PostgresRepository:
                            cluster_evidence.novel AS cluster_novel,
                            cluster_evidence.abstained AS cluster_abstained,
                            cluster_evidence.inference_run_id AS clustering_inference_run_id,
+                           embedding_evidence.id AS embedding_evidence_id,
+                           embedding_evidence.embedding_normalized,
+                           embedding_evidence.inference_run_id AS embedding_inference_run_id,
+                           embedding_evidence.model_artifact_id AS embedding_model_artifact_id,
                            count(*) OVER() AS total_count
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
@@ -5022,6 +5120,12 @@ class PostgresRepository:
                         ORDER BY latest_cluster_evidence.created_at DESC, latest_cluster_evidence.id DESC
                         LIMIT 1
                     ) cluster_evidence ON true
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM {self.schema}.embedding_evidence latest_embedding_evidence
+                        WHERE latest_embedding_evidence.refined_detection_id = refined.id
+                        ORDER BY latest_embedding_evidence.created_at DESC, latest_embedding_evidence.id DESC
+                        LIMIT 1
+                    ) embedding_evidence ON true
                     WHERE {where}
                     ORDER BY {order}
                     LIMIT %s OFFSET %s
@@ -5106,6 +5210,23 @@ class PostgresRepository:
                     (roi_id,),
                 )
                 row["clustering_evidence"] = list(cursor.fetchall())
+                cursor.execute(
+                    f"""
+                    SELECT evidence.*, runs.model_selector,
+                           artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint
+                    FROM {self.schema}.embedding_evidence evidence
+                    JOIN {self.schema}.classification_inference_runs runs
+                      ON runs.id = evidence.inference_run_id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = evidence.model_artifact_id
+                    WHERE evidence.refined_detection_id = %s
+                    ORDER BY evidence.created_at DESC, evidence.id DESC
+                    """,
+                    (roi_id,),
+                )
+                row["embedding_evidence"] = list(cursor.fetchall())
         return row
 
     def list_feature_space_sources(self, *, project_id: str) -> list[dict[str, Any]]:
@@ -5162,9 +5283,31 @@ class PostgresRepository:
                     GROUP BY runs.id, runs.model_selector, artifacts.artifact_id,
                              artifacts.run_id, artifacts.artifact_fingerprint
                     HAVING count(evidence.embedding_payload_ref) > 0
+                    UNION ALL
+                    SELECT 'embedding' AS source_kind,
+                           runs.id AS inference_run_id,
+                           runs.model_selector,
+                           artifacts.artifact_id,
+                           artifacts.run_id AS model_run_id,
+                           artifacts.artifact_fingerprint,
+                           count(*) AS evidence_count,
+                           count(evidence.embedding_payload_ref) AS embedding_count,
+                           (jsonb_agg(evidence.embedding_shape)
+                              FILTER (WHERE evidence.embedding_shape IS NOT NULL))->0
+                              AS embedding_shape,
+                           max(evidence.created_at) AS latest_evidence_at
+                    FROM {self.schema}.classification_inference_runs runs
+                    JOIN {self.schema}.embedding_evidence evidence
+                      ON evidence.inference_run_id = runs.id
+                    LEFT JOIN {self.schema}.model_artifacts artifacts
+                      ON artifacts.id = evidence.model_artifact_id
+                    WHERE runs.project_id = %s
+                    GROUP BY runs.id, runs.model_selector, artifacts.artifact_id,
+                             artifacts.run_id, artifacts.artifact_fingerprint
+                    HAVING count(evidence.embedding_payload_ref) > 0
                     ORDER BY latest_evidence_at DESC, source_kind, model_selector
                     """,
-                    (project_id, project_id),
+                    (project_id, project_id, project_id),
                 )
                 return list(cursor.fetchall())
 
@@ -5175,12 +5318,25 @@ class PostgresRepository:
         source_kind: str,
         inference_run_id: str,
         limit: int,
+        offset: int = 0,
+        sort_by: str = "original",
     ) -> list[dict[str, Any]]:
         """Return embedding references for one immutable evidence source."""
 
-        if source_kind not in {"classification", "clustering"}:
+        if source_kind not in {"classification", "clustering", "embedding"}:
             raise ValueError(f"Unsupported feature-space source kind: {source_kind}")
-        table = "classification_evidence" if source_kind == "classification" else "clustering_evidence"
+        table = {
+            "classification": "classification_evidence",
+            "clustering": "clustering_evidence",
+            "embedding": "embedding_evidence",
+        }[source_kind]
+        order_by = {
+            "original": "evidence.refined_detection_id",
+            "image_area_asc": "(refined.roi_shape->>0)::bigint * (refined.roi_shape->>1)::bigint ASC NULLS LAST, evidence.refined_detection_id",
+            "image_area_desc": "(refined.roi_shape->>0)::bigint * (refined.roi_shape->>1)::bigint DESC NULLS LAST, evidence.refined_detection_id",
+            "longest_side_asc": "GREATEST((refined.roi_shape->>0)::integer, (refined.roi_shape->>1)::integer) ASC NULLS LAST, evidence.refined_detection_id",
+            "longest_side_desc": "GREATEST((refined.roi_shape->>0)::integer, (refined.roi_shape->>1)::integer) DESC NULLS LAST, evidence.refined_detection_id",
+        }.get(sort_by, "evidence.refined_detection_id")
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -5191,16 +5347,18 @@ class PostgresRepository:
                            evidence.embedding_shape,
                            evidence.embedding_sha256
                     FROM {self.schema}.{table} evidence
+                    JOIN {self.schema}.detections_refined refined
+                      ON refined.id = evidence.refined_detection_id
                     JOIN {self.schema}.classification_inference_runs runs
                       ON runs.id = evidence.inference_run_id
                     WHERE evidence.project_id = %s
                       AND evidence.inference_run_id = %s
                       AND runs.project_id = %s
                       AND evidence.embedding_payload_ref IS NOT NULL
-                    ORDER BY evidence.refined_detection_id
-                    LIMIT %s
+                    ORDER BY {order_by}
+                    LIMIT %s OFFSET %s
                     """,
-                    (project_id, inference_run_id, project_id, limit),
+                    (project_id, inference_run_id, project_id, limit, offset),
                 )
                 return list(cursor.fetchall())
 
@@ -5213,9 +5371,13 @@ class PostgresRepository:
     ) -> int:
         """Count persisted ROI vectors for one immutable feature-space source."""
 
-        if source_kind not in {"classification", "clustering"}:
+        if source_kind not in {"classification", "clustering", "embedding"}:
             raise ValueError(f"Unsupported feature-space source kind: {source_kind}")
-        table = "classification_evidence" if source_kind == "classification" else "clustering_evidence"
+        table = {
+            "classification": "classification_evidence",
+            "clustering": "clustering_evidence",
+            "embedding": "embedding_evidence",
+        }[source_kind]
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -5738,13 +5900,13 @@ class PostgresRepository:
     ) -> tuple[str, str, list[Any]]:
         """Build the shared target query used by previews, counts, and workers."""
 
-        if evidence_kind not in {"classification", "clustering"}:
+        if evidence_kind not in {"classification", "clustering", "embedding"}:
             raise ValueError(f"Unsupported evidence kind: {evidence_kind}")
-        evidence_table = (
-            "classification_evidence"
-            if evidence_kind == "classification"
-            else "clustering_evidence"
-        )
+        evidence_table = {
+            "classification": "classification_evidence",
+            "clustering": "clustering_evidence",
+            "embedding": "embedding_evidence",
+        }[evidence_kind]
 
         filters = dict(selection or {})
         clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
@@ -5777,7 +5939,7 @@ class PostgresRepository:
         label_id = filters.get("label_id")
         if label_id:
             if evidence_kind != "classification" and str(filters.get("label_source") or "any") != "human":
-                raise ValueError("Clustering evidence queries cannot filter by predicted label")
+                raise ValueError("Non-classification evidence queries cannot filter by predicted label")
             label_source = str(filters.get("label_source") or "any")
             if label_source == "human":
                 clauses.append("annotation.label_id = %s")
@@ -5808,7 +5970,7 @@ class PostgresRepository:
             )
         elif evidence_state == "disagreement":
             if evidence_kind != "classification":
-                raise ValueError("Clustering evidence does not have classification disagreement state")
+                raise ValueError("Non-classification evidence does not have classification disagreement state")
             clauses.append(
                 "model_evidence.id IS NOT NULL AND ((model_evidence.prototype_class_index IS NOT NULL AND "
                 "model_evidence.prototype_class_index <> model_evidence.predicted_class_index) OR "
@@ -6073,14 +6235,14 @@ class PostgresRepository:
             class_label_ids=mappings,
         )
 
-    def _ensure_clustering_artifact(
+    def _ensure_evidence_artifact(
         self,
         cursor,
         *,
         project_id: str,
         model: dict[str, Any],
     ) -> str:
-        """Register a clustering or hybrid model without inventing labels."""
+        """Register a non-classification evidence model without inventing labels."""
 
         cursor.execute(
             f"""
@@ -6120,7 +6282,7 @@ class PostgresRepository:
 
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                artifact_row_id = self._ensure_clustering_artifact(
+                artifact_row_id = self._ensure_evidence_artifact(
                     cursor, project_id=project_id, model=model
                 )
                 cursor.execute(
@@ -6204,6 +6366,88 @@ class PostgresRepository:
                 candidate_clusters = EXCLUDED.candidate_clusters,
                 nearest_neighbors = EXCLUDED.nearest_neighbors,
                 evidence_packet = EXCLUDED.evidence_packet,
+                oracle_result = EXCLUDED.oracle_result
+            RETURNING id, refined_detection_id
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql_text, tuple(value for row in values for value in row))
+                rows = cursor.fetchall()
+            connection.commit()
+        return rows
+
+    def prepare_embedding_evidence_context(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        model: dict[str, Any],
+    ) -> EmbeddingEvidenceContext:
+        """Resolve the immutable Oracle artifact for an embedding run."""
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                artifact_row_id = self._ensure_evidence_artifact(
+                    cursor, project_id=project_id, model=model
+                )
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.classification_inference_runs
+                    SET model_artifact_id = %s
+                    WHERE id = %s
+                    """,
+                    (artifact_row_id, inference_run_id),
+                )
+            connection.commit()
+        return EmbeddingEvidenceContext(
+            project_id=project_id,
+            inference_run_id=inference_run_id,
+            model_artifact_id=artifact_row_id,
+        )
+
+    def store_embedding_evidence_batch(
+        self,
+        *,
+        evidence_context: EmbeddingEvidenceContext,
+        records: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist Oracle Builder embedding-model results idempotently."""
+
+        if not records:
+            return []
+        values = [
+            (
+                evidence_context.project_id,
+                str(record["refined_detection_id"]),
+                evidence_context.inference_run_id,
+                evidence_context.model_artifact_id,
+                record["embedding_payload_ref"],
+                record["embedding_dtype"],
+                json.dumps(list(record["embedding_shape"])),
+                record["embedding_sha256"],
+                record["embedding_normalized"],
+                json.dumps(json_ready(record.get("output") or {})),
+                json.dumps(json_ready(record.get("oracle_result") or {})),
+            )
+            for record in records
+        ]
+        columns = """
+            project_id, refined_detection_id, inference_run_id, model_artifact_id,
+            embedding_payload_ref, embedding_dtype, embedding_shape, embedding_sha256,
+            embedding_normalized, output, oracle_result
+        """
+        placeholder = "(" + ", ".join(["%s"] * 6 + ["%s::jsonb"] + ["%s"] * 2 + ["%s::jsonb"] * 2) + ")"
+        sql_text = f"""
+            INSERT INTO {self.schema}.embedding_evidence ({columns})
+            VALUES {", ".join(placeholder for _ in values)}
+            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
+                model_artifact_id = EXCLUDED.model_artifact_id,
+                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
+                embedding_dtype = EXCLUDED.embedding_dtype,
+                embedding_shape = EXCLUDED.embedding_shape,
+                embedding_sha256 = EXCLUDED.embedding_sha256,
+                embedding_normalized = EXCLUDED.embedding_normalized,
+                output = EXCLUDED.output,
                 oracle_result = EXCLUDED.oracle_result
             RETURNING id, refined_detection_id
         """
@@ -6547,6 +6791,7 @@ class PostgresRepository:
         progress: dict[str, Any] | None = None,
         submitted_by_user_id: str | None = None,
         submitted_by_username: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         stage_value = stage.value if isinstance(stage, PipelineStage) else stage
         status_value = status.value if isinstance(status, JobStatus) else status
@@ -6580,12 +6825,28 @@ class PostgresRepository:
                     frame_ids=list(dict.fromkeys(payload_frame_ids)),
                     detection_ids=list(dict.fromkeys(payload_detection_ids)),
                 )
+                # Fast path for recovery after an interrupted outbox
+                # materialization.  The unique index below remains the race
+                # protection, while this lookup also makes the operation
+                # idempotent against older schemas during a rolling upgrade.
+                if idempotency_key is not None:
+                    cursor.execute(
+                        f"SELECT * FROM {self.schema}.processing_jobs "
+                        "WHERE project_id = %s AND idempotency_key = %s",
+                        (resolved_project_id, idempotency_key),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is not None:
+                        connection.commit()
+                        return existing
+                insert_conflict_sql = "ON CONFLICT DO NOTHING" if idempotency_key is not None else ""
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.processing_jobs
                     (project_id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts, payload, progress, summary,
-                     submitted_by_user_id, submitted_by_username)
-                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s, %s, %s)
+                     submitted_by_user_id, submitted_by_username, idempotency_key)
+                    VALUES (%s, %s, %s, %s::{self.schema}.stage_name, %s::{self.schema}.job_status, %s, 0, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
+                    {insert_conflict_sql}
                     RETURNING *;
                     """,
                     (
@@ -6601,9 +6862,23 @@ class PostgresRepository:
                         summary,
                         submitted_by_user_id,
                         submitted_by_username,
+                        idempotency_key,
                     ),
                 )
                 row = cursor.fetchone()
+                # A duplicate submission returns the original job without
+                # emitting duplicate events, dependencies, or frame updates.
+                if row is None and idempotency_key is not None:
+                    cursor.execute(
+                        f"SELECT * FROM {self.schema}.processing_jobs WHERE project_id = %s AND idempotency_key = %s",
+                        (resolved_project_id, idempotency_key),
+                    )
+                    row = cursor.fetchone()
+                    connection.commit()
+                    if row is not None:
+                        return row
+                if row is None:
+                    raise RuntimeError("Job creation did not return a row")
                 for dependency in depends_on or []:
                     cursor.execute(
                         f"""
@@ -6884,6 +7159,58 @@ class PostgresRepository:
             connection.commit()
         return step
 
+    def reclaim_stale_processing_series_planning_steps(
+        self,
+        project_id: str | None = None,
+        older_than_seconds: float | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return abandoned empty planning steps to the director queue.
+
+        Planning currently spans job creation and work-unit attachment.  This
+        conservative recovery only touches old planning steps that never gained
+        a work unit, so it cannot duplicate a dispatched job.
+        """
+        timeout = float(older_than_seconds if older_than_seconds is not None else self.config.queue.lease_seconds)
+        bounded_limit = min(max(1, int(limit)), 1000)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH candidate AS (
+                        SELECT steps.id
+                        FROM {self.schema}.processing_series_steps steps
+                        JOIN {self.schema}.processing_series series ON series.id = steps.series_id
+                        WHERE steps.status = 'planning'
+                          AND (%s::uuid IS NULL OR series.project_id = %s::uuid)
+                          AND COALESCE(steps.updated_at, steps.started_at)
+                              < NOW() - (%s * INTERVAL '1 second')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM {self.schema}.processing_work_units units
+                              WHERE units.step_id = steps.id
+                          )
+                        ORDER BY COALESCE(steps.updated_at, steps.started_at)
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                    )
+                    UPDATE {self.schema}.processing_series_steps steps
+                    SET status = 'queued', started_at = NULL, updated_at = NOW()
+                    FROM candidate
+                    WHERE steps.id = candidate.id
+                    RETURNING steps.*, (SELECT project_id FROM {self.schema}.processing_series series WHERE series.id = steps.series_id) AS project_id;
+                    """,
+                    (project_id, project_id, timeout, bounded_limit),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    self._append_job_event(
+                        cursor,
+                        None,
+                        "processing_series.step_reclaimed",
+                        {"series_id": str(row["series_id"]), "step_id": str(row["id"]), "project_id": str(row["project_id"])},
+                    )
+            connection.commit()
+        return rows
+
     def attach_processing_work_units(self, *, series_id: str, step_id: str, job_ids: Sequence[str], matched_count: int) -> None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -6992,7 +7319,8 @@ class PostgresRepository:
                 if series is None:
                     return None
                 cursor.execute(f"""UPDATE {self.schema}.processing_jobs jobs SET status = 'queued', lease_expires_at = NULL,
-                    worker_id = NULL, error_message = NULL, finished_at = NULL, control_reason = %s, updated_at = NOW()
+                    worker_id = NULL, lease_token = NULL, error_message = NULL, failure_category = NULL,
+                    available_at = NOW(), finished_at = NULL, control_reason = %s, updated_at = NOW()
                     FROM {self.schema}.processing_work_units units WHERE units.job_id = jobs.id AND units.series_id = %s
                     AND jobs.status IN ('failed', 'dead_lettered', 'cancelled')""", (reason, series_id))
                 cursor.execute(f"""UPDATE {self.schema}.processing_series_steps steps SET status = 'active', finished_at = NULL
@@ -7217,7 +7545,11 @@ class PostgresRepository:
         *,
         summary: str | None = None,
         log_message: str | None = None,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
     ) -> dict[str, Any] | None:
+        if (worker_id is None) != (lease_token is None):
+            raise ValueError("worker_id and lease_token must be supplied together.")
         logs_tail = None
         if log_message:
             current = self.get_job(job_id)
@@ -7236,6 +7568,7 @@ class PostgresRepository:
                         logs_tail = COALESCE(%s::jsonb, logs_tail),
                         updated_at = NOW()
                     WHERE id = %s
+                      AND (%s::text IS NULL OR (worker_id = %s AND lease_token = %s::uuid AND status IN ('leased', 'working')))
                     RETURNING *;
                     """,
                     (
@@ -7243,6 +7576,9 @@ class PostgresRepository:
                         summary,
                         None if logs_tail is None else json.dumps(json_ready(logs_tail)),
                         job_id,
+                        worker_id,
+                        worker_id,
+                        lease_token,
                     ),
                 )
                 row = cursor.fetchone()
@@ -7717,7 +8053,9 @@ class PostgresRepository:
                     SET status = 'queued',
                         control_reason = %s,
                         lease_expires_at = NULL,
+                        lease_token = NULL,
                         worker_id = NULL,
+                        available_at = NOW(),
                         finished_at = NULL,
                         updated_at = NOW()
                     {where}
@@ -7731,7 +8069,15 @@ class PostgresRepository:
             connection.commit()
         return {"matched_count": len(rows), "resumed_count": len(rows), "jobs": rows}
 
-    def finalize_paused_job(self, job_id: str) -> dict[str, Any] | None:
+    def finalize_paused_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any] | None:
+        if (worker_id is None) != (lease_token is None):
+            raise ValueError("worker_id and lease_token must be supplied together.")
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -7740,15 +8086,17 @@ class PostgresRepository:
                     SET status = 'paused',
                         lease_expires_at = NULL,
                         worker_id = NULL,
+                        lease_token = NULL,
                         updated_at = NOW()
                     WHERE id = %s
+                      AND (%s::text IS NULL OR (worker_id = %s AND lease_token = %s::uuid AND status IN ('leased', 'working')))
                     RETURNING *;
                     """,
-                    (job_id,),
+                    (job_id, worker_id, worker_id, lease_token),
                 )
                 row = cursor.fetchone()
                 if row is not None:
-                    self._append_job_event(cursor, job_id, "job.paused", {"finalized": True})
+                    self._append_job_event(cursor, job_id, "job.paused", {"finalized": True, "worker_id": worker_id})
             connection.commit()
         return row
 
@@ -7767,7 +8115,9 @@ class PostgresRepository:
                     SET status = 'queued',
                         control_reason = %s,
                         lease_expires_at = NULL,
+                        lease_token = NULL,
                         worker_id = NULL,
+                        available_at = NOW(),
                         finished_at = NULL,
                         updated_at = NOW()
                     WHERE id = %s AND status = 'paused'
@@ -7923,7 +8273,13 @@ class PostgresRepository:
             connection.commit()
         return row
 
-    def heartbeat(self, worker_id: str, job_id: str) -> dict[str, Any] | None:
+    def heartbeat(self, worker_id: str, job_id: str, *, lease_token: str | None = None) -> dict[str, Any] | None:
+        """Extend a lease only when this worker still owns its claim.
+
+        ``lease_token`` is optional only for compatibility with pre-fencing
+        callers. Worker runtimes should always pass the token returned by
+        :meth:`claim_jobs`.
+        """
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -7932,39 +8288,69 @@ class PostgresRepository:
                     SET lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
                         updated_at = NOW()
                     WHERE id = %s AND worker_id = %s AND status = 'leased'
+                      AND (%s::uuid IS NULL OR lease_token = %s::uuid)
                     RETURNING *;
                     """,
-                    (self.config.queue.lease_seconds, job_id, worker_id),
+                    (self.config.queue.lease_seconds, job_id, worker_id, lease_token, lease_token),
                 )
                 job_row = cursor.fetchone()
-                cursor.execute(
-                    f"""
-                    UPDATE {self.schema}.worker_sessions
-                    SET status = 'working',
-                        leased_job_id = %s,
-                        last_heartbeat = NOW()
-                    WHERE worker_id = %s
-                    RETURNING *;
-                    """,
-                    (job_id, worker_id),
-                )
+                if job_row is not None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.worker_sessions
+                        SET status = 'working',
+                            leased_job_id = %s,
+                            last_heartbeat = NOW()
+                        WHERE worker_id = %s
+                        RETURNING *;
+                        """,
+                        (job_id, worker_id),
+                    )
                 if job_row is not None:
                     self._append_job_event(
                         cursor,
                         job_id,
                         "job.heartbeat",
-                        {"worker_id": worker_id},
+                        {"worker_id": worker_id, "lease_token": lease_token},
                     )
                     self._append_worker_event(
                         cursor,
                         "worker.heartbeat",
                         worker_id,
-                        {"job_id": job_id},
+                        {"job_id": job_id, "lease_token": lease_token},
                     )
             connection.commit()
         return job_row
 
+    def get_job_control(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+    ) -> dict[str, Any] | None:
+        """Return an in-flight job's controls only to the current lease owner.
+
+        ``None`` means the lease was lost. Handlers must then abandon any output
+        publication. A ``pause_requested:`` reason may be acknowledged at a
+        safe checkpoint with :meth:`finalize_paused_job`.
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT id, status, control_reason, lease_expires_at
+                    FROM {self.schema}.processing_jobs
+                    WHERE id = %s AND worker_id = %s AND lease_token = %s::uuid
+                      AND status IN ('leased', 'working')""",
+                    (job_id, worker_id, lease_token),
+                )
+                return cursor.fetchone()
+
     def requeue_expired_jobs(self) -> dict[str, int]:
+        queue = self.config.queue
+        base_delay = max(0, int(queue.retry_backoff_base_seconds))
+        max_delay = max(0, int(queue.retry_backoff_max_seconds))
+        jitter = max(0, int(queue.retry_backoff_jitter_seconds))
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -7979,8 +8365,13 @@ class PostgresRepository:
                         status = CASE WHEN expired.attempt_count >= expired.max_attempts THEN 'dead_lettered'::{self.schema}.job_status
                                       ELSE 'queued'::{self.schema}.job_status END,
                         worker_id = NULL,
+                        lease_token = NULL,
                         lease_expires_at = NULL,
                         control_reason = NULL,
+                        available_at = CASE WHEN expired.attempt_count >= expired.max_attempts THEN jobs.available_at
+                            ELSE NOW() + ((LEAST({max_delay}, {base_delay} * POWER(2, GREATEST(expired.attempt_count - 1, 0)))
+                                + LEAST({jitter}, {base_delay} / 4)) * INTERVAL '1 second') END,
+                        failure_category = 'lease_expired',
                         error_message = CASE WHEN expired.attempt_count >= expired.max_attempts
                                              THEN COALESCE(jobs.error_message, 'Lease expired and job reached max attempts')
                                              ELSE jobs.error_message END,
@@ -8035,6 +8426,7 @@ class PostgresRepository:
                 SELECT jobs.id
                 FROM {self.schema}.processing_jobs jobs
                 WHERE jobs.status = 'queued'
+                  AND jobs.available_at <= NOW()
                   {stage_clause}
                   AND NOT EXISTS (
                       SELECT 1
@@ -8051,6 +8443,7 @@ class PostgresRepository:
             SET
                 status = 'leased',
                 worker_id = %s,
+                lease_token = gen_random_uuid(),
                 lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
                 control_reason = NULL,
                 attempt_count = attempt_count + 1,
@@ -8072,6 +8465,7 @@ class PostgresRepository:
                         "job.leased",
                         {
                             "worker_id": worker_id,
+                            "lease_token": row.get("lease_token"),
                             "stage": row.get("stage"),
                             "attempt_count": row.get("attempt_count"),
                             "lease_expires_at": row.get("lease_expires_at"),
@@ -8081,7 +8475,16 @@ class PostgresRepository:
 
         return rows
 
-    def complete_job(self, job_id: str, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    def complete_job(
+        self,
+        job_id: str,
+        result: dict[str, Any] | None = None,
+        *,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any] | None:
+        if (worker_id is None) != (lease_token is None):
+            raise ValueError("worker_id and lease_token must be supplied together.")
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -8093,14 +8496,18 @@ class PostgresRepository:
                         error_message = NULL,
                         lease_expires_at = NULL,
                         worker_id = NULL,
+                        lease_token = NULL,
                         control_reason = NULL,
                         finished_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
-                      AND status IN ('queued', 'leased', 'working')
+                      AND (
+                          (%s::text IS NULL AND status IN ('queued', 'leased', 'working'))
+                          OR (worker_id = %s AND lease_token = %s::uuid AND status IN ('leased', 'working'))
+                      )
                     RETURNING *;
                     """,
-                    (json.dumps(json_ready(result or {})), job_id),
+                    (json.dumps(json_ready(result or {})), job_id, worker_id, worker_id, lease_token),
                 )
                 row = cursor.fetchone()
                 if row is not None:
@@ -8108,7 +8515,7 @@ class PostgresRepository:
                         cursor,
                         job_id,
                         "job.completed",
-                        {"result": result or {}},
+                        {"result": result or {}, "worker_id": worker_id, "lease_token": lease_token},
                     )
             connection.commit()
         return row
@@ -8119,7 +8526,12 @@ class PostgresRepository:
         error_message: str,
         result: dict[str, Any] | None = None,
         retryable: bool = True,
+        failure_category: str | None = None,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
     ) -> dict[str, Any] | None:
+        if (worker_id is None) != (lease_token is None):
+            raise ValueError("worker_id and lease_token must be supplied together.")
         current = self.get_job(job_id)
         if current is None:
             return None
@@ -8127,9 +8539,13 @@ class PostgresRepository:
         if retryable and current["attempt_count"] < current["max_attempts"]:
             next_status = JobStatus.QUEUED.value
             finished_at_sql = "NULL"
+            retry_delay_seconds = self._retry_delay_seconds(int(current["attempt_count"] or 0))
+            available_at_sql = "NOW() + (%s * INTERVAL '1 second')"
         else:
             next_status = JobStatus.DEAD_LETTERED.value if retryable else JobStatus.FAILED.value
             finished_at_sql = "NOW()"
+            retry_delay_seconds = None
+            available_at_sql = "NOW()"
 
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -8142,18 +8558,29 @@ class PostgresRepository:
                         error_message = %s,
                         lease_expires_at = NULL,
                         worker_id = NULL,
+                        lease_token = NULL,
                         control_reason = NULL,
+                        available_at = {available_at_sql},
+                        failure_category = %s,
                         finished_at = {finished_at_sql},
                         updated_at = NOW()
                     WHERE id = %s
-                      AND status IN ('queued', 'leased', 'working')
+                      AND (
+                          (%s::text IS NULL AND status IN ('queued', 'leased', 'working'))
+                          OR (worker_id = %s AND lease_token = %s::uuid AND status IN ('leased', 'working'))
+                      )
                     RETURNING *;
                     """,
                     (
                         next_status,
                         json.dumps(json_ready(result or {})),
                         error_message,
+                        *(([retry_delay_seconds] if retry_delay_seconds is not None else [])),
+                        failure_category or ("retryable_error" if retryable else "permanent_error"),
                         job_id,
+                        worker_id,
+                        worker_id,
+                        lease_token,
                     ),
                 )
                 row = cursor.fetchone()
@@ -8171,17 +8598,44 @@ class PostgresRepository:
                         {
                             "error_message": error_message,
                             "retryable": retryable,
+                            "failure_category": failure_category or ("retryable_error" if retryable else "permanent_error"),
+                            "retry_delay_seconds": retry_delay_seconds,
                             "next_status": next_status,
                             "result": result or {},
+                            "worker_id": worker_id,
+                            "lease_token": lease_token,
                         },
                     )
             connection.commit()
         return row
 
-    def fail_job(self, job_id: str, error_message: str, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        return self.record_failure(job_id=job_id, error_message=error_message, result=result, retryable=False)
+    def fail_job(
+        self,
+        job_id: str,
+        error_message: str,
+        result: dict[str, Any] | None = None,
+        *,
+        failure_category: str | None = None,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self.record_failure(
+            job_id=job_id,
+            error_message=error_message,
+            result=result,
+            retryable=False,
+            failure_category=failure_category,
+            worker_id=worker_id,
+            lease_token=lease_token,
+        )
 
-    def retry_job(self, job_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+    def retry_job(
+        self,
+        job_id: str,
+        *,
+        project_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -8191,7 +8645,10 @@ class PostgresRepository:
                         status = 'queued',
                         lease_expires_at = NULL,
                         worker_id = NULL,
-                        control_reason = NULL,
+                        lease_token = NULL,
+                        control_reason = %s,
+                        available_at = NOW(),
+                        failure_category = NULL,
                         error_message = NULL,
                         finished_at = NULL,
                         updated_at = NOW()
@@ -8199,13 +8656,191 @@ class PostgresRepository:
                       AND (%s::uuid IS NULL OR project_id = %s::uuid)
                     RETURNING *;
                     """,
-                    (job_id, project_id, project_id),
+                    (reason, job_id, project_id, project_id),
                 )
                 row = cursor.fetchone()
                 if row is not None:
-                    self._append_job_event(cursor, job_id, "job.retried", {})
+                    self._append_job_event(cursor, job_id, "job.retried", {"reason": reason})
             connection.commit()
         return row
+
+    def enqueue_successor_dispatch(
+        self,
+        *,
+        parent_job_id: str,
+        worker_id: str,
+        lease_token: str,
+        stage: PipelineStage | str,
+        idempotency_key: str,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        priority: int | None = None,
+        max_attempts: int | None = None,
+        payload: dict[str, Any] | None = None,
+        depends_on: Sequence[str] | None = None,
+        summary: str | None = None,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Durably record a successor before completing the fenced parent.
+
+        The record is materialized only after ``parent_job_id`` succeeds.  Its
+        project/idempotency key is unique, so worker retries cannot make two
+        child jobs even if dispatch materialization is repeated.
+        """
+        if not idempotency_key:
+            raise ValueError("idempotency_key is required for successor dispatch")
+        stage_value = stage.value if isinstance(stage, PipelineStage) else str(stage)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT project_id FROM {self.schema}.processing_jobs
+                    WHERE id = %s AND worker_id = %s AND lease_token = %s::uuid
+                      AND status IN ('leased', 'working')""",
+                    (parent_job_id, worker_id, lease_token),
+                )
+                parent = cursor.fetchone()
+                if parent is None:
+                    return None
+                resolved_project_id = self._required_project_id(project_id or str(parent["project_id"]), "enqueue_successor_dispatch")
+                if str(parent["project_id"]) != str(resolved_project_id):
+                    raise ValueError("Successor dispatch project must match its parent job")
+                spec = {
+                    "stage": stage_value, "project_id": resolved_project_id,
+                    "run_id": run_id, "asset_id": asset_id, "priority": priority,
+                    "max_attempts": max_attempts, "payload": payload or {},
+                    "depends_on": [str(value) for value in depends_on or []],
+                    "summary": summary, "submitted_by_user_id": submitted_by_user_id,
+                    "submitted_by_username": submitted_by_username,
+                }
+                cursor.execute(
+                    f"""INSERT INTO {self.schema}.processing_job_dispatches
+                    (project_id, parent_job_id, idempotency_key, job_spec)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (project_id, idempotency_key) DO NOTHING
+                    RETURNING *""",
+                    (resolved_project_id, parent_job_id, idempotency_key, json.dumps(json_ready(spec))),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        f"SELECT * FROM {self.schema}.processing_job_dispatches WHERE project_id = %s AND idempotency_key = %s",
+                        (resolved_project_id, idempotency_key),
+                    )
+                    row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(cursor, parent_job_id, "job.successor_dispatch_enqueued", {
+                        "dispatch_id": str(row["id"]), "idempotency_key": idempotency_key, "stage": stage_value,
+                    })
+            connection.commit()
+        return row
+
+    def materialize_pending_dispatches(
+        self,
+        *,
+        parent_job_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, int]:
+        """Materialize ready durable dispatch records; safe to call repeatedly."""
+        clauses = ["dispatches.status = 'pending'", "dispatches.available_at <= NOW()", "parents.status = 'succeeded'"]
+        params: list[Any] = []
+        if parent_job_id is not None:
+            clauses.append("dispatches.parent_job_id = %s::uuid")
+            params.append(parent_job_id)
+        params.append(max(1, limit))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT dispatches.* FROM {self.schema}.processing_job_dispatches dispatches
+                    JOIN {self.schema}.processing_jobs parents ON parents.id = dispatches.parent_job_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY dispatches.created_at ASC LIMIT %s FOR UPDATE OF dispatches SKIP LOCKED""",
+                    tuple(params),
+                )
+                dispatches = cursor.fetchall()
+            connection.commit()
+        materialized = failed = 0
+        for dispatch in dispatches:
+            spec = dispatch["job_spec"] or {}
+            try:
+                job = self.create_job(
+                    spec["stage"], project_id=str(dispatch["project_id"]), run_id=spec.get("run_id"),
+                    asset_id=spec.get("asset_id"), priority=spec.get("priority"),
+                    max_attempts=spec.get("max_attempts"), payload=spec.get("payload") or {},
+                    depends_on=spec.get("depends_on") or [], summary=spec.get("summary"),
+                    submitted_by_user_id=spec.get("submitted_by_user_id"),
+                    submitted_by_username=spec.get("submitted_by_username"),
+                    idempotency_key=str(dispatch["idempotency_key"]),
+                )
+                with self.connect() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            f"""UPDATE {self.schema}.processing_job_dispatches
+                            SET status = 'materialized', child_job_id = %s, materialized_at = NOW(),
+                                error_message = NULL, updated_at = NOW()
+                            WHERE id = %s AND status = 'pending'""",
+                            (job["id"], dispatch["id"]),
+                        )
+                        self._append_job_event(cursor, dispatch["parent_job_id"], "job.successor_dispatch_materialized", {
+                            "dispatch_id": str(dispatch["id"]), "child_job_id": str(job["id"]),
+                        })
+                    connection.commit()
+                materialized += 1
+            except Exception as exc:
+                with self.connect() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            f"UPDATE {self.schema}.processing_job_dispatches SET error_message = %s, updated_at = NOW() WHERE id = %s",
+                            (str(exc)[:2000], dispatch["id"]),
+                        )
+                    connection.commit()
+                failed += 1
+        return {"materialized": materialized, "failed": failed, "pending": len(dispatches) - materialized - failed}
+
+    @contextmanager
+    def job_supervisor_lock(self, name: str = "job-supervisor"):
+        """Yield whether this process owns the singleton supervisor lock."""
+        lock_key = f"{self.schema}:{name}"
+        # Use a dedicated connection: holding a session-level advisory lock on
+        # the normal repository pool would deadlock a deployment configured
+        # with a one-connection pool while the supervisor does its work.
+        with psycopg.connect(
+            self.config.database.dsn,
+            connect_timeout=self.config.database.connect_timeout_s,
+            row_factory=dict_row,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0)) AS acquired", (lock_key,))
+                row = cursor.fetchone() or {}
+                acquired = bool(row.get("acquired"))
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (lock_key,))
+                    connection.commit()
+
+    def get_job_supervisor_signals(self) -> dict[str, int]:
+        """Return low-cost counters appropriate for supervisor health alerts."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT
+                        COUNT(*) FILTER (WHERE status = 'queued' AND available_at > NOW())::bigint AS retry_scheduled,
+                        COUNT(*) FILTER (WHERE status = 'dead_lettered')::bigint AS dead_lettered,
+                        COUNT(*) FILTER (WHERE status = 'leased' AND lease_expires_at < NOW())::bigint AS expired_leases
+                    FROM {self.schema}.processing_jobs"""
+                )
+                signals = cursor.fetchone() or {}
+                cursor.execute(
+                    f"""SELECT COUNT(*)::bigint AS pending_dispatches,
+                        COUNT(*) FILTER (WHERE error_message IS NOT NULL)::bigint AS failed_dispatches
+                    FROM {self.schema}.processing_job_dispatches WHERE status = 'pending'"""
+                )
+                signals.update(cursor.fetchone() or {})
+        return {key: int(value or 0) for key, value in signals.items()}
 
     def cancel_jobs(
         self,
@@ -9180,3 +9815,176 @@ class PostgresRepository:
                 (project_id, run_id, observed_at),
             )
             return cursor.fetchall()
+
+    # Export artifacts are intentionally separate from processing_jobs: a job is
+    # transient execution state, while an artifact is a durable, downloadable
+    # scientific release record.
+    def create_export_artifact(
+        self,
+        *,
+        project_id: str,
+        request: dict[str, Any],
+        requested_by_user_id: str | None = None,
+        requested_by_username: str | None = None,
+        expires_at: datetime | None = None,
+        input_snapshot: dict[str, Any] | None = None,
+        estimate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_project_id = self._required_project_id(project_id, "create_export_artifact")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT 1 FROM {self.schema}.projects WHERE id = %s", (resolved_project_id,)
+            )
+            if cursor.fetchone() is None:
+                raise ValueError("Project was not found.")
+            if requested_by_user_id is not None:
+                cursor.execute(
+                    f"SELECT 1 FROM {self.schema}.project_memberships WHERE project_id = %s AND user_id = %s",
+                    (resolved_project_id, requested_by_user_id),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("Export requester is not a member of the selected project.")
+            cursor.execute(
+                f"""INSERT INTO {self.schema}.export_artifacts
+                    (project_id, requested_by_user_id, requested_by_username, request, expires_at, input_snapshot, estimate)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb) RETURNING *""",
+                (resolved_project_id, requested_by_user_id, requested_by_username,
+                 json.dumps(json_ready(request)), expires_at,
+                 json.dumps(json_ready(input_snapshot)) if input_snapshot is not None else None,
+                 json.dumps(json_ready(estimate)) if estimate is not None else None),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+            return row
+
+    def attach_export_artifact_job(
+        self, export_id: str, job_id: str, *, project_id: str,
+    ) -> dict[str, Any] | None:
+        resolved_project_id = self._required_project_id(project_id, "attach_export_artifact_job")
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._ensure_project_scope(cursor, resolved_project_id, job_ids=[job_id])
+            cursor.execute(
+                f"""UPDATE {self.schema}.export_artifacts SET job_id = %s
+                    WHERE id = %s AND project_id = %s RETURNING *""",
+                (job_id, export_id, resolved_project_id),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+            return row
+
+    def get_export_artifact(
+        self, export_id: str, *, project_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        resolved_project_id = self._required_project_id(project_id, "get_export_artifact")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM {self.schema}.export_artifacts WHERE id = %s AND project_id = %s",
+                (export_id, resolved_project_id),
+            )
+            return cursor.fetchone()
+
+    def list_export_artifacts(
+        self, *, project_id: str, limit: int = 100, offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        resolved_project_id = self._required_project_id(project_id, "list_export_artifacts")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT * FROM {self.schema}.export_artifacts
+                    WHERE project_id = %s ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s""",
+                (resolved_project_id, max(1, min(int(limit), 500)), max(0, int(offset))),
+            )
+            return cursor.fetchall()
+
+    def update_export_artifact(
+        self,
+        export_id: str,
+        *,
+        project_id: str,
+        status: str | None = None,
+        manifest: dict[str, Any] | None = None,
+        snapshot_at: datetime | None = None,
+        artifact_path: str | None = None,
+        artifact_sha256: str | None = None,
+        size_bytes: int | None = None,
+        failure_message: str | None = None,
+        progress: dict[str, Any] | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        input_snapshot: dict[str, Any] | None = None,
+        estimate: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        resolved_project_id = self._required_project_id(project_id, "update_export_artifact")
+        allowed_statuses = {"queued", "working", "succeeded", "failed", "cancelled", "expired"}
+        if status is not None and status not in allowed_statuses:
+            raise ValueError(f"Unsupported export artifact status {status!r}.")
+        if size_bytes is not None and size_bytes < 0:
+            raise ValueError("Export artifact size_bytes must not be negative.")
+        fields: list[str] = []
+        params: list[Any] = []
+        for column, value, is_json in (
+            ("status", status, False), ("manifest", manifest, True), ("snapshot_at", snapshot_at, False),
+            ("artifact_path", artifact_path, False), ("artifact_sha256", artifact_sha256, False),
+            ("size_bytes", size_bytes, False), ("failure_message", failure_message, False),
+            ("progress", progress, True), ("attempts", attempts, True),
+            ("input_snapshot", input_snapshot, True), ("estimate", estimate, True),
+        ):
+            if value is None:
+                continue
+            fields.append(f"{column} = %s" + ("::jsonb" if is_json else ""))
+            params.append(json.dumps(json_ready(value)) if is_json else value)
+        if status == "working":
+            fields.append("started_at = COALESCE(started_at, NOW())")
+        elif status in {"succeeded", "failed", "cancelled", "expired"}:
+            fields.append("completed_at = COALESCE(completed_at, NOW())")
+        if not fields:
+            return self.get_export_artifact(export_id, project_id=resolved_project_id)
+        params.extend([export_id, resolved_project_id])
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self.schema}.export_artifacts SET {', '.join(fields)} "
+                "WHERE id = %s AND project_id = %s RETURNING *", tuple(params),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+            return row
+
+    def begin_export_attempt(self, export_id: str, *, project_id: str, job_id: str, attempt_number: int) -> dict[str, Any] | None:
+        artifact = self.get_export_artifact(export_id, project_id=project_id)
+        if artifact is None:
+            return None
+        attempts = list(artifact.get("attempts") or ())
+        attempts = [item for item in attempts if int(item.get("attempt_number", -1)) != int(attempt_number)]
+        attempts.append({"attempt_number": int(attempt_number), "job_id": str(job_id), "status": "working",
+                         "started_at": datetime.now(timezone.utc).isoformat(), "products": {}})
+        return self.update_export_artifact(export_id, project_id=project_id, status="working", failure_message="", progress={}, attempts=attempts)
+
+    def update_export_attempt_product(self, export_id: str, *, project_id: str, attempt_number: int, product: str, status: str, detail: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        artifact = self.get_export_artifact(export_id, project_id=project_id)
+        if artifact is None:
+            return None
+        attempts = list(artifact.get("attempts") or ())
+        now = datetime.now(timezone.utc).isoformat()
+        for attempt in attempts:
+            if int(attempt.get("attempt_number", -1)) == int(attempt_number):
+                products = dict(attempt.get("products") or {})
+                prior = dict(products.get(product) or {})
+                products[product] = {**prior, "status": status, "updated_at": now, **(detail or {})}
+                attempt["products"] = products
+                break
+        return self.update_export_artifact(export_id, project_id=project_id, progress={"attempt_number": attempt_number, "product": product, "status": status, **(detail or {})}, attempts=attempts)
+
+    def finish_export_attempt(self, export_id: str, *, project_id: str, attempt_number: int, status: str, error: str | None = None, retry_pending: bool = False) -> dict[str, Any] | None:
+        artifact = self.get_export_artifact(export_id, project_id=project_id)
+        if artifact is None:
+            return None
+        attempts = list(artifact.get("attempts") or ())
+        now = datetime.now(timezone.utc).isoformat()
+        for attempt in attempts:
+            if int(attempt.get("attempt_number", -1)) == int(attempt_number):
+                attempt.update({"status": status, "completed_at": now, "retry_pending": retry_pending})
+                if error:
+                    attempt["error"] = error[:4000]
+                break
+        artifact_status = "queued" if retry_pending else ("succeeded" if status == "succeeded" else "failed")
+        return self.update_export_artifact(export_id, project_id=project_id, status=artifact_status,
+                                           failure_message="" if retry_pending else error,
+                                           progress={"attempt_number": attempt_number, "status": status, "retry_pending": retry_pending}, attempts=attempts)

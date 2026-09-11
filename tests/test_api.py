@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import io
-import sqlite3
 import tempfile
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +22,6 @@ from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
-from Pelagia.services.io_exports import ExportPayload, _sqlite_bytes, _xlsx_bytes
 from pelagia_interchange import DatasetBuilder, StorageFormat
 
 
@@ -37,11 +33,15 @@ class FakeRepository:
         self.telemetry_imports = []
         self.timeline_events = {}
         self.created_jobs = []
+        self.export_artifacts = []
         self.registered_runs = []
         self.shutdown_requests = []
         self.priority_updates = []
         self.cancel_job_calls = []
         self.control_job_calls = []
+        self.retry_job_calls = []
+        self.job_event_calls = []
+        self.job_events = [{"id": 1, "event_type": "job.created"}]
         self.delete_job_calls = []
         self.logs = []
         self.preprocessed_payload_ref = None
@@ -830,8 +830,39 @@ class FakeRepository:
         self.created_jobs.append(job)
         return job
 
+    def create_export_artifact(self, **kwargs):
+        row = {"id": "export-1", "status": "queued", **kwargs}
+        self.export_artifacts.append(row)
+        return row
+
+    def prepare_export_snapshot(self, **kwargs):
+        request = kwargs["request"]
+        return (
+            {"schema_version": "1.0", "selection": {"asset_ids": request.get("asset_ids", [])}, "roi_items": [], "telemetry_items": []},
+            {"schema_version": "1.0", "counts": {"asset_count": len(request.get("asset_ids", [])), "roi_count": 0, "telemetry_source_count": 0, "input_bytes": 0, "estimated_bundle_bytes": 0, "estimated_file_count": 8}, "advisory": True},
+        )
+
+    def attach_export_artifact_job(self, export_id, job_id, *, project_id):
+        row = next((item for item in self.export_artifacts if item["id"] == export_id and item["project_id"] == project_id), None)
+        if row is not None:
+            row["job_id"] = job_id
+        return row
+
+    def get_export_artifact(self, export_id, *, project_id):
+        return next((item for item in self.export_artifacts if item["id"] == export_id and item["project_id"] == project_id), None)
+
+    def list_export_artifacts(self, *, project_id, limit=100, offset=0):
+        return [item for item in self.export_artifacts if item["project_id"] == project_id][offset:offset + limit]
+
     def list_job_events(self, **kwargs):
-        return [{"id": 1, "event_type": "job.created", **kwargs}]
+        self.job_event_calls.append(kwargs)
+        after_id = kwargs.get("after_id")
+        rows = [
+            {**event, **kwargs}
+            for event in self.job_events
+            if after_id is None or event["id"] > after_id
+        ]
+        return list(reversed(rows))
 
     def list_logs(self, **kwargs):
         return [{"id": 1, "event_type": "job.created", "level": kwargs.get("level") or "info", **kwargs}]
@@ -860,6 +891,7 @@ class FakeRepository:
         return {"matched_count": 1, "resumed_count": 1, "jobs": []}
 
     def retry_job(self, job_id, **kwargs):
+        self.retry_job_calls.append((job_id, kwargs))
         if not self._visible(job_id, kwargs.get("project_id")):
             return None
         return {"id": job_id, "status": "queued"}
@@ -1438,10 +1470,20 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
         "/curation/clustering-targets/preview",
         json={"model_ref": "roi-clusters", "roi_ids": ["refined-det-1"]},
     )
+    embedding_job = client.post(
+        "/curation/embedding-jobs",
+        json={"roi_ids": ["refined-det-1"], "model_ref": "roi-embeddings"},
+    )
+    embedding_preview = client.post(
+        "/curation/embedding-targets/preview",
+        json={"model_ref": "roi-embeddings", "roi_ids": ["refined-det-1"]},
+    )
 
     assert options.status_code == 200
     assert options.json()["oracle"]["available_model_count"] == 1
+    assert options.json()["oracle"]["available_embedding_model_count"] == 1
     assert options.json()["models"][0]["alias"] == "test-refiner"
+    assert options.json()["embedding_models"][0]["task"] == "embedding"
     assert options.json()["default_label_dictionary"]["key"] == "pelagia-core@0.1.1"
     assert imported.status_code == 200
     assert imported.json()["dictionary_key"] == "pelagia-core@0.1.1"
@@ -1469,7 +1511,33 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     assert clustering_job.json()["evidence_kind"] == "clustering"
     assert clustering_preview.status_code == 200
     assert clustering_preview.json()["evidence_kind"] == "clustering"
-    assert target_calls[-1]["evidence_kind"] == "clustering"
+    assert embedding_job.status_code == 202
+    assert embedding_job.json()["evidence_kind"] == "embedding"
+    assert embedding_preview.status_code == 200
+    assert embedding_preview.json()["evidence_kind"] == "embedding"
+    assert target_calls[-3]["evidence_kind"] == "clustering"
+    assert target_calls[-1]["evidence_kind"] == "embedding"
+
+
+def test_curation_options_supports_embedding_only_oracle_catalog():
+    client, repository, _ = make_client()
+
+    class EmbeddingOnlyOracle:
+        def list_models(self, *, task="segmentation"):
+            return ([{"alias": "embedding-v1", "available": True, "task": task}]
+                    if task == "embedding" else [])
+
+    client.app.state.context.oracle = EmbeddingOnlyOracle()
+    repository.list_curation_labels = lambda **_: []
+
+    response = client.get("/curation/options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["oracle"]["status"] == "ready"
+    assert "error" not in body["oracle"]
+    assert body["oracle"]["available_embedding_model_count"] == 1
+    assert body["embedding_models"] == [{"alias": "embedding-v1", "available": True, "task": "embedding"}]
 
 
 def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(monkeypatch):
@@ -1554,8 +1622,8 @@ def test_curation_feature_space_api_keeps_evidence_sources_and_clusters_scoped(m
     assert similar.json()["items"][0]["thumbnail_url"].startswith("/refined-detections/")
     assert members.json()["items"][0]["roi_url"].startswith("/refined-detections/")
     assert calls == [
-        ("browse", {"source_key": "classification:run-1", "limit": 120}),
-        ("similar", {"roi_id": "refined-det-1", "source_key": "classification:run-1", "limit": 80, "minimum": 0.5}),
+        ("browse", {"source_key": "classification:run-1", "limit": 120, "offset": 0, "sort_by": "original"}),
+        ("similar", {"roi_id": "refined-det-1", "source_key": "classification:run-1", "limit": 80, "minimum": 0.5, "offset": 0}),
         ("clusters", {"source_key": "clustering:run-2"}),
         ("members", {"source_key": "clustering:run-2", "cluster_id": "cluster-a", "limit": 120, "offset": 0}),
     ]
@@ -1599,11 +1667,12 @@ def test_curation_feature_space_analysis_queues_a_stable_ephemeral_job():
         {
             "project_id": "project-1",
             "payload": {
-                "analysis_version": 1,
+                "analysis_version": 2,
                 "source_key": "classification:run-1",
                 "min_cluster_size": 7,
                 "min_samples": 3,
                 "cluster_selection_epsilon": 0.15,
+                "cluster_selection_method": "eom",
                 "cache_key": first.json()["cache_key"],
             },
             "submitted_by_user_id": "dev",
@@ -1613,11 +1682,12 @@ def test_curation_feature_space_analysis_queues_a_stable_ephemeral_job():
         {
             "project_id": "project-1",
             "payload": {
-                "analysis_version": 1,
+                "analysis_version": 2,
                 "source_key": "classification:run-1",
                 "min_cluster_size": 7,
                 "min_samples": 3,
                 "cluster_selection_epsilon": 0.15,
+                "cluster_selection_method": "eom",
                 "cache_key": first.json()["cache_key"],
             },
             "submitted_by_user_id": "dev",
@@ -1642,97 +1712,45 @@ def test_curation_feature_space_analysis_validates_source_and_queue_limit():
     assert "At most two" in full.json()["detail"]
 
 
-def test_io_export_options_are_discoverable():
-    client, repository, _ = make_client()
+def test_api_does_not_register_legacy_io_export_routes():
+    client, _, _ = make_client()
 
     response = client.get("/io/export/options")
 
-    assert response.status_code == 200
-    body = response.json()
-    assert "sqlite" in body["formats"]
-    assert "xlsx" in body["formats"]
-    assert "runs" in body["tables"]
-    assert "users" in body["tables"]
-    assert "frame_metadata" in body["datasets"]
-    assert body["endpoints"]["table"] == "/io/export/table/{table_name}"
+    assert response.status_code == 404
 
 
-def test_io_table_export_requires_admin_for_auth_tables():
-    client, _, _ = make_client(auth_enabled=True)
+def test_api_queues_uuid_rooted_export_bundle():
+    client, repository, _ = make_client(auth_enabled=True)
     headers = auth_headers(client, username="ada", project_key="default")
 
-    response = client.get("/io/export/table/users", headers=headers)
-
-    assert response.status_code == 403
-    assert "Admin permission" in response.json()["detail"]
-
-
-def test_io_table_export_routes_to_export_service(monkeypatch):
-    calls = []
-
-    class FakeExportService:
-        def __init__(self, repository):
-            self.repository = repository
-
-        def table_export(self, tables, *, file_format, project_id, include_all_projects, filters):
-            calls.append(
-                {
-                    "tables": tables,
-                    "file_format": file_format,
-                    "project_id": project_id,
-                    "include_all_projects": include_all_projects,
-                    "filters": filters,
-                }
-            )
-            return ExportPayload(
-                filename="runs.xlsx",
-                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                content=b"export-bytes",
-                row_counts={"runs": 2},
-            )
-
-    monkeypatch.setattr("Pelagia.api.routes.io.ExportService", FakeExportService)
-    client, _, _ = make_client(auth_enabled=True)
-    headers = auth_headers(client, username="ada", project_key="default")
-
-    response = client.get(
-        "/io/export/table/runs",
+    options = client.get("/exports/options", headers=headers)
+    estimate = client.post(
+        "/exports/estimate",
         headers=headers,
-        params={"format": "xlsx", "collection": "test", "limit": 50},
+        json={"products": ["raw_roi_statistics"], "asset_ids": ["asset-1"]},
+    )
+    response = client.post(
+        "/exports",
+        headers=headers,
+        json={
+            "products": ["raw_roi_statistics", "roi_evidence"],
+            "formats": {"raw_roi_statistics": "sqlite"},
+            "asset_ids": ["asset-1"],
+            "roi_stage": "refined",
+        },
     )
 
-    assert response.status_code == 200
-    assert response.content == b"export-bytes"
-    assert response.headers["content-disposition"] == 'attachment; filename="runs.xlsx"'
-    assert response.headers["x-pelagia-export-rows"] == '{"runs": 2}'
-    assert calls == [
-        {
-            "tables": ["runs"],
-            "file_format": "xlsx",
-            "project_id": "project-1",
-            "include_all_projects": False,
-            "filters": {"collection": "test", "active_only": False, "limit": 50, "offset": 0},
-        }
-    ]
-
-
-def test_io_export_writers_create_sqlite_and_xlsx_files(tmp_path):
-    rows = [{"id": "run-1", "count": 2, "metadata": {"ok": True}}]
-
-    sqlite_payload = _sqlite_bytes({"runs": rows})
-    sqlite_path = tmp_path / "export.sqlite"
-    sqlite_path.write_bytes(sqlite_payload)
-    connection = sqlite3.connect(sqlite_path)
-    try:
-        assert connection.execute("SELECT id, count FROM runs").fetchone() == ("run-1", 2)
-    finally:
-        connection.close()
-
-    xlsx_payload = _xlsx_bytes({"runs": rows})
-    assert xlsx_payload.startswith(b"PK")
-    with zipfile.ZipFile(io.BytesIO(xlsx_payload)) as archive:
-        assert "xl/workbook.xml" in archive.namelist()
-        assert "xl/worksheets/sheet1.xml" in archive.namelist()
+    assert options.status_code == 200
+    assert estimate.status_code == 200
+    assert estimate.json()["estimate"]["advisory"] is True
+    assert "telemetry" in options.json()["products"]
+    assert response.status_code == 202
+    assert response.json()["job"]["stage"] == PipelineStage.EXPORT_BUNDLE.value
+    assert repository.export_artifacts[0]["request"]["products"] == ["raw_roi_statistics", "roi_evidence"]
+    assert repository.export_artifacts[0]["job_id"] == "job-new"
+    assert repository.export_artifacts[0]["estimate"]["status"] == "pending"
+    assert response.json()["estimate"]["status"] == "pending"
 
 
 def test_api_lists_system_status_without_live_database():
@@ -2030,7 +2048,6 @@ def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_
     headers = {"Authorization": f"Bearer {login_body['token']}"}
 
     project_scoped = client.get("/assets", headers=headers)
-    project_export = client.get("/io/export/table/runs", headers=headers)
     created = client.post(
         "/projects",
         headers=headers,
@@ -2042,7 +2059,6 @@ def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_
     )
 
     assert project_scoped.status_code == 403
-    assert project_export.status_code == 403
     assert created.status_code == 200
     body = created.json()
     assert body["project"]["project_key"] == "first-project"
@@ -2949,6 +2965,65 @@ def test_api_can_create_queue_job():
     assert repository.created_jobs[0]["submitted_by_username"] == "ada"
 
 
+@pytest.mark.parametrize(
+    ("source_key", "selection"),
+    [
+        ("targets", {"asset_ids": ["asset-1"]}),
+        ("selection", {"frame_ids": ["frame-1"]}),
+        ("targets", {"collections": ["tow-1"]}),
+        ("selection", {"collection": ["tow-1"]}),
+    ],
+)
+def test_api_forwards_bounded_processing_series_targets_without_preset_snapshot(monkeypatch, source_key, selection):
+    client, _, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+    captured = {}
+
+    class FakeProcessingQueueService:
+        def __init__(self, context):
+            captured["context"] = context
+
+        def create_series(self, request, *, project_id):
+            captured["request"] = request
+            captured["project_id"] = project_id
+            return {"id": "series-1", "project_id": project_id}
+
+    monkeypatch.setattr("Pelagia.api.routes.processing.ProcessingQueueService", FakeProcessingQueueService)
+
+    response = client.post(
+        "/processing/series",
+        headers=headers,
+        json={
+            source_key: selection,
+            "steps": [{"stage": "segment"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["series"]["id"] == "series-1"
+    assert captured["project_id"] == "project-1"
+    assert captured["request"].preset_snapshot == {}
+    assert captured["request"].selection == selection
+    assert captured["request"].steps[0]["filters"]["asset_ids"] == selection.get("asset_ids", [])
+    assert captured["request"].steps[0]["filters"]["frame_ids"] == selection.get("frame_ids", [])
+    expected_collections = selection.get("collections") or selection.get("collection", [])
+    assert captured["request"].steps[0]["filters"]["collection"] == expected_collections
+
+
+def test_api_rejects_processing_series_without_a_bounded_target():
+    client, _, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/processing/series",
+        headers=headers,
+        json={"targets": {}, "steps": [{"stage": "segment"}]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "A processing series requires at least one asset, frame, or collection target."
+
+
 def test_api_create_queue_job_rejects_cross_project_asset():
     client, repository, _ = make_client()
     headers = auth_headers(client, username="admin", project_key="other")
@@ -2992,6 +3067,71 @@ def test_api_lists_jobs_with_details_when_requested():
     assert job["include_details"] is True
     assert job["payload"]["frame_ids"] == ["frame-1"]
     assert job["result"]["detection_ids"] == ["det-1"]
+
+
+def test_api_streams_project_scoped_job_event_replay():
+    client, repository, _ = make_client(auth_enabled=True)
+    repository.job_events = [
+        {"id": 3, "event_type": "job.completed", "payload": {"job_id": "job-1"}},
+        {"id": 4, "event_type": "job.created", "payload": {"job_id": "job-2"}},
+    ]
+
+    response = client.get(
+        "/jobs/stream?after_id=0&wait_seconds=0",
+        headers={**auth_headers(client), "Last-Event-ID": "2"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.text.startswith('id: 3\nevent: job.completed\ndata: {"id":3')
+    assert 'id: 4\nevent: job.created\ndata: {"id":4' in response.text
+    assert repository.job_event_calls[-1]["project_id"] == "project-1"
+    # The standard SSE replay cursor wins over the query fallback.
+    assert repository.job_event_calls[-1]["after_id"] == 2
+
+
+def test_api_job_stream_requires_auth_and_emits_heartbeat_when_idle():
+    client, repository, _ = make_client(auth_enabled=True)
+
+    unauthenticated = client.get("/jobs/stream?wait_seconds=0")
+    assert unauthenticated.status_code == 401
+
+    response = client.get(
+        "/jobs/stream?after_id=1&wait_seconds=0",
+        headers=auth_headers(client, username="admin", project_key="other"),
+    )
+
+    assert response.status_code == 200
+    assert response.text == ": heartbeat\n\n"
+    assert repository.job_event_calls[-1]["project_id"] == "project-2"
+
+
+def test_api_job_stream_rejects_invalid_last_event_id():
+    client, _, _ = make_client(auth_enabled=True)
+
+    response = client.get(
+        "/jobs/stream",
+        headers={**auth_headers(client), "Last-Event-ID": "not-an-event-id"},
+    )
+
+    assert response.status_code == 422
+    assert "Last-Event-ID" in response.json()["detail"]
+
+
+def test_api_job_retry_records_operator_reason():
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/jobs/job-1/retry",
+        headers=auth_headers(client),
+        json={"reason": "resolved transient storage outage"},
+    )
+
+    assert response.status_code == 200
+    assert repository.retry_job_calls == [
+        ("job-1", {"project_id": "project-1", "reason": "resolved transient storage outage"})
+    ]
 
 
 def test_api_can_clear_jobs():

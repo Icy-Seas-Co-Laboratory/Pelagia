@@ -2,7 +2,7 @@
 
 Pelagia's curation workflow keeps three responsibilities explicit:
 
-- **Oracle Builder** executes classification and self-supervised clustering models and owns model artifacts, embeddings, prototype calculations, K-nearest-neighbor calculations, and cluster fitting.
+- **Oracle Builder** executes classification and representation-only embedding models (plus legacy self-supervised clustering models) and owns model artifacts, embeddings, prototype calculations, K-nearest-neighbor calculations, and any downstream cluster fitting.
 - **Pelagia** owns the project label vocabulary, human annotations and reviews, immutable model provenance, evidence records, and classification jobs.
 - **PelagiaView** presents the review queue and turns an explicit reviewer action into a human assertion.
 
@@ -12,7 +12,7 @@ A model prediction is never written as human ground truth. Selecting **Accept pr
 
 1. Start Oracle Builder with a classification bundle registered under the selector configured by `oracle.default_classification_model`.
 2. Run at least one Pelagia worker with the `classify` capability. The standard worker TOML assigns this capability to the existing refinement workers, so a separate process is optional.
-3. Open **ML Evidence** in PelagiaView. Select one or more ready classification and/or self-supervised clustering models, constrain the refined ROI target query, review the per-model workload, and queue the resulting evidence jobs.
+3. Open **ML Evidence** in PelagiaView. Select one or more ready classification and/or embedding models, constrain the refined ROI target query, review the per-model workload, and queue the resulting evidence jobs.
 4. Open **Curation** to inspect the resulting evidence in context, explore feature-space outputs, and make explicit human annotation or review decisions. Curation does not enqueue ML inference.
 5. Filter and sort the queue by human state, review state, evidence availability, confidence, disagreement, or telemetry ranges. Assign a project label, then verify, reject, or flag the assertion.
 
@@ -42,15 +42,15 @@ Useful keyboard actions in the gallery are `1`–`0` for the first ten labels, a
 
 ## Evidence storage
 
-`detections_refined` is the canonical curatable ROI. Each evidence job creates one `classification_inference_runs` row (the legacy table name is retained for compatibility) and one per-ROI evidence row. Classification jobs write `classification_evidence`; clustering jobs write `clustering_evidence`. Probability, prototype, KNN, cluster assignment, similarity, and novelty/abstention summaries are indexed or retained in Postgres. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
+`detections_refined` is the canonical curatable ROI. Each evidence job creates one `classification_inference_runs` row (the legacy table name is retained for compatibility) and one per-ROI evidence row. Classification jobs write `classification_evidence`; embedding jobs write `embedding_evidence`; legacy clustering jobs write `clustering_evidence`. Probability, prototype, KNN, cluster assignment, similarity, and novelty/abstention summaries are indexed or retained in Postgres. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
 
-The clustering packet is evidence about location in a model-defined feature space, not a Pelagia label or biological taxonomy. Cluster IDs are run-local and must be interpreted together with the Oracle artifact, embedding contract, clustering method, and run provenance. A classification artifact may also return a secondary clustering packet; Pelagia stores that packet alongside the classification evidence without converting it into a human assertion.
+An embedding packet is evidence about location in a model-defined feature space, not a Pelagia label or biological taxonomy. Clusters, when derived downstream, are run-local and must be interpreted together with the embedding contract, clustering method, and run provenance. Legacy clustering artifacts remain readable; Pelagia does not convert either embedding or clustering evidence into a human assertion.
 
 ## Feature-space exploration
 
 PelagiaView's **Clusters** analysis page is a project-scoped ROI browser for feature-space evidence. A reviewer first selects one persisted evidence source, which is always one inference run and its recorded model artifact. Its **Similar ROIs** view performs exact cosine comparison against that source's NPY ROI vectors; it never compares vectors from different runs or artifacts. For runs above 100,000 vectors, the API returns a deterministic exact ranking of the first 100,000 vectors in stable ROI-ID order and reports that coverage to the UI rather than failing. A provenance-compatible, materialized per-run vector index remains the required path for full-source search at larger scale.
 
-Its **Clusters** and **UMAP** views use the same project- and inference-run-scoped vectors. They produce exactly ten UMAP coordinates with a fixed random seed (`20260826`) and derive the browser's groups from HDBSCAN, rather than from a model's recorded cluster identity. Users can adjust `min_cluster_size`, `min_samples` (min_n), and `cluster_selection_epsilon` for the exploratory grouping; the response records those values. The analysis is queued only to dedicated `feature_space_analysis` CPU workers, has a hard 30-second worker deadline, permits at most two active analyses per project, and caches a completed identical request for 15 minutes (with 30-minute job cleanup). The coordinates, component extents, group labels, and membership strengths support client-side range filtering; no source vectors are changed. To retain a responsive visualization and bounded computation, it analyzes at most the deterministic first 5,000 persisted vectors, reporting whether coverage is `full_source` or `deterministic_prefix`; vectors with a different dimensionality than the largest compatible cohort and unreadable vectors are reported separately. Vectors from different model artifacts remain separate feature spaces and are never mixed. UMAP coordinates and HDBSCAN assignments are exploratory analysis results, not a label, taxonomy claim, or replacement for recorded Oracle clustering evidence.
+Its **Clusters** and **UMAP** views use the same project- and inference-run-scoped vectors and reuse one matching result while a reviewer moves between those views. They produce exactly ten UMAP coordinates with a fixed random seed (`20260826`) and derive the browser's groups from HDBSCAN, rather than from a model's recorded cluster identity. The primary UI exposes a minimum group size, group detail, and strictness; these resolve to and record `min_cluster_size`, `min_samples`, `cluster_selection_method` (`eom` or `leaf`), and `cluster_selection_epsilon`. Expert users can set the native values in Advanced settings. The analysis is queued only to dedicated `feature_space_analysis` CPU workers, has a hard 30-second worker deadline, permits at most two active analyses per project, and caches a completed identical request for 15 minutes (with 30-minute job cleanup). The coordinates, component extents, group labels, and membership strengths support client-side range filtering; no source vectors are changed. To retain a responsive visualization and bounded computation, it analyzes at most the deterministic first 5,000 persisted vectors, reporting whether coverage is `full_source` or `deterministic_prefix`; vectors with a different dimensionality than the largest compatible cohort and unreadable vectors are reported separately. Vectors from different model artifacts remain separate feature spaces and are never mixed. UMAP coordinates and HDBSCAN assignments are exploratory analysis results, not a label, taxonomy claim, or replacement for recorded Oracle clustering evidence.
 
 Recorded Oracle clusters, label prototypes, and model-specific similarity remain available as ROI evidence and provenance, but do not drive the Clusters browser's grouping. They remain scoped to the model artifact and inference run that created them. A group identifier is not a reusable biological category.
 
@@ -65,11 +65,13 @@ KNN neighbor identity, class, rank, and similarity are retained. The current Ora
 - `GET /curation/rois` and `GET /curation/rois/{id}` — queue and detailed evidence
 - `GET /curation/feature-space/sources` — project embedding spaces, scoped to inference runs
 - `GET /curation/feature-space/similar/{roi_id}` — exact bounded cosine neighbors in one source
-- `GET /curation/feature-space/umap` — bounded, run-scoped deterministic 10-D UMAP projection and HDBSCAN assignments; accepts `min_cluster_size`, `min_samples`, and `cluster_selection_epsilon` for exploratory grouping
+- `GET /curation/feature-space/umap` — bounded, run-scoped deterministic 10-D UMAP projection and HDBSCAN assignments; accepts `min_cluster_size`, `min_samples`, `cluster_selection_method`, and `cluster_selection_epsilon` for exploratory grouping
 - `GET /curation/feature-space/clusters` and `GET /curation/feature-space/clusters/{cluster_id}/rois` — run-local clustering browser
 - `POST /curation/classification-jobs` — asynchronous Oracle classification
-- `POST /curation/clustering-jobs` — asynchronous Oracle self-supervised clustering evidence
-- `POST /curation/clustering-targets/preview` — preview clustering targets
+- `POST /curation/embedding-jobs` — asynchronous Oracle embedding evidence
+- `POST /curation/embedding-targets/preview` — preview embedding targets
+- `POST /curation/clustering-jobs` — legacy asynchronous Oracle self-supervised clustering evidence
+- `POST /curation/clustering-targets/preview` — preview legacy clustering targets
 - `POST /curation/annotations` — explicit human assertion
 - `POST /curation/annotations/remove` — retire the current assertion while retaining history
 - `POST /curation/reviews` — human verification state

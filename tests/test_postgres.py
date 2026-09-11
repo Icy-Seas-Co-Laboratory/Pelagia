@@ -95,6 +95,13 @@ def test_packaged_migrations_are_discoverable_and_rendered():
         "0017_processing_series_snapshots",
         "0018_roi_clustering_evidence",
         "0019_feature_space_analysis",
+        "0020_roi_embedding_evidence",
+        "0021_roi_continuity",
+            "0022_job_lease_fencing",
+            "0023_job_retry_dispatch",
+            "0024_export_bundles",
+            "0025_export_lifecycle",
+            "0026_clear_series_work_units",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -113,39 +120,43 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.classification_evidence" in curation_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.roi_label_annotations" in curation_schema
     assert "{schema}" not in curation_schema
-    telemetry_schema = postgres.render_migration(migrations[-10], "pelagia_unit")
+    telemetry_schema = postgres.render_migration(migrations[9], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.telemetry_observations" in telemetry_schema
     assert "PARTITION BY HASH (stream_id)" in telemetry_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.timeline_events" in telemetry_schema
     assert "{schema}" not in telemetry_schema
-    durability_schema = postgres.render_migration(migrations[-9], "pelagia_unit")
+    durability_schema = postgres.render_migration(migrations[10], "pelagia_unit")
     assert "ADD COLUMN IF NOT EXISTS import_key text" in durability_schema
     assert "telemetry_sources_import_key" in durability_schema
     assert "{schema}" not in durability_schema
-    index_schema = postgres.render_migration(migrations[-8], "pelagia_unit")
+    index_schema = postgres.render_migration(migrations[11], "pelagia_unit")
     assert "telemetry_streams_sensor_project" in index_schema
     assert "{schema}" not in index_schema
-    overlap_schema = postgres.render_migration(migrations[-7], "pelagia_unit")
+    overlap_schema = postgres.render_migration(migrations[12], "pelagia_unit")
     assert "USING gist" in overlap_schema
     assert "tstzrange(start_at, COALESCE(end_at, start_at), '[]')" in overlap_schema
     assert "{schema}" not in overlap_schema
-    reference_name_schema = postgres.render_migration(migrations[-6], "pelagia_unit")
+    reference_name_schema = postgres.render_migration(migrations[13], "pelagia_unit")
     assert "telemetry_streams_sensor_project_idx" in reference_name_schema
     assert "{schema}" not in reference_name_schema
-    telemetry_stage_schema = postgres.render_migration(migrations[-5], "pelagia_unit")
+    telemetry_stage_schema = postgres.render_migration(migrations[14], "pelagia_unit")
     assert "ADD VALUE IF NOT EXISTS 'telemetry_import'" in telemetry_stage_schema
     assert "{schema}" not in telemetry_stage_schema
-    series_schema = postgres.render_migration(migrations[-4], "pelagia_unit")
+    series_schema = postgres.render_migration(migrations[15], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_series" in series_schema
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_work_units" in series_schema
     assert "{schema}" not in series_schema
-    analysis_schema = postgres.render_migration(migrations[-1], "pelagia_unit")
+    analysis_schema = postgres.render_migration(migrations[18], "pelagia_unit")
     assert "ADD VALUE IF NOT EXISTS 'feature_space_analysis'" in analysis_schema
     assert "{schema}" not in analysis_schema
-    clustering_schema = postgres.render_migration(migrations[-2], "pelagia_unit")
+    clustering_schema = postgres.render_migration(migrations[17], "pelagia_unit")
+    embedding_schema = postgres.render_migration(migrations[19], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.clustering_evidence" in clustering_schema
     assert "evidence_kind" in clustering_schema
     assert "{schema}" not in clustering_schema
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.embedding_evidence" in embedding_schema
+    assert "'embedding'" in embedding_schema
+    assert "{schema}" not in embedding_schema
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -177,10 +188,63 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 19
-    assert status["migrations"]["applied_count"] == 19
+    assert status["migrations"]["available_count"] == 26
+    assert status["migrations"]["applied_count"] == 26
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_postgres_export_artifacts_are_project_scoped_and_attach_jobs(postgres_repo):
+    project = postgres_repo.create_project(f"export-{uuid.uuid4().hex}")
+    other = postgres_repo.create_project(f"export-other-{uuid.uuid4().hex}")
+    artifact = postgres_repo.create_export_artifact(
+        project_id=str(project["id"]), request={"products": ["raw_roi_statistics"]},
+    )
+    job = postgres_repo.create_job(
+        PipelineStage.EXPORT_BUNDLE, project_id=str(project["id"]), payload={"export_id": str(artifact["id"])},
+    )
+    attached = postgres_repo.attach_export_artifact_job(
+        str(artifact["id"]), str(job["id"]), project_id=str(project["id"]),
+    )
+    assert attached is not None and str(attached["job_id"]) == str(job["id"])
+    assert postgres_repo.get_export_artifact(str(artifact["id"]), project_id=str(other["id"])) is None
+    completed = postgres_repo.update_export_artifact(
+        str(artifact["id"]), project_id=str(project["id"]), status="succeeded",
+        manifest={"export_id": str(artifact["id"])}, artifact_path="/not/exposed.zip",
+        artifact_sha256="a" * 64, size_bytes=12,
+    )
+    assert completed is not None and completed["status"] == "succeeded"
+
+
+def test_initialize_schema_upgrades_database_missing_latest_job_columns(postgres_repo):
+    """The base schema must not index 0023 columns before its migration runs."""
+
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"ALTER TABLE {postgres_repo.schema}.processing_jobs "
+                "DROP COLUMN lease_token, "
+                "DROP COLUMN available_at, "
+                "DROP COLUMN failure_category, "
+                "DROP COLUMN idempotency_key"
+            )
+            cursor.execute(
+                f"DROP TABLE {postgres_repo.schema}.processing_job_dispatches"
+            )
+            cursor.execute(
+                f"DELETE FROM {postgres_repo.schema}.schema_migrations "
+                "WHERE migration_id IN ('0022_job_lease_fencing', '0023_job_retry_dispatch')"
+            )
+        connection.commit()
+
+    postgres_repo.initialize_schema()
+
+    status = postgres_repo.migration_status()
+    assert status["ready"] is True
+    assert status["pending_count"] == 0
+    assert {
+        row["migration_id"] for row in status["applied"]
+    } >= {"0022_job_lease_fencing", "0023_job_retry_dispatch"}
 
 
 def test_processing_series_is_project_scoped_and_advances_terminal_steps(postgres_repo):
@@ -1855,6 +1919,170 @@ def test_postgres_repository_enforces_project_scope_on_job_creation(postgres_rep
         )
 
 
+def test_postgres_repository_lease_token_fences_stale_worker_updates(postgres_repo):
+    project = postgres_repo.create_project(f"lease-fencing-{uuid.uuid4().hex}")
+    job = postgres_repo.create_job(
+        PipelineStage.EXTRACT_FRAMES,
+        project_id=str(project["id"]),
+        summary="fenced lease",
+    )
+    first_claim = postgres_repo.claim_jobs("first-worker", stages=[PipelineStage.EXTRACT_FRAMES], limit=1)[0]
+    first_token = str(first_claim["lease_token"])
+    assert first_claim["lease_token"] is not None
+
+    # Simulate an old worker that continues after its lease was reclaimed.
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.processing_jobs SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = %s",
+                (job["id"],),
+            )
+        connection.commit()
+    assert postgres_repo.requeue_expired_jobs()["queued"] == 1
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.processing_jobs SET available_at = NOW() - INTERVAL '1 second' WHERE id = %s",
+                (job["id"],),
+            )
+        connection.commit()
+    second_claim = postgres_repo.claim_jobs("second-worker", stages=[PipelineStage.EXTRACT_FRAMES], limit=1)[0]
+    second_token = str(second_claim["lease_token"])
+    assert second_token != first_token
+
+    assert postgres_repo.heartbeat("first-worker", str(job["id"]), lease_token=first_token) is None
+    assert postgres_repo.update_job_progress(
+        str(job["id"]), {"completed": 99}, worker_id="first-worker", lease_token=first_token
+    ) is None
+    assert postgres_repo.complete_job(
+        str(job["id"]), {"stale": True}, worker_id="first-worker", lease_token=first_token
+    ) is None
+    assert postgres_repo.record_failure(
+        str(job["id"]), "stale failure", worker_id="first-worker", lease_token=first_token
+    ) is None
+
+    completed = postgres_repo.complete_job(
+        str(job["id"]), {"current": True}, worker_id="second-worker", lease_token=second_token
+    )
+    assert completed is not None
+    assert completed["status"] == JobStatus.SUCCEEDED.value
+    assert completed["result"] == {"current": True}
+
+
+def test_postgres_repository_schedules_retry_and_replays_dead_letter(postgres_repo):
+    project = postgres_repo.create_project(f"retry-schedule-{uuid.uuid4().hex}")
+    job = postgres_repo.create_job(PipelineStage.SEGMENT, project_id=str(project["id"]))
+    claim = postgres_repo.claim_jobs("retry-worker")[0]
+    retried = postgres_repo.record_failure(
+        str(job["id"]), "temporary storage error", retryable=True,
+        failure_category="infrastructure", worker_id="retry-worker", lease_token=str(claim["lease_token"]),
+    )
+    assert retried["status"] == JobStatus.QUEUED.value
+    assert retried["failure_category"] == "infrastructure"
+    assert retried["available_at"] > retried["updated_at"]
+    assert postgres_repo.claim_jobs("another-worker") == []
+    signals = postgres_repo.get_job_supervisor_signals()
+    assert signals["retry_scheduled"] >= 1
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.processing_jobs SET available_at = NOW() - INTERVAL '1 second' WHERE id = %s",
+                (job["id"],),
+            )
+        connection.commit()
+    assert postgres_repo.claim_jobs("another-worker")[0]["id"] == job["id"]
+
+
+def test_postgres_repository_materializes_idempotent_successor_dispatch(postgres_repo):
+    project = postgres_repo.create_project(f"successor-dispatch-{uuid.uuid4().hex}")
+    parent = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))
+    claim = postgres_repo.claim_jobs("dispatch-worker")[0]
+    dispatch = postgres_repo.enqueue_successor_dispatch(
+        parent_job_id=str(parent["id"]), worker_id="dispatch-worker", lease_token=str(claim["lease_token"]),
+        project_id=str(project["id"]), stage=PipelineStage.SEGMENT,
+        idempotency_key=f"successor:{parent['id']}:segment", payload={"frame_ids": []},
+    )
+    assert dispatch is not None and dispatch["status"] == "pending"
+    assert postgres_repo.materialize_pending_dispatches(parent_job_id=str(parent["id"]))["materialized"] == 0
+    assert postgres_repo.complete_job(str(parent["id"]), worker_id="dispatch-worker", lease_token=str(claim["lease_token"]))
+    assert postgres_repo.materialize_pending_dispatches(parent_job_id=str(parent["id"]))["materialized"] == 1
+    assert postgres_repo.materialize_pending_dispatches(parent_job_id=str(parent["id"]))["materialized"] == 0
+    children = postgres_repo.list_jobs(project_id=str(project["id"]), stage=PipelineStage.SEGMENT.value)
+    assert len(children) == 1
+
+
+def test_postgres_repository_recovers_dispatch_after_materialization_interruption(postgres_repo, monkeypatch):
+    """A crash after child creation must leave a replayable, idempotent outbox row."""
+    project = postgres_repo.create_project(f"dispatch-recovery-{uuid.uuid4().hex}")
+    parent = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))
+    claim = postgres_repo.claim_jobs("dispatch-recovery-worker")[0]
+    key = f"successor:{parent['id']}:segment"
+    dispatch = postgres_repo.enqueue_successor_dispatch(
+        parent_job_id=str(parent["id"]), worker_id="dispatch-recovery-worker",
+        lease_token=str(claim["lease_token"]), project_id=str(project["id"]),
+        stage=PipelineStage.SEGMENT, idempotency_key=key, payload={"frame_ids": []},
+    )
+    assert dispatch is not None
+    assert postgres_repo.complete_job(
+        str(parent["id"]), worker_id="dispatch-recovery-worker", lease_token=str(claim["lease_token"])
+    ) is not None
+
+    original_create_job = postgres_repo.create_job
+    interrupted = False
+
+    def create_then_interrupt(*args, **kwargs):
+        nonlocal interrupted
+        created = original_create_job(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated process interruption after child creation")
+        return created
+
+    monkeypatch.setattr(postgres_repo, "create_job", create_then_interrupt)
+    first = postgres_repo.materialize_pending_dispatches(parent_job_id=str(parent["id"]))
+    assert first == {"materialized": 0, "failed": 1, "pending": 0}
+
+    monkeypatch.setattr(postgres_repo, "create_job", original_create_job)
+    recovered = postgres_repo.materialize_pending_dispatches(parent_job_id=str(parent["id"]))
+    assert recovered == {"materialized": 1, "failed": 0, "pending": 0}
+    children = postgres_repo.list_jobs(project_id=str(project["id"]), stage=PipelineStage.SEGMENT.value)
+    assert len(children) == 1
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT status, child_job_id, error_message FROM {postgres_repo.schema}.processing_job_dispatches WHERE id = %s",
+                (dispatch["id"],),
+            )
+            persisted = cursor.fetchone()
+    assert persisted["status"] == "materialized"
+    assert str(persisted["child_job_id"]) == str(children[0]["id"])
+    assert persisted["error_message"] is None
+
+
+def test_postgres_repository_supervisor_lock_is_singleton(postgres_repo):
+    with postgres_repo.job_supervisor_lock() as first:
+        assert first is True
+        with postgres_repo.job_supervisor_lock() as second:
+            assert second is False
+
+
+def test_postgres_repository_reclaims_only_empty_stale_series_planning_steps(postgres_repo):
+    project = postgres_repo.create_project(f"series-reclaim-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    series = postgres_repo.create_processing_series(
+        project_id=project_id,
+        steps=[{"stage": PipelineStage.SEGMENT.value, "filters": {}, "options": {}}],
+    )
+    step = postgres_repo.claim_processing_series_step(str(series["id"]), project_id=project_id)
+    assert step is not None and step["status"] == "planning"
+
+    reclaimed = postgres_repo.reclaim_stale_processing_series_planning_steps(
+        project_id=project_id, older_than_seconds=-1, limit=1
+    )
+    assert [str(row["id"]) for row in reclaimed] == [str(step["id"])]
+    assert postgres_repo.list_processing_series_steps(str(series["id"]), project_id=project_id)[0]["status"] == "queued"
+
+
 def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
     other_project = postgres_repo.create_project(f"cancel-scope-{uuid.uuid4().hex}")
     queued_job = postgres_repo.create_job(
@@ -1924,6 +2152,37 @@ def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
     assert events[0]["event_type"] == "job.cancelled"
     assert events[0]["payload"]["bulk"] is True
     assert events[0]["payload"]["previous_status"] == JobStatus.QUEUED.value
+
+
+def test_postgres_repository_clears_terminal_series_jobs_and_work_units(postgres_repo):
+    project = postgres_repo.create_project(f"clear-series-job-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    series = postgres_repo.create_processing_series(
+        project_id=project_id,
+        steps=[{"stage": PipelineStage.SEGMENT.value, "filters": {}, "options": {}}],
+    )
+    step = postgres_repo.claim_processing_series_step(str(series["id"]), project_id=project_id)
+    assert step is not None
+    job = postgres_repo.create_job(
+        PipelineStage.SEGMENT,
+        project_id=project_id,
+        status=JobStatus.CANCELLED,
+    )
+    postgres_repo.attach_processing_work_units(
+        series_id=str(series["id"]),
+        step_id=str(step["id"]),
+        job_ids=[str(job["id"])],
+        matched_count=1,
+    )
+
+    result = postgres_repo.delete_jobs(
+        project_id=project_id,
+        statuses=[JobStatus.CANCELLED.value],
+    )
+
+    assert result["deleted_count"] == 1
+    assert postgres_repo.get_job(str(job["id"]), project_id=project_id) is None
+    assert postgres_repo.list_processing_work_units(str(series["id"]), project_id=project_id) == []
 
 
 def test_postgres_repository_bulk_pause_and_resume_are_stage_scoped(postgres_repo):

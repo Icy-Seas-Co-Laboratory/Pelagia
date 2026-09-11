@@ -17,6 +17,7 @@ from Pelagia.workers.handlers import (
     roi_refinement_handler,
 )
 from Pelagia.workers.worker import Worker
+from Pelagia.workers.progress import JobPauseRequested, JobProgressReporter
 from Pelagia.workers.runtime import worker_runtime_profile
 
 
@@ -33,6 +34,8 @@ class FakeRepository:
         self.completed = []
         self.failures = []
         self.created_jobs = []
+        self.successor_dispatches = []
+        self.materialized_dispatches = []
         self.replaced_detections = []
         self.refined_detections = []
         self.background_calls = []
@@ -47,6 +50,8 @@ class FakeRepository:
         self.shutdown_requested = False
         self.project_calls = []
         self.heartbeats = []
+        self.job_control = {"status": "leased", "control_reason": None}
+        self.paused_jobs = []
 
     def get_asset(self, asset_id, **kwargs):
         self.project_calls.append(("get_asset", kwargs.get("project_id")))
@@ -58,11 +63,11 @@ class FakeRepository:
     def claim_jobs(self, worker_id, stages=None):
         return list(self.claimed_jobs)
 
-    def complete_job(self, job_id, result=None):
+    def complete_job(self, job_id, result=None, **kwargs):
         self.completed.append((job_id, result))
         return {"id": job_id, "status": "succeeded", "result": result}
 
-    def record_failure(self, job_id, error_message, retryable=True):
+    def record_failure(self, job_id, error_message, retryable=True, **kwargs):
         self.failures.append((job_id, error_message, retryable))
         return {"id": job_id, "status": "queued", "error_message": error_message}
 
@@ -71,7 +76,24 @@ class FakeRepository:
         self.created_jobs.append(job)
         return job
 
-    def update_job_progress(self, job_id, progress, summary=None, log_message=None):
+    def enqueue_successor_dispatch(self, **kwargs):
+        dispatch = {"id": "segment-dispatch-1", **kwargs}
+        self.successor_dispatches.append(dispatch)
+        return dispatch
+
+    def materialize_pending_dispatches(self, *, parent_job_id=None, **kwargs):
+        self.materialized_dispatches.append(parent_job_id)
+        return {"materialized": 1, "failed": 0}
+
+    def get_job_control(self, job_id, **kwargs):
+        return None if self.job_control is None else {"id": job_id, **self.job_control}
+
+    def finalize_paused_job(self, job_id, **kwargs):
+        self.paused_jobs.append((job_id, kwargs))
+        self.job_control = None
+        return {"id": job_id, "status": "paused"}
+
+    def update_job_progress(self, job_id, progress, summary=None, log_message=None, **kwargs):
         self.progress_updates.append(
             {
                 "job_id": job_id,
@@ -227,7 +249,7 @@ class FakeRepository:
         self.requeued += 1
         return {"queued": 0, "dead_lettered": 0}
 
-    def heartbeat(self, worker_id, job_id):
+    def heartbeat(self, worker_id, job_id, **kwargs):
         self.heartbeats.append((worker_id, job_id))
         return {"id": job_id, "worker_id": worker_id, "status": "leased"}
 
@@ -247,6 +269,26 @@ class FakeOracle:
 
 def make_context(repository):
     return AppContext(config=CoreConfig(), repository=repository, kvstore=None, oracle=FakeOracle())
+
+
+def test_progress_checkpoint_acknowledges_requested_pause():
+    repo = FakeRepository()
+    repo.job_control = {"status": "leased", "control_reason": "pause_requested:operator"}
+    reporter = JobProgressReporter(
+        {"id": "job-1", "_worker_id": "worker-1", "_lease_token": "lease-1"},
+        make_context(repo),
+        stage=PipelineStage.SEGMENT.value,
+        unit="frames",
+        total=10,
+    )
+
+    with pytest.raises(JobPauseRequested):
+        reporter.checkpoint()
+
+    assert repo.paused_jobs == [
+        ("job-1", {"worker_id": "worker-1", "lease_token": "lease-1"})
+    ]
+    assert repo.failures == []
 
 
 def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
@@ -477,6 +519,49 @@ def test_clustering_handler_persists_cluster_packet_without_classification_label
     assert stored[0]["records"][0]["embedding_payload_ref"] == "cluster-embedding-key"
 
 
+def test_embedding_handler_persists_embedding_product_without_cluster_evidence():
+    repo = FakeRepository()
+    repo.create_classification_inference_run = lambda **values: {"id": "embedding-run-1", **values}
+    repo.count_classification_targets = lambda **values: 1
+    repo.list_classification_targets = lambda **values: ([{
+        "id": "refined-embedding-1", "created_at": "2026-01-01T00:00:00+00:00",
+        "bbox_x": 0, "bbox_y": 0, "bbox_w": 2, "bbox_h": 2,
+        "crop_bbox_x": 0, "crop_bbox_y": 0, "crop_bbox_w": 2, "crop_bbox_h": 2,
+        "roi_payload": np.ones((2, 2), dtype="uint8").tobytes(),
+        "roi_encoding": "raw", "roi_format": "raw_ndarray_c_order",
+        "roi_dtype": "uint8", "roi_shape": [2, 2],
+    }] if values.get("after_id") is None else [])
+    repo.prepare_embedding_evidence_context = lambda **values: {"id": "embedding-context", **values}
+    stored = []
+    repo.store_embedding_evidence_batch = lambda **values: stored.append(values) or [{"id": "embedding-evidence-1"}]
+    repo.complete_classification_inference_run = lambda run_id, **values: {"id": run_id, **values}
+
+    class EmbeddingOracle:
+        def predict_batch(self, model_ref, items):
+            assert model_ref == "roi-embedding"
+            return [type("Response", (), {"transport_request_id": "transport-embedding-1", "result": {
+                "result_id": "embedding-result-1", "execution": {"duration_ms": 4.0},
+                "model": {"artifact_id": "00000000-0000-0000-0000-000000000031", "run_id": "00000000-0000-0000-0000-000000000032", "task": "embedding"},
+                "output": {"type": "embedding", "embedding": np.asarray([1.0, 0.0], dtype="float32"), "embedding_normalized": True},
+            }})()]
+
+    class EmbeddingKVStore:
+        def put_store(self, payload):
+            assert payload
+            return "embedding-key"
+
+    context = AppContext(config=CoreConfig(), repository=repo, kvstore=EmbeddingKVStore(), oracle=EmbeddingOracle())
+    result = classification_handler({
+        "id": "job-embedding", "project_id": "project-1", "stage": PipelineStage.CLASSIFY.value,
+        "payload": {"model_ref": "roi-embedding", "evidence_kind": "embedding", "roi_ids": []},
+    }, context)
+
+    assert result["evidence_kind"] == "embedding"
+    assert result["detection_count"] == 1
+    assert stored[0]["records"][0]["embedding_payload_ref"] == "embedding-key"
+    assert stored[0]["records"][0]["embedding_normalized"] is True
+
+
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     repo = FakeRepository()
     repo.assets["asset-1"]["metadata"] = {"analysis": "generated", "source": "asset"}
@@ -609,7 +694,7 @@ def test_extract_frames_handler_reports_video_ingest_progress(monkeypatch):
     assert mid_progress["secondary"]["estimated_tile_count"] == 10
 
 
-def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
+def test_extract_frames_handler_records_durable_segment_dispatch(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
 
@@ -624,6 +709,8 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
             "stage": PipelineStage.EXTRACT_FRAMES.value,
             "run_id": "run-1",
             "asset_id": "asset-1",
+            "_worker_id": "worker-1",
+            "_lease_token": "lease-1",
             "payload": {
                 "enqueue_segment": True,
                 "padding": 4,
@@ -633,9 +720,10 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
         context,
     )
 
-    assert result["segment_job_id"] == "segment-job-1"
-    assert repo.created_jobs[0]["stage"] == PipelineStage.SEGMENT.value
-    assert repo.created_jobs[0]["payload"] == {
+    assert result["segment_dispatch_id"] == "segment-dispatch-1"
+    assert repo.created_jobs == []
+    assert repo.successor_dispatches[0]["stage"] == PipelineStage.SEGMENT
+    assert repo.successor_dispatches[0]["payload"] == {
         "command_type": "segment_frames",
         "command_version": 1,
         "frame_ids": [10],
@@ -648,7 +736,8 @@ def test_extract_frames_handler_can_enqueue_segment_job(monkeypatch):
             "mask_encoding": "zstd",
             "collections": ["test"],
     }
-    assert repo.created_jobs[0]["depends_on"] == ["job-1"]
+    assert repo.successor_dispatches[0]["depends_on"] == ["job-1"]
+    assert repo.successor_dispatches[0]["idempotency_key"] == "legacy-extract-segment:job-1"
 
 
 def test_extract_frames_handler_preserves_project_when_enqueuing_segment(monkeypatch):
@@ -667,14 +756,17 @@ def test_extract_frames_handler_preserves_project_when_enqueuing_segment(monkeyp
             "stage": PipelineStage.EXTRACT_FRAMES.value,
             "run_id": "run-1",
             "asset_id": "asset-1",
+            "_worker_id": "worker-1",
+            "_lease_token": "lease-1",
             "payload": {"enqueue_segment": True},
         },
         context,
     )
 
     assert result["project_id"] == "project-1"
-    assert repo.created_jobs[0]["project_id"] == "project-1"
-    assert repo.created_jobs[0]["stage"] == PipelineStage.SEGMENT.value
+    assert repo.created_jobs == []
+    assert repo.successor_dispatches[0]["project_id"] == "project-1"
+    assert repo.successor_dispatches[0]["stage"] == PipelineStage.SEGMENT
     assert ("get_asset", "project-1") in repo.project_calls
     assert repo.frame_status_rows == [
         {
@@ -1417,6 +1509,7 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-1"],
+                "method": "oracle",
                 "model_ref": "test-refiner",
                 "allow_frame_expansion": False,
                 "encoding": "raw",
@@ -1778,6 +1871,61 @@ def test_worker_run_once_stops_when_shutdown_requested():
 
     assert worker.run_once(stages=[PipelineStage.EXTRACT_FRAMES]) == 0
     assert repo.touches[-1]["status"] == "stopped"
+
+
+def test_worker_treats_checkpoint_pause_as_controlled_exit():
+    repo = FakeRepository()
+    repo.claimed_jobs = [
+        {
+            "id": "job-pause",
+            "lease_token": "lease-pause",
+            "stage": PipelineStage.SEGMENT.value,
+            "payload": {"frame_ids": ["frame-1"]},
+        }
+    ]
+    registry = HandlerRegistry()
+
+    def pausing_handler(job, context):
+        repo.job_control = {
+            "status": "leased",
+            "control_reason": "pause_requested:operator",
+        }
+        JobProgressReporter(
+            job,
+            context,
+            stage=PipelineStage.SEGMENT.value,
+            unit="frames",
+            total=1,
+        ).checkpoint()
+        raise AssertionError("checkpoint must stop the handler")
+
+    registry.register(PipelineStage.SEGMENT, pausing_handler)
+    worker = Worker(context=make_context(repo), handlers=registry, worker_id="worker-1")
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
+    assert repo.paused_jobs[0][0] == "job-pause"
+    assert repo.completed == []
+    assert repo.failures == []
+
+
+def test_worker_materializes_successor_dispatch_only_after_parent_completion():
+    repo = FakeRepository()
+    repo.claimed_jobs = [
+        {
+            "id": "job-parent",
+            "lease_token": "lease-parent",
+            "stage": PipelineStage.SEGMENT.value,
+            "payload": {},
+        }
+    ]
+    registry = HandlerRegistry()
+    registry.register(PipelineStage.SEGMENT, lambda job, context: {"ok": True})
+    worker = Worker(context=make_context(repo), handlers=registry, worker_id="worker-1")
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
+    assert repo.completed[0][0] == "job-parent"
+    assert repo.materialized_dispatches == ["job-parent"]
+    assert repo.failures == []
 
 
 def test_worker_run_forever_requeues_and_stops_from_event():

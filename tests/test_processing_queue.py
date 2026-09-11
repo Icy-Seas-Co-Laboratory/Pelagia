@@ -406,3 +406,90 @@ def test_series_resolves_recognized_preset_settings_into_stage_options():
         "min_width": 12, "padding": 20,
     }
     assert repository.steps[2]["options"] == {"method": "identity", "max_iterations": 4}
+
+
+def test_reconcile_series_advances_terminal_ready_step_after_missed_worker_hook():
+    class RecoveryRepository(SeriesRepository):
+        def __init__(self):
+            super().__init__()
+            self.series = {"id": "series-1", "project_id": "project-1", "status": "active"}
+            self.steps = [
+                {"id": "step-0", "series_id": "series-1", "status": "active", "stage": "preprocess_frames", "filters": {}, "options": {}},
+                {"id": "step-1", "series_id": "series-1", "status": "queued", "stage": "segment", "filters": {}, "options": {}},
+            ]
+            self.units = [{"step_id": "step-0", "job_id": "job-1", "job_status": "succeeded"}]
+            self.hooks = []
+
+        def list_processing_series(self, *, project_id, status, limit, offset):
+            assert project_id == "project-1"
+            assert status == ["queued", "active"]
+            return [self.get_processing_series("series-1", project_id=project_id)]
+
+        def list_processing_work_units(self, series_id, *, project_id):
+            return self.units
+
+        def advance_processing_series_for_job(self, job_id):
+            self.hooks.append(job_id)
+            self.steps[0]["status"] = "succeeded"
+            return {"series_id": "series-1", "step_id": "step-0", "ready": True, "failed": False}
+
+    repository = RecoveryRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    result = service.reconcile_series(project_id="project-1")
+
+    assert result == {"examined": 1, "reclaimed_planning": 0, "advanced": 1}
+    assert repository.hooks == ["job-1"]
+    assert repository.attached == [("step-1", ["job-1"], 3)]
+
+
+def test_reconcile_series_reclaims_only_stale_planning_steps_when_repository_supports_it():
+    class PlanningRecoveryRepository(SeriesRepository):
+        def __init__(self):
+            super().__init__()
+            self.series = {"id": "series-1", "project_id": "project-1", "status": "active"}
+            self.steps = [{"id": "step-0", "series_id": "series-1", "status": "planning", "stage": "segment", "filters": {}, "options": {}}]
+            self.reclaim_arguments = None
+
+        def reclaim_stale_processing_series_planning_steps(self, *, project_id, older_than_seconds, limit):
+            self.reclaim_arguments = (project_id, older_than_seconds, limit)
+            self.steps[0]["status"] = "queued"
+            return [{"series_id": "series-1", "step_id": "step-0"}]
+
+        def list_processing_series(self, *, project_id, status, limit, offset):
+            return [self.get_processing_series("series-1", project_id=project_id)]
+
+        def list_processing_work_units(self, series_id, *, project_id):
+            return []
+
+    repository = PlanningRecoveryRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    result = service.reconcile_series(project_id="project-1", planning_timeout_seconds=60)
+
+    assert repository.reclaim_arguments == ("project-1", 60, 100)
+    assert result["reclaimed_planning"] == 1
+    assert repository.attached == [("step-0", ["job-1"], 3)]
+
+
+def test_resume_series_dispatches_the_next_step_when_a_pause_stranded_it():
+    class ResumeRepository(SeriesRepository):
+        def __init__(self):
+            super().__init__()
+            self.series = {"id": "series-1", "project_id": "project-1", "status": "paused"}
+            self.steps = [{"id": "step-0", "series_id": "series-1", "status": "queued", "stage": "segment", "filters": {}, "options": {}}]
+            self.resume_arguments = None
+
+        def resume_processing_series(self, series_id, *, project_id, reason):
+            self.resume_arguments = (series_id, project_id, reason)
+            self.series["status"] = "active"
+            return dict(self.series)
+
+    repository = ResumeRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    series = service.resume_series("series-1", project_id="project-1", reason="operator approved")
+
+    assert repository.resume_arguments == ("series-1", "project-1", "operator approved")
+    assert series["status"] == "active"
+    assert repository.attached == [("step-0", ["job-1"], 3)]

@@ -7,6 +7,22 @@ from ..processing.timing import measure_phase
 from ..services.context import AppContext
 
 
+class JobControlInterrupt(RuntimeError):
+    """Base class for expected, non-failure exits from a leased handler."""
+
+
+class JobLeaseLost(JobControlInterrupt):
+    """Raised when a handler no longer owns the job lease."""
+
+
+class JobPauseRequested(JobControlInterrupt):
+    """Raised after a handler acknowledges a pause at a safe checkpoint."""
+
+
+class JobCancellationRequested(JobControlInterrupt):
+    """Raised when cancellation is observed at a safe checkpoint."""
+
+
 class JobProgressReporter:
     """Small helper for writing throttled, structured job progress updates."""
 
@@ -37,8 +53,55 @@ class JobProgressReporter:
         value = self.job.get("id")
         return None if value is None else str(value)
 
+    @property
+    def claim_identity(self) -> dict[str, str]:
+        """Return the ephemeral worker claim identity when this is leased work."""
+        worker_id = self.job.get("_worker_id")
+        lease_token = self.job.get("_lease_token")
+        if worker_id and lease_token:
+            return {"worker_id": str(worker_id), "lease_token": str(lease_token)}
+        return {}
+
     def start(self, message: str | None = None) -> None:
         self.update(0, message=message or f"Starting {self.stage}", force=True)
+
+    def checkpoint(self) -> dict[str, Any] | None:
+        """Stop leased work before the next batch when its control state changed.
+
+        Lightweight repositories and direct handler calls do not carry a lease
+        identity, so checkpoints remain backwards compatible no-ops for them.
+        A missing control row for claimed work means that this worker no longer
+        owns the lease (including the current immediate-cancellation behavior).
+        """
+        repository = self.context.repository
+        identity = self.claim_identity
+        if repository is None or not identity:
+            return None
+        get_control = getattr(repository, "get_job_control", None)
+        if not callable(get_control) or self.job_id is None:
+            return None
+        control = get_control(self.job_id, **identity)
+        if control is None:
+            raise JobLeaseLost(f"Lease lost for job {self.job_id}")
+
+        reason = str(control.get("control_reason") or "")
+        status = str(control.get("status") or "")
+        if reason.startswith("cancel_requested:") or status == "cancelled":
+            finalize = getattr(repository, "finalize_cancelled_job", None)
+            if callable(finalize):
+                finalized = finalize(self.job_id, **identity)
+                if finalized is None:
+                    raise JobLeaseLost(f"Lease lost for job {self.job_id}")
+            raise JobCancellationRequested(f"Cancellation requested for job {self.job_id}")
+        if reason.startswith("pause_requested:"):
+            finalize = getattr(repository, "finalize_paused_job", None)
+            if not callable(finalize):
+                raise JobLeaseLost(f"Cannot acknowledge pause for job {self.job_id}")
+            finalized = finalize(self.job_id, **identity)
+            if finalized is None:
+                raise JobLeaseLost(f"Lease lost for job {self.job_id}")
+            raise JobPauseRequested(f"Pause requested for job {self.job_id}")
+        return control
 
     def update(
         self,
@@ -51,6 +114,9 @@ class JobProgressReporter:
         message: str | None = None,
         force: bool = False,
     ) -> None:
+        # Check before throttling so every logical batch boundary observes
+        # operator controls even when no progress row needs to be emitted.
+        self.checkpoint()
         job_id = self.job_id
         repository = self.context.repository
         if repository is None or job_id is None:
@@ -87,12 +153,15 @@ class JobProgressReporter:
             "message": message,
         }
         with measure_phase("progress.database_update"):
-            update_job_progress(
+            updated = update_job_progress(
                 job_id,
                 progress,
                 summary=message,
                 log_message=None,
+                **self.claim_identity,
             )
+        if updated is None and self.claim_identity:
+            raise JobLeaseLost(f"Lease lost while updating progress for job {job_id}")
         self.last_emit_at = now
         self.last_completed = completed_int
 

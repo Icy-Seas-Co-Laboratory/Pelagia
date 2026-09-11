@@ -13,6 +13,11 @@ from .job_commands import PreprocessFramesCommand, RoiRefinementCommand, Segment
 PREPROCESS_FRAMES_PER_JOB = 1_000
 SEGMENT_FRAMES_PER_JOB = 1_000
 ROI_REFINEMENT_DETECTIONS_PER_JOB = 10_000
+# A planning step has no durable director lease in the initial series schema.
+# Keep the recovery timeout deliberately conservative: a second director must
+# never reclaim work that a healthy planner is still materialising.
+PROCESSING_SERIES_PLANNING_TIMEOUT_SECONDS = 15 * 60
+_TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "dead_lettered", "cancelled"})
 
 
 # Processing presets are a UI-facing flat document. Queue payloads are also
@@ -198,6 +203,105 @@ class ProcessingQueueService:
             return advanced
         self.advance_series(str(advanced["series_id"]), project_id=str(series["project_id"]))
         return advanced
+
+    def resume_series(
+        self,
+        series_id: str,
+        *,
+        project_id: str,
+        reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Resume a series and immediately dispatch a step made ready while paused.
+
+        Repository control methods intentionally only mutate durable state.  The
+        director follow-up belongs here so a final job that completed during a
+        pause cannot leave its next queued step stranded until another job
+        happens to finish.
+        """
+        series = self.repository.resume_processing_series(
+            series_id, project_id=project_id, reason=reason,
+        )
+        if series is None:
+            return None
+        return self.advance_series(series_id, project_id=project_id)
+
+    def reconcile_series(
+        self,
+        *,
+        project_id: str,
+        limit: int = 100,
+        planning_timeout_seconds: int = PROCESSING_SERIES_PLANNING_TIMEOUT_SECONDS,
+    ) -> dict[str, int]:
+        """Recover dispatch that was interrupted after durable job completion.
+
+        This routine is safe to run repeatedly from a scheduler.  It advances
+        only queued/active series and delegates stale planning reclamation to
+        the repository, where the timestamp predicate and status transition can
+        be atomic.  It deliberately never advances paused or terminal series.
+
+        The repository's ``reclaim_stale_processing_series_planning_steps``
+        method is optional during the rolling upgrade; without it terminal-ready
+        recovery remains available, while planning rows are left untouched.
+        """
+        if planning_timeout_seconds <= 0:
+            raise ValueError("planning_timeout_seconds must be positive.")
+        bounded_limit = min(max(1, int(limit)), 1_000)
+        reclaimed = 0
+        advanced = 0
+        examined = 0
+
+        reclaim = getattr(self.repository, "reclaim_stale_processing_series_planning_steps", None)
+        if reclaim is not None:
+            reclaimed_rows = reclaim(
+                project_id=project_id,
+                older_than_seconds=planning_timeout_seconds,
+                limit=bounded_limit,
+            )
+            # A reclaimed row is queued again; advance_series atomically claims
+            # it, so another reconciler/director may win without duplicating it.
+            seen_reclaimed_series: set[str] = set()
+            for row in reclaimed_rows:
+                recovered_series_id = str(row["series_id"])
+                if recovered_series_id in seen_reclaimed_series:
+                    continue
+                seen_reclaimed_series.add(recovered_series_id)
+                reclaimed += 1
+                self.advance_series(recovered_series_id, project_id=project_id)
+
+        for series in self.repository.list_processing_series(
+            project_id=project_id, status=["queued", "active"], limit=bounded_limit, offset=0,
+        ):
+            examined += 1
+            series_id = str(series["id"])
+            steps = list(series.get("steps") or [])
+            active_steps = [step for step in steps if step.get("status") == "active"]
+            if not active_steps:
+                # This includes a newly-created queued series after a process
+                # crash before its initial director call.
+                if not any(step.get("status") == "queued" for step in steps):
+                    # In particular, do not count or disturb a non-stale
+                    # planning step owned by another director.
+                    continue
+                before = self.repository.get_processing_series(series_id, project_id=project_id)
+                self.advance_series(series_id, project_id=project_id)
+                if before is not None:
+                    advanced += 1
+                continue
+
+            for step in active_steps:
+                step_id = str(step["id"])
+                units = [
+                    unit for unit in self.repository.list_processing_work_units(series_id, project_id=project_id)
+                    if str(unit.get("step_id")) == step_id
+                ]
+                # An active step without attached units is not safe to infer as
+                # complete: it may be between job creation and attachment.
+                if not units or any(str(unit.get("job_status")) not in _TERMINAL_JOB_STATUSES for unit in units):
+                    continue
+                self.advance_series_for_job(str(units[0]["job_id"]))
+                advanced += 1
+
+        return {"examined": examined, "reclaimed_planning": reclaimed, "advanced": advanced}
 
     def advance_series(self, series_id: str, *, project_id: str) -> dict[str, Any] | None:
         """Plan queued steps one at a time, recursively passing empty selections."""

@@ -88,8 +88,6 @@ if APIRouter is not None:
     @router.post("/series")
     def create_processing_series(request: Request, body: ProcessingSeriesRequest) -> dict:
         auth = require_project_write(request)
-        if not body.preset_snapshot:
-            raise HTTPException(status_code=422, detail="A preset snapshot is required to create a processing series.")
         selection = dict(body.selection or body.targets or {})
         common_filters = {
             "asset_ids": selection.get("asset_ids") or [],
@@ -147,8 +145,21 @@ if APIRouter is not None:
     def control_processing_series(request: Request, series_id: str, action: Literal["pause", "resume", "cancel", "retry"], body: SeriesReasonRequest | None = None) -> dict:
         auth = require_project_write(request)
         repository = get_context(request).repository
+        reason = None if body is None else body.reason
+        # Resuming a series must also hand control back to the director: the
+        # final job of a step may have completed while the series was paused.
+        # The service performs that idempotent advancement after persistence.
+        if action == "resume":
+            series = ProcessingQueueService(get_context(request)).resume_series(
+                series_id,
+                project_id=auth.project_id,
+                reason=reason,
+            )
+            if series is None:
+                raise HTTPException(status_code=404, detail=f"Processing series {series_id!r} was not found.")
+            return as_response(series)
         method = getattr(repository, f"{action}_processing_series")
-        series = method(series_id, project_id=auth.project_id, reason=None if body is None else body.reason)
+        series = method(series_id, project_id=auth.project_id, reason=reason)
         if series is None:
             raise HTTPException(status_code=404, detail=f"Processing series {series_id!r} was not found.")
         return as_response(series)

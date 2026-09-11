@@ -67,6 +67,7 @@ class FrameRepository(RepositoryScope):
             "replace_detections", "replace_frame_detections", "list_detections",
             "get_detection", "get_detections", "get_refined_detection_for_candidate",
             "get_refined_detection", "list_detection_records",
+            "list_refined_detections_for_continuity", "record_roi_continuity",
             "list_asset_detection_stats", "list_asset_processing_state",
             "list_frame_processing_state", "ensure_frame_status_rows",
             "upsert_frame_stage_status", "refresh_frame_status_counts",
@@ -88,12 +89,17 @@ class JobRepository(RepositoryScope):
             "list_worker_sessions", "touch_worker", "get_worker_session",
             "request_worker_shutdown", "heartbeat", "requeue_expired_jobs",
             "claim_jobs", "complete_job", "record_failure", "fail_job", "retry_job",
+            "enqueue_successor_dispatch", "materialize_pending_dispatches",
+            "job_supervisor_lock", "get_job_supervisor_signals",
             "cancel_jobs", "delete_jobs",
             "create_processing_series", "get_processing_series", "list_processing_series_steps",
             "list_processing_work_units", "claim_processing_series_step", "finish_processing_series_step",
             "attach_processing_work_units", "advance_processing_series_for_job",
             "pause_processing_series", "resume_processing_series", "cancel_processing_series",
             "retry_processing_series",
+            "create_export_artifact", "attach_export_artifact_job", "get_export_artifact",
+            "list_export_artifacts", "update_export_artifact", "begin_export_attempt",
+            "update_export_attempt_product", "finish_export_attempt",
         }
     )
 

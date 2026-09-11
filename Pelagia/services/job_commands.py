@@ -307,6 +307,26 @@ class RoiRefinementCommand(JobCommand):
 
 
 @dataclass(frozen=True, slots=True)
+class RoiContinuityCommand(JobCommand):
+    command_type = "roi_continuity"
+    stage = PipelineStage.ROI_CONTINUITY
+
+    asset_id: str
+    options: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "RoiContinuityCommand":
+        cls._validate_payload(payload)
+        asset_id = payload.get("asset_id")
+        if not asset_id:
+            raise ValueError("roi_continuity requires asset_id.")
+        return cls(asset_id=str(asset_id), options=_payload_values(payload, {"asset_id"}))
+
+    def to_payload(self) -> dict[str, Any]:
+        return {**self._payload_header(), "asset_id": self.asset_id, **_compact(self.options)}
+
+
+@dataclass(frozen=True, slots=True)
 class ClassificationTargetSelection:
     """Stable, serializable query describing refined ROIs eligible for evidence generation."""
 
@@ -371,7 +391,7 @@ class ClassificationCommand(JobCommand):
         if not model_ref:
             raise ValueError("Classification jobs require model_ref.")
         evidence_kind = str(payload.get("evidence_kind") or "classification").strip()
-        if evidence_kind not in {"classification", "clustering"}:
+        if evidence_kind not in {"classification", "clustering", "embedding"}:
             raise ValueError("Classification jobs require a supported evidence_kind.")
         roi_ids = tuple(str(value) for value in payload.get("roi_ids") or () if value)
         selection_payload = payload.get("selection")
@@ -461,6 +481,7 @@ def command_model(stage: PipelineStage | str) -> type[JobCommand] | None:
         PipelineStage.SEGMENT: SegmentFramesCommand,
         PipelineStage.BACKGROUND_FRAMES: FrameBackgroundCommand,
         PipelineStage.ROI_REFINEMENT: RoiRefinementCommand,
+        PipelineStage.ROI_CONTINUITY: RoiContinuityCommand,
         PipelineStage.CLASSIFY: ClassificationCommand,
         PipelineStage.TELEMETRY_IMPORT: TelemetryImportCommand,
     }.get(PipelineStage(stage))

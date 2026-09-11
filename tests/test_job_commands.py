@@ -106,6 +106,15 @@ def test_classification_command_preserves_reproducible_target_selection():
     assert payload["selection"]["min_area"] == 25.0
 
 
+def test_classification_command_accepts_embedding_evidence():
+    command = ClassificationCommand.from_payload(
+        {"model_ref": "embedding-v1", "evidence_kind": "embedding"}
+    )
+
+    assert command.evidence_kind == "embedding"
+    assert command.to_payload()["evidence_kind"] == "embedding"
+
+
 def test_telemetry_import_command_preserves_parser_and_mapping():
     command = TelemetryImportCommand.from_payload(
         {

@@ -20,6 +20,10 @@ max_attempts = 3
 max_claim_count = 1
 lease_seconds = 300
 heartbeat_interval_seconds = 30
+# Retryable failures are rescheduled with exponential backoff and bounded jitter.
+retry_backoff_base_seconds = 15
+retry_backoff_max_seconds = 900
+retry_backoff_jitter_seconds = 5
 
 [kvstore]
 # Parent directory for named, project-scoped stores containing large frame payloads.
@@ -251,7 +255,12 @@ image_quality = 90
 max_dim = 100
 
 [processing.roi_refinement]
-# Pelagia owns workflow behavior around Oracle Builder inference.
+# Default CPU-only refiner. Oracle Builder remains available with method="oracle".
+default_method = "heuristic_edge_v1"
+# Strong-gradient percentile and axis exclusion used by heuristic_edge_v1.
+heuristic_gradient_percentile = 90.0
+heuristic_axis_exclusion_degrees = 10.0
+heuristic_max_growth_pixels = 32
 max_iterations = 5
 # Crop growth distance when a refined mask touches an uncovered edge.
 expansion_pixels = 256
@@ -279,6 +288,16 @@ residual_min_height = null
 residual_min_width_plus_height = null
 # Null reuses the parent candidate padding, bounded by the current ROI crop.
 residual_padding = null
+
+[processing.roi_continuity]
+# Build auditable logical assemblies only for assets that declare line-scan geometry.
+enabled = true
+require_line_scan_metadata = true
+# Consecutive frames append along this axis; "y" is the usual line-scan layout.
+scan_axis = "y"
+boundary_band_pixels = 32
+max_frame_gap = 1
+min_link_score = 0.7
 
 [api]
 # FastAPI development server defaults.

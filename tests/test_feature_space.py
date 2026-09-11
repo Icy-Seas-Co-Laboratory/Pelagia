@@ -151,8 +151,27 @@ def test_feature_space_browse_rois_returns_source_scoped_reference_candidates():
             "source_kind": "classification",
             "inference_run_id": "run-class",
             "limit": 2,
+            "offset": 0,
+            "sort_by": "original",
         }
     ]
+
+
+def test_feature_space_browse_and_similarity_apply_offsets_after_stable_ordering():
+    context = _Context()
+    service = FeatureSpaceService(context, project_id="project-1")
+
+    browse = service.browse_rois(source_key="classification:run-class", limit=1, offset=2)
+    similar = service.similar_rois(
+        roi_id="roi-reference", source_key="classification:run-class", limit=1, minimum=0.0, offset=1
+    )
+
+    assert browse["offset"] == 2
+    assert browse["total"] == 3
+    assert context.repository.embedding_calls[0]["offset"] == 2
+    assert similar["offset"] == 1
+    assert similar["total"] == 3
+    assert [item["id"] for item in similar["items"]] == ["roi-near"]
 
 
 def test_feature_space_similarity_returns_a_deterministic_prefix_for_large_runs():
@@ -219,6 +238,7 @@ def test_feature_space_umap_returns_run_scoped_coordinates_and_hdbscan_assignmen
         min_cluster_size=7,
         min_samples=3,
         cluster_selection_epsilon=0.15,
+        cluster_selection_method="leaf",
     )
 
     assert result["source_key"] == "classification:run-class"
@@ -237,9 +257,10 @@ def test_feature_space_umap_returns_run_scoped_coordinates_and_hdbscan_assignmen
         "min_cluster_size": 7,
         "min_samples": 3,
         "cluster_selection_epsilon": 0.15,
+        "cluster_selection_method": "leaf",
         "metric": "euclidean",
     }
-    assert hdbscan_calls == [{"min_cluster_size": 7, "min_samples": 3, "cluster_selection_epsilon": 0.15}]
+    assert hdbscan_calls == [{"min_cluster_size": 7, "min_samples": 3, "cluster_selection_epsilon": 0.15, "cluster_selection_method": "leaf"}]
     assert len(result["component_ranges"]) == 10
     assert result["items"][0]["bbox_w"] == 20
     assert result["items"][0]["bbox_h"] == 10
@@ -329,3 +350,18 @@ def test_feature_space_uses_label_prototypes_for_classification_runs():
     assert members["source_key"] == "clustering:run-cluster"
     assert members["cluster_id"] == "cluster-a"
     assert members["organization_kind"] == "self_supervised_clusters"
+
+
+def test_embedding_feature_space_source_supports_similarity_but_not_recorded_clusters():
+    context = _Context()
+    service = FeatureSpaceService(context, project_id="project-1")
+
+    result = service.similar_rois(
+        roi_id="roi-reference", source_key="embedding:run-embedding", limit=2, minimum=0.0
+    )
+
+    assert parse_feature_space_source("embedding:run-embedding").key == "embedding:run-embedding"
+    assert result["source_key"] == "embedding:run-embedding"
+    assert context.repository.embedding_calls[-1]["source_kind"] == "embedding"
+    with pytest.raises(FeatureSpaceError, match="do not contain recorded clusters"):
+        service.clusters(source_key="embedding:run-embedding")

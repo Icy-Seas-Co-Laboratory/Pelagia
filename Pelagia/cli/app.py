@@ -1712,6 +1712,64 @@ if typer is not None:
             context.close()
         typer.echo(json.dumps({"worker_id": worker.worker_id, "status": "stopped"}, sort_keys=True))
 
+    @app.command("reconcile_processing_series")
+    def reconcile_processing_series(
+        project_key: Optional[str] = None,
+        limit: int = 100,
+        planning_timeout_seconds: int = 900,
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Recover series dispatches interrupted by worker or director failure.
+
+        Run this command from one scheduled supervisor.  It is idempotent and
+        intentionally does not execute image-processing work itself.
+        """
+        from ..services.processing_queue import ProcessingQueueService
+
+        context = _context_from_options(None, database_dsn, schema)
+        try:
+            if context.repository is None:
+                raise RuntimeError("A PostgresRepository is required to reconcile processing series.")
+            with context.repository.job_supervisor_lock() as acquired:
+                if not acquired:
+                    _echo_json({"status": "skipped", "reason": "another job supervisor holds the lock"})
+                    return
+                if project_key:
+                    project_ids = [_project_id_from_key(context, project_key)]
+                else:
+                    project_ids = [str(project["id"]) for project in _list_all_projects(context.repository, active_only=True)]
+                service = ProcessingQueueService(context)
+                expired_leases = context.repository.requeue_expired_jobs()
+                dispatched = context.repository.materialize_pending_dispatches(limit=limit)
+                results = [
+                    {
+                        "project_id": project_id,
+                        **service.reconcile_series(
+                            project_id=project_id,
+                            limit=limit,
+                            planning_timeout_seconds=planning_timeout_seconds,
+                        ),
+                    }
+                    for project_id in project_ids
+                ]
+                # Series reconciliation can make an outbox record ready during
+                # the same pass, so drain once more before releasing the lock.
+                dispatched_after_reconcile = context.repository.materialize_pending_dispatches(limit=limit)
+                result = {
+                    "status": "completed",
+                    "projects": results,
+                    "expired_leases": expired_leases,
+                    "dispatches": {
+                        "before_reconcile": dispatched,
+                        "after_reconcile": dispatched_after_reconcile,
+                    },
+                    "signals": context.repository.get_job_supervisor_signals(),
+                }
+        finally:
+            context.close()
+        _echo_json(result)
+
     @app.command("worker_shutdown")
     def worker_shutdown(
         worker_id: str,

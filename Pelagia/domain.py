@@ -50,6 +50,7 @@ class PipelineStage(str, Enum):
     PREPROCESS_FRAMES = "preprocess_frames"
     SEGMENT = "segment"
     ROI_REFINEMENT = "roi_refinement"
+    ROI_CONTINUITY = "roi_continuity"
     CLASSIFY = "classify"
     FEATURE_SPACE_ANALYSIS = "feature_space_analysis"
     PUBLISH = "publish"
@@ -62,6 +63,7 @@ class PipelineStage(str, Enum):
     REGISTRY_LOAD = "registry_load"
     REGISTRY_EXPORT = "registry_export"
     REGISTRY_GENERATE = "registry_generate"
+    EXPORT_BUNDLE = "export_bundle"
 
 
 class JobStatus(str, Enum):

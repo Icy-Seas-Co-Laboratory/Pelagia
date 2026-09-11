@@ -53,6 +53,10 @@ class QueueConfig:
     max_claim_count: int = 1
     lease_seconds: int = 300
     heartbeat_interval_seconds: int = 30
+    # Retry delays are calculated from the claimed-attempt number and capped.
+    retry_backoff_base_seconds: int = 15
+    retry_backoff_max_seconds: int = 900
+    retry_backoff_jitter_seconds: int = 5
 
 
 @dataclass(slots=True)
@@ -386,6 +390,7 @@ class ThumbhashProcessingConfig:
 class RoiRefinementProcessingConfig:
     """Pelagia-owned refinement workflow parameters."""
 
+    default_method: str = "heuristic_edge_v1"
     max_iterations: int = 3
     expansion_pixels: int | None = 256
     edge_touch_margin: int = 1
@@ -402,6 +407,21 @@ class RoiRefinementProcessingConfig:
     residual_min_height: float | None = None
     residual_min_width_plus_height: float | None = None
     residual_padding: int | None = None
+    heuristic_gradient_percentile: float = 90.0
+    heuristic_axis_exclusion_degrees: float = 10.0
+    heuristic_max_growth_pixels: int = 32
+
+
+@dataclass(slots=True)
+class RoiContinuityProcessingConfig:
+    """Auditable line-scan assembly defaults for frame-local refined ROI segments."""
+
+    enabled: bool = True
+    require_line_scan_metadata: bool = True
+    scan_axis: str = "y"
+    boundary_band_pixels: int = 32
+    max_frame_gap: int = 1
+    min_link_score: float = 0.7
 
 
 @dataclass(slots=True)
@@ -419,6 +439,7 @@ class ProcessingConfig:
     frame_storage: FrameStorageProcessingConfig = field(default_factory=FrameStorageProcessingConfig)
     thumbhash: ThumbhashProcessingConfig = field(default_factory=ThumbhashProcessingConfig)
     roi_refinement: RoiRefinementProcessingConfig = field(default_factory=RoiRefinementProcessingConfig)
+    roi_continuity: RoiContinuityProcessingConfig = field(default_factory=RoiContinuityProcessingConfig)
 
 
 @dataclass(slots=True)
@@ -561,6 +582,9 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "queue", "max_claim_count", "PELAGIA_QUEUE_MAX_CLAIM_COUNT", int)
     _set_from_env(settings, "queue", "lease_seconds", "PELAGIA_QUEUE_LEASE_SECONDS", int)
     _set_from_env(settings, "queue", "heartbeat_interval_seconds", "PELAGIA_QUEUE_HEARTBEAT_SECONDS", int)
+    _set_from_env(settings, "queue", "retry_backoff_base_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_BASE_SECONDS", int)
+    _set_from_env(settings, "queue", "retry_backoff_max_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_MAX_SECONDS", int)
+    _set_from_env(settings, "queue", "retry_backoff_jitter_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_JITTER_SECONDS", int)
 
     _set_from_env(settings, "kvstore", "backend", "PELAGIA_KVSTORE_BACKEND")
     _set_from_env(settings, "kvstore", "directory", "PELAGIA_KVSTORE_DIRECTORY", Path)
@@ -776,6 +800,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     mask_augmentation = _section(settings, "processing.mask_augmentation")
     roi_assembly = _section(settings, "processing.roi_assembly")
     roi_filter = _section(settings, "processing.roi_filter")
+    roi_continuity = _section(settings, "processing.roi_continuity")
     roi_recording = _section(settings, "processing.roi_recording")
     video_ingest = _section(settings, "processing.video_ingest")
     flatfield = _section(settings, "processing.flatfield")
@@ -806,6 +831,15 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             lease_seconds=int(queue.get("lease_seconds", QueueConfig.lease_seconds)),
             heartbeat_interval_seconds=int(
                 queue.get("heartbeat_interval_seconds", QueueConfig.heartbeat_interval_seconds)
+            ),
+            retry_backoff_base_seconds=int(
+                queue.get("retry_backoff_base_seconds", QueueConfig.retry_backoff_base_seconds)
+            ),
+            retry_backoff_max_seconds=int(
+                queue.get("retry_backoff_max_seconds", QueueConfig.retry_backoff_max_seconds)
+            ),
+            retry_backoff_jitter_seconds=int(
+                queue.get("retry_backoff_jitter_seconds", QueueConfig.retry_backoff_jitter_seconds)
             ),
         ),
         kvstore=KVStoreConfig(
@@ -1303,6 +1337,11 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                 max_dim=int(thumbhash.get("max_dim", ThumbhashProcessingConfig.max_dim)),
             ),
             roi_refinement=RoiRefinementProcessingConfig(
+                default_method=str(
+                    roi_refinement.get(
+                        "default_method", RoiRefinementProcessingConfig.default_method
+                    )
+                ),
                 max_iterations=int(
                     roi_refinement.get(
                         "max_iterations",
@@ -1390,6 +1429,54 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                     roi_refinement.get(
                         "residual_padding",
                         RoiRefinementProcessingConfig.residual_padding,
+                    )
+                ),
+                heuristic_gradient_percentile=float(
+                    roi_refinement.get(
+                        "heuristic_gradient_percentile",
+                        RoiRefinementProcessingConfig.heuristic_gradient_percentile,
+                    )
+                ),
+                heuristic_axis_exclusion_degrees=float(
+                    roi_refinement.get(
+                        "heuristic_axis_exclusion_degrees",
+                        RoiRefinementProcessingConfig.heuristic_axis_exclusion_degrees,
+                    )
+                ),
+                heuristic_max_growth_pixels=int(
+                    roi_refinement.get(
+                        "heuristic_max_growth_pixels",
+                        RoiRefinementProcessingConfig.heuristic_max_growth_pixels,
+                    )
+                ),
+            ),
+            roi_continuity=RoiContinuityProcessingConfig(
+                enabled=bool(
+                    roi_continuity.get("enabled", RoiContinuityProcessingConfig.enabled)
+                ),
+                require_line_scan_metadata=bool(
+                    roi_continuity.get(
+                        "require_line_scan_metadata",
+                        RoiContinuityProcessingConfig.require_line_scan_metadata,
+                    )
+                ),
+                scan_axis=str(
+                    roi_continuity.get("scan_axis", RoiContinuityProcessingConfig.scan_axis)
+                ),
+                boundary_band_pixels=int(
+                    roi_continuity.get(
+                        "boundary_band_pixels",
+                        RoiContinuityProcessingConfig.boundary_band_pixels,
+                    )
+                ),
+                max_frame_gap=int(
+                    roi_continuity.get(
+                        "max_frame_gap", RoiContinuityProcessingConfig.max_frame_gap
+                    )
+                ),
+                min_link_score=float(
+                    roi_continuity.get(
+                        "min_link_score", RoiContinuityProcessingConfig.min_link_score
                     )
                 ),
             ),

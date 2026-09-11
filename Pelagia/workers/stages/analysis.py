@@ -42,6 +42,7 @@ def handle(job: dict, context: AppContext) -> dict:
             min_cluster_size=int(payload.get("min_cluster_size", 5)),
             min_samples=payload.get("min_samples"),
             cluster_selection_epsilon=float(payload.get("cluster_selection_epsilon", 0.0)),
+            cluster_selection_method=str(payload.get("cluster_selection_method", "eom")),
         )
     # Job results are retrieved outside the curation route, so retain the same
     # authenticated-image paths the synchronous response previously supplied.

@@ -1,0 +1,23 @@
+[Unit]
+Description=Pelagia job workflow supervisor
+Documentation=file:///opt/pelagia/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Copy this file to /etc/systemd/system and set these paths for the deployment.
+User=pelagia
+Group=pelagia
+WorkingDirectory=/opt/pelagia
+EnvironmentFile=-/etc/pelagia/pelagia.env
+ExecStart=/opt/pelagia/.venv/bin/pelagia reconcile_processing_series --limit 100 --planning-timeout-seconds 900
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/pelagia
+
+# The PostgreSQL advisory lock in reconcile_processing_series provides the
+# singleton guarantee if a manual invocation overlaps this timer or another
+# host runs the same unit.  Do not replace it with a long-running shell loop.

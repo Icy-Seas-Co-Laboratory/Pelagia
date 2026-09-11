@@ -35,9 +35,11 @@ def parse_feature_space_source(value: str) -> FeatureSpaceSource:
         separator != ":"
         or not inference_run_id
         or ":" in inference_run_id
-        or kind not in {"classification", "clustering"}
+        or kind not in {"classification", "clustering", "embedding"}
     ):
-        raise FeatureSpaceError("Feature-space source must be classification:<run-id> or clustering:<run-id>.")
+        raise FeatureSpaceError(
+            "Feature-space source must be classification:<run-id>, clustering:<run-id>, or embedding:<run-id>."
+        )
     return FeatureSpaceSource(kind=kind, inference_run_id=inference_run_id)
 
 
@@ -62,7 +64,9 @@ class FeatureSpaceService:
             result.append(item)
         return result
 
-    def browse_rois(self, *, source_key: str, limit: int) -> dict[str, Any]:
+    def browse_rois(
+        self, *, source_key: str, limit: int, offset: int = 0, sort_by: str = "original"
+    ) -> dict[str, Any]:
         """Return bounded ROI cards that can seed an exact similarity search."""
 
         source = parse_feature_space_source(source_key)
@@ -71,6 +75,8 @@ class FeatureSpaceService:
             source_kind=source.kind,
             inference_run_id=source.inference_run_id,
             limit=limit,
+            offset=offset,
+            sort_by=sort_by,
         )
         ids = [str(row["refined_detection_id"]) for row in rows if row.get("embedding_payload_ref")]
         summaries = self.repository.list_feature_space_roi_summaries(
@@ -81,6 +87,13 @@ class FeatureSpaceService:
             "items": [by_id[roi_id] for roi_id in ids if roi_id in by_id],
             "source_key": source.key,
             "limit": limit,
+            "offset": offset,
+            "sort_by": sort_by,
+            "total": self.repository.count_feature_space_embeddings(
+                project_id=self.project_id,
+                source_kind=source.kind,
+                inference_run_id=source.inference_run_id,
+            ),
         }
 
     def umap_rois(
@@ -90,6 +103,7 @@ class FeatureSpaceService:
         min_cluster_size: int = 5,
         min_samples: int | None = None,
         cluster_selection_epsilon: float = 0.0,
+        cluster_selection_method: str = "eom",
     ) -> dict[str, Any]:
         """Project one run to deterministic UMAP coordinates and HDBSCAN groups.
 
@@ -105,6 +119,8 @@ class FeatureSpaceService:
             raise FeatureSpaceError("HDBSCAN min_samples must be at least 1.")
         if cluster_selection_epsilon < 0.0:
             raise FeatureSpaceError("HDBSCAN cluster_selection_epsilon cannot be negative.")
+        if cluster_selection_method not in {"eom", "leaf"}:
+            raise FeatureSpaceError("HDBSCAN cluster_selection_method must be 'eom' or 'leaf'.")
         total_vector_count = self.repository.count_feature_space_embeddings(
             project_id=self.project_id,
             source_kind=source.kind,
@@ -163,6 +179,7 @@ class FeatureSpaceService:
                 min_cluster_size=min_cluster_size,
                 min_samples=min_samples,
                 cluster_selection_epsilon=cluster_selection_epsilon,
+                cluster_selection_method=cluster_selection_method,
             )
         except (FloatingPointError, ValueError, TypeError) as exc:
             raise FeatureSpaceError("UMAP/HDBSCAN could not be computed safely for the selected source.") from exc
@@ -205,6 +222,7 @@ class FeatureSpaceService:
                 "min_cluster_size": min_cluster_size,
                 "min_samples": min_samples,
                 "cluster_selection_epsilon": cluster_selection_epsilon,
+                "cluster_selection_method": cluster_selection_method,
                 "metric": "euclidean",
             },
             "component_ranges": component_ranges,
@@ -251,6 +269,7 @@ class FeatureSpaceService:
         min_cluster_size: int,
         min_samples: int | None,
         cluster_selection_epsilon: float,
+        cluster_selection_method: str = "eom",
     ) -> tuple[np.ndarray, np.ndarray]:
         try:
             from hdbscan import HDBSCAN
@@ -262,6 +281,7 @@ class FeatureSpaceService:
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
             cluster_selection_epsilon=cluster_selection_epsilon,
+            cluster_selection_method=cluster_selection_method,
             metric="euclidean",
             prediction_data=False,
         )
@@ -276,6 +296,7 @@ class FeatureSpaceService:
         source_key: str,
         limit: int,
         minimum: float,
+        offset: int = 0,
     ) -> dict[str, Any]:
         source = parse_feature_space_source(source_key)
         if not -1.0 <= minimum <= 1.0:
@@ -286,6 +307,7 @@ class FeatureSpaceService:
                 source=source,
                 limit=limit,
                 minimum=minimum,
+                offset=offset,
             )
         total_vector_count = self.repository.count_feature_space_embeddings(
             project_id=self.project_id,
@@ -336,7 +358,9 @@ class FeatureSpaceService:
         ranked = sorted(
             (item for item in scored if item[1] >= minimum),
             key=lambda item: (-item[1], item[0]),
-        )[:limit]
+        )
+        match_count = len(ranked)
+        ranked = ranked[offset:offset + limit]
         summaries = self.repository.list_feature_space_roi_summaries(
             project_id=self.project_id, roi_ids=[item[0] for item in ranked]
         )
@@ -361,6 +385,8 @@ class FeatureSpaceService:
             "readable_embedding_count": len(vectors),
             "unreadable_embedding_count": unreadable_count,
             "limit": limit,
+            "offset": offset,
+            "total": match_count,
         }
 
     def _cluster_local_similar_rois(
@@ -370,6 +396,7 @@ class FeatureSpaceService:
         source: FeatureSpaceSource,
         limit: int,
         minimum: float,
+        offset: int,
     ) -> dict[str, Any]:
         """Use persisted cluster membership instead of an unsafe full-run scan.
 
@@ -390,7 +417,7 @@ class FeatureSpaceService:
             inference_run_id=source.inference_run_id,
             cluster_id=cluster_id,
             limit=limit,
-            offset=0,
+            offset=offset,
             minimum=minimum,
         )
         items = []
@@ -411,6 +438,8 @@ class FeatureSpaceService:
             "readable_embedding_count": None,
             "unreadable_embedding_count": 0,
             "limit": limit,
+            "offset": offset,
+            "total": result["total"],
             "cluster_id": cluster_id,
         }
 
@@ -421,11 +450,13 @@ class FeatureSpaceService:
                 project_id=self.project_id, inference_run_id=source.inference_run_id
             )
             organization_kind = "self_supervised_clusters"
-        else:
+        elif source.kind == "classification":
             rows = self.repository.list_feature_space_label_prototypes(
                 project_id=self.project_id, inference_run_id=source.inference_run_id
             )
             organization_kind = "label_prototypes"
+        else:
+            raise FeatureSpaceError("Embedding sources do not contain recorded clusters.")
         return {
             "items": rows,
             "source_key": source.key,
@@ -452,7 +483,7 @@ class FeatureSpaceService:
                 minimum=-1.0,
             )
             organization_kind = "self_supervised_clusters"
-        else:
+        elif source.kind == "classification":
             try:
                 result = self.repository.list_feature_space_label_prototype_members(
                     project_id=self.project_id,
@@ -464,6 +495,8 @@ class FeatureSpaceService:
             except ValueError as exc:
                 raise FeatureSpaceError(str(exc)) from exc
             organization_kind = "label_prototypes"
+        else:
+            raise FeatureSpaceError("Embedding sources do not contain recorded clusters.")
         result.update(
             source_key=source.key,
             cluster_id=cluster_id,

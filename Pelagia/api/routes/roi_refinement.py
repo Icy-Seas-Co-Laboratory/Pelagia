@@ -16,6 +16,11 @@ if APIRouter is not None:
     from ...processing.detection_recording import choose_roi_encoding
     from ...processing.detection_refinement import RoiRefinementOptions, identity_refine_detections, refine_detections, refined_storage_candidate_detection_id
     from ...processing.frame_store import retrieve_frame
+    from ...processing.heuristic_refinement import (
+        HEURISTIC_EDGE_METHOD_NAME,
+        HeuristicEdgeRefinementBackend,
+        HeuristicEdgeRefinementParameters,
+    )
     from ...processing.oracle_client import (
         OracleInferenceClient,
         OracleInferenceError,
@@ -24,7 +29,7 @@ if APIRouter is not None:
         OracleUnavailableError,
     )
     from ...processing.capabilities import roi_refinement_capabilities
-    from ...services.job_commands import RoiRefinementCommand
+    from ...services.job_commands import RoiContinuityCommand, RoiRefinementCommand
     from ...services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
     from ...services.pipeline import PipelineService
     from ._common import (
@@ -43,7 +48,7 @@ if APIRouter is not None:
         model_config = ConfigDict(protected_namespaces=(), extra="forbid")
 
         detection_ids: list[str] = Field(default_factory=list)
-        method: Literal["oracle", "identity"] = "oracle"
+        method: Literal["oracle", "identity", "heuristic_edge_v1"] = "heuristic_edge_v1"
         model_ref: str | None = None
         max_iterations: int | None = None
         expansion_pixels: int | None = None
@@ -61,6 +66,9 @@ if APIRouter is not None:
         residual_min_height: float | None = None
         residual_min_width_plus_height: float | None = None
         residual_padding: int | None = None
+        heuristic_gradient_percentile: float | None = None
+        heuristic_axis_exclusion_degrees: float | None = None
+        heuristic_max_growth_pixels: int | None = None
         allow_frame_expansion: bool = True
         store: bool = True
         dry_run: bool = False
@@ -70,6 +78,16 @@ if APIRouter is not None:
         asset_id: str | None = None
         priority: int | None = None
         depends_on: list[str] | None = None
+
+    class QueueRoiContinuityRequest(BaseModel):
+        model_config = ConfigDict(protected_namespaces=(), extra="forbid")
+        asset_id: str
+        scan_axis: Literal["x", "y"] | None = None
+        boundary_band_pixels: int | None = None
+        min_link_score: float | None = None
+        priority: int | None = None
+        depends_on: list[str] | None = None
+        dry_run: bool = False
 
     router = APIRouter(prefix="/roi-refinement", tags=["roi-refinement"])
 
@@ -175,6 +193,13 @@ if APIRouter is not None:
                 "method": "identity",
                 "refinement_method": "identity",
             }
+        if body.method == HEURISTIC_EDGE_METHOD_NAME:
+            return {
+                "inference_backend": "pelagia_builtin",
+                "model_ref": None,
+                "method": HEURISTIC_EDGE_METHOD_NAME,
+                "refinement_method": HEURISTIC_EDGE_METHOD_NAME,
+            }
         return {
             "inference_backend": "oracle_builder",
             "model_ref": body.model_ref or context.config.oracle.default_mask_model,
@@ -192,6 +217,28 @@ if APIRouter is not None:
         return OracleRoiRefinementBackend(
             OracleInferenceClient(context.config.oracle),
             model_ref,
+        )
+
+    def _resolve_heuristic_backend(request: Request, body: RoiRefinementRequest):
+        defaults = get_context(request).config.processing.roi_refinement
+        return HeuristicEdgeRefinementBackend(
+            HeuristicEdgeRefinementParameters(
+                gradient_percentile=(
+                    defaults.heuristic_gradient_percentile
+                    if body.heuristic_gradient_percentile is None
+                    else body.heuristic_gradient_percentile
+                ),
+                axis_exclusion_degrees=(
+                    defaults.heuristic_axis_exclusion_degrees
+                    if body.heuristic_axis_exclusion_degrees is None
+                    else body.heuristic_axis_exclusion_degrees
+                ),
+                max_growth_pixels=(
+                    defaults.heuristic_max_growth_pixels
+                    if body.heuristic_max_growth_pixels is None
+                    else body.heuristic_max_growth_pixels
+                ),
+            )
         )
 
     def _missing_roi_payload_ids(rows: list[dict[str, Any]]) -> list[str]:
@@ -288,7 +335,12 @@ if APIRouter is not None:
                     ),
                 )
 
-        backend = None if body.method == "identity" else _resolve_backend(request, body)
+        backend = (
+            None if body.method == "identity"
+            else _resolve_heuristic_backend(request, body)
+            if body.method == HEURISTIC_EDGE_METHOD_NAME
+            else _resolve_backend(request, body)
+        )
         method = "identity" if body.method == "identity" else backend.method_name
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
 
@@ -409,7 +461,7 @@ if APIRouter is not None:
             "detection_ids": body.detection_ids,
             "method": body.method,
             "model_ref": (
-                None if body.method == "identity"
+                None if body.method in {"identity", HEURISTIC_EDGE_METHOD_NAME}
                 else body.model_ref or context.config.oracle.default_mask_model
             ),
             "max_iterations": options.max_iterations,
@@ -428,6 +480,9 @@ if APIRouter is not None:
             "residual_min_height": options.residual_min_height,
             "residual_min_width_plus_height": options.residual_min_width_plus_height,
             "residual_padding": options.residual_padding,
+            "heuristic_gradient_percentile": body.heuristic_gradient_percentile,
+            "heuristic_axis_exclusion_degrees": body.heuristic_axis_exclusion_degrees,
+            "heuristic_max_growth_pixels": body.heuristic_max_growth_pixels,
             "allow_frame_expansion": body.allow_frame_expansion,
         }
         payload = {key: value for key, value in payload.items() if value is not None}
@@ -462,6 +517,27 @@ if APIRouter is not None:
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"job": as_response(job)}
+
+    @router.post("/continuity/jobs")
+    def queue_roi_continuity_job(request: Request, body: QueueRoiContinuityRequest) -> dict:
+        auth = require_project_write(request)
+        repository = get_repository(request)
+        asset = repository.get_asset(body.asset_id, project_id=auth.project_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail=f"Asset {body.asset_id!r} was not found.")
+        payload = RoiContinuityCommand.from_payload({
+            "asset_id": body.asset_id, "scan_axis": body.scan_axis,
+            "boundary_band_pixels": body.boundary_band_pixels, "min_link_score": body.min_link_score,
+        }).to_payload()
+        if body.dry_run:
+            return as_response({"dry_run": True, "payload": payload, "asset_id": body.asset_id})
+        job = PipelineService(get_context(request)).queue(
+            PipelineStage.ROI_CONTINUITY, project_id=auth.project_id, asset_id=body.asset_id,
+            priority=body.priority, payload=payload, depends_on=body.depends_on or [],
+            summary=f"ROI continuity queued for asset {body.asset_id}",
+            submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+        )
         return {"job": as_response(job)}
 
     def _options_dict(options: RoiRefinementOptions) -> dict[str, Any]:

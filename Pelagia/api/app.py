@@ -6,7 +6,7 @@ from ..config import CoreConfig
 from ..observability import configure_core_logging
 from ..services.context import AppContext
 from ..version import __version__
-from .routes import assets, auth, collections, curation, detections, frame, health, ingestion, io, jobs, kvstore, live, live_preview, live_sandbox, logs, models, processing, processing_status, registry, roi_refinement, runs, segmentation, system, telemetry, workers
+from .routes import assets, auth, collections, curation, detections, exports, frame, health, ingestion, jobs, kvstore, live, live_preview, live_sandbox, logs, models, processing, processing_status, registry, roi_refinement, runs, segmentation, system, telemetry, workers
 
 
 def create_app(config: CoreConfig | None = None):
@@ -61,7 +61,7 @@ def create_app(config: CoreConfig | None = None):
         auth,
         system,
         ingestion,
-        io,
+        exports,
         segmentation,
         runs,
         jobs,

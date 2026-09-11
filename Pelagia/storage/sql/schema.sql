@@ -7,7 +7,7 @@ BEGIN
         CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence', 'interchange', 'telemetry');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'classify', 'publish', 'train_model', 'io_import', 'telemetry_import', 'io_export', 'io_upload', 'io_download');
+        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'roi_continuity', 'classify', 'publish', 'train_model', 'io_import', 'telemetry_import', 'io_export', 'io_upload', 'io_download', 'export_bundle');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
         CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'working', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
@@ -21,12 +21,14 @@ ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'train_model';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'background_frames';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'preprocess_frames';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'roi_refinement';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'roi_continuity';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_import';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'telemetry_import';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_export';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_download';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'feature_space_analysis';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'export_bundle';
 
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'paused';
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'working';
@@ -720,7 +722,13 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
     priority integer NOT NULL DEFAULT 100,
     attempt_count integer NOT NULL DEFAULT 0,
     max_attempts integer NOT NULL DEFAULT 3,
+    -- A queued retry is ineligible for claiming until this instant.
+    available_at timestamptz NOT NULL DEFAULT NOW(),
+    failure_category text,
+    idempotency_key text,
     lease_expires_at timestamptz,
+    -- Rotated on every claim.  Workers must present it when mutating a lease.
+    lease_token uuid,
     worker_id text,
     submitted_by_user_id text,
     submitted_by_username text,
@@ -740,6 +748,17 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_jobs (
 ALTER TABLE {schema}.processing_jobs
     ADD COLUMN IF NOT EXISTS submitted_by_user_id text,
     ADD COLUMN IF NOT EXISTS submitted_by_username text;
+
+ALTER TABLE {schema}.processing_jobs
+    ADD COLUMN IF NOT EXISTS lease_token uuid;
+
+-- Keep the base schema executable against databases that predate migration
+-- 0023.  The indexes below require these columns before the migration ledger
+-- is replayed by initialize_schema().
+ALTER TABLE {schema}.processing_jobs
+    ADD COLUMN IF NOT EXISTS available_at timestamptz NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS failure_category text,
+    ADD COLUMN IF NOT EXISTS idempotency_key text;
 
 ALTER TABLE {schema}.processing_jobs
     ADD COLUMN IF NOT EXISTS project_id uuid;
@@ -809,12 +828,14 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_series_steps (
     matched_count bigint NOT NULL DEFAULT 0, job_count bigint NOT NULL DEFAULT 0,
     failure_policy text CHECK (failure_policy IN ('fail_fast', 'continue')),
     skip_reason text,
-    started_at timestamptz, finished_at timestamptz, UNIQUE (series_id, step_index)
+    started_at timestamptz, updated_at timestamptz NOT NULL DEFAULT NOW(), finished_at timestamptz, UNIQUE (series_id, step_index)
 );
+ALTER TABLE {schema}.processing_series_steps
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
 CREATE TABLE IF NOT EXISTS {schema}.processing_work_units (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), series_id uuid NOT NULL REFERENCES {schema}.processing_series(id) ON DELETE CASCADE,
     step_id uuid NOT NULL REFERENCES {schema}.processing_series_steps(id) ON DELETE CASCADE,
-    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE RESTRICT, created_at timestamptz NOT NULL DEFAULT NOW(),
+    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT NOW(),
     UNIQUE (job_id), UNIQUE (step_id, job_id)
 );
 
@@ -909,6 +930,24 @@ CREATE TABLE IF NOT EXISTS {schema}.job_events (
     created_at timestamptz NOT NULL DEFAULT NOW()
 );
 
+-- A successor dispatch is recorded under the parent claim before that parent
+-- completes.  A supervisor can safely materialize it after a crash.
+CREATE TABLE IF NOT EXISTS {schema}.processing_job_dispatches (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
+    parent_job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
+    idempotency_key text NOT NULL,
+    job_spec jsonb NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    child_job_id uuid REFERENCES {schema}.processing_jobs(id) ON DELETE SET NULL,
+    error_message text,
+    available_at timestamptz NOT NULL DEFAULT NOW(),
+    materialized_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT NOW(),
+    updated_at timestamptz NOT NULL DEFAULT NOW(),
+    UNIQUE (project_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS {schema}.logs (
     id bigserial PRIMARY KEY,
     project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
@@ -966,6 +1005,9 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {
 CREATE INDEX IF NOT EXISTS idx_{schema}_models_project_id ON {schema}.models (project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_project_id ON {schema}.processing_jobs (project_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_status ON {schema}.processing_jobs (status, stage, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_available ON {schema}.processing_jobs (available_at, priority, created_at) WHERE status = 'queued';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_idempotency
+    ON {schema}.processing_jobs (project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_run_id ON {schema}.processing_jobs (run_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_stage_status_updated ON {schema}.processing_jobs (stage, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_updated ON {schema}.processing_jobs (updated_at DESC, id DESC);
@@ -1000,6 +1042,8 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_has_refined
 CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_collections
     ON {schema}.frame_processing_status USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dispatches_pending
+    ON {schema}.processing_job_dispatches (available_at, created_at) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_project_id ON {schema}.logs (project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_event_type ON {schema}.logs (event_type, created_at DESC);
@@ -1036,6 +1080,12 @@ EXECUTE FUNCTION {schema}.set_updated_at();
 DROP TRIGGER IF EXISTS trg_processing_jobs_updated_at ON {schema}.processing_jobs;
 CREATE TRIGGER trg_processing_jobs_updated_at
 BEFORE UPDATE ON {schema}.processing_jobs
+FOR EACH ROW
+EXECUTE FUNCTION {schema}.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_processing_series_steps_updated_at ON {schema}.processing_series_steps;
+CREATE TRIGGER trg_processing_series_steps_updated_at
+BEFORE UPDATE ON {schema}.processing_series_steps
 FOR EACH ROW
 EXECUTE FUNCTION {schema}.set_updated_at();
 

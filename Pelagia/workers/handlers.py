@@ -27,12 +27,20 @@ from ..processing.ingest_background import MeanFieldIngestAddon
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_codec import decode_array_payload
 from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
+from ..processing.heuristic_refinement import (
+    HEURISTIC_EDGE_METHOD_NAME,
+    HeuristicEdgeRefinementBackend,
+    HeuristicEdgeRefinementParameters,
+)
 from ..processing.oracle_client import OracleInferenceClient, OracleInferenceItem, OracleRoiRefinementBackend
+from ..processing.roi_continuity import (
+    FrameLocalRoiSegment, LineScanGeometry, RoiContinuityOptions,
+    assemble_line_scan_continuity,
+)
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
 from ..services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
-from ..services.pipeline import PipelineService
 from ..services.job_commands import (
     ExtractFramesCommand,
     ClassificationCommand,
@@ -40,9 +48,10 @@ from ..services.job_commands import (
     FrameSelection,
     PreprocessFramesCommand,
     RoiRefinementCommand,
+    RoiContinuityCommand,
     SegmentFramesCommand,
 )
-from .progress import JobProgressReporter
+from .progress import JobControlInterrupt, JobProgressReporter
 from .registry import HandlerRegistry
 
 def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
@@ -459,9 +468,19 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
 
     if payload.get("enqueue_segment"):
+        worker_id = job.get("_worker_id")
+        lease_token = job.get("_lease_token")
+        enqueue_dispatch = getattr(context.repository, "enqueue_successor_dispatch", None)
+        if not worker_id or not lease_token or not callable(enqueue_dispatch):
+            raise RuntimeError(
+                "Queued segmentation requires a leased worker and durable successor dispatch support."
+            )
         roi_recording_defaults = context.config.processing.roi_recording
-        segment_job = PipelineService(context).queue(
-            PipelineStage.SEGMENT,
+        segment_dispatch = enqueue_dispatch(
+            parent_job_id=str(job["id"]),
+            worker_id=str(worker_id),
+            lease_token=str(lease_token),
+            stage=PipelineStage.SEGMENT,
             project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
@@ -482,8 +501,11 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             summary=f"segment queued for {len(frame_rows)} extracted frames",
             submitted_by_user_id=job.get("submitted_by_user_id"),
             submitted_by_username=job.get("submitted_by_username"),
+            idempotency_key=f"legacy-extract-segment:{job['id']}",
         )
-        result["segment_job_id"] = segment_job["id"]
+        if segment_dispatch is None:
+            raise RuntimeError("Lease was lost before segmentation dispatch could be recorded.")
+        result["segment_dispatch_id"] = str(segment_dispatch["id"])
 
     return result
 
@@ -557,6 +579,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
 
     frame_records: dict[str, FrameRecord] = {}
     for work_frame_ids in frame_id_work_units(frame_ids):
+        progress.checkpoint()
         with measure_phase("selection.frame_metadata_lookup"):
             work_records = context.repository.get_frame_records(
                 work_frame_ids,
@@ -579,6 +602,7 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
 
     completed_count = 0
     for work_frame_ids in frame_id_work_units(frame_ids):
+        progress.checkpoint()
         processed_frames = []
         for frame_id in work_frame_ids:
             frame = retrieve_frame(
@@ -600,6 +624,9 @@ def preprocess_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
                 context=context,
             )
             processed_frames.append((frame_id, processed))
+        # Publication is the batch commit boundary. Recheck controls after CPU
+        # processing so a pause/cancel does not publish the next batch.
+        progress.checkpoint()
         stored_rows.extend(
             store_preprocessed_frames(
                 processed_frames,
@@ -694,6 +721,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
     )
     progress.start(f"Generating background from {len(frame_ids)} frame{'s' if len(frame_ids) != 1 else ''}")
     for frame_id in frame_ids:
+        progress.checkpoint()
         with measure_phase("selection.frame_metadata_lookup"):
             frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
@@ -716,6 +744,7 @@ def background_frames_handler(job: dict[str, Any], context: AppContext) -> dict[
         background_kwargs["window_stride"] = payload.get("window_stride")
     if payload.get("window_width") is not None:
         background_kwargs["window_width"] = payload.get("window_width")
+    progress.checkpoint()
     result = ensure_asset_background_windows(frame_ids, **background_kwargs)
     result.update(
         {
@@ -815,6 +844,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
     )
 
     for index, frame_id in enumerate(frame_ids, start=1):
+        progress.checkpoint()
         with measure_phase("selection.frame_metadata_lookup"):
             frame_record = context.repository.get_frame_record(frame_id, project_id=project_id)
         if frame_record is None:
@@ -850,6 +880,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
 
     inserted = []
     for resolved_frame_run_id, run_frame_ids in frame_ids_by_run.items():
+        progress.checkpoint()
         with measure_phase("segmentation.database_update"):
             inserted.extend(
                 context.repository.replace_frame_detections(
@@ -999,8 +1030,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
 
     defaults = context.config.processing.roi_refinement
-    requested_method = str(payload.get("method") or "oracle").strip().lower()
-    if requested_method not in {"oracle", "identity"}:
+    requested_method = str(payload.get("method") or defaults.default_method).strip().lower()
+    if requested_method not in {"oracle", "identity", HEURISTIC_EDGE_METHOD_NAME}:
         raise ValueError(f"Unsupported ROI refinement method: {requested_method!r}.")
     backend = None
     method = "identity"
@@ -1010,6 +1041,30 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 OracleInferenceClient(context.config.oracle),
                 payload.get("model_ref") or context.config.oracle.default_mask_model,
             )
+        method = backend.method_name
+    elif requested_method == HEURISTIC_EDGE_METHOD_NAME:
+        backend = HeuristicEdgeRefinementBackend(
+            HeuristicEdgeRefinementParameters(
+                gradient_percentile=float(
+                    payload.get(
+                        "heuristic_gradient_percentile",
+                        defaults.heuristic_gradient_percentile,
+                    )
+                ),
+                axis_exclusion_degrees=float(
+                    payload.get(
+                        "heuristic_axis_exclusion_degrees",
+                        defaults.heuristic_axis_exclusion_degrees,
+                    )
+                ),
+                max_growth_pixels=int(
+                    payload.get(
+                        "heuristic_max_growth_pixels",
+                        defaults.heuristic_max_growth_pixels,
+                    )
+                ),
+            )
+        )
         method = backend.method_name
     with measure_phase("refinement.options_resolution"):
         options = _roi_refinement_options_from_payload(payload, context)
@@ -1035,6 +1090,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     with measure_phase("refinement.record_construction"):
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
+    progress.checkpoint()
     results = (
         identity_refine_detections(detection_records, frame_loader=frame_loader)
         if requested_method == "identity"
@@ -1060,6 +1116,9 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         )
         for result in results
     ]
+    # Refinement may be a single model batch; pause/cancel again immediately
+    # before its durable publication boundary.
+    progress.checkpoint()
     with measure_phase("refinement.database_update"):
         stored = context.repository.upsert_refined_detections(
             [
@@ -1110,8 +1169,15 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "detection_ids": detection_ids,
         "refined_detection_ids": [row.get("id") for row in stored],
         "frame_ids": frame_ids,
-        "inference_backend": "none" if requested_method == "identity" else "oracle_builder",
-        "model_ref": None if requested_method == "identity" else payload.get("model_ref") or context.config.oracle.default_mask_model,
+        "inference_backend": (
+            "none" if requested_method == "identity"
+            else "pelagia_builtin" if requested_method == HEURISTIC_EDGE_METHOD_NAME
+            else "oracle_builder"
+        ),
+        "model_ref": (
+            None if requested_method in {"identity", HEURISTIC_EDGE_METHOD_NAME}
+            else payload.get("model_ref") or context.config.oracle.default_mask_model
+        ),
         "method": requested_method,
         "refinement_method": method,
         "resolved_options": {
@@ -1135,6 +1201,54 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             "expansion_frame_payload_kind": expansion_payload_kind,
         },
     }
+
+
+@collect_result_timings(unit_count_key="segment_count")
+def roi_continuity_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
+    """Persist an audited logical assembly of adjacent line-scan ROI segments."""
+    if context.repository is None:
+        raise RuntimeError("ROI continuity handler requires a PostgresRepository.")
+    payload = RoiContinuityCommand.from_payload(_job_payload(job)).to_payload()
+    project_id = _job_project_id(job, context)
+    if project_id is None:
+        raise ValueError("ROI continuity requires a project_id.")
+    defaults = context.config.processing.roi_continuity
+    if not defaults.enabled:
+        raise ValueError("ROI continuity is disabled by configuration.")
+    asset_id = str(payload["asset_id"])
+    asset = context.repository.get_asset(asset_id, project_id=project_id)
+    metadata = dict((asset or {}).get("metadata") or {})
+    declared = bool(metadata.get("line_scan") or metadata.get("line_scan_geometry"))
+    if defaults.require_line_scan_metadata and not declared:
+        raise ValueError("ROI continuity requires asset metadata declaring line_scan geometry.")
+    geometry = LineScanGeometry(declared=declared or not defaults.require_line_scan_metadata,
+                                scan_axis=str(payload.get("scan_axis", defaults.scan_axis)))
+    options = RoiContinuityOptions(
+        boundary_band_pixels=int(payload.get("boundary_band_pixels", defaults.boundary_band_pixels)),
+        min_link_score=float(payload.get("min_link_score", defaults.min_link_score)),
+    )
+    rows = context.repository.list_refined_detections_for_continuity(asset_id, project_id=project_id)
+    segments = [FrameLocalRoiSegment(
+        segment_id=str(row["id"]), frame_id=str(row["frame_id"]), asset_id=str(row["asset_id"]),
+        frame_index=int(row["frame_index"]), frame_width=int(row["frame_width"]), frame_height=int(row["frame_height"]),
+        bbox_x=int(row["bbox_x"]), bbox_y=int(row["bbox_y"]), bbox_w=int(row["bbox_w"]), bbox_h=int(row["bbox_h"]),
+        edge_angle_degrees=(row.get("metadata") or {}).get("dominant_edge_angle_degrees"),
+        edge_strength=(row.get("metadata") or {}).get("edge_strength"), metadata=dict(row.get("metadata") or {}),
+    ) for row in rows]
+    result = assemble_line_scan_continuity(segments, geometry=geometry, options=options)
+    assemblies = [{"assembly_id": item.assembly_id, "segment_ids": list(item.segment_ids),
+                   "link_pairs": [list(pair) for pair in item.link_pairs]} for item in result.assemblies]
+    decisions = [{"source_segment_id": item.source_segment_id, "target_segment_id": item.target_segment_id,
+                  "score": item.score, "accepted": item.accepted, "reason": item.reason,
+                  "features": item.features} for item in result.decisions]
+    stored = context.repository.record_roi_continuity(
+        project_id=project_id, asset_id=asset_id, run_id=job.get("run_id"), job_id=job.get("id"),
+        method="line_scan_continuity_v1", parameters={"scan_axis": geometry.scan_axis, **payload},
+        assemblies=assemblies, decisions=decisions, metadata={"line_scan_declared": declared},
+    )
+    return {"stage": PipelineStage.ROI_CONTINUITY.value, "project_id": project_id, "asset_id": asset_id,
+            "continuity_run_id": stored.get("id"), "segment_count": len(segments),
+            "accepted_link_count": len(result.accepted_links), "assembly_count": len(result.assemblies)}
 
 
 @collect_result_timings(unit_count_key="detection_count")
@@ -1189,6 +1303,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
     batch_number = 0
     evidence_context = None
     clustering_context = None
+    embedding_context = None
     oracle_execution_ms = 0.0
     oracle_execution_count = 0
     try:
@@ -1270,12 +1385,14 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 message=f"Saving evidence from batch {batch_number} of {batch_count}",
                 force=True,
             )
-            if evidence_context is None:
+            if evidence_context is None and clustering_context is None and embedding_context is None:
                 first_result = responses[0].result
                 first_output = dict(first_result.get("output") or {})
-                expected_type = "clustering" if command.evidence_kind == "clustering" else "classification"
+                expected_type = command.evidence_kind
                 if first_output.get("type") != expected_type:
                     raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
+                if str((first_result.get("model") or {}).get("task") or "") != command.evidence_kind:
+                    raise RuntimeError(f"Oracle Builder model did not declare {command.evidence_kind} task")
                 if command.evidence_kind == "classification":
                     with measure_phase("classification.evidence_context_database_write"):
                         evidence_context = context.repository.prepare_classification_evidence_context(
@@ -1285,14 +1402,24 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                             probabilities=list(first_output.get("probabilities") or []),
                         )
                 else:
-                    with measure_phase("clustering.evidence_context_database_write"):
-                        clustering_context = context.repository.prepare_clustering_evidence_context(
+                    with measure_phase("clustering.evidence_context_database_write") if command.evidence_kind == "clustering" else measure_phase("classification.evidence_context_database_write"):
+                        context_factory = (
+                            context.repository.prepare_clustering_evidence_context
+                            if command.evidence_kind == "clustering"
+                            else context.repository.prepare_embedding_evidence_context
+                        )
+                        context_value = context_factory(
                             project_id=project_id,
                             inference_run_id=str(inference_run["id"]),
                             model=dict(first_result.get("model") or {}),
                         )
+                    if command.evidence_kind == "clustering":
+                        clustering_context = context_value
+                    else:
+                        embedding_context = context_value
             evidence_records: list[dict[str, Any]] = []
             clustering_records: list[dict[str, Any]] = []
+            embedding_records: list[dict[str, Any]] = []
             for target, response in zip(targets, responses, strict=True):
                 row = response.result
                 execution = row.get("execution") or {}
@@ -1302,9 +1429,11 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     oracle_execution_count += 1
                 with measure_phase("classification.evidence_prepare"):
                     output = dict(row.get("output") or {})
-                    expected_type = "clustering" if command.evidence_kind == "clustering" else "classification"
+                    expected_type = command.evidence_kind
                     if output.get("type") != expected_type:
                         raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
+                    if str((row.get("model") or {}).get("task") or "") != command.evidence_kind:
+                        raise RuntimeError(f"Oracle Builder model did not declare {command.evidence_kind} task")
                     embedding = output.pop("embedding", None)
                     clustering_packet = output.pop("clustering_evidence", None)
                     if command.evidence_kind == "clustering":
@@ -1313,6 +1442,19 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     embedding_dtype = None
                     embedding_shape = None
                     embedding_sha256 = None
+                    embedding_normalized = output.get("embedding_normalized")
+                if command.evidence_kind == "embedding":
+                    if (
+                        not isinstance(embedding, np.ndarray)
+                        or embedding.dtype != np.dtype("float32")
+                        or embedding.ndim != 1
+                        or embedding.size < 1
+                    ):
+                        raise RuntimeError("Oracle Builder embedding output must contain a non-empty float32 one-dimensional array")
+                    if not np.isfinite(embedding).all():
+                        raise RuntimeError("Oracle Builder embedding output contains non-finite values")
+                    if not isinstance(embedding_normalized, bool):
+                        raise RuntimeError("Oracle Builder embedding output must declare embedding_normalized")
                 if isinstance(embedding, np.ndarray):
                     with measure_phase("classification.embedding_serialize"):
                         buffer = io.BytesIO()
@@ -1325,6 +1467,9 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     if kvstore is not None:
                         with measure_phase("classification.embedding_store"):
                             embedding_ref = kvstore.put_store(payload)
+                if command.evidence_kind == "embedding":
+                    if embedding_ref is None:
+                        raise RuntimeError("The project embedding store is unavailable")
                 oracle_result = {
                     "result_id": row.get("result_id"),
                     "result_set_id": row.get("result_set_id"),
@@ -1342,6 +1487,19 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                             "embedding_dtype": embedding_dtype,
                             "embedding_shape": embedding_shape,
                             "embedding_sha256": embedding_sha256,
+                        }
+                    )
+                elif command.evidence_kind == "embedding":
+                    embedding_records.append(
+                        {
+                            "refined_detection_id": str(target["id"]),
+                            "output": output,
+                            "oracle_result": oracle_result,
+                            "embedding_payload_ref": embedding_ref,
+                            "embedding_dtype": embedding_dtype,
+                            "embedding_shape": embedding_shape,
+                            "embedding_sha256": embedding_sha256,
+                            "embedding_normalized": embedding_normalized,
                         }
                     )
                 if clustering_packet is not None:
@@ -1374,7 +1532,13 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                         evidence_context=clustering_context,
                         records=clustering_records,
                     )
-            completed += len(evidence_records)
+            if embedding_records:
+                with measure_phase("classification.evidence_database_batch_write"):
+                    context.repository.store_embedding_evidence_batch(
+                        evidence_context=embedding_context,
+                        records=embedding_records,
+                    )
+            completed += len(targets)
             progress.update(
                 completed,
                 current={
@@ -1388,6 +1552,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
             after_id = str(targets[-1]["id"])
             if len(targets) < batch_size:
                 break
+        progress.checkpoint()
         context.repository.complete_classification_inference_run(
             str(inference_run["id"]),
             status="complete",
@@ -1425,6 +1590,10 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 else None
             ),
         }
+    except JobControlInterrupt:
+        # Pause, cancellation, and lease loss are worker-control outcomes, not
+        # failed scientific inference. The worker owns their terminal handling.
+        raise
     except Exception as exc:
         progress.update(
             completed,

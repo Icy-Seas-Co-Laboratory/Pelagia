@@ -4,6 +4,7 @@ import os
 import sys
 import socket
 import time
+import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Event, Thread
@@ -13,6 +14,7 @@ from ..domain import PipelineStage
 from ..observability import get_core_logger
 from ..services.context import AppContext
 from .common import mark_job_frame_stage_failed
+from .progress import JobCancellationRequested, JobLeaseLost, JobPauseRequested
 from .registry import HandlerRegistry
 from .runtime import worker_runtime_profile
 
@@ -62,8 +64,28 @@ class Worker:
         session = self.context.repository.get_worker_session(self.worker_id)
         return bool(session and session.get("shutdown_requested"))
 
+    @staticmethod
+    def _call_claim_aware(method, *args, worker_id: str, lease_token: str | None, **kwargs):
+        """Call fenced repository methods without breaking lightweight repositories.
+
+        Production repository methods accept the current claim identity.  Small
+        test and extension repositories from before lease fencing may not yet
+        declare those keyword arguments, so only omit them when their Python
+        signature proves they cannot accept arbitrary keyword arguments.
+        """
+        if lease_token:
+            try:
+                parameters = inspect.signature(method).parameters.values()
+                accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+                names = {parameter.name for parameter in parameters}
+            except (TypeError, ValueError):
+                accepts_keywords, names = True, set()
+            if accepts_keywords or {"worker_id", "lease_token"} <= names:
+                kwargs.update(worker_id=worker_id, lease_token=lease_token)
+        return method(*args, **kwargs)
+
     @contextmanager
-    def _maintain_job_lease(self, job_id: str) -> Iterator[None]:
+    def _maintain_job_lease(self, job_id: str, lease_token: str | None) -> Iterator[None]:
         """Renew a claimed job lease while its handler is running.
 
         Handlers may block in external services for longer than the queue lease.
@@ -80,7 +102,13 @@ class Worker:
 
         def renew() -> None:
             try:
-                repository.heartbeat(self.worker_id, job_id)
+                self._call_claim_aware(
+                    repository.heartbeat,
+                    self.worker_id,
+                    job_id,
+                    worker_id=self.worker_id,
+                    lease_token=lease_token,
+                )
             except Exception:
                 get_core_logger("worker").exception(
                     "Worker %s could not renew the lease for job %s",
@@ -106,6 +134,63 @@ class Worker:
             stopped.set()
             thread.join(timeout=min(interval, 2.0))
 
+    def _acknowledge_requested_pause(self, job_id: str, lease_token: str | None) -> bool:
+        """Pause before handler entry when an operator raced with the claim.
+
+        Stage handlers remain responsible for their own batch-level checkpoints;
+        this runtime check prevents a newly leased job from starting expensive
+        work after a pause request was already persisted.
+        """
+        repository = self.context.repository
+        if repository is None or not lease_token:
+            return False
+        control = repository.get_job_control(
+            job_id,
+            worker_id=self.worker_id,
+            lease_token=lease_token,
+        )
+        if control is None:
+            return True
+        if not str(control.get("control_reason") or "").startswith("pause_requested:"):
+            return False
+        repository.finalize_paused_job(
+            job_id,
+            worker_id=self.worker_id,
+            lease_token=lease_token,
+        )
+        get_core_logger("worker").info("Worker %s acknowledged pause for job %s", self.worker_id, job_id)
+        return True
+
+    def _run_post_completion_actions(self, job_id: str) -> None:
+        """Best-effort accelerators for work already made durable on completion.
+
+        These actions must not turn an already-succeeded parent into a failure.
+        Both the dispatch outbox and series director have independent scheduled
+        reconciliation paths, so an exception here is safe to retry later.
+        """
+        repository = self.context.repository
+        if repository is None:
+            return
+        materialize = getattr(repository, "materialize_pending_dispatches", None)
+        if callable(materialize):
+            try:
+                materialize(parent_job_id=job_id)
+            except Exception:
+                get_core_logger("worker").exception(
+                    "Could not materialize successor dispatches for completed job %s",
+                    job_id,
+                )
+        if hasattr(repository, "advance_processing_series_for_job"):
+            try:
+                from ..services.processing_queue import ProcessingQueueService
+
+                ProcessingQueueService(self.context).advance_series_for_job(job_id)
+            except Exception:
+                get_core_logger("worker").exception(
+                    "Could not advance processing series for completed job %s",
+                    job_id,
+                )
+
     def run_once(self, stages: list[PipelineStage] | None = None) -> int:
         """Claim and process currently available jobs once."""
         if self.context.repository is None:
@@ -124,6 +209,12 @@ class Worker:
             self._touch("working", stages=stages, leased_job_id=str(job["id"]))
             started = time.perf_counter()
             job_id = str(job["id"])
+            lease_token = None if job.get("lease_token") is None else str(job["lease_token"])
+            # Keep claim identity out of the persisted payload while allowing
+            # progress reporters and future checkpoint-aware handlers to fence
+            # their updates against a re-claimed lease.
+            job["_worker_id"] = self.worker_id
+            job["_lease_token"] = lease_token
             stage = job.get("stage")
             run_id = None if job.get("run_id") is None else str(job.get("run_id"))
             asset_id = None if job.get("asset_id") is None else str(job.get("asset_id"))
@@ -138,14 +229,30 @@ class Worker:
                     payload={"stage": stage},
                 )
             try:
-                with self._maintain_job_lease(job_id):
+                if self._acknowledge_requested_pause(job_id, lease_token):
+                    continue
+                with self._maintain_job_lease(job_id, lease_token):
                     result = self.handlers.handle(job, job_context)
-                self.context.repository.complete_job(job["id"], result=result)
-                # Series planning is a separate, idempotent director action so
-                # legacy jobs keep their existing completion semantics.
-                if hasattr(self.context.repository, "advance_processing_series_for_job"):
-                    from ..services.processing_queue import ProcessingQueueService
-                    ProcessingQueueService(self.context).advance_series_for_job(job_id)
+                # Close the race between the handler's final checkpoint and
+                # terminal publication. This also observes immediate cancel,
+                # which invalidates the claim and therefore returns no control.
+                if self._acknowledge_requested_pause(job_id, lease_token):
+                    continue
+                completed = self._call_claim_aware(
+                    self.context.repository.complete_job,
+                    job["id"],
+                    result=result,
+                    worker_id=self.worker_id,
+                    lease_token=lease_token,
+                )
+                if completed is None and lease_token:
+                    get_core_logger("worker").warning(
+                        "Worker %s lost lease before completing job %s; output was not published.",
+                        self.worker_id,
+                        job_id,
+                    )
+                    continue
+                self._run_post_completion_actions(job_id)
                 duration_ms = (time.perf_counter() - started) * 1000
                 timings = (result or {}).get("timings")
                 if timings:
@@ -171,9 +278,15 @@ class Worker:
                             "timings": timings,
                         },
                     )
+            except (JobPauseRequested, JobCancellationRequested, JobLeaseLost) as exc:
+                get_core_logger("worker").info(
+                    "Worker %s stopped job %s at a cooperative checkpoint: %s",
+                    self.worker_id,
+                    job_id,
+                    exc,
+                )
             except Exception as exc:
                 duration_ms = (time.perf_counter() - started) * 1000
-                mark_job_frame_stage_failed(job, job_context)
                 get_core_logger("worker").exception(
                     "Worker %s failed job %s stage=%s",
                     self.worker_id,
@@ -195,7 +308,25 @@ class Worker:
                             "error_message": str(exc),
                         },
                     )
-                self.context.repository.record_failure(job["id"], str(exc), retryable=True)
+                failed = self._call_claim_aware(
+                    self.context.repository.record_failure,
+                    job["id"],
+                    str(exc),
+                    retryable=True,
+                    worker_id=self.worker_id,
+                    lease_token=lease_token,
+                )
+                # Do not let a stale worker overwrite per-frame status after a
+                # newer lease has started work on the same job.
+                if failed is not None or not lease_token:
+                    mark_job_frame_stage_failed(job, job_context)
+                if failed is None and lease_token:
+                    get_core_logger("worker").warning(
+                        "Worker %s lost lease before recording failure for job %s.",
+                        self.worker_id,
+                        job_id,
+                    )
+                    continue
                 if hasattr(self.context.repository, "advance_processing_series_for_job"):
                     from ..services.processing_queue import ProcessingQueueService
                     ProcessingQueueService(self.context).advance_series_for_job(job_id)

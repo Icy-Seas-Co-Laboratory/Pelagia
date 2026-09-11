@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 from uuid import UUID
 
 from ...domain import JobStatus, PipelineStage
 
 try:
-    from fastapi import APIRouter, HTTPException, Query, Request
+    from fastapi import APIRouter, Header, HTTPException, Query, Request
+    from fastapi.responses import StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
@@ -57,6 +60,25 @@ if APIRouter is not None:
         if invalid:
             raise HTTPException(status_code=422, detail=f"Invalid job id(s): {', '.join(invalid)}.")
         return resolved
+
+    def _stream_after_id(*, after_id: int | None, last_event_id: str | None) -> int | None:
+        """Resolve an SSE replay cursor, preferring the standard event header."""
+        if last_event_id is None or not last_event_id.strip():
+            return after_id
+        try:
+            resolved = int(last_event_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Last-Event-ID must be an integer.") from exc
+        if resolved < 0:
+            raise HTTPException(status_code=422, detail="Last-Event-ID must be non-negative.")
+        return resolved
+
+    def _sse_event(event: dict[str, Any]) -> str:
+        event_id = event.get("id")
+        event_type = str(event.get("event_type") or "job.event").replace("\n", "").replace("\r", "")
+        payload = json.dumps(as_response(event), separators=(",", ":"), ensure_ascii=False)
+        prefix = f"id: {event_id}\n" if event_id is not None else ""
+        return f"{prefix}event: {event_type}\ndata: {payload}\n\n"
 
     class CreateJobRequest(BaseModel):
         stage: PipelineStage
@@ -216,6 +238,56 @@ if APIRouter is not None:
         )
         return {"events": as_response(events)}
 
+    @router.get("/stream", response_class=StreamingResponse)
+    def stream_job_events(
+        request: Request,
+        after_id: int | None = Query(None, ge=0),
+        last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+        run_id: str | None = None,
+        job_id: str | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+        wait_seconds: float = Query(15.0, ge=0.0, le=30.0),
+    ) -> StreamingResponse:
+        """Return a bounded SSE long-poll of project-scoped job events.
+
+        Each connection replays events after its cursor and then closes.  When
+        no event arrives before ``wait_seconds`` it emits a heartbeat comment,
+        allowing clients to reconnect with the last received event id without
+        holding an unbounded application worker open.
+        """
+        repository = get_repository(request)
+        project_id = scoped_project_id(request)
+        resolved_after_id = _stream_after_id(after_id=after_id, last_event_id=last_event_id)
+
+        def event_stream():
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                events = repository.list_job_events(
+                    project_id=project_id,
+                    after_id=resolved_after_id,
+                    run_id=run_id,
+                    job_id=job_id,
+                    limit=limit,
+                    offset=0,
+                )
+                if events:
+                    # Storage's list endpoint is newest-first; SSE replay must
+                    # be oldest-first so Last-Event-ID advances monotonically.
+                    for event in sorted(events, key=lambda item: int(item.get("id", 0))):
+                        yield _sse_event(event)
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield ": heartbeat\n\n"
+                    return
+                time.sleep(min(0.25, remaining))
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @router.post("/clear", response_model=JobsClearResponse, response_model_exclude_none=True)
     def clear_jobs(request: Request, body: ClearJobsRequest | None = None) -> dict:
         repository = get_repository(request)
@@ -306,10 +378,14 @@ if APIRouter is not None:
         return {"job": as_response(job)}
 
     @router.post("/{job_id}/retry", response_model=JobDetailResponse, response_model_exclude_none=True)
-    def retry_job(request: Request, job_id: str) -> dict:
+    def retry_job(request: Request, job_id: str, body: ReasonRequest | None = None) -> dict:
         repository = get_repository(request)
         auth = require_project_write(request)
-        job = repository.retry_job(job_id, project_id=auth.project_id)
+        job = repository.retry_job(
+            job_id,
+            project_id=auth.project_id,
+            reason=None if body is None else body.reason,
+        )
         if job is None:
             raise HTTPException(
                 status_code=404,

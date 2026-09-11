@@ -34,6 +34,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "roi_refinement_options": "/roi-refinement/options",
                 "roi_refinement": "/roi-refinement",
                 "queue_roi_refinement": "/roi-refinement/jobs",
+                "queue_roi_continuity": "/roi-refinement/continuity/jobs",
                 "live_threshold": "/live/threshold",
                 "live_detection_candidate": "/live/detection-candidate",
                 "live_sandbox": "/live/sandbox",
@@ -89,6 +90,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 "roi_filter",
                 "roi_recording",
                 "roi_refinement",
+                "roi_continuity",
             ],
             "preprocessing": preprocessing_capabilities(processing),
             "segmentation": segmentation_capabilities(processing, allowed_encodings=allowed_encodings),
@@ -123,6 +125,12 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                     "unit": "rois",
                     "queue_endpoint": "/roi-refinement/jobs",
                 },
+                {
+                    "id": PipelineStage.ROI_CONTINUITY.value,
+                    "label": "Line-scan ROI Continuity",
+                    "unit": "assets",
+                    "queue_endpoint": "/roi-refinement/continuity/jobs",
+                },
             ],
             "queueable_stages": [
                 PipelineStage.EXTRACT_FRAMES.value,
@@ -130,6 +138,7 @@ def system_capabilities(config: CoreConfig) -> dict[str, Any]:
                 PipelineStage.PREPROCESS_FRAMES.value,
                 PipelineStage.SEGMENT.value,
                 PipelineStage.ROI_REFINEMENT.value,
+                PipelineStage.ROI_CONTINUITY.value,
             ],
             "worker_capabilities": [stage.value for stage in PipelineStage],
         },
@@ -160,16 +169,17 @@ def roi_refinement_capabilities(
     return {
         "pipeline_stage_order": [
             "source",
-            "model_selection",
-            "oracle_inference",
+            "refinement_selection",
+            "refinement",
             "expansion",
             "residual_discovery",
             "reconciliation",
             "recording",
         ],
         "supported": {
-            "inference_backend": "oracle_builder",
-            "methods": ["oracle", "identity"],
+            "inference_backends": ["pelagia_builtin", "oracle_builder", "none"],
+            "inference_backend": "pelagia_builtin",
+            "methods": ["heuristic_edge_v1", "oracle", "identity"],
             "model_refs": model_refs,
             "models": models,
             "oracle": oracle_health or {"enabled": config.oracle.enabled, "status": "unknown"},
@@ -178,7 +188,7 @@ def roi_refinement_capabilities(
         "defaults": {
             "roi_refinement": {
                 **_dataclass_dict(defaults),
-                "method": "oracle",
+                "method": defaults.default_method,
                 "model_ref": config.oracle.default_mask_model,
             },
         },
@@ -187,8 +197,13 @@ def roi_refinement_capabilities(
                 _field("detection_ids", "Detection IDs", "string-list", request_field_name="detection_ids"),
             ],
             "model_selection": [
-                _field("method", "Refinement Method", "enum", options=["oracle", "identity"], default="oracle"),
+                _field("method", "Refinement Method", "enum", options=["heuristic_edge_v1", "oracle", "identity"], default=defaults.default_method),
                 _field("model_ref", "Oracle Model", "enum", options=model_refs, config_section="oracle"),
+            ],
+            "heuristic_edge": [
+                _field("heuristic_gradient_percentile", "Strong Gradient Percentile", "number", minimum=0, maximum=100, step=1, config_section="processing.roi_refinement"),
+                _field("heuristic_axis_exclusion_degrees", "Axis Exclusion Degrees", "number", minimum=0, maximum=44, step=1, config_section="processing.roi_refinement"),
+                _field("heuristic_max_growth_pixels", "Maximum Seed Growth", "integer", minimum=0, step=1, config_section="processing.roi_refinement"),
             ],
             "expansion": [
                 _field("allow_frame_expansion", "Allow Frame Expansion", "boolean", default=True),

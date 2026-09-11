@@ -62,6 +62,18 @@ def test_core_config_load_applies_auth_env(monkeypatch):
     assert config.auth.dev_project_key == "sandbox"
 
 
+def test_core_config_load_applies_queue_retry_env(monkeypatch):
+    monkeypatch.setenv("PELAGIA_QUEUE_RETRY_BACKOFF_BASE_SECONDS", "7")
+    monkeypatch.setenv("PELAGIA_QUEUE_RETRY_BACKOFF_MAX_SECONDS", "60")
+    monkeypatch.setenv("PELAGIA_QUEUE_RETRY_BACKOFF_JITTER_SECONDS", "2")
+
+    config = CoreConfig.load(local_config_path=None)
+
+    assert config.queue.retry_backoff_base_seconds == 7
+    assert config.queue.retry_backoff_max_seconds == 60
+    assert config.queue.retry_backoff_jitter_seconds == 2
+
+
 def test_core_config_load_applies_normalized_api_root_path(monkeypatch):
     monkeypatch.setenv("PELAGIA_API_ROOT_PATH", "pelagia-api/")
 
