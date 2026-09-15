@@ -93,7 +93,7 @@ def prepare_export_snapshot(
     # metadata need a conservative fixed allowance per ROI/source.
     estimated_files = (
         len(asset_ids) * (1 if ExportProduct.RAW_ROI_STATISTICS.value in products else 0)
-        + len(asset_ids) * (1 if ExportProduct.BINNED_ROI_STATISTICS.value in products else 0)
+        + (1 if ExportProduct.BINNED_ROI_STATISTICS.value in products else 0)
         + len(roi_items) * (2 if ExportProduct.ROI_EVIDENCE.value in products else 0)
         + len(telemetry_items) * 3 + 8
     )

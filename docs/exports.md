@@ -34,6 +34,20 @@ worksheets in the same per-asset workbook. Telemetry bundles also include origin
 catalog records, normalized observations, and timeline context for a future
 verified import workflow.
 
+ROI evidence uses a compact, UUID-addressed layout:
+`products/roi-evidence/{asset_uuid}/{frame_uuid}/{roi_uuid}.png`, with a
+same-named `.json` sidecar containing the ROI, frame, asset, and ML-evidence
+metadata.
+
+The binned ROI product is one project-level time-series table rather than one
+file per asset. Each row represents an exact frame capture time and includes a
+count column for every bounding-box-area bin, plus ROI/frame/asset counts,
+concurrent data-stream count, source frame dimensions, declared scan rate, and
+available instrument/deployment context. A data stream uses its declared
+`data_stream_id`, `stream_id`, or `camera_id`; when absent, the source asset is
+treated as one stream. Mixed frame dimensions or scan rates are preserved as
+semicolon-separated values, while their scalar columns are null.
+
 While an export is running, its associated job reports estimated work units.
 Input freezing reports every 1,000 selected records. ROI products then report
 their read and write phases in 1,000-ROI batches; telemetry reports completed

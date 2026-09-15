@@ -73,6 +73,24 @@ def _selection_sql(repository, project_id: str, selection: Mapping[str, Any]) ->
         clauses.append("assets.id = ANY(%s::uuid[])")
         params.append(list(dict.fromkeys(asset_ids)))
 
+    # Registry datasets retain the refined-detection UUID as their source key.
+    # EXISTS prevents a many-to-many tag join from duplicating exported ROIs.
+    tag_ids = [str(value) for value in selection.get("tag_ids") or () if value]
+    if tag_ids:
+        clauses.append(
+            f"""EXISTS (
+                SELECT 1 FROM {schema}.registry_items registry_item
+                JOIN {schema}.registry_descriptor_annotations tag_annotation
+                  ON tag_annotation.workspace_id = registry_item.workspace_id
+                 AND tag_annotation.item_id = registry_item.item_id
+                WHERE registry_item.source_key = refined.id::text
+                  AND tag_annotation.is_current
+                  AND tag_annotation.status = 'accepted'
+                  AND tag_annotation.descriptor_id = ANY(%s::uuid[])
+            )"""
+        )
+        params.append(list(dict.fromkeys(tag_ids)))
+
     roi_ids = [str(value) for value in selection.get("roi_ids") or () if value]
     if roi_ids:
         clauses.append("refined.id = ANY(%s::uuid[])")

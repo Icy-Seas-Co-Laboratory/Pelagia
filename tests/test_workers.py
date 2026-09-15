@@ -291,6 +291,26 @@ def test_progress_checkpoint_acknowledges_requested_pause():
     assert repo.failures == []
 
 
+def test_worker_lease_heartbeat_passes_fenced_identity_once():
+    class StrictHeartbeatRepository:
+        def __init__(self):
+            self.calls = []
+
+        def heartbeat(self, worker_id, job_id, *, lease_token):
+            self.calls.append((worker_id, job_id, lease_token))
+            return {"id": job_id, "status": "leased"}
+
+    repository = StrictHeartbeatRepository()
+    worker = Worker(
+        context=make_context(repository), handlers=HandlerRegistry(), worker_id="worker-1",
+    )
+
+    with worker._maintain_job_lease("job-1", "lease-1"):
+        pass
+
+    assert repository.calls == [("worker-1", "job-1", "lease-1")]
+
+
 def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
     with pytest.raises(ValueError, match="explicit stages"):
         worker_runtime_profile(None)

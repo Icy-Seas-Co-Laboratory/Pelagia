@@ -50,6 +50,44 @@ def test_bbox_bins_follow_documented_boundaries():
     assert {(item["area_bin_lower_px2"], item["roi_count"]) for item in bins} == {(10, 1), (100, 1), (1000, 2)}
 
 
+def test_binned_time_series_has_one_row_per_capture_time_with_size_columns():
+    first_time = "2026-09-11T12:00:00+00:00"
+    second_time = "2026-09-11T12:00:01+00:00"
+    first_asset, second_asset = str(uuid.uuid4()), str(uuid.uuid4())
+    first_frame, second_frame = str(uuid.uuid4()), str(uuid.uuid4())
+    first = _row(area=10, asset_id=first_asset)
+    second = _row(area=100, asset_id=second_asset)
+    third = _row(area=10, asset_id=first_asset)
+    fourth = _row(area=1001, asset_id=first_asset)
+    for row, capture_time, frame_id, camera_id, scan_rate in (
+        (first, first_time, first_frame, "camera-a", 10),
+        (second, first_time, second_frame, "camera-b", 20),
+        (third, first_time, first_frame, "camera-a", 10),
+        (fourth, second_time, str(uuid.uuid4()), "camera-a", 10),
+    ):
+        row["frame_captured_at"] = capture_time
+        row["frame_id"] = frame_id
+        row["frame_metadata"] = {"camera_id": camera_id, "scan_rate_hz": scan_rate, "station": "A01"}
+
+    series = roi.binned_time_series([first, second, third, fourth])
+
+    assert len(series) == 2
+    first_row = series[0]
+    assert first_row["capture_time"] == first_time
+    assert first_row["frame_count"] == 2
+    assert first_row["asset_count"] == 2
+    assert first_row["concurrent_datastream_count"] == 2
+    assert first_row["frame_width_px"] == 100
+    assert first_row["frame_height_px"] == 80
+    assert first_row["scan_rate_hz"] is None
+    assert first_row["scan_rates_hz"] == "10.0; 20.0"
+    assert first_row["roi_count_10_to_20_px2"] == 2
+    assert first_row["roi_count_100_to_200_px2"] == 1
+    assert first_row["roi_count_1000_to_2000_px2"] == 0
+    assert series[1]["capture_time"] == second_time
+    assert series[1]["roi_count_1000_to_2000_px2"] == 1
+
+
 def test_writers_use_uuid_paths_and_include_evidence(tmp_path, monkeypatch):
     asset_id = str(uuid.uuid4()); row = _row(asset_id=asset_id)
     monkeypatch.setattr(roi, "_selected_rows", lambda *args: [row])
@@ -64,10 +102,33 @@ def test_writers_use_uuid_paths_and_include_evidence(tmp_path, monkeypatch):
         assert db.execute("SELECT count(*) FROM asset_metadata").fetchone()[0] == 1
         assert db.execute("SELECT count(*) FROM frame_metadata").fetchone()[0] == 0
     evidence = roi.write_roi_evidence(Repository(), project_id=str(uuid.uuid4()), selection={}, output_root=tmp_path)
-    sidecar = tmp_path / [path for path in evidence["paths"] if path.endswith("metadata.json")][0]
+    roi_id = row["id"]
+    frame_id = row["frame_id"]
+    sidecar_path = f"products/roi-evidence/{asset_id}/{frame_id}/{roi_id}.json"
+    image_path = f"products/roi-evidence/{asset_id}/{frame_id}/{roi_id}.png"
+    assert sidecar_path in evidence["paths"]
+    assert image_path in evidence["paths"]
+    sidecar = tmp_path / sidecar_path
     payload = json.loads(sidecar.read_text())
     assert len(payload["evidence"]["evidence"]) == 2
-    assert (sidecar.parent / "image.png").exists()
+    assert (tmp_path / image_path).exists()
+
+
+def test_binned_writer_creates_one_project_time_series_file(tmp_path, monkeypatch):
+    row = _row(area=100)
+    row["frame_captured_at"] = "2026-09-11T12:00:00+00:00"
+    monkeypatch.setattr(roi, "_selected_rows", lambda *args: [row])
+
+    result = roi.write_binned_roi_statistics(
+        object(), project_id=str(uuid.uuid4()), selection={}, output_root=tmp_path, file_format="json",
+    )
+
+    assert result["schema_version"] == "2.0"
+    assert result["time_count"] == 1
+    assert result["paths"] == ["products/roi-statistics-binned/time-series.json"]
+    payload = json.loads((tmp_path / result["paths"][0]).read_text())
+    assert list(payload) == ["roi_time_series"]
+    assert payload["roi_time_series"][0]["roi_count_100_to_200_px2"] == 1
 
 
 def test_roi_row_collection_reports_bounded_progress(monkeypatch):

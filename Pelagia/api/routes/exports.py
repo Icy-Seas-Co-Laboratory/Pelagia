@@ -54,9 +54,16 @@ if APIRouter is not None:
         value.pop("artifact_path", None)
         if value.get("status") == "succeeded":
             value["download_url"] = f"/exports/{value['id']}/download"
-        get_job = getattr(repository, "get_job", None)
-        if callable(get_job) and value.get("job_id"):
-            job = get_job(str(value["job_id"]), project_id=project_id)
+        list_jobs = getattr(repository, "list_jobs", None)
+        if callable(list_jobs) and value.get("job_id"):
+            jobs = list_jobs(
+                project_id=project_id,
+                job_ids=[str(value["job_id"])],
+                limit=1,
+                include_details=False,
+                include_progress=True,
+            )
+            job = next((item for item in jobs if str(item.get("id")) == str(value["job_id"])), None)
             if job is not None:
                 value["job"] = as_response(job)
         return as_response(value)
@@ -135,7 +142,27 @@ if APIRouter is not None:
         artifacts = repository.list_export_artifacts(
             project_id=str(auth.project_id), limit=limit, offset=offset,
         )
-        return {"exports": [_artifact_response(item, repository=repository, project_id=str(auth.project_id)) for item in artifacts], "limit": limit, "offset": offset}
+        job_ids = [str(item["job_id"]) for item in artifacts if item.get("job_id")]
+        jobs_by_id: dict[str, dict[str, Any]] = {}
+        if job_ids:
+            jobs_by_id = {
+                str(job["id"]): job
+                for job in repository.list_jobs(
+                    project_id=str(auth.project_id),
+                    job_ids=job_ids,
+                    limit=len(job_ids),
+                    include_details=False,
+                    include_progress=True,
+                )
+            }
+        responses = []
+        for artifact in artifacts:
+            response = _artifact_response(artifact)
+            job = jobs_by_id.get(str(artifact.get("job_id")))
+            if job is not None:
+                response["job"] = as_response(job)
+            responses.append(response)
+        return {"exports": responses, "limit": limit, "offset": offset}
 
     @router.get("/{export_id}")
     def get_export(request: Request, export_id: str) -> dict[str, Any]:

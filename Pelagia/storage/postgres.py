@@ -9889,7 +9889,15 @@ class PostgresRepository:
         resolved_project_id = self._required_project_id(project_id, "list_export_artifacts")
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
-                f"""SELECT * FROM {self.schema}.export_artifacts
+                # Export manifests and frozen input snapshots can be very large.
+                # History only needs enough metadata to render status and obtain
+                # the associated job progress; the full immutable record remains
+                # available from get_export_artifact().
+                f"""SELECT id, project_id, job_id, requested_by_user_id,
+                           requested_by_username, status, request, snapshot_at,
+                           artifact_sha256, size_bytes, failure_message,
+                           expires_at, created_at, started_at, completed_at, updated_at
+                    FROM {self.schema}.export_artifacts
                     WHERE project_id = %s ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s""",
                 (resolved_project_id, max(1, min(int(limit), 500)), max(0, int(offset))),
             )

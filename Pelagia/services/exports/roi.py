@@ -173,7 +173,7 @@ def bbox_area_bins(maximum: float) -> list[tuple[int, int | None]]:
 
 
 def binned_statistics(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate rows by requested bounding-box area intervals."""
+    """Return the legacy long-form area-bin summary for a set of ROIs."""
     normalized = [statistics_row(row) for row in rows]
     numeric = [float(row["bounding_box_area_px2"]) for row in normalized if row["bounding_box_area_px2"] is not None]
     if not numeric:
@@ -194,6 +194,121 @@ def binned_statistics(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
             "mean_bounding_box_width_px": mean("bounding_box_width_px"),
             "mean_bounding_box_height_px": mean("bounding_box_height_px"),
         })
+    return output
+
+
+_BINNED_CONTEXT_COLUMNS = (
+    "collection", "instrument", "deployment", "cruise", "station", "sample_id", "depth_m",
+)
+_STREAM_ID_ALIASES = ("data_stream_id", "stream_id", "camera_id")
+_SCAN_RATE_ALIASES = ("scan_rate_hz", "frame_rate_hz", "frames_per_second", "fps")
+
+
+def _distinct_values(values: Iterable[Any]) -> list[Any]:
+    output: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        key = str(_jsonable(value))
+        if key not in seen:
+            seen.add(key)
+            output.append(_jsonable(value))
+    return output
+
+
+def _one_or_join(values: Iterable[Any]) -> Any:
+    distinct = _distinct_values(values)
+    if not distinct:
+        return None
+    return distinct[0] if len(distinct) == 1 else "; ".join(map(str, distinct))
+
+
+def _stream_identifier(row: Mapping[str, Any]) -> str:
+    """Return the declared stream ID, or the asset UUID as a faithful fallback."""
+    contexts = (_mapping(row.get("frame_metadata")), _mapping(row.get("source_asset_metadata")))
+    value = _first_metadata_value(contexts, _STREAM_ID_ALIASES)
+    return str(value) if value is not None else str(row.get("source_asset_id", row.get("asset_id")))
+
+
+def _scan_rates_hz(rows: Iterable[Mapping[str, Any]]) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        contexts = (_mapping(row.get("frame_metadata")), _mapping(row.get("source_asset_metadata")))
+        value = _first_metadata_value(contexts, _SCAN_RATE_ALIASES)
+        if value is None:
+            continue
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            continue
+        if rate not in values:
+            values.append(rate)
+    return values
+
+
+def binned_time_series(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate ROI size-bin counts and acquisition context by exact capture time.
+
+    Each capture time has one analysis row.  Size bins are fixed columns shared
+    by every row, so time-series tools can use the table without pivoting.
+    ``concurrent_datastream_count`` uses declared stream/camera identifiers and
+    falls back to the asset UUID when a source has not declared one.
+    """
+    source_rows = list(rows)
+    numeric = [
+        float(row["bbox_w"]) * float(row["bbox_h"])
+        for row in source_rows if row.get("bbox_w") is not None and row.get("bbox_h") is not None
+    ]
+    if not numeric:
+        return []
+    bins = bbox_area_bins(max(numeric))
+    grouped: dict[str | None, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in source_rows:
+        capture_time = row.get("frame_captured_at", row.get("captured_at"))
+        grouped[None if capture_time is None else str(_jsonable(capture_time))].append(row)
+
+    def time_sort_key(value: str | None) -> tuple[bool, str]:
+        return value is None, "" if value is None else value
+
+    output: list[dict[str, Any]] = []
+    for capture_time in sorted(grouped, key=time_sort_key):
+        members = grouped[capture_time]
+        frame_ids = {str(row["frame_id"]) for row in members if row.get("frame_id") is not None}
+        asset_ids = {str(row["source_asset_id"]) for row in members if row.get("source_asset_id") is not None}
+        dimensions = _distinct_values(
+            f"{row['frame_width']}x{row['frame_height']}"
+            for row in members if row.get("frame_width") is not None and row.get("frame_height") is not None
+        )
+        widths = _distinct_values(row.get("frame_width") for row in members)
+        heights = _distinct_values(row.get("frame_height") for row in members)
+        rates = _scan_rates_hz(members)
+        contexts = [statistics_row(row) for row in members]
+        record: dict[str, Any] = {
+            "capture_time": capture_time,
+            "run_ids": _one_or_join(row.get("run_id") for row in members),
+            "frame_count": len(frame_ids),
+            "asset_count": len(asset_ids),
+            "concurrent_datastream_count": len({_stream_identifier(row) for row in members}),
+            "frame_width_px": widths[0] if len(widths) == 1 else None,
+            "frame_height_px": heights[0] if len(heights) == 1 else None,
+            "frame_dimensions_px": _one_or_join(dimensions),
+            "scan_rate_hz": rates[0] if len(rates) == 1 else None,
+            "scan_rates_hz": _one_or_join(rates),
+            "roi_count_total": len(members),
+        }
+        record.update({
+            column: _one_or_join(item.get(column) for item in contexts)
+            for column in _BINNED_CONTEXT_COLUMNS
+        })
+        for lower, upper in bins:
+            column = f"roi_count_{lower}_to_{upper}_px2"
+            record[column] = sum(
+                1 for row in members
+                if row.get("bbox_w") is not None and row.get("bbox_h") is not None
+                and lower <= float(row["bbox_w"]) * float(row["bbox_h"]) < upper
+            )
+        output.append(record)
     return output
 
 
@@ -280,23 +395,26 @@ def write_raw_roi_statistics(repository: Any, *, project_id: str, selection: Map
 
 
 def write_binned_roi_statistics(repository: Any, *, project_id: str, selection: Mapping[str, Any], output_root: Path, file_format: str = "json", kvstore: Any = None, progress_callback: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
-    rows_by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rows = _selected_rows(
         repository, project_id, selection,
         None if progress_callback is None else lambda completed, message: progress_callback(completed, 0, message),
     )
-    for row in rows: rows_by_asset[str(row["source_asset_id"])].append(row)
     suffix = {"json": "json", "sqlite": "sqlite", "xlsx": "xlsx"}.get(file_format)
     if suffix is None: raise RoiExportError("ROI export format must be json, sqlite, or xlsx")
-    paths = []
-    written = 0
-    for _ordinal, (asset_id, asset_rows) in enumerate(sorted(rows_by_asset.items()), 1):
-        target = output_root / "products" / "roi-statistics-binned" / "assets" / asset_id
-        target.mkdir(parents=True, exist_ok=True); output = target / f"summary.{suffix}"
-        _write_tables(output, {"roi_area_bins": binned_statistics(asset_rows)}, file_format); paths.append(str(output.relative_to(output_root)))
-        written += len(asset_rows)
-        if progress_callback: progress_callback(len(rows) + written, len(rows) * 2, f"Wrote bins for asset {asset_id}")
-    return {"product": "roi-statistics-binned", "schema_version": "1.0", "asset_count": len(rows_by_asset), "roi_count": sum(map(len, rows_by_asset.values())), "paths": paths}
+    target = output_root / "products" / "roi-statistics-binned"
+    target.mkdir(parents=True, exist_ok=True)
+    output = target / f"time-series.{suffix}"
+    time_series = binned_time_series(rows)
+    _write_tables(output, {"roi_time_series": time_series}, file_format)
+    if progress_callback:
+        progress_callback(len(rows) * 2, len(rows) * 2, "Wrote binned ROI time series")
+    return {
+        "product": "roi-statistics-binned", "schema_version": "2.0",
+        "asset_count": len({str(row["source_asset_id"]) for row in rows if row.get("source_asset_id") is not None}),
+        "frame_count": len({str(row["frame_id"]) for row in rows if row.get("frame_id") is not None}),
+        "time_count": len(time_series), "roi_count": len(rows),
+        "paths": [str(output.relative_to(output_root))],
+    }
 
 
 def write_roi_evidence(repository: Any, *, project_id: str, selection: Mapping[str, Any], output_root: Path, file_format: str = "json", kvstore: Any = None, progress_callback: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
@@ -307,12 +425,12 @@ def write_roi_evidence(repository: Any, *, project_id: str, selection: Mapping[s
     for ordinal, row in enumerate(rows, 1):
         if row.get("roi_payload") is None: continue
         asset_id, frame_id, roi_id = map(str, (row["source_asset_id"], row["frame_id"], row["id"]))
-        target = output_root / "products" / "roi-evidence" / "assets" / asset_id / "frames" / frame_id / "rois" / roi_id
+        target = output_root / "products" / "roi-evidence" / asset_id / frame_id
         target.mkdir(parents=True, exist_ok=True)
-        payload, extension, representation = portable_roi_image(row); image = target / f"image.{extension}"; image.write_bytes(payload)
+        payload, extension, representation = portable_roi_image(row); image = target / f"{roi_id}.{extension}"; image.write_bytes(payload)
         detail = repository.get_curation_roi(roi_id, project_id=project_id) if hasattr(repository, "get_curation_roi") else {}
         sidecar = {"roi": _jsonable(dict(row)), "statistics": statistics_row(row), "additional_metadata": additional_metadata_rows(row), "evidence": _jsonable(detail), "image": {"path": str(image.relative_to(output_root)), "sha256": hashlib.sha256(payload).hexdigest(), **representation}}
-        metadata = target / "metadata.json"; metadata.write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
+        metadata = target / f"{roi_id}.json"; metadata.write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
         paths.extend((str(image.relative_to(output_root)), str(metadata.relative_to(output_root))))
         if progress_callback and (ordinal % _PROGRESS_BATCH_SIZE == 0 or ordinal == len(rows)):
             progress_callback(len(rows) + ordinal, len(rows) * 2, f"Wrote evidence through ROI {ordinal:,}")

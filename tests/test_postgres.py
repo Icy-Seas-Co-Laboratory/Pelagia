@@ -212,8 +212,18 @@ def test_postgres_export_artifacts_are_project_scoped_and_attach_jobs(postgres_r
         str(artifact["id"]), project_id=str(project["id"]), status="succeeded",
         manifest={"export_id": str(artifact["id"])}, artifact_path="/not/exposed.zip",
         artifact_sha256="a" * 64, size_bytes=12,
+        input_snapshot={"large_membership": ["snapshot-marker"]},
+        attempts=[{"attempt_number": 1, "details": "attempt-marker"}],
+        estimate={"estimated_bundle_bytes": 1024},
+        progress={"completed": 1, "total": 1},
     )
     assert completed is not None and completed["status"] == "succeeded"
+    history = postgres_repo.list_export_artifacts(project_id=str(project["id"]))
+    assert len(history) == 1
+    assert not {"manifest", "input_snapshot", "attempts", "estimate", "progress"}.intersection(history[0])
+    assert postgres_repo.get_export_artifact(str(artifact["id"]), project_id=str(project["id"]))["manifest"] == {
+        "export_id": str(artifact["id"])
+    }
 
 
 def test_initialize_schema_upgrades_database_missing_latest_job_columns(postgres_repo):

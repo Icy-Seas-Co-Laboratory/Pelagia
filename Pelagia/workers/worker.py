@@ -84,6 +84,25 @@ class Worker:
                 kwargs.update(worker_id=worker_id, lease_token=lease_token)
         return method(*args, **kwargs)
 
+    @staticmethod
+    def _call_heartbeat(method, worker_id: str, job_id: str, lease_token: str | None):
+        """Renew a lease without passing ``worker_id`` twice.
+
+        Unlike other fenced repository methods, ``heartbeat`` takes the worker
+        ID as its first positional argument.  It must therefore receive only
+        the optional lease token as a keyword.
+        """
+        if lease_token:
+            try:
+                parameters = inspect.signature(method).parameters.values()
+                accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+                names = {parameter.name for parameter in parameters}
+            except (TypeError, ValueError):
+                accepts_keywords, names = True, set()
+            if accepts_keywords or "lease_token" in names:
+                return method(worker_id, job_id, lease_token=lease_token)
+        return method(worker_id, job_id)
+
     @contextmanager
     def _maintain_job_lease(self, job_id: str, lease_token: str | None) -> Iterator[None]:
         """Renew a claimed job lease while its handler is running.
@@ -102,11 +121,10 @@ class Worker:
 
         def renew() -> None:
             try:
-                self._call_claim_aware(
+                self._call_heartbeat(
                     repository.heartbeat,
                     self.worker_id,
                     job_id,
-                    worker_id=self.worker_id,
                     lease_token=lease_token,
                 )
             except Exception:

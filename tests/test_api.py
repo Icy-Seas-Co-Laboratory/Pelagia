@@ -1737,6 +1737,7 @@ def test_api_queues_uuid_rooted_export_bundle():
             "products": ["raw_roi_statistics", "roi_evidence"],
             "formats": {"raw_roi_statistics": "sqlite"},
             "asset_ids": ["asset-1"],
+            "filters": {"tag_ids": ["00000000-0000-0000-0000-000000000123"]},
             "roi_stage": "refined",
         },
     )
@@ -1750,7 +1751,38 @@ def test_api_queues_uuid_rooted_export_bundle():
     assert repository.export_artifacts[0]["request"]["products"] == ["raw_roi_statistics", "roi_evidence"]
     assert repository.export_artifacts[0]["job_id"] == "job-new"
     assert repository.export_artifacts[0]["estimate"]["status"] == "pending"
+    assert repository.export_artifacts[0]["request"]["filters"] == {
+        "tag_ids": ["00000000-0000-0000-0000-000000000123"]
+    }
     assert response.json()["estimate"]["status"] == "pending"
+
+
+def test_api_lists_exports_with_lightweight_batched_job_summaries():
+    client, repository, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client, username="ada", project_key="default")
+    repository.export_artifacts = [
+        {"id": "export-1", "project_id": "project-1", "job_id": "job-1", "status": "working", "request": {}},
+        {"id": "export-2", "project_id": "project-1", "job_id": "job-2", "status": "queued", "request": {}},
+    ]
+    calls: list[dict] = []
+
+    def list_jobs(**kwargs):
+        calls.append(kwargs)
+        return [
+            {"id": "job-1", "status": "working", "progress": {"completed": 1, "total": 2}},
+            {"id": "job-2", "status": "queued", "progress": {}},
+        ]
+
+    repository.list_jobs = list_jobs
+    response = client.get("/exports", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["exports"][0]["job"]["progress"] == {"completed": 1, "total": 2}
+    assert response.json()["exports"][1]["job"]["status"] == "queued"
+    assert calls == [{
+        "project_id": "project-1", "job_ids": ["job-1", "job-2"], "limit": 2,
+        "include_details": False, "include_progress": True,
+    }]
 
 
 def test_api_lists_system_status_without_live_database():
