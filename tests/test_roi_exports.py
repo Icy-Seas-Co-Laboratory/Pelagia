@@ -19,6 +19,9 @@ def _row(*, area: int = 100, asset_id: str | None = None) -> dict:
         "frame_id": str(uuid.uuid4()), "frame_index": 4, "frame_width": 100, "frame_height": 80,
         "frame_metadata": {"station": "A01"}, "bbox_x": 2, "bbox_y": 3, "bbox_w": 10, "bbox_h": area // 10,
         "area": 19.5, "perimeter": 20, "major_axis_length": 8, "minor_axis_length": 3,
+        "centroid_x": 7.5, "centroid_y": 9.5,
+        "major_axis_center_x": 7.0, "major_axis_center_y": 9.0,
+        "major_axis_orientation_degrees": 45.0, "major_axis_direction_degrees": 225.0,
         "min_gray_value": 1, "mean_gray_value": 3.2, "refinement_method": "identity",
         "metadata": {"detection_method": "threshold", "unmapped": "retained"}, "run_id": str(uuid.uuid4()),
         "roi_payload": payload, "roi_encoding": encoding, "roi_format": format_name, "roi_dtype": "uint8", "roi_shape": [2, 3],
@@ -29,6 +32,9 @@ def test_statistics_row_is_analyst_facing_and_entity_metadata_is_not_repeated():
     row = roi.statistics_row(_row())
     assert row["image_name"] == "source image.tif"
     assert row["bounding_box_area_px2"] == 100
+    assert row["centroid_x_px"] == 7.5
+    assert row["major_axis_orientation_degrees"] == 45.0
+    assert row["major_axis_direction_degrees"] == 225.0
     assert row["instrument"] == "Camera A"
     assert row["station"] == "A01"
     assert not any("metadata" in name for name in row)

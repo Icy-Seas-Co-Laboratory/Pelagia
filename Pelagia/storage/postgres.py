@@ -52,6 +52,8 @@ REQUIRED_SCHEMA_TABLES = (
     "classification_results",
     "classification_labels",
     "classification_inference_runs",
+    "classification_inference_batches",
+    "classification_inference_batch_items",
     "classification_evidence",
     "clustering_evidence",
     "embedding_evidence",
@@ -303,6 +305,17 @@ class PostgresRepository:
         """Borrow a bounded, reusable connection for one repository operation."""
 
         return self._pool.connection()
+
+    @contextmanager
+    def _operation_connection(self, connection=None):
+        """Use a caller transaction or own and commit one repository operation."""
+
+        if connection is not None:
+            yield connection
+            return
+        with self.connect() as managed_connection:
+            yield managed_connection
+            managed_connection.commit()
 
     def close(self) -> None:
         """Close this process's connection pool."""
@@ -2804,12 +2817,14 @@ class PostgresRepository:
                 (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
                  crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
                  area, perimeter, major_axis_length, minor_axis_length,
+                 centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
+                 major_axis_orientation_degrees, major_axis_direction_degrees,
                  min_gray_value, mean_gray_value, roi_payload, mask_payload,
                  roi_encoding, roi_format, roi_dtype, roi_shape,
                  mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
-                        %s::jsonb, %s::jsonb)
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb)
                 RETURNING *;
                 """,
                 (
@@ -2828,6 +2843,12 @@ class PostgresRepository:
                     detection.perimeter,
                     detection.major_axis_length,
                     detection.minor_axis_length,
+                    detection.centroid_x,
+                    detection.centroid_y,
+                    detection.major_axis_center_x,
+                    detection.major_axis_center_y,
+                    detection.major_axis_orientation_degrees,
+                    detection.major_axis_direction_degrees,
                     detection.min_gray_value,
                     detection.mean_gray_value,
                     detection.roi_payload,
@@ -2872,12 +2893,19 @@ class PostgresRepository:
                         (candidate_detection_id, job_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
                          crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
                          area, perimeter, major_axis_length, minor_axis_length,
+                         centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
+                         major_axis_orientation_degrees, major_axis_direction_degrees,
                          min_gray_value, mean_gray_value, roi_payload, mask_payload,
                          roi_encoding, roi_format, roi_dtype, roi_shape,
                          mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
-                                %s, %s, %s::jsonb, %s, %s::jsonb)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s, %s::jsonb,
+                                %s, %s, %s, %s::jsonb,
+                                %s, %s::jsonb)
                         RETURNING *;
                         """,
                         (
@@ -2898,6 +2926,12 @@ class PostgresRepository:
                             detection.perimeter,
                             detection.major_axis_length,
                             detection.minor_axis_length,
+                            detection.centroid_x,
+                            detection.centroid_y,
+                            detection.major_axis_center_x,
+                            detection.major_axis_center_y,
+                            detection.major_axis_orientation_degrees,
+                            detection.major_axis_direction_degrees,
                             detection.min_gray_value,
                             detection.mean_gray_value,
                             detection.roi_payload,
@@ -5059,6 +5093,10 @@ class PostgresRepository:
                            refined.crop_bbox_x, refined.crop_bbox_y,
                            refined.crop_bbox_w, refined.crop_bbox_h,
                            refined.area, refined.perimeter, refined.roi_shape,
+                           refined.centroid_x, refined.centroid_y,
+                           refined.major_axis_center_x, refined.major_axis_center_y,
+                           refined.major_axis_orientation_degrees,
+                           refined.major_axis_direction_degrees,
                            refined.roi_encoding, refined.created_at,
                            frames.frame_index, frames.captured_at AS captured_at,
                            frames.width AS frame_width, frames.height AS frame_height,
@@ -6103,14 +6141,51 @@ class PostgresRepository:
         model_selector: str,
         evidence_kind: str = "classification",
         parameters: dict[str, Any] | None = None,
+        artifact_id: str | None = None,
+        artifact_fingerprint: str | None = None,
+        output_schema_version: str | None = None,
     ) -> dict[str, Any]:
+        pinned_contract = (artifact_id, artifact_fingerprint, output_schema_version)
+        if any(pinned_contract) and not all(pinned_contract):
+            raise ValueError(
+                "Oracle V2 inference runs require artifact_id, artifact_fingerprint, "
+                "and output_schema_version together."
+            )
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                if job_id is not None:
+                    cursor.execute(
+                        f"""
+                        SELECT *
+                        FROM {self.schema}.classification_inference_runs
+                        WHERE project_id = %s AND job_id = %s
+                          AND oracle_artifact_id IS NOT NULL
+                        FOR UPDATE
+                        """,
+                        (project_id, job_id),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is not None:
+                        if any(
+                            str(existing.get(column) or "") != str(value or "")
+                            for column, value in (
+                                ("oracle_artifact_id", artifact_id),
+                                ("oracle_artifact_fingerprint_sha256", artifact_fingerprint),
+                                ("oracle_output_schema_version", output_schema_version),
+                            )
+                        ):
+                            raise ValueError(
+                                "Inference job is already pinned to a different Oracle V2 contract."
+                            )
+                        connection.commit()
+                        return existing
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.classification_inference_runs
-                        (project_id, job_id, model_selector, evidence_kind, parameters)
-                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                        (project_id, job_id, model_selector, evidence_kind, parameters,
+                         oracle_artifact_id, oracle_artifact_fingerprint_sha256,
+                         oracle_output_schema_version)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s)
                     RETURNING *
                     """,
                     (
@@ -6119,11 +6194,258 @@ class PostgresRepository:
                         model_selector,
                         evidence_kind,
                         json.dumps(json_ready(parameters or {})),
+                        artifact_id,
+                        artifact_fingerprint,
+                        output_schema_version,
                     ),
                 )
                 row = cursor.fetchone()
             connection.commit()
         return row
+
+    def reserve_classification_inference_batch(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        request_id: str,
+        batch_index: int,
+        items: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Reserve an immutable V2 request correlation before sending its bytes.
+
+        Retrying the same request ID must name exactly the same inputs.  The
+        item ledger gives response handling a durable first-success boundary
+        even if a client times out after Oracle Builder accepted it.
+        """
+        if not request_id:
+            raise ValueError("request_id is required")
+        if batch_index < 0:
+            raise ValueError("batch_index must be non-negative")
+        normalized = [
+            {
+                "refined_detection_id": str(item["refined_detection_id"]),
+                "item_id": str(item["item_id"]),
+                "input_sha256": str(item["input_sha256"]),
+            }
+            for item in items
+        ]
+        if not normalized:
+            raise ValueError("An inference batch must contain at least one item")
+        if len({item["item_id"] for item in normalized}) != len(normalized):
+            raise ValueError("Inference batch item_id values must be unique")
+        if len({item["refined_detection_id"] for item in normalized}) != len(normalized):
+            raise ValueError("Inference batch refined_detection_id values must be unique")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT id FROM {self.schema}.classification_inference_runs
+                    WHERE id = %s AND project_id = %s
+                    """,
+                    (inference_run_id, project_id),
+                )
+                if cursor.fetchone() is None:
+                    raise KeyError(inference_run_id)
+                cursor.execute(
+                    f"""
+                    SELECT count(*) AS count
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.runs run ON run.id = refined.run_id
+                    WHERE run.project_id = %s
+                      AND refined.id = ANY(%s::uuid[])
+                    """,
+                    (
+                        project_id,
+                        [item["refined_detection_id"] for item in normalized],
+                    ),
+                )
+                if int(cursor.fetchone()["count"]) != len(normalized):
+                    raise ValueError(
+                        "Inference batch items must belong to the inference run project."
+                    )
+                cursor.execute(
+                    f"""
+                    SELECT * FROM {self.schema}.classification_inference_batches
+                    WHERE inference_run_id = %s AND request_id = %s
+                    FOR UPDATE
+                    """,
+                    (inference_run_id, request_id),
+                )
+                batch = cursor.fetchone()
+                if batch is None:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.schema}.classification_inference_batches
+                            (project_id, inference_run_id, request_id, batch_index)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (project_id, inference_run_id, request_id, batch_index),
+                    )
+                    batch = cursor.fetchone()
+                    cursor.executemany(
+                        f"""
+                        INSERT INTO {self.schema}.classification_inference_batch_items
+                            (project_id, inference_run_id, batch_id, refined_detection_id,
+                             item_id, input_sha256)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                project_id, inference_run_id, batch["id"],
+                                item["refined_detection_id"], item["item_id"],
+                                item["input_sha256"],
+                            )
+                            for item in normalized
+                        ],
+                    )
+                else:
+                    if int(batch["batch_index"]) != batch_index:
+                        raise ValueError("request_id is already reserved for another batch index")
+                    cursor.execute(
+                        f"""
+                        SELECT refined_detection_id::text, item_id, input_sha256
+                        FROM {self.schema}.classification_inference_batch_items
+                        WHERE batch_id = %s
+                        ORDER BY item_id
+                        """,
+                        (batch["id"],),
+                    )
+                    existing_items = list(cursor.fetchall())
+                    expected_items = sorted(normalized, key=lambda item: item["item_id"])
+                    if existing_items != expected_items:
+                        raise ValueError("request_id is already reserved for different inference inputs")
+            connection.commit()
+        return batch
+
+    def complete_classification_inference_batch(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        request_id: str,
+        results: Sequence[Mapping[str, Any]],
+        error: str | None = None,
+        _connection=None,
+    ) -> dict[str, Any]:
+        """Record V2 outcomes while preserving the first successful item result.
+
+        Oracle Builder may report a retryable per-item failure.  A later
+        success supersedes that failure, but an existing success is immutable.
+        """
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT * FROM {self.schema}.classification_inference_batches
+                    WHERE project_id = %s AND inference_run_id = %s AND request_id = %s
+                    FOR UPDATE
+                    """,
+                    (project_id, inference_run_id, request_id),
+                )
+                batch = cursor.fetchone()
+                if batch is None:
+                    raise KeyError(request_id)
+                for result in results:
+                    status = str(result["status"])
+                    if status not in {"succeeded", "failed"}:
+                        raise ValueError("Inference item status must be succeeded or failed")
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.classification_inference_batch_items
+                        SET status = %s, detail = %s::jsonb, completed_at = NOW()
+                        WHERE batch_id = %s
+                          AND item_id = %s
+                          AND refined_detection_id = %s
+                          AND input_sha256 = %s
+                          AND status <> 'succeeded'
+                        """,
+                        (
+                            status, json.dumps(json_ready(result.get("detail") or {})),
+                            batch["id"], str(result["item_id"]),
+                            str(result["refined_detection_id"]), str(result["input_sha256"]),
+                        ),
+                    )
+                    if cursor.rowcount == 0:
+                        cursor.execute(
+                            f"""
+                            SELECT id FROM {self.schema}.classification_inference_batch_items
+                            WHERE batch_id = %s
+                              AND item_id = %s
+                              AND refined_detection_id = %s
+                              AND input_sha256 = %s
+                            """,
+                            (
+                                batch["id"], str(result["item_id"]),
+                                str(result["refined_detection_id"]), str(result["input_sha256"]),
+                            ),
+                        )
+                        if cursor.fetchone() is None:
+                            raise ValueError(
+                                "Inference result does not match a reserved batch item."
+                            )
+                cursor.execute(
+                    f"""
+                    SELECT count(*) FILTER (WHERE status = 'reserved') AS reserved_count,
+                           count(*) FILTER (WHERE status = 'failed') AS failed_count
+                    FROM {self.schema}.classification_inference_batch_items
+                    WHERE batch_id = %s
+                    """,
+                    (batch["id"],),
+                )
+                counts = cursor.fetchone()
+                if int(counts["reserved_count"]) == 0:
+                    status = "failed" if int(counts["failed_count"]) else "complete"
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.classification_inference_batches
+                        SET status = %s, error_detail = %s, completed_at = NOW()
+                        WHERE id = %s
+                        RETURNING *
+                        """,
+                        (status, error, batch["id"]),
+                    )
+                    batch = cursor.fetchone()
+        return batch
+
+    def list_classification_inference_batches(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the project-scoped V2 batch ledger needed for exact job resume."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT batch.*,
+                           coalesce(
+                               jsonb_agg(
+                                   jsonb_build_object(
+                                       'refined_detection_id', item.refined_detection_id::text,
+                                       'item_id', item.item_id,
+                                       'input_sha256', item.input_sha256,
+                                       'status', item.status,
+                                       'detail', item.detail,
+                                       'completed_at', item.completed_at
+                                   )
+                                   ORDER BY item.item_id
+                               ) FILTER (WHERE item.id IS NOT NULL),
+                               '[]'::jsonb
+                           ) AS items
+                    FROM {self.schema}.classification_inference_batches batch
+                    LEFT JOIN {self.schema}.classification_inference_batch_items item
+                      ON item.batch_id = batch.id
+                    WHERE batch.project_id = %s
+                      AND batch.inference_run_id = %s
+                    GROUP BY batch.id
+                    ORDER BY batch.batch_index, batch.created_at, batch.id
+                    """,
+                    (project_id, inference_run_id),
+                )
+                return list(cursor.fetchall())
 
     def _ensure_classification_artifact(
         self,
@@ -6141,9 +6463,9 @@ class PostgresRepository:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (project_id, artifact_id) DO UPDATE SET
                 run_id = EXCLUDED.run_id,
-                artifact_fingerprint = EXCLUDED.artifact_fingerprint,
                 architecture = EXCLUDED.architecture,
                 contract_version = EXCLUDED.contract_version
+            WHERE {self.schema}.model_artifacts.artifact_fingerprint IS NOT DISTINCT FROM EXCLUDED.artifact_fingerprint
             RETURNING id
             """,
             (
@@ -6157,7 +6479,10 @@ class PostgresRepository:
                 json.dumps(json_ready(model)),
             ),
         )
-        artifact_row_id = str(cursor.fetchone()["id"])
+        artifact_row = cursor.fetchone()
+        if artifact_row is None:
+            raise ValueError("Oracle artifact ID is already registered with a different fingerprint")
+        artifact_row_id = str(artifact_row["id"])
         mappings: dict[int, str] = {}
         for probability in probabilities:
             class_index = int(probability["class_index"])
@@ -6252,10 +6577,10 @@ class PostgresRepository:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (project_id, artifact_id) DO UPDATE SET
                 run_id = EXCLUDED.run_id,
-                artifact_fingerprint = EXCLUDED.artifact_fingerprint,
                 architecture = EXCLUDED.architecture,
                 contract_version = EXCLUDED.contract_version,
                 metadata = {self.schema}.model_artifacts.metadata || EXCLUDED.metadata
+            WHERE {self.schema}.model_artifacts.artifact_fingerprint IS NOT DISTINCT FROM EXCLUDED.artifact_fingerprint
             RETURNING id
             """,
             (
@@ -6269,7 +6594,10 @@ class PostgresRepository:
                 json.dumps(json_ready(model)),
             ),
         )
-        return str(cursor.fetchone()["id"])
+        artifact_row = cursor.fetchone()
+        if artifact_row is None:
+            raise ValueError("Oracle artifact ID is already registered with a different fingerprint")
+        return str(artifact_row["id"])
 
     def prepare_clustering_evidence_context(
         self,
@@ -6300,11 +6628,44 @@ class PostgresRepository:
             model_artifact_id=artifact_row_id,
         )
 
+    def _validate_completed_inference_batch(
+        self,
+        cursor,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        request_id: str,
+        refined_detection_ids: Sequence[str],
+    ) -> None:
+        """Ensure a V2 evidence write follows recorded successful item results."""
+        cursor.execute(
+            f"""
+            SELECT item.refined_detection_id::text
+            FROM {self.schema}.classification_inference_batch_items item
+            JOIN {self.schema}.classification_inference_batches batch
+              ON batch.id = item.batch_id
+            WHERE batch.project_id = %s
+              AND batch.inference_run_id = %s
+              AND batch.request_id = %s
+              AND item.status = 'succeeded'
+              AND item.refined_detection_id = ANY(%s::uuid[])
+            """,
+            (project_id, inference_run_id, request_id, list(refined_detection_ids)),
+        )
+        completed = {str(row["refined_detection_id"]) for row in cursor.fetchall()}
+        expected = {str(value) for value in refined_detection_ids}
+        if completed != expected:
+            raise ValueError(
+                "Evidence may only be stored for successful, reserved Oracle V2 batch items."
+            )
+
     def store_clustering_evidence_batch(
         self,
         *,
         evidence_context: ClusteringEvidenceContext,
         records: Sequence[dict[str, Any]],
+        batch_request_id: str | None = None,
+        _connection=None,
     ) -> list[dict[str, Any]]:
         """Persist Oracle Builder's per-ROI clustering packets idempotently."""
 
@@ -6350,30 +6711,21 @@ class PostgresRepository:
         sql_text = f"""
             INSERT INTO {self.schema}.clustering_evidence ({columns})
             VALUES {", ".join(placeholders for _ in values)}
-            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
-                model_artifact_id = EXCLUDED.model_artifact_id,
-                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
-                embedding_dtype = EXCLUDED.embedding_dtype,
-                embedding_shape = EXCLUDED.embedding_shape,
-                embedding_sha256 = EXCLUDED.embedding_sha256,
-                cluster_index = EXCLUDED.cluster_index,
-                cluster_id = EXCLUDED.cluster_id,
-                similarity = EXCLUDED.similarity,
-                similarity_floor = EXCLUDED.similarity_floor,
-                novelty_similarity_threshold = EXCLUDED.novelty_similarity_threshold,
-                novel = EXCLUDED.novel,
-                abstained = EXCLUDED.abstained,
-                candidate_clusters = EXCLUDED.candidate_clusters,
-                nearest_neighbors = EXCLUDED.nearest_neighbors,
-                evidence_packet = EXCLUDED.evidence_packet,
-                oracle_result = EXCLUDED.oracle_result
+            ON CONFLICT (inference_run_id, refined_detection_id) DO NOTHING
             RETURNING id, refined_detection_id
         """
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
+                if batch_request_id is not None:
+                    self._validate_completed_inference_batch(
+                        cursor,
+                        project_id=evidence_context.project_id,
+                        inference_run_id=evidence_context.inference_run_id,
+                        request_id=batch_request_id,
+                        refined_detection_ids=[str(record["refined_detection_id"]) for record in records],
+                    )
                 cursor.execute(sql_text, tuple(value for row in values for value in row))
                 rows = cursor.fetchall()
-            connection.commit()
         return rows
 
     def prepare_embedding_evidence_context(
@@ -6410,6 +6762,8 @@ class PostgresRepository:
         *,
         evidence_context: EmbeddingEvidenceContext,
         records: Sequence[dict[str, Any]],
+        batch_request_id: str | None = None,
+        _connection=None,
     ) -> list[dict[str, Any]]:
         """Persist Oracle Builder embedding-model results idempotently."""
 
@@ -6440,22 +6794,21 @@ class PostgresRepository:
         sql_text = f"""
             INSERT INTO {self.schema}.embedding_evidence ({columns})
             VALUES {", ".join(placeholder for _ in values)}
-            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
-                model_artifact_id = EXCLUDED.model_artifact_id,
-                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
-                embedding_dtype = EXCLUDED.embedding_dtype,
-                embedding_shape = EXCLUDED.embedding_shape,
-                embedding_sha256 = EXCLUDED.embedding_sha256,
-                embedding_normalized = EXCLUDED.embedding_normalized,
-                output = EXCLUDED.output,
-                oracle_result = EXCLUDED.oracle_result
+            ON CONFLICT (inference_run_id, refined_detection_id) DO NOTHING
             RETURNING id, refined_detection_id
         """
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
+                if batch_request_id is not None:
+                    self._validate_completed_inference_batch(
+                        cursor,
+                        project_id=evidence_context.project_id,
+                        inference_run_id=evidence_context.inference_run_id,
+                        request_id=batch_request_id,
+                        refined_detection_ids=[str(record["refined_detection_id"]) for record in records],
+                    )
                 cursor.execute(sql_text, tuple(value for row in values for value in row))
                 rows = cursor.fetchall()
-            connection.commit()
         return rows
 
     def store_classification_evidence_batch(
@@ -6463,6 +6816,8 @@ class PostgresRepository:
         *,
         evidence_context: ClassificationEvidenceContext,
         records: Sequence[dict[str, Any]],
+        batch_request_id: str | None = None,
+        _connection=None,
     ) -> list[dict[str, Any]]:
         """Persist one Oracle response batch in one database transaction.
 
@@ -6556,32 +6911,20 @@ class PostgresRepository:
         evidence_sql = f"""
             INSERT INTO {self.schema}.classification_evidence ({columns})
             VALUES {", ".join(row_placeholder for _ in values)}
-            ON CONFLICT (inference_run_id, refined_detection_id) DO UPDATE SET
-                predicted_label_id = EXCLUDED.predicted_label_id,
-                predicted_class_index = EXCLUDED.predicted_class_index,
-                predicted_label_name = EXCLUDED.predicted_label_name,
-                confidence = EXCLUDED.confidence,
-                entropy = EXCLUDED.entropy,
-                probability_margin = EXCLUDED.probability_margin,
-                prototype_class_index = EXCLUDED.prototype_class_index,
-                prototype_similarity = EXCLUDED.prototype_similarity,
-                prototype_margin = EXCLUDED.prototype_margin,
-                knn_class_index = EXCLUDED.knn_class_index,
-                knn_agreement = EXCLUDED.knn_agreement,
-                knn_weighted_support = EXCLUDED.knn_weighted_support,
-                knn_margin = EXCLUDED.knn_margin,
-                embedding_payload_ref = EXCLUDED.embedding_payload_ref,
-                embedding_dtype = EXCLUDED.embedding_dtype,
-                embedding_shape = EXCLUDED.embedding_shape,
-                embedding_sha256 = EXCLUDED.embedding_sha256,
-                probabilities = EXCLUDED.probabilities,
-                evidence_packet = EXCLUDED.evidence_packet,
-                oracle_result = EXCLUDED.oracle_result
+            ON CONFLICT (inference_run_id, refined_detection_id) DO NOTHING
             RETURNING id, refined_detection_id
         """
         parameters = tuple(value for row in values for value in row)
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
+                if batch_request_id is not None:
+                    self._validate_completed_inference_batch(
+                        cursor,
+                        project_id=evidence_context.project_id,
+                        inference_run_id=evidence_context.inference_run_id,
+                        request_id=batch_request_id,
+                        refined_detection_ids=[str(record["refined_detection_id"]) for record in records],
+                    )
                 cursor.execute(evidence_sql, parameters)
                 evidence_rows = cursor.fetchall()
                 evidence_ids = [row["id"] for row in evidence_rows]
@@ -6607,8 +6950,118 @@ class PostgresRepository:
                         """,
                         tuple(value for row in neighbor_values for value in row),
                     )
-            connection.commit()
         return evidence_rows
+
+    def finalize_classification_inference_batch(
+        self,
+        *,
+        project_id: str,
+        inference_run_id: str,
+        request_id: str,
+        evidence_kind: str,
+        results: Sequence[Mapping[str, Any]],
+        classification_context: ClassificationEvidenceContext | None = None,
+        classification_records: Sequence[dict[str, Any]] = (),
+        embedding_context: EmbeddingEvidenceContext | None = None,
+        embedding_records: Sequence[dict[str, Any]] = (),
+        clustering_context: ClusteringEvidenceContext | None = None,
+        clustering_records: Sequence[dict[str, Any]] = (),
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically commit V2 item outcomes and their durable evidence.
+
+        A successful ledger item is a recovery boundary: once visible, its
+        primary evidence row must also be visible.  Evidence inserts keep their
+        run/ROI uniqueness constraint, so retries preserve the first committed
+        scientific result even if Oracle produces a different later response.
+        """
+
+        if evidence_kind not in {"classification", "embedding", "clustering"}:
+            raise ValueError("Unsupported inference evidence kind")
+
+        result_item_ids = [str(result["item_id"]) for result in results]
+        result_detection_ids = [str(result["refined_detection_id"]) for result in results]
+        if len(result_item_ids) != len(set(result_item_ids)) or len(result_detection_ids) != len(
+            set(result_detection_ids)
+        ):
+            raise ValueError("An inference batch contains duplicate item outcomes")
+        successful_ids = {
+            str(result["refined_detection_id"])
+            for result in results
+            if str(result["status"]) == "succeeded"
+        }
+
+        def record_ids(records: Sequence[dict[str, Any]]) -> set[str]:
+            ids = [str(record["refined_detection_id"]) for record in records]
+            if len(ids) != len(set(ids)):
+                raise ValueError("An inference batch contains duplicate evidence records")
+            return set(ids)
+
+        class_ids = record_ids(classification_records)
+        embedding_ids = record_ids(embedding_records)
+        cluster_ids = record_ids(clustering_records)
+        primary_ids = {
+            "classification": class_ids,
+            "embedding": embedding_ids,
+            "clustering": cluster_ids,
+        }[evidence_kind]
+        if primary_ids != successful_ids:
+            raise ValueError(
+                "Every successful inference item must have exactly one primary evidence record."
+            )
+        if not (class_ids | embedding_ids | cluster_ids).issubset(successful_ids):
+            raise ValueError("Evidence records may only be supplied for successful items")
+
+        contexts_and_records = (
+            (classification_context, classification_records),
+            (embedding_context, embedding_records),
+            (clustering_context, clustering_records),
+        )
+        for evidence_context, records in contexts_and_records:
+            if records and evidence_context is None:
+                raise ValueError("Evidence records require their prepared evidence context")
+            if evidence_context is not None and (
+                evidence_context.project_id != project_id
+                or evidence_context.inference_run_id != inference_run_id
+            ):
+                raise ValueError("Evidence context does not match the project-scoped inference run")
+
+        with self.connect() as connection:
+            try:
+                batch = self.complete_classification_inference_batch(
+                    project_id=project_id,
+                    inference_run_id=inference_run_id,
+                    request_id=request_id,
+                    results=results,
+                    error=error,
+                    _connection=connection,
+                )
+                if classification_records:
+                    self.store_classification_evidence_batch(
+                        evidence_context=classification_context,
+                        records=classification_records,
+                        batch_request_id=request_id,
+                        _connection=connection,
+                    )
+                if embedding_records:
+                    self.store_embedding_evidence_batch(
+                        evidence_context=embedding_context,
+                        records=embedding_records,
+                        batch_request_id=request_id,
+                        _connection=connection,
+                    )
+                if clustering_records:
+                    self.store_clustering_evidence_batch(
+                        evidence_context=clustering_context,
+                        records=clustering_records,
+                        batch_request_id=request_id,
+                        _connection=connection,
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return batch
 
     def complete_classification_inference_run(
         self,

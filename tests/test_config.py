@@ -133,9 +133,12 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.auth.bootstrap_admin_username is None
     assert config.auth.bootstrap_admin_password is None
     assert config.oracle.enabled is True
-    assert config.oracle.base_url == "http://127.0.0.1:8100"
-    assert config.oracle.default_mask_model == "pelagia-refiner"
-    assert config.oracle.max_items_per_request == 256
+    assert config.oracle.base_url == "http://127.0.0.1:8110"
+    assert config.oracle.default_mask_model == ""
+    assert config.oracle.max_items_per_request == 64
+    assert config.oracle.max_payload_bytes == 32 * 1024 * 1024
+    assert config.oracle.max_output_bytes_per_item == 32 * 1024 * 1024
+    assert config.oracle.retry_attempts == 2
     assert config.artifacts.local_root.as_posix() == ".pelagia"
     assert config.artifacts.plugins.builtin_enabled is True
     assert config.artifacts.plugins.local_path.as_posix() == ".pelagia/plugins"

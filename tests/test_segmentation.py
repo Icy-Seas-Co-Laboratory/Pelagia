@@ -30,13 +30,46 @@ from Pelagia.processing.frame_threshold import (
     threshold_sobel_edges,
 )
 from Pelagia.processing.detection_candidate import live_detection_candidate_wrapper, live_segment_wrapper, segment_frame, threshold_frame
-from Pelagia.processing.detection_recording import build_candidate_detection_record, choose_roi_encoding
+from Pelagia.processing.detection_recording import (
+    build_candidate_detection_record,
+    choose_roi_encoding,
+    component_major_axis_orientation,
+)
 from Pelagia.processing.mask_augmentation import augment_mask
 from Pelagia.processing.roi_assembly import assemble_candidate_rois
 from Pelagia.processing.roi_filter import filter_candidate_rois, should_store_roi_payload
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
+
+
+def test_major_axis_orientation_is_directed_from_axis_midpoint_toward_centroid():
+    mask = np.zeros((3, 7), dtype=np.uint8)
+    mask[0, :5] = 255
+    mask[1, 4:6] = 255
+
+    measurements = component_major_axis_orientation(mask)
+
+    assert measurements.centroid_x == pytest.approx(19 / 7)
+    assert measurements.centroid_y == pytest.approx(2 / 7)
+    assert measurements.major_axis_center_x is not None
+    assert measurements.major_axis_center_y is not None
+    assert measurements.orientation_degrees == pytest.approx(10.822217570357)
+    assert measurements.direction_degrees == pytest.approx(measurements.orientation_degrees)
+
+
+def test_major_axis_direction_is_null_when_centroid_is_on_axis_midpoint():
+    mask = np.zeros((1, 5), dtype=np.uint8)
+    mask[0, :] = 255
+
+    measurements = component_major_axis_orientation(mask)
+
+    assert measurements.centroid_x == 2.0
+    assert measurements.centroid_y == 0.0
+    assert measurements.major_axis_center_x == 2.0
+    assert measurements.major_axis_center_y == 0.0
+    assert measurements.orientation_degrees == 0.0
+    assert measurements.direction_degrees is None
 
 
 def test_roi_storage_tier_uses_padded_image_pixel_count_not_bytes_or_channels():

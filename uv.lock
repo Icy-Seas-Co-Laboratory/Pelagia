@@ -296,7 +296,7 @@ wheels = [
 
 [[package]]
 name = "oracle-data-contracts"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "../oracle-builder/oracle_data_contracts" }
 dependencies = [
     { name = "numpy" },

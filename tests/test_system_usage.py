@@ -44,7 +44,7 @@ def test_system_usage_includes_postgres_storage_location_and_size(tmp_path):
 
     usage = SystemUsageService(AppContext(config=config, repository=UsageRepository())).snapshot()
 
-    assert usage["storage"]["kvstore_default"]["resolved_path"] == str(tmp_path / "kvstore")
+    assert usage["storage"]["kvstore_directory"]["resolved_path"] == str(tmp_path / "kvstore")
     assert usage["storage"]["raw_assets_default"]["resolved_path"] == str(tmp_path / "import")
     database_storage = usage["storage"]["database"]["storage"]
     assert database_storage["available"] is True

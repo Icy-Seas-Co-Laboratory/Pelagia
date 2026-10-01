@@ -1244,19 +1244,19 @@ class FakeKVStore2Status:
 class FakeOracle:
     method_name = "oracle_builder:test-refiner"
 
+    def get_model(self, artifact_id):
+        return {"artifact_id": artifact_id, "fingerprint_sha256": "f" * 64,
+                "capabilities": {"model_task": "segmentation", "request_task": "mask_refinement",
+                                 "required_inputs": ["image", "candidate_mask"], "default_outputs": ["mask"]}}
+
     def list_models(self, *, task="segmentation"):
         return [
             {
-                "alias": "test-refiner",
-                "loaded": True,
-                "available": True,
+                "artifact_id": "test-refiner",
+                "fingerprint_sha256": "f" * 64,
+                "name": "Test refiner",
+                "status": "complete",
                 "task": task,
-                "model": {
-                    "artifact_id": "artifact-test",
-                    "run_id": "run-test",
-                    "task": task,
-                    "architecture": "unet",
-                },
             }
         ]
 
@@ -1288,6 +1288,7 @@ def make_client(*, auth_enabled=False):
         kvstore=kvstore,
         oracle=FakeOracle(),
     )
+    app.state.context._project_kvstores["project-1"] = kvstore
     return TestClient(app), repository, kvstore
 
 
@@ -1390,6 +1391,13 @@ def test_curation_registry_dataset_preview_and_generation_are_consistent(tmp_pat
 
 def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     client, repository, _ = make_client()
+    def evidence_model(artifact_id):
+        task = {"roi-clusters": "clustering", "roi-embeddings": "embedding"}.get(
+            artifact_id, "classification"
+        )
+        return {"artifact_id": artifact_id, "fingerprint_sha256": "f" * 64,
+                "capabilities": {"model_task": task, "request_task": "classification"}}
+    client.app.state.context.oracle.get_model = evidence_model
     label = {"id": "label-1", "name": "copepod", "display_name": "Copepod"}
     roi = {
         "id": "refined-det-1",
@@ -1482,7 +1490,7 @@ def test_curation_api_keeps_model_evidence_and_human_actions_explicit():
     assert options.status_code == 200
     assert options.json()["oracle"]["available_model_count"] == 1
     assert options.json()["oracle"]["available_embedding_model_count"] == 1
-    assert options.json()["models"][0]["alias"] == "test-refiner"
+    assert options.json()["models"][0]["artifact_id"] == "test-refiner"
     assert options.json()["embedding_models"][0]["task"] == "embedding"
     assert options.json()["default_label_dictionary"]["key"] == "pelagia-core@0.1.1"
     assert imported.status_code == 200
@@ -1816,13 +1824,14 @@ def test_api_reports_system_usage_and_preserves_system_use_discovery():
     assert usage["host"]["hostname"]
     assert usage["cpu"]["logical_cpus"] is not None
     assert usage["memory"]["total_bytes"] is not None
-    assert usage["storage"]["kvstore_default"]["available"] is True
+    assert usage["storage"]["kvstore_directory"]["available"] is True
     assert usage["storage"]["raw_assets_default"]["available"] is True
     assert "status" in usage["stress"]
 
     assert use_response.status_code == 200
     use = use_response.json()
-    assert use["storage"] == usage["storage"]
+    assert use["storage"].keys() == usage["storage"].keys()
+    assert use["storage"]["kvstore_directory"]["configured_path"] == usage["storage"]["kvstore_directory"]["configured_path"]
     assert use["common_flows"]["system_usage"] == "GET /system/usage"
 
 
@@ -1928,7 +1937,7 @@ def test_api_exposes_system_config():
     assert "roi_recording" in body["effective"]["processing"]
     assert body["effective"]["processing"]["roi_recording"]["small_roi_encoding"] == "zstd"
     assert body["effective"]["processing"]["roi_recording"]["large_roi_encoding"] == "jpg"
-    assert body["effective"]["kvstore"]["root_path"]
+    assert body["effective"]["kvstore"]["directory"]
     assert body["defaults"]["processing"]["video_ingest"]["n_tile"] == 4
     assert body["defaults"]["processing"]["preprocessing"]["mask_path"] is None
 
@@ -1966,7 +1975,7 @@ def test_api_exposes_system_capabilities():
     assert "roi_refinement" in body["processing"]
     assert "mask_augmentation" in body["processing"]["groups"]
     assert "roi_refinement" in body["processing"]["groups"]
-    assert body["processing"]["roi_refinement"]["supported"]["inference_backend"] == "oracle_builder"
+    assert body["processing"]["roi_refinement"]["supported"]["inference_backend"] == "pelagia_builtin"
     assert body["storage"]["kvstore"]["hash_algorithm_options"] == ["sha256", "blake3"]
 
 
@@ -2068,6 +2077,7 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
 def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_path):
     client, repository, _ = make_client(auth_enabled=True)
     repository.projects.clear()
+    client.app.state.context._project_kvstores.clear()
 
     login = client.post(
         "/auth/login",
@@ -2392,21 +2402,21 @@ def test_api_roi_refinement_options_are_ui_ready():
     body = response.json()
     assert body["pipeline_stage_order"] == [
         "source",
-        "model_selection",
-        "oracle_inference",
+        "refinement_selection",
+        "refinement",
         "expansion",
         "residual_discovery",
         "reconciliation",
         "recording",
     ]
-    assert body["supported"]["inference_backend"] == "oracle_builder"
-    assert body["supported"]["methods"] == ["oracle", "identity"]
+    assert body["supported"]["inference_backend"] == "pelagia_builtin"
+    assert body["supported"]["methods"] == ["heuristic_edge_v1", "oracle", "identity"]
     assert "test-refiner" in body["supported"]["model_refs"]
     assert body["supported"]["oracle"]["status"] == "ready"
     reconciliation_fields = {field["key"]: field for field in body["fields"]["reconciliation"]}
     assert reconciliation_fields["overlap_iou_threshold"]["max"] == 1
     assert body["defaults"]["roi_refinement"]["overlap_reconciliation_enabled"] is True
-    assert body["defaults"]["roi_refinement"]["method"] == "oracle"
+    assert body["defaults"]["roi_refinement"]["method"] == "heuristic_edge_v1"
     residual_fields = {field["key"]: field for field in body["fields"]["residual_discovery"]}
     assert residual_fields["residual_roi_assembly_connectivity"]["options"] == [4, 8]
     assert body["defaults"]["roi_refinement"]["residual_discovery_enabled"] is False
@@ -2433,6 +2443,7 @@ def test_api_roi_refinement_dry_run_resolves_oracle_model_ref():
         "/roi-refinement",
         json={
             "detection_ids": ["det-1"],
+            "method": "oracle",
             "model_ref": "test-refiner",
             "dry_run": True,
         },
@@ -2453,6 +2464,7 @@ def test_api_roi_refinement_oracle_stores_refined_detection():
         "/roi-refinement",
         json={
             "detection_ids": ["det-1"],
+            "method": "oracle",
             "model_ref": "test-refiner",
             "allow_frame_expansion": False,
             "store": True,
@@ -2605,6 +2617,7 @@ def test_api_queue_roi_refinement_job():
         headers=headers,
         json={
             "detection_ids": ["det-1"],
+            "method": "oracle",
             "model_ref": "test-refiner",
             "allow_frame_expansion": False,
             "residual_discovery_enabled": True,
@@ -2625,6 +2638,7 @@ def test_api_queue_roi_refinement_job():
     assert body["job"]["depends_on"] == ["job-1"]
     assert body["job"]["payload"]["detection_ids"] == ["det-1"]
     assert body["job"]["payload"]["model_ref"] == "test-refiner"
+    assert body["job"]["payload"]["model_fingerprint"] == "f" * 64
     assert body["job"]["payload"]["residual_discovery_enabled"] is True
     assert body["job"]["payload"]["residual_min_area"] == 4
     assert body["job"]["payload"]["residual_roi_assembly_connectivity"] == 4
@@ -2641,6 +2655,7 @@ def test_api_queue_roi_refinement_job_dry_run():
         headers=headers,
         json={
             "detection_ids": ["det-1"],
+            "method": "oracle",
             "model_ref": "test-refiner",
             "dry_run": True,
         },
@@ -3515,11 +3530,11 @@ def test_api_rejects_removed_preprocessing_field_parameters():
 
 
 def test_api_can_generate_frame_background(monkeypatch):
-    from Pelagia.api.routes import frame
+    from Pelagia.services.pipeline import PipelineService
 
     calls = []
 
-    def fake_generate_background_for_frames(frame_ids, **kwargs):
+    def fake_generate_background_for_frames(self, frame_ids, **kwargs):
         calls.append((frame_ids, kwargs))
         return {
             "background_payload_ref": "background-key",
@@ -3528,7 +3543,7 @@ def test_api_can_generate_frame_background(monkeypatch):
             "updated_frame_count": len(frame_ids),
         }
 
-    monkeypatch.setattr(frame, "generate_background_for_frames", fake_generate_background_for_frames)
+    monkeypatch.setattr(PipelineService, "generate_background", fake_generate_background_for_frames)
     client, _, _ = make_client()
 
     response = client.post(

@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from ..domain import DetectionRecord
-from .detection_recording import build_candidate_detection_record
+from .detection_recording import build_candidate_detection_record, component_major_axis_orientation
 from .frame_codec import decode_array_payload, encode_array_payload
 from .frame_model import FrameData
 from .frame_preprocess import as_binary_mask, as_grayscale_array
@@ -204,6 +204,13 @@ class DetectionRefinementResult:
             crop_bbox = self.crop_bbox or _detection_crop_bbox(self.candidate_detection)
             area, perimeter, major_axis, minor_axis = _mask_measurements(self.refined_mask)
             min_gray, mean_gray = _gray_stats(self.roi, self.refined_mask)
+            orientation = component_major_axis_orientation(self.refined_mask)
+        metadata.update(
+            {
+                "major_axis_orientation_method": "pca_mask_extent_centroid_direction_v1",
+                "major_axis_orientation_coordinate_system": "image_px_x_right_y_down",
+            }
+        )
         return replace(
             self.candidate_detection,
             bbox_x=int(bbox[0]),
@@ -221,6 +228,20 @@ class DetectionRefinementResult:
             min_gray_value=int(min_gray),
             mean_gray_value=float(mean_gray),
             roi_payload=roi_payload,
+            centroid_x=float(crop_bbox[0]) + orientation.centroid_x,
+            centroid_y=float(crop_bbox[1]) + orientation.centroid_y,
+            major_axis_center_x=(
+                None
+                if orientation.major_axis_center_x is None
+                else float(crop_bbox[0]) + orientation.major_axis_center_x
+            ),
+            major_axis_center_y=(
+                None
+                if orientation.major_axis_center_y is None
+                else float(crop_bbox[1]) + orientation.major_axis_center_y
+            ),
+            major_axis_orientation_degrees=orientation.orientation_degrees,
+            major_axis_direction_degrees=orientation.direction_degrees,
             mask_payload=mask_payload,
             roi_encoding=roi_encoding,
             roi_format=roi_format,

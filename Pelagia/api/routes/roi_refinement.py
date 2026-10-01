@@ -214,6 +214,8 @@ if APIRouter is not None:
         if context.oracle is not None:
             return context.oracle
         model_ref = body.model_ref or context.config.oracle.default_mask_model
+        if not model_ref:
+            raise HTTPException(status_code=422, detail="Select a sealed Oracle mask-model artifact.")
         return OracleRoiRefinementBackend(
             OracleInferenceClient(context.config.oracle),
             model_ref,
@@ -251,6 +253,7 @@ if APIRouter is not None:
     @router.get("/options", response_model=OptionsResponse)
     def get_roi_refinement_options(request: Request) -> dict:
         context = get_context(request)
+        owns_client = context.oracle is None
         client = context.oracle or OracleInferenceClient(context.config.oracle)
         try:
             models = client.list_models(task="segmentation")
@@ -258,6 +261,9 @@ if APIRouter is not None:
         except OracleInferenceError:
             models = []
             oracle_health = {"enabled": context.config.oracle.enabled, "status": "unavailable"}
+        finally:
+            if owns_client:
+                client.close()
         return as_response(
             roi_refinement_capabilities(
                 context.config,
@@ -453,6 +459,31 @@ if APIRouter is not None:
         auth = require_project_write(request)
         options = _resolve_options(request, body)
         model_metadata = _requested_model_metadata(request, body)
+        model_fingerprint = None
+        if body.method == "oracle":
+            model_ref = body.model_ref or context.config.oracle.default_mask_model
+            if not model_ref:
+                raise HTTPException(status_code=422, detail="Select a sealed Oracle mask-model artifact.")
+            client = context.oracle
+            if client is None or callable(getattr(client, "get_model", None)):
+                owns_client = client is None
+                if owns_client:
+                    client = OracleInferenceClient(context.config.oracle)
+                try:
+                    detail = client.get_model(model_ref)
+                except OracleRejectedError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except OracleInferenceError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+                finally:
+                    if owns_client:
+                        client.close()
+                capabilities = detail.get("capabilities") or {}
+                if capabilities.get("request_task") != "mask_refinement":
+                    raise HTTPException(status_code=422, detail="Selected Oracle artifact is not a mask-refinement model.")
+                model_fingerprint = detail.get("fingerprint_sha256")
+                if not isinstance(model_fingerprint, str) or len(model_fingerprint) != 64:
+                    raise HTTPException(status_code=422, detail="Selected Oracle artifact has no valid fingerprint.")
 
         first_detection = repository.get_detection(body.detection_ids[0], project_id=auth.project_id)
         if first_detection is None:
@@ -464,6 +495,7 @@ if APIRouter is not None:
                 None if body.method in {"identity", HEURISTIC_EDGE_METHOD_NAME}
                 else body.model_ref or context.config.oracle.default_mask_model
             ),
+            "model_fingerprint": model_fingerprint,
             "max_iterations": options.max_iterations,
             "expansion_pixels": options.expansion_pixels,
             "edge_touch_margin": options.edge_touch_margin,

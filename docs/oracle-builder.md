@@ -1,62 +1,61 @@
 # Oracle Builder inference
 
-Pelagia does not load or execute ML frameworks. Oracle Builder is the sole
-host for learned ROI mask refinement and future classification tasks. Pelagia
-also provides the deterministic CPU-only `heuristic_edge_v1` refiner.
+Pelagia owns ROI inputs, project scope, processing jobs, human labels, and
+evidence storage. Oracle Builder owns sealed model artifacts, model execution,
+preprocessing, tiling, and thresholding. Pelagia never imports TensorFlow or
+Keras. The default ROI refiner is Pelagia's CPU-only `heuristic_edge_v1`.
 
-Pelagia sends whole ROI crops and candidate masks in bounded NPZ batches.
-Oracle Builder owns model preprocessing, tiling, batching, thresholding, and
-immutable model provenance. Pelagia owns candidate selection, frame expansion,
-residual discovery, overlap reconciliation, measurements, job state, and
-storage.
+## Interactive V2 contract
 
-## Configuration
+Pelagia sends bounded batches to Oracle Builder's Orchestrator at
+`POST /v2/inference/models/{artifact_id}:predict`. The former `/v1/models`
+resident HTTP service and `oracle-serve` are retired. Pelagia selects a sealed
+artifact by its catalog UUID, reads its fingerprint and capabilities, and pins
+the fingerprint on inference requests. A display name is never a selector.
+The Python environment requires `oracle-data-contracts` 0.3.x for the shared
+V2 NPZ encoder and decoder; upgrade that package with this Pelagia release.
+
+Image models for classification, embedding, and clustering share one V2 request
+task (`classification`) and one versioned image-output shape. Pelagia requests
+the fields supported by the selected artifact and records its per-item status,
+request/item IDs, input hash, model fingerprint, output schema version, and
+project-scoped evidence. A null output field is not a human label. Segmentation
+models use the V2 `mask_refinement` task; Oracle returns the final reconstructed
+mask for candidate-delta models. Pelagia retains frame expansion, residual
+discovery, overlap reconciliation, measurement, and refined-ROI publication.
 
 ```toml
 [oracle]
 enabled = true
-base_url = "http://127.0.0.1:8100"
-default_mask_model = "pelagia-refiner"
+base_url = "http://127.0.0.1:8110" # Orchestrator, not the private runtime
+default_mask_model = ""            # sealed catalog artifact UUID, if desired
+default_classification_model = ""  # sealed catalog artifact UUID, if desired
 connect_timeout_seconds = 5
 read_timeout_seconds = 120
-max_items_per_request = 256
-max_payload_bytes = 268435456
+max_items_per_request = 64
+max_payload_bytes = 33554432
+max_output_bytes_per_item = 33554432
+retry_attempts = 2
 ```
 
-Use `PELAGIA_ORACLE_API_TOKEN` for the optional bearer token. Do not put service
-credentials in browser configuration or processing presets.
+Set `PELAGIA_ORACLE_API_TOKEN` to an Oracle Builder analyst-or-higher role
+token. Keep it server-side. The Oracle Builder stack must run its Orchestrator
+and private inference runtime; see its `docs/inference-api.md` for runtime and
+accelerator placement. The private runtime is not a Pelagia endpoint.
 
-Start Oracle Builder before Pelagia refinement workers:
+The HTTP V2 path returns one result per submitted item. Pelagia records progress
+after each completed batch. Oracle Builder does not currently publish a
+separate progress message queue. On an unknown transport outcome, Pelagia may
+repeat the same request with the same correlation IDs and pinned fingerprint;
+evidence writes preserve the first stored result per run and ROI. A fingerprint mismatch
+requires reselecting the intended artifact. Oversized or invalid requests must
+be corrected before retrying.
 
-```bash
-cd ../oracle-builder
-oracle-serve --model pelagia-refiner=/absolute/path/to/sealed/run --port 8100
-```
+`GET /roi-refinement/options` and `GET /curation/options` expose compatible
+catalog models through Pelagia. PelagiaView does not call Oracle Builder.
+Oracle outages fail learned inference without silently substituting an
+identity model. Existing historical evidence remains readable.
 
-`GET /roi-refinement/options` reports Oracle availability and registered mask
-models through Pelagia. PelagiaView never connects to Oracle directly.
-
-Oracle outages fail immediate requests with a service error and cause queued
-jobs to follow normal Pelagia retry policy. There is no silent identity-model
-fallback. Successful refined detections record Oracle request/result IDs,
-artifact/run identity, fingerprint, input hash, threshold, transforms, and
-execution timing.
-
-The default refinement method is `heuristic_edge_v1`. It grows the candidate
-mask through similar local intensity while treating strong oblique gradients as
-barriers; literal horizontal and vertical edges are deliberately ignored to
-avoid line-scan sensor artifacts. Its resolved parameters and edge evidence
-are recorded with every refined ROI. Set `method = "oracle"` to use a learned
-model, or `method = "identity"` for an unchanged promotion.
-
-Identity is an
-explicit non-ML promotion path: each selected candidate becomes a refined ROI
-with the same crop, mask, geometry, and measurements. It does not contact
-Oracle or run expansion, residual discovery, or overlap reconciliation. If a
-candidate crop was not stored, Pelagia may materialize it from the source frame
-before recording the refined ROI.
-
-For line-scan assets, queue `POST /roi-refinement/continuity/jobs` after the
-relevant refinement jobs. The asset metadata must declare `line_scan` (or
-`line_scan_geometry`). This stage creates auditable logical assemblies and link
-decisions across adjacent frames; it never combines frame-local raster payloads.
+Oracle Builder's durable V1 inference runs remain available for explicit
+frozen-dataset batch operations. Pelagia's operational ROI jobs use V2 because
+Pelagia owns and batches those inputs.

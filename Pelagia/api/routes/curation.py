@@ -18,7 +18,9 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..auth import require_project_read, require_project_write
     from ...domain import PipelineStage
-    from ...processing.oracle_client import OracleInferenceClient, OracleInferenceError
+    from ...processing.oracle_client import (
+        OracleInferenceClient, OracleInferenceError, OracleRejectedError,
+    )
     from ...services.pipeline import PipelineService
     from ...services.feature_space import (
         FeatureSpaceError,
@@ -219,6 +221,31 @@ if APIRouter is not None:
             selection=resolved_selection,
         )
         return resolved_model_ref, resolved_selection, target_count
+
+    def _model_fingerprint(request: Request, model_ref: str, evidence_kind: str) -> str | None:
+        context = get_context(request)
+        client = context.oracle
+        if client is not None and not callable(getattr(client, "get_model", None)):
+            return None
+        owns_client = not callable(getattr(client, "get_model", None))
+        if owns_client:
+            client = OracleInferenceClient(context.config.oracle)
+        try:
+            detail = client.get_model(model_ref)
+        except OracleRejectedError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except OracleInferenceError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        finally:
+            if owns_client:
+                client.close()
+        task = str((detail.get("capabilities") or {}).get("model_task") or detail.get("task") or "")
+        if task != evidence_kind:
+            raise HTTPException(status_code=422, detail=f"Selected Oracle artifact is {task or 'unknown'}, not {evidence_kind}.")
+        fingerprint = detail.get("fingerprint_sha256")
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise HTTPException(status_code=422, detail="Selected Oracle artifact has no valid fingerprint.")
+        return fingerprint
 
     @router.get("/options")
     def options(request: Request) -> dict:
@@ -619,12 +646,14 @@ if APIRouter is not None:
         )
         if target_count < 1:
             raise HTTPException(status_code=422, detail="No refined ROIs match this evidence query.")
+        model_fingerprint = _model_fingerprint(request, model_ref, evidence_kind)
         job = PipelineService(get_context(request)).queue(
             PipelineStage.CLASSIFY,
             project_id=auth.project_id,
             payload={
                 "roi_ids": body.roi_ids,
                 "model_ref": model_ref,
+                "model_fingerprint": model_fingerprint,
                 "evidence_kind": evidence_kind,
                 "selection": selection,
             },

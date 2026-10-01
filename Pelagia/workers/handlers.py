@@ -3,9 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import io
+import uuid
 from typing import Any
 
 import numpy as np
+from oracle_data_contracts.inference_v2 import (
+    V2InferenceRequest, V2ResponseOptions, encode_v2_inference_request,
+)
 
 from ..domain import AssetKind, DetectionRecord, FrameRecord, JobStatus, PipelineStage
 from ..domain import normalize_collections
@@ -33,6 +37,7 @@ from ..processing.heuristic_refinement import (
     HeuristicEdgeRefinementParameters,
 )
 from ..processing.oracle_client import OracleInferenceClient, OracleInferenceItem, OracleRoiRefinementBackend
+from ..processing.oracle_evidence import json_image_output, normalize_image_output, IMAGE_OUTPUT_VERSION
 from ..processing.roi_continuity import (
     FrameLocalRoiSegment, LineScanGeometry, RoiContinuityOptions,
     assemble_line_scan_continuity,
@@ -1036,10 +1041,14 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     backend = None
     method = "identity"
     if requested_method == "oracle":
+        model_ref = payload.get("model_ref") or context.config.oracle.default_mask_model
+        if not model_ref:
+            raise ValueError("ROI refinement requires a sealed Oracle artifact ID")
         with measure_phase("refinement.model_resolution"):
             backend = context.oracle or OracleRoiRefinementBackend(
                 OracleInferenceClient(context.config.oracle),
-                payload.get("model_ref") or context.config.oracle.default_mask_model,
+                model_ref,
+                fingerprint=payload.get("model_fingerprint"),
             )
         method = backend.method_name
     elif requested_method == HEURISTIC_EDGE_METHOD_NAME:
@@ -1251,365 +1260,372 @@ def roi_continuity_handler(job: dict[str, Any], context: AppContext) -> dict[str
             "accepted_link_count": len(result.accepted_links), "assembly_count": len(result.assemblies)}
 
 
+def _classification_target_snapshot(repository, *, project_id: str, command: ClassificationCommand) -> list[str]:
+    """Capture the project-scoped target population before evidence writes change it."""
+    selected: list[str] = []
+    after_created_at = None
+    after_id = None
+    while True:
+        rows = repository.list_classification_targets(
+            project_id=project_id, model_ref=command.model_ref,
+            evidence_kind=command.evidence_kind, roi_ids=command.roi_ids,
+            selection=command.selection.to_payload(), limit=1000,
+            after_created_at=after_created_at, after_id=after_id,
+        )
+        if not rows:
+            break
+        selected.extend(str(row["id"]) for row in rows)
+        after_created_at, after_id = rows[-1]["created_at"], str(rows[-1]["id"])
+        if len(rows) < 1000:
+            break
+    return selected
+
+
+def _classification_target_inputs(repository, *, project_id: str, command: ClassificationCommand,
+                                  roi_ids: list[str]) -> list[tuple[dict[str, Any], OracleInferenceItem]]:
+    rows = repository.list_classification_targets(
+        project_id=project_id, model_ref=command.model_ref,
+        evidence_kind=command.evidence_kind, roi_ids=roi_ids,
+        selection={"evidence_state": "all"}, limit=len(roi_ids),
+    )
+    indexed = {str(row["id"]): row for row in rows}
+    if set(indexed) != set(roi_ids):
+        raise RuntimeError("A selected refined ROI is no longer available in this project")
+    prepared = []
+    for roi_id in roi_ids:
+        row = indexed[roi_id]
+        with measure_phase("classification.roi_decode"):
+            image = decode_array_payload(
+                row["roi_payload"],
+                {"kvstore_encoding": row.get("roi_encoding"), "kvstore_format": row.get("roi_format"),
+                 "dtype": row.get("roi_dtype"), "shape": row.get("roi_shape")},
+            )
+        with measure_phase("classification.roi_crop"):
+            crop = refined_bbox_classification_crop(image, row)
+        prepared.append((row, OracleInferenceItem(
+            resource_type="refined_detection", resource_id=roi_id,
+            inputs={"image": crop.image},
+            metadata={"project_id": project_id, "classification_input": crop.metadata},
+        )))
+    return prepared
+
+
 @collect_result_timings(unit_count_key="detection_count")
 def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
-    """Classify refined ROIs through Oracle Builder and persist evidence only."""
-
+    """Persist correlated V2 image evidence without creating human annotations."""
     if context.repository is None:
         raise RuntimeError("Classification handler requires a PostgresRepository.")
     command = ClassificationCommand.from_payload(_job_payload(job))
     project_id = _job_project_id(job, context)
     if project_id is None:
         raise ValueError("Classification jobs require project_id.")
-    target_count = context.repository.count_classification_targets(
-        project_id=project_id,
-        model_ref=command.model_ref,
-        evidence_kind=command.evidence_kind,
-        roi_ids=command.roi_ids,
-        selection=command.selection.to_payload(),
-    )
-    inference_run = context.repository.create_classification_inference_run(
-        project_id=project_id,
-        job_id=None if job.get("id") is None else str(job["id"]),
-        model_selector=command.model_ref,
-        evidence_kind=command.evidence_kind,
-        parameters={
-            "roi_ids": list(command.roi_ids),
-            "selection": command.selection.to_payload(),
-            "target_count": target_count,
-            "evidence_kind": command.evidence_kind,
-            "input_crop_policy": CLASSIFICATION_CROP_POLICY,
-        },
-    )
-    progress = JobProgressReporter(
-        job,
-        context,
-        stage=PipelineStage.CLASSIFY.value,
-        unit="rois",
-        total=target_count,
-    )
-    progress.start(
-        f"Preparing {target_count} refined ROI{'s' if target_count != 1 else ''} for classification"
-    )
     client = context.oracle
     owns_client = not callable(getattr(client, "predict_batch", None))
     if owns_client:
         client = OracleInferenceClient(context.config.oracle)
+    inference_run = None
+    progress = None
     completed = 0
-    after_created_at = None
-    after_id = None
-    batch_size = context.config.oracle.max_items_per_request
-    batch_count = (target_count + batch_size - 1) // batch_size if target_count else 0
     batch_number = 0
-    evidence_context = None
-    clustering_context = None
-    embedding_context = None
+    batch_count = 0
     oracle_execution_ms = 0.0
     oracle_execution_count = 0
     try:
-        while completed < target_count:
-            batch_number += 1
-            progress.update(
-                completed,
-                current={
-                    "phase": "loading_inputs",
-                    "batch": batch_number,
-                    "batch_count": batch_count,
-                },
-                message=f"Loading ROI inputs for batch {batch_number} of {batch_count}",
-                force=True,
-            )
+        detail = client.get_model(command.model_ref)
+        capabilities = detail.get("capabilities") or {}
+        fingerprint = str(detail.get("fingerprint_sha256") or "")
+        if command.model_fingerprint and command.model_fingerprint != fingerprint:
+            raise RuntimeError("Oracle model fingerprint changed after the job was queued")
+        if len(fingerprint) != 64 or capabilities.get("model_task") != command.evidence_kind or capabilities.get("request_task") != "classification":
+            raise RuntimeError("Selected Oracle artifact is incompatible with this evidence job")
+        if capabilities.get("output_schema_name") != "oracle_builder.inference.v2.image_output" or capabilities.get("output_schema_version") != IMAGE_OUTPUT_VERSION:
+            raise RuntimeError("Selected Oracle artifact has an unsupported image output schema")
+        client.warm_model(command.model_ref, fingerprint)
+        with measure_phase("classification.target_database_read"):
+            selected_ids = _classification_target_snapshot(context.repository, project_id=project_id, command=command)
+        requested_batch_size = min(context.config.oracle.max_items_per_request, 64)
+        inference_run = context.repository.create_classification_inference_run(
+            project_id=project_id, job_id=None if job.get("id") is None else str(job["id"]),
+            model_selector=command.model_ref, evidence_kind=command.evidence_kind,
+            artifact_id=command.model_ref, artifact_fingerprint=fingerprint,
+            output_schema_version=IMAGE_OUTPUT_VERSION,
+            parameters={"roi_ids": list(command.roi_ids), "selection": command.selection.to_payload(),
+                        "selected_roi_ids": selected_ids, "target_count": len(selected_ids),
+                        "batch_size": requested_batch_size, "evidence_kind": command.evidence_kind,
+                        "input_crop_policy": CLASSIFICATION_CROP_POLICY},
+        )
+        parameters = inference_run.get("parameters") or {}
+        if isinstance(parameters, str):
+            import json
+            parameters = json.loads(parameters)
+        target_ids = list(parameters.get("selected_roi_ids") or selected_ids)
+        target_count = len(target_ids)
+        batch_size = int(parameters.get("batch_size") or requested_batch_size)
+        if batch_size < 1 or batch_size > 64:
+            raise RuntimeError("Stored Oracle batch size is invalid")
+        progress = JobProgressReporter(job, context, stage=PipelineStage.CLASSIFY.value,
+                                       unit="rois", total=target_count)
+        progress.start(f"Preparing {target_count} refined ROIs for Oracle inference")
+        prior_batches = context.repository.list_classification_inference_batches(
+            project_id=project_id, inference_run_id=str(inference_run["id"]),
+        )
+        completed_prefix = 0
+        for prior_index, batch in enumerate(prior_batches):
+            ids = {str(item["refined_detection_id"]) for item in batch["items"]}
+            expected_slice = set(target_ids[completed_prefix:completed_prefix + len(ids)])
+            if ids != expected_slice or int(batch["batch_index"]) != prior_index:
+                raise RuntimeError("Stored Oracle batch ledger differs from the selected ROI snapshot")
+            completed_prefix += len(ids)
+        if completed_prefix > target_count:
+            raise RuntimeError("Stored Oracle batch ledger exceeds the selected ROI snapshot")
+        batches = list(prior_batches)
+        for start in range(completed_prefix, target_count, batch_size):
+            batches.append({"batch_index": len(batches), "request_id": None,
+                            "items": [{"refined_detection_id": roi_id} for roi_id in target_ids[start:start + batch_size]]})
+        batch_count = len(batches)
+        evidence_context = None
+        embedding_context = None
+        clustering_context = None
+        output_fields = list(capabilities.get("default_outputs") or [])
+        batch_index = 0
+        while batch_index < len(batches):
+            batch = batches[batch_index]
+            batch_number = batch_index + 1
+            progress.checkpoint()
+            if batch["items"] and all(
+                item.get("status") == "succeeded" for item in batch["items"]
+            ):
+                completed += len(batch["items"])
+                progress.update(
+                    completed,
+                    current={"phase": "resuming", "batch": batch_number,
+                             "batch_count": batch_count},
+                    message=f"Recovered completed batch {batch_number} of {batch_count}",
+                )
+                batch_index += 1
+                continue
+            roi_ids = [str(item["refined_detection_id"]) for item in batch["items"]]
+            progress.update(completed, current={"phase": "loading_inputs", "batch": batch_number,
+                                                "batch_count": batch_count},
+                            message=f"Loading ROI inputs for batch {batch_number} of {batch_count}", force=True)
             with measure_phase("classification.target_database_read"):
-                targets = context.repository.list_classification_targets(
-                    project_id=project_id,
-                    model_ref=command.model_ref,
-                    evidence_kind=command.evidence_kind,
-                    roi_ids=command.roi_ids,
-                    selection=command.selection.to_payload(),
-                    limit=batch_size,
-                    after_created_at=after_created_at,
-                    after_id=after_id,
-                )
-            if not targets:
-                break
-            oracle_items: list[OracleInferenceItem] = []
-            for row in targets:
-                with measure_phase("classification.roi_decode"):
-                    image = decode_array_payload(
-                        row["roi_payload"],
-                        {
-                            "kvstore_encoding": row.get("roi_encoding"),
-                            "kvstore_format": row.get("roi_format"),
-                            "dtype": row.get("roi_dtype"),
-                            "shape": row.get("roi_shape"),
-                        },
-                    )
-                with measure_phase("classification.roi_crop"):
-                    classification_crop = refined_bbox_classification_crop(image, row)
-                oracle_items.append(
-                    OracleInferenceItem(
-                        resource_type="refined_detection",
-                        resource_id=str(row["id"]),
-                        inputs={"image": classification_crop.image},
-                        metadata={
-                            "project_id": project_id,
-                            "classification_input": classification_crop.metadata,
-                        },
-                    )
-                )
-            progress.update(
-                completed,
-                current={
-                    "phase": "oracle_inference",
-                    "batch": batch_number,
-                    "batch_count": batch_count,
-                    "batch_size": len(oracle_items),
-                },
-                message=(
-                    f"Oracle Builder is classifying batch {batch_number} of {batch_count} "
-                    f"({len(oracle_items)} ROIs)"
-                ),
-                force=True,
+                pairs = _classification_target_inputs(context.repository, project_id=project_id,
+                                                      command=command, roi_ids=roi_ids)
+            request_id = str(batch.get("request_id") or uuid.uuid5(
+                uuid.NAMESPACE_URL, f"pelagia:oracle:{inference_run['id']}:{batch_number - 1}"))
+            items = []
+            for row, item in pairs:
+                item_id = next((str(old["item_id"]) for old in batch["items"]
+                                if str(old["refined_detection_id"]) == str(row["id"]) and old.get("item_id")), None)
+                item_id = item_id or str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                                    f"pelagia:oracle:{inference_run['id']}:{row['id']}"))
+                items.append(OracleInferenceItem(item.resource_type, item.resource_id,
+                                                 item.inputs, item.metadata, item_id=item_id))
+            prepared = client.prepare_items(items, request_id=request_id)
+            # Split unreserved work by the actual encoded frame size. NPZ
+            # compression varies with image content, so pixel counts alone
+            # cannot enforce Oracle's 32 MiB public request limit.
+            frame_limit = min(context.config.oracle.max_payload_bytes, 32 * 1024 * 1024)
+            frame_options = V2ResponseOptions(
+                outputs=frozenset(output_fields),
+                max_output_bytes=context.config.oracle.max_output_bytes_per_item,
             )
-            responses = client.predict_batch(command.model_ref, oracle_items)
-            if len(responses) != len(targets):
-                raise RuntimeError("Oracle Builder returned an unexpected classification result count")
-            progress.update(
-                completed,
-                current={
-                    "phase": "saving_evidence",
-                    "batch": batch_number,
-                    "batch_count": batch_count,
-                    "batch_size": len(targets),
-                },
-                message=f"Saving evidence from batch {batch_number} of {batch_count}",
-                force=True,
-            )
-            if evidence_context is None and clustering_context is None and embedding_context is None:
-                first_result = responses[0].result
-                first_output = dict(first_result.get("output") or {})
-                expected_type = command.evidence_kind
-                if first_output.get("type") != expected_type:
-                    raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
-                if str((first_result.get("model") or {}).get("task") or "") != command.evidence_kind:
-                    raise RuntimeError(f"Oracle Builder model did not declare {command.evidence_kind} task")
-                if command.evidence_kind == "classification":
-                    with measure_phase("classification.evidence_context_database_write"):
-                        evidence_context = context.repository.prepare_classification_evidence_context(
-                            project_id=project_id,
-                            inference_run_id=str(inference_run["id"]),
-                            model=dict(first_result.get("model") or {}),
-                            probabilities=list(first_output.get("probabilities") or []),
-                        )
-                else:
-                    with measure_phase("clustering.evidence_context_database_write") if command.evidence_kind == "clustering" else measure_phase("classification.evidence_context_database_write"):
-                        context_factory = (
-                            context.repository.prepare_clustering_evidence_context
-                            if command.evidence_kind == "clustering"
-                            else context.repository.prepare_embedding_evidence_context
-                        )
-                        context_value = context_factory(
-                            project_id=project_id,
-                            inference_run_id=str(inference_run["id"]),
-                            model=dict(first_result.get("model") or {}),
-                        )
-                    if command.evidence_kind == "clustering":
-                        clustering_context = context_value
+            def fits_frame(candidate_count: int) -> bool:
+                encoded = encode_v2_inference_request(V2InferenceRequest(
+                    request_id, "classification", prepared[:candidate_count], frame_options,
+                ))
+                return len(encoded) <= frame_limit
+
+            if fits_frame(len(prepared)):
+                fitting = len(prepared)
+            else:
+                lower, upper = 0, len(prepared)
+                while lower + 1 < upper:
+                    middle = (lower + upper) // 2
+                    if fits_frame(middle):
+                        lower = middle
                     else:
-                        embedding_context = context_value
-            evidence_records: list[dict[str, Any]] = []
-            clustering_records: list[dict[str, Any]] = []
-            embedding_records: list[dict[str, Any]] = []
-            for target, response in zip(targets, responses, strict=True):
-                row = response.result
-                execution = row.get("execution") or {}
-                duration_ms = execution.get("duration_ms") if isinstance(execution, dict) else None
-                if isinstance(duration_ms, (int, float)):
-                    oracle_execution_ms += float(duration_ms)
-                    oracle_execution_count += 1
-                with measure_phase("classification.evidence_prepare"):
-                    output = dict(row.get("output") or {})
-                    expected_type = command.evidence_kind
-                    if output.get("type") != expected_type:
-                        raise RuntimeError(f"Oracle Builder model did not return {expected_type} output")
-                    if str((row.get("model") or {}).get("task") or "") != command.evidence_kind:
-                        raise RuntimeError(f"Oracle Builder model did not declare {command.evidence_kind} task")
-                    embedding = output.pop("embedding", None)
-                    clustering_packet = output.pop("clustering_evidence", None)
-                    if command.evidence_kind == "clustering":
-                        clustering_packet = output.pop("evidence", None)
-                    embedding_ref = None
-                    embedding_dtype = None
-                    embedding_shape = None
-                    embedding_sha256 = None
-                    embedding_normalized = output.get("embedding_normalized")
-                if command.evidence_kind == "embedding":
-                    if (
-                        not isinstance(embedding, np.ndarray)
-                        or embedding.dtype != np.dtype("float32")
-                        or embedding.ndim != 1
-                        or embedding.size < 1
-                    ):
-                        raise RuntimeError("Oracle Builder embedding output must contain a non-empty float32 one-dimensional array")
-                    if not np.isfinite(embedding).all():
-                        raise RuntimeError("Oracle Builder embedding output contains non-finite values")
-                    if not isinstance(embedding_normalized, bool):
-                        raise RuntimeError("Oracle Builder embedding output must declare embedding_normalized")
-                if isinstance(embedding, np.ndarray):
-                    with measure_phase("classification.embedding_serialize"):
-                        buffer = io.BytesIO()
-                        np.save(buffer, embedding, allow_pickle=False)
-                        payload = buffer.getvalue()
-                        embedding_sha256 = hashlib.sha256(payload).hexdigest()
-                        embedding_dtype = str(embedding.dtype)
-                        embedding_shape = list(embedding.shape)
-                    kvstore = context.kvstore_for_project(project_id)
-                    if kvstore is not None:
-                        with measure_phase("classification.embedding_store"):
-                            embedding_ref = kvstore.put_store(payload)
-                if command.evidence_kind == "embedding":
-                    if embedding_ref is None:
-                        raise RuntimeError("The project embedding store is unavailable")
-                oracle_result = {
-                    "result_id": row.get("result_id"),
-                    "result_set_id": row.get("result_set_id"),
-                    "input_sha256": row.get("input_sha256"),
-                    "execution": row.get("execution"),
-                    "transport_request_id": response.transport_request_id,
-                }
-                if command.evidence_kind == "classification":
-                    evidence_records.append(
-                        {
-                            "refined_detection_id": str(target["id"]),
-                            "output": output,
-                            "oracle_result": oracle_result,
-                            "embedding_payload_ref": embedding_ref,
-                            "embedding_dtype": embedding_dtype,
-                            "embedding_shape": embedding_shape,
-                            "embedding_sha256": embedding_sha256,
-                        }
-                    )
-                elif command.evidence_kind == "embedding":
-                    embedding_records.append(
-                        {
-                            "refined_detection_id": str(target["id"]),
-                            "output": output,
-                            "oracle_result": oracle_result,
-                            "embedding_payload_ref": embedding_ref,
-                            "embedding_dtype": embedding_dtype,
-                            "embedding_shape": embedding_shape,
-                            "embedding_sha256": embedding_sha256,
-                            "embedding_normalized": embedding_normalized,
-                        }
-                    )
-                if clustering_packet is not None:
-                    if clustering_context is None:
-                        clustering_context = context.repository.prepare_clustering_evidence_context(
-                            project_id=project_id,
-                            inference_run_id=str(inference_run["id"]),
-                            model=dict(row.get("model") or {}),
-                        )
-                    clustering_records.append(
-                        {
-                            "refined_detection_id": str(target["id"]),
-                            "evidence_packet": clustering_packet,
-                            "oracle_result": oracle_result,
-                            "embedding_payload_ref": embedding_ref,
-                            "embedding_dtype": embedding_dtype,
-                            "embedding_shape": embedding_shape,
-                            "embedding_sha256": embedding_sha256,
-                        }
-                    )
-            if evidence_records:
-                with measure_phase("classification.evidence_database_batch_write"):
-                    context.repository.store_classification_evidence_batch(
-                        evidence_context=evidence_context,
-                        records=evidence_records,
-                    )
-            if clustering_records:
-                with measure_phase("clustering.evidence_database_batch_write"):
-                    context.repository.store_clustering_evidence_batch(
-                        evidence_context=clustering_context,
-                        records=clustering_records,
-                    )
-            if embedding_records:
-                with measure_phase("classification.evidence_database_batch_write"):
-                    context.repository.store_embedding_evidence_batch(
-                        evidence_context=embedding_context,
-                        records=embedding_records,
-                    )
-            completed += len(targets)
-            progress.update(
-                completed,
-                current={
-                    "phase": "saving_evidence",
-                    "batch": batch_number,
-                    "batch_count": batch_count,
-                },
-                message=f"Saved evidence for {completed} of {target_count} refined ROIs",
+                        upper = middle
+                fitting = lower
+            if fitting == 0:
+                raise RuntimeError("One ROI exceeds Oracle Builder's configured V2 frame limit")
+            if fitting < len(prepared):
+                if batch.get("request_id"):
+                    raise RuntimeError("A reserved Oracle batch exceeds the current V2 frame limit")
+                remainder = batch["items"][fitting:]
+                batch["items"] = batch["items"][:fitting]
+                batches.insert(batch_index + 1, {
+                    "batch_index": batch_index + 1, "request_id": None,
+                    "items": remainder,
+                })
+                for later_index in range(batch_index + 2, len(batches)):
+                    batches[later_index]["batch_index"] = later_index
+                pairs, items, prepared = pairs[:fitting], items[:fitting], prepared[:fitting]
+                batch_count = len(batches)
+            prepared_by_id = {str(row["id"]): value for (row, _), value in zip(pairs, prepared, strict=True)}
+            ledger_items = [{"refined_detection_id": str(row["id"]), "item_id": value.item_id,
+                             "input_sha256": value.input_sha256}
+                            for (row, _), value in zip(pairs, prepared, strict=True)]
+            context.repository.reserve_classification_inference_batch(
+                project_id=project_id, inference_run_id=str(inference_run["id"]),
+                request_id=request_id, batch_index=batch_number - 1, items=ledger_items,
             )
-            after_created_at = targets[-1]["created_at"]
-            after_id = str(targets[-1]["id"])
-            if len(targets) < batch_size:
-                break
+            already_succeeded = {
+                str(item["item_id"])
+                for item in batch["items"]
+                if item.get("status") == "succeeded" and item.get("item_id")
+            }
+            unresolved = {value.item_id for value in prepared} - already_succeeded
+            for attempt in range(max(1, context.config.oracle.retry_attempts + 1)):
+                progress.update(completed, current={"phase": "oracle_inference", "batch": batch_number,
+                                                    "batch_count": batch_count, "attempt": attempt + 1},
+                                message=f"Oracle inference batch {batch_number} of {batch_count}", force=True)
+                responses = client.predict_batch(command.model_ref, items, fingerprint=fingerprint,
+                                                 task="classification", outputs=output_fields,
+                                                 request_id=request_id)
+                outcomes = []
+                class_records = []
+                embedding_records = []
+                cluster_records = []
+                for (target, _), response in zip(pairs, responses, strict=True):
+                    row = response.result
+                    item_id = str(row["item_id"])
+                    prepared_item = prepared_by_id[str(target["id"])]
+                    if row.get("input_sha256") != prepared_item.input_sha256:
+                        raise RuntimeError("Oracle returned a different ROI input hash")
+                    status = "succeeded" if row.get("status") == "ok" else "failed"
+                    if item_id not in unresolved:
+                        continue
+                    outcomes.append({"item_id": item_id, "refined_detection_id": str(target["id"]),
+                                     "input_sha256": prepared_item.input_sha256, "status": status,
+                                     "detail": row.get("error") or {}})
+                    if status != "succeeded":
+                        continue
+                    output_v2 = dict(row.get("output") or {})
+                    output = normalize_image_output(output_v2, expected_task=command.evidence_kind)
+                    model = dict(row.get("model") or {})
+                    if model.get("artifact_id") != command.model_ref or model.get("artifact_fingerprint") != fingerprint:
+                        raise RuntimeError("Oracle result model differs from the pinned artifact")
+                    execution = row.get("execution") or {}
+                    duration_ms = row.get("duration_ms") or execution.get("duration_ms")
+                    if isinstance(duration_ms, (int, float)):
+                        oracle_execution_ms += float(duration_ms)
+                        oracle_execution_count += 1
+                    if command.evidence_kind == "classification" and evidence_context is None:
+                        with measure_phase("classification.evidence_context_database_write"):
+                            evidence_context = context.repository.prepare_classification_evidence_context(
+                                project_id=project_id, inference_run_id=str(inference_run["id"]),
+                                model=model, probabilities=list(output["probabilities"]),
+                            )
+                    elif command.evidence_kind == "embedding" and embedding_context is None:
+                        embedding_context = context.repository.prepare_embedding_evidence_context(
+                            project_id=project_id, inference_run_id=str(inference_run["id"]), model=model,
+                        )
+                    elif command.evidence_kind == "clustering" and clustering_context is None:
+                        clustering_context = context.repository.prepare_clustering_evidence_context(
+                            project_id=project_id, inference_run_id=str(inference_run["id"]), model=model,
+                        )
+                    embedding = output.pop("embedding", None)
+                    embedding_ref = embedding_dtype = embedding_sha256 = None
+                    embedding_shape = None
+                    if isinstance(embedding, np.ndarray):
+                        with measure_phase("classification.embedding_serialize"):
+                            buffer = io.BytesIO()
+                            np.save(buffer, embedding, allow_pickle=False)
+                            payload = buffer.getvalue()
+                            embedding_sha256 = hashlib.sha256(payload).hexdigest()
+                            embedding_dtype = str(embedding.dtype)
+                            embedding_shape = list(embedding.shape)
+                        kvstore = context.kvstore_for_project(project_id)
+                        if kvstore is not None:
+                            with measure_phase("classification.embedding_store"):
+                                embedding_ref = kvstore.put_store(payload)
+                    if command.evidence_kind in {"embedding", "clustering"} and embedding_ref is None:
+                        raise RuntimeError("The project embedding store is unavailable")
+                    output_packet = dict(output_v2)
+                    if isinstance(output_packet.get("embedding"), dict):
+                        output_packet["embedding"] = {key: value for key, value in output_packet["embedding"].items()
+                                                      if key != "values"}
+                        output_packet["embedding"].update({"payload_ref": embedding_ref,
+                                                           "sha256": embedding_sha256})
+                    output_packet = json_image_output(output_packet)
+                    oracle_result = {
+                        "request_id": request_id, "item_id": item_id,
+                        "result_id": row.get("result_id"), "result_set_id": row.get("result_set_id"),
+                        "input_sha256": prepared_item.input_sha256, "model_fingerprint": fingerprint,
+                        "output_schema_name": output_v2.get("schema_name"),
+                        "output_schema_version": output_v2.get("schema_version"),
+                        "execution": execution, "duration_ms": duration_ms,
+                        "output_packet": output_packet,
+                    }
+                    record = {"refined_detection_id": str(target["id"]), "output": output,
+                              "oracle_result": oracle_result, "embedding_payload_ref": embedding_ref,
+                              "embedding_dtype": embedding_dtype, "embedding_shape": embedding_shape,
+                              "embedding_sha256": embedding_sha256}
+                    if command.evidence_kind == "classification":
+                        class_records.append(record)
+                        if output.get("clustering_evidence") is not None:
+                            if clustering_context is None:
+                                clustering_context = context.repository.prepare_clustering_evidence_context(
+                                    project_id=project_id, inference_run_id=str(inference_run["id"]), model=model)
+                            cluster_records.append({**record, "evidence_packet": output["clustering_evidence"]})
+                    elif command.evidence_kind == "embedding":
+                        embedding_records.append({**record, "embedding_normalized": output["embedding_normalized"]})
+                    else:
+                        cluster_records.append({**record, "evidence_packet": output["clustering_evidence"]})
+                    unresolved.remove(item_id)
+                with measure_phase("classification.evidence_database_batch_write"):
+                    context.repository.finalize_classification_inference_batch(
+                        project_id=project_id,
+                        inference_run_id=str(inference_run["id"]),
+                        request_id=request_id,
+                        evidence_kind=command.evidence_kind,
+                        results=outcomes,
+                        classification_context=evidence_context,
+                        classification_records=class_records,
+                        embedding_context=embedding_context,
+                        embedding_records=embedding_records,
+                        clustering_context=clustering_context,
+                        clustering_records=cluster_records,
+                    )
+                if not unresolved:
+                    break
+            if unresolved:
+                raise RuntimeError(f"Oracle Builder failed {len(unresolved)} ROI items in batch {batch_number}")
+            completed += len(pairs)
+            progress.update(completed, current={"phase": "saving_evidence", "batch": batch_number,
+                                                "batch_count": batch_count},
+                            message=f"Saved evidence for {completed} of {target_count} refined ROIs")
+            batch_index += 1
         progress.checkpoint()
         context.repository.complete_classification_inference_run(
-            str(inference_run["id"]),
-            status="complete",
-            metadata={
-                "completed_count": completed,
-                "input_crop_policy": CLASSIFICATION_CROP_POLICY,
-                "oracle_execution_ms": round(oracle_execution_ms, 3),
+            str(inference_run["id"]), status="complete",
+            metadata={"completed_count": completed, "input_crop_policy": CLASSIFICATION_CROP_POLICY,
+                      "oracle_execution_ms": round(oracle_execution_ms, 3),
+                      "oracle_execution_count": oracle_execution_count},
+        )
+        progress.finish(completed=completed, secondary={"phase": "complete", "batch_count": batch_count},
+                        message=f"Oracle {command.evidence_kind} complete: {completed} refined ROIs")
+        return {"stage": PipelineStage.CLASSIFY.value, "project_id": project_id,
+                "inference_run_id": str(inference_run["id"]), "model_ref": command.model_ref,
+                "model_fingerprint": fingerprint, "evidence_kind": command.evidence_kind,
+                "selection": command.selection.to_payload(), "input_crop_policy": CLASSIFICATION_CROP_POLICY,
+                "detection_count": completed, "oracle_execution_ms": round(oracle_execution_ms, 3),
                 "oracle_execution_count": oracle_execution_count,
-                "oracle_average_execution_ms": (
-                    round(oracle_execution_ms / oracle_execution_count, 3)
-                    if oracle_execution_count
-                    else None
-                ),
-            },
-        )
-        progress.finish(
-            completed=completed,
-            secondary={"phase": "complete", "batch_count": batch_count},
-            message=f"Classification complete: {completed} refined ROIs",
-        )
-        return {
-            "stage": PipelineStage.CLASSIFY.value,
-            "project_id": project_id,
-            "inference_run_id": str(inference_run["id"]),
-            "model_ref": command.model_ref,
-            "evidence_kind": command.evidence_kind,
-            "selection": command.selection.to_payload(),
-            "input_crop_policy": CLASSIFICATION_CROP_POLICY,
-            "detection_count": completed,
-            "oracle_execution_ms": round(oracle_execution_ms, 3),
-            "oracle_execution_count": oracle_execution_count,
-            "oracle_average_execution_ms": (
-                round(oracle_execution_ms / oracle_execution_count, 3)
-                if oracle_execution_count
-                else None
-            ),
-        }
+                "oracle_average_execution_ms": (round(oracle_execution_ms / oracle_execution_count, 3)
+                                                if oracle_execution_count else None)}
     except JobControlInterrupt:
-        # Pause, cancellation, and lease loss are worker-control outcomes, not
-        # failed scientific inference. The worker owns their terminal handling.
         raise
     except Exception as exc:
-        progress.update(
-            completed,
-            current={
-                "phase": "failed",
-                "batch": batch_number,
-                "batch_count": batch_count,
-            },
-            message=f"Classification failed after {completed} of {target_count} ROIs: {exc}",
-            force=True,
-        )
-        context.repository.complete_classification_inference_run(
-            str(inference_run["id"]),
-            status="failed",
-            metadata={"completed_count": completed, "error": str(exc)},
-        )
+        if progress is not None:
+            progress.update(completed, current={"phase": "failed", "batch": batch_number,
+                                                "batch_count": batch_count},
+                            message=f"Oracle evidence failed after {completed} ROIs: {exc}", force=True)
+        if inference_run is not None:
+            context.repository.complete_classification_inference_run(
+                str(inference_run["id"]), status="failed",
+                metadata={"completed_count": completed, "error": str(exc)},
+            )
         raise
     finally:
         if owns_client:

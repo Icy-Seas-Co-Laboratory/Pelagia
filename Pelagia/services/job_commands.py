@@ -381,6 +381,7 @@ class ClassificationCommand(JobCommand):
 
     roi_ids: tuple[str, ...] = ()
     model_ref: str = ""
+    model_fingerprint: str | None = None
     evidence_kind: str = "classification"
     selection: ClassificationTargetSelection = field(default_factory=ClassificationTargetSelection)
 
@@ -400,6 +401,7 @@ class ClassificationCommand(JobCommand):
         return cls(
             roi_ids=roi_ids,
             model_ref=model_ref,
+            model_fingerprint=None if not payload.get("model_fingerprint") else str(payload["model_fingerprint"]),
             evidence_kind=evidence_kind,
             selection=ClassificationTargetSelection.from_payload(selection_payload),
         )
@@ -409,6 +411,7 @@ class ClassificationCommand(JobCommand):
             **self._payload_header(),
             "roi_ids": list(self.roi_ids),
             "model_ref": self.model_ref,
+            "model_fingerprint": self.model_fingerprint,
             "evidence_kind": self.evidence_kind,
             "selection": self.selection.to_payload(),
         }

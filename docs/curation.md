@@ -10,9 +10,9 @@ A model prediction is never written as human ground truth. Selecting **Accept pr
 
 ## Operating the workflow
 
-1. Start Oracle Builder with a classification bundle registered under the selector configured by `oracle.default_classification_model`.
+1. Start Oracle Builder's Orchestrator and private V2 inference runtime. Select a sealed classification artifact ID from the catalog, or configure `oracle.default_classification_model` with that ID.
 2. Run at least one Pelagia worker with the `classify` capability. The standard worker TOML assigns this capability to the existing refinement workers, so a separate process is optional.
-3. Open **ML Evidence** in PelagiaView. Select one or more ready classification and/or embedding models, constrain the refined ROI target query, review the per-model workload, and queue the resulting evidence jobs.
+3. Open **ML Evidence** in PelagiaView. Select one or more sealed classification, embedding, or clustering artifacts, constrain the refined ROI target query, review the per-model workload, and queue the resulting evidence jobs.
 4. Open **Curation** to inspect the resulting evidence in context, explore feature-space outputs, and make explicit human annotation or review decisions. Curation does not enqueue ML inference.
 5. Filter and sort the queue by human state, review state, evidence availability, confidence, disagreement, or telemetry ranges. Assign a project label, then verify, reject, or flag the assertion.
 
@@ -28,9 +28,9 @@ result across page reloads. Pelagia resolves the exact number of eligible ROIs
 before inference and reports input loading, the current Oracle batch, evidence
 storage, completion, and failure through the standard job progress record. The
 worker runtime renews the queue lease while a handler is active, including while
-it is blocked waiting for an Oracle response. Progress advances between batches;
-Oracle Builder's synchronous inference endpoint does not expose per-image
-progress within a submitted batch.
+it is waiting for an Oracle V2 response. Progress advances between batches;
+the V2 endpoint returns per-item results but does not publish a separate
+progress subscription for an in-flight request.
 
 Classification inputs use only the refined detection's `bbox_*` rectangle. The
 worker decodes the stored ROI payload, removes the surrounding `crop_bbox_*`
@@ -42,7 +42,7 @@ Useful keyboard actions in the gallery are `1`–`0` for the first ten labels, a
 
 ## Evidence storage
 
-`detections_refined` is the canonical curatable ROI. Each evidence job creates one `classification_inference_runs` row (the legacy table name is retained for compatibility) and one per-ROI evidence row. Classification jobs write `classification_evidence`; embedding jobs write `embedding_evidence`; legacy clustering jobs write `clustering_evidence`. Probability, prototype, KNN, cluster assignment, similarity, and novelty/abstention summaries are indexed or retained in Postgres. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
+`detections_refined` is the canonical curatable ROI. Each evidence job creates one `classification_inference_runs` row (the legacy table name is retained for compatibility) and one per-ROI evidence row. Classification jobs write `classification_evidence`; embedding jobs write `embedding_evidence`; clustering jobs write `clustering_evidence`. Probability, prototype, KNN, cluster assignment, similarity, and novelty/abstention summaries are indexed or retained in Postgres. Full evidence packets and Oracle result provenance are retained as JSON. Embeddings are NPY-encoded in the project's KVStore and referenced by hash from Postgres.
 
 An embedding packet is evidence about location in a model-defined feature space, not a Pelagia label or biological taxonomy. Clusters, when derived downstream, are run-local and must be interpreted together with the embedding contract, clustering method, and run provenance. Legacy clustering artifacts remain readable; Pelagia does not convert either embedding or clustering evidence into a human assertion.
 
@@ -70,8 +70,8 @@ KNN neighbor identity, class, rank, and similarity are retained. The current Ora
 - `POST /curation/classification-jobs` — asynchronous Oracle classification
 - `POST /curation/embedding-jobs` — asynchronous Oracle embedding evidence
 - `POST /curation/embedding-targets/preview` — preview embedding targets
-- `POST /curation/clustering-jobs` — legacy asynchronous Oracle self-supervised clustering evidence
-- `POST /curation/clustering-targets/preview` — preview legacy clustering targets
+- `POST /curation/clustering-jobs` — asynchronous Oracle clustering evidence
+- `POST /curation/clustering-targets/preview` — preview clustering targets
 - `POST /curation/annotations` — explicit human assertion
 - `POST /curation/annotations/remove` — retire the current assertion while retaining history
 - `POST /curation/reviews` — human verification state

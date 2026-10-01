@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import cv2
@@ -14,6 +15,18 @@ from .frame_model import FrameData
 from .mask_augmentation import as_binary_mask
 from .roi_assembly import CandidateRoi
 from .timing import measure_phase
+
+
+@dataclass(frozen=True, slots=True)
+class MajorAxisOrientation:
+    """Mask-derived position and orientation measurements in local pixel coordinates."""
+
+    centroid_x: float
+    centroid_y: float
+    major_axis_center_x: float | None
+    major_axis_center_y: float | None
+    orientation_degrees: float | None
+    direction_degrees: float | None
 
 
 def frame_metadata_value(frame: FrameData, key: str, default: Any = None) -> Any:
@@ -152,6 +165,7 @@ def build_candidate_detection_record(
         candidate.bbox_w,
         candidate.bbox_h,
     )
+    orientation = component_major_axis_orientation(object_mask)
 
     # Cropped/preprocessed frames carry their original-frame offset in bbox_x/y.
     frame_x_offset = int(getattr(processed_frame, "bbox_x", 0) or 0)
@@ -168,6 +182,18 @@ def build_candidate_detection_record(
         int(crop_x1 - crop_x0),
         int(crop_y1 - crop_y0),
     )
+    centroid_x = frame_x_offset + candidate.bbox_x + orientation.centroid_x
+    centroid_y = frame_y_offset + candidate.bbox_y + orientation.centroid_y
+    major_axis_center_x = (
+        None
+        if orientation.major_axis_center_x is None
+        else frame_x_offset + candidate.bbox_x + orientation.major_axis_center_x
+    )
+    major_axis_center_y = (
+        None
+        if orientation.major_axis_center_y is None
+        else frame_y_offset + candidate.bbox_y + orientation.major_axis_center_y
+    )
 
     metadata = dict(extra_metadata or {})
     metadata.update(candidate.metadata)
@@ -180,6 +206,8 @@ def build_candidate_detection_record(
             "detection_stage": "candidate",
             "mask_kind": "candidate",
             "foreground_polarity": "bright",
+            "major_axis_orientation_method": "pca_mask_extent_centroid_direction_v1",
+            "major_axis_orientation_coordinate_system": "image_px_x_right_y_down",
             "object_bbox": object_bbox,
             "roi_bbox": crop_bbox,
             "padding": int(max(0, padding)),
@@ -216,6 +244,12 @@ def build_candidate_detection_record(
         min_gray_value=min_gray,
         mean_gray_value=mean_gray,
         roi_payload=payload,
+        centroid_x=centroid_x,
+        centroid_y=centroid_y,
+        major_axis_center_x=major_axis_center_x,
+        major_axis_center_y=major_axis_center_y,
+        major_axis_orientation_degrees=orientation.orientation_degrees,
+        major_axis_direction_degrees=orientation.direction_degrees,
         mask_payload=mask_payload,
         crop_bbox_x=int(crop_bbox[0]),
         crop_bbox_y=int(crop_bbox[1]),
@@ -322,6 +356,57 @@ def component_axis_lengths(contour: np.ndarray, width: int, height: int) -> tupl
         except cv2.error:
             pass
     return float(max(width, height)), float(min(width, height))
+
+
+def component_major_axis_orientation(mask: np.ndarray) -> MajorAxisOrientation:
+    """Measure an ROI's PCA major axis and direct it toward its foreground centroid.
+
+    The undirected angle is in image coordinates: 0 degrees points right and 90
+    degrees points down.  Its directed counterpart points from the geometric
+    midpoint of the mask's projected major-axis extent toward the centroid. A
+    circular object has no stable major axis; when the centroid is exactly at
+    the midpoint, only the directed angle is null.
+    """
+    binary = as_binary_mask(mask)
+    rows, columns = np.nonzero(binary)
+    if columns.size == 0:
+        raise ValueError("ROI orientation requires at least one foreground pixel.")
+
+    points = np.column_stack((columns, rows)).astype(np.float64, copy=False)
+    centroid = np.mean(points, axis=0)
+    if len(points) < 2:
+        return MajorAxisOrientation(float(centroid[0]), float(centroid[1]), None, None, None, None)
+
+    covariance = np.cov(points, rowvar=False, bias=True)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    major_variance = float(eigenvalues[-1])
+    minor_variance = float(eigenvalues[0])
+    if major_variance <= 0 or np.isclose(major_variance, minor_variance, rtol=1e-6, atol=1e-12):
+        return MajorAxisOrientation(float(centroid[0]), float(centroid[1]), None, None, None, None)
+
+    vector = np.asarray(eigenvectors[:, -1], dtype=np.float64)
+    # Eigenvectors have arbitrary sign. Choose a stable positive-x (then
+    # positive-y) orientation before resolving the centroid-directed endpoint.
+    if vector[0] < 0 or (np.isclose(vector[0], 0.0) and vector[1] < 0):
+        vector *= -1
+    orientation = float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0)
+
+    projections = points @ vector
+    axis_center = vector * ((float(np.min(projections)) + float(np.max(projections))) / 2.0)
+    centroid_offset = float(np.dot(centroid - axis_center, vector))
+    direction = (
+        None
+        if np.isclose(centroid_offset, 0.0, atol=1e-9)
+        else float((orientation + (0.0 if centroid_offset > 0 else 180.0)) % 360.0)
+    )
+    return MajorAxisOrientation(
+        centroid_x=float(centroid[0]),
+        centroid_y=float(centroid[1]),
+        major_axis_center_x=float(axis_center[0]),
+        major_axis_center_y=float(axis_center[1]),
+        orientation_degrees=orientation,
+        direction_degrees=direction,
+    )
 
 
 def component_gray_stats(gray_crop: np.ndarray, mask: np.ndarray) -> tuple[int, float]:

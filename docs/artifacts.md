@@ -59,8 +59,8 @@ where files live.
 
 ## Model references
 
-`GET /roi-refinement/options` proxies Oracle Builder's model catalog and exposes
-operational aliases plus immutable artifact identity. Pelagia stores the
-resolved artifact/run IDs and fingerprint on refined detections; it does not
-interpret model directories or framework files. See [Oracle Builder
+`GET /roi-refinement/options` proxies Oracle Builder's V2 catalog and exposes
+sealed artifact IDs, friendly names, and model capabilities. Pelagia pins the
+artifact fingerprint for inference and records it on refined detections; it does
+not interpret model directories or framework files. See [Oracle Builder
 inference](oracle-builder.md).

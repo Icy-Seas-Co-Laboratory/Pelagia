@@ -94,8 +94,8 @@ Configure the Oracle Builder service used for learned refinement:
 
 ```toml
 [oracle]
-base_url = "http://127.0.0.1:8100"
-default_mask_model = "pelagia-refiner"
+base_url = "http://127.0.0.1:8110"
+default_mask_model = "" # Optional sealed Oracle Builder catalog artifact UUID
 ```
 
 ## 4. Initialize And Run

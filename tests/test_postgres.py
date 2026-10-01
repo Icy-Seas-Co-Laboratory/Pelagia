@@ -102,6 +102,8 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0024_export_bundles",
             "0025_export_lifecycle",
             "0026_clear_series_work_units",
+            "0027_roi_orientation",
+            "0028_oracle_v2_inference_provenance",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -157,6 +159,11 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.embedding_evidence" in embedding_schema
     assert "'embedding'" in embedding_schema
     assert "{schema}" not in embedding_schema
+    inference_v2_schema = postgres.render_migration(migrations[27], "pelagia_unit")
+    assert "classification_inference_batches" in inference_v2_schema
+    assert "oracle_artifact_fingerprint_sha256" in inference_v2_schema
+    assert "classification_inference_batch_items" in inference_v2_schema
+    assert "{schema}" not in inference_v2_schema
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -188,10 +195,236 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 26
-    assert status["migrations"]["applied_count"] == 26
+    assert status["migrations"]["available_count"] == 28
+    assert status["migrations"]["applied_count"] == 28
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_postgres_reuses_oracle_v2_inference_run_for_job(postgres_repo):
+    project = postgres_repo.create_project(f"oracle-v2-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    job = postgres_repo.create_job(
+        PipelineStage.CLASSIFY,
+        project_id=project_id,
+        payload={},
+    )
+    artifact_id = str(uuid.uuid4())
+    arguments = {
+        "project_id": project_id,
+        "job_id": str(job["id"]),
+        "model_selector": artifact_id,
+        "evidence_kind": "classification",
+        "artifact_id": artifact_id,
+        "artifact_fingerprint": "a" * 64,
+        "output_schema_version": "image_analysis.v1",
+    }
+
+    first = postgres_repo.create_classification_inference_run(**arguments)
+    resumed = postgres_repo.create_classification_inference_run(**arguments)
+
+    assert resumed["id"] == first["id"]
+    assert resumed["oracle_artifact_id"] == artifact_id
+    assert resumed["oracle_artifact_fingerprint_sha256"] == "a" * 64
+    assert postgres_repo.list_classification_inference_batches(
+        project_id=project_id,
+        inference_run_id=str(first["id"]),
+    ) == []
+    with pytest.raises(ValueError, match="different Oracle V2 contract"):
+        postgres_repo.create_classification_inference_run(
+            **(arguments | {"artifact_fingerprint": "b" * 64})
+        )
+
+
+def test_postgres_atomically_commits_oracle_ledger_and_evidence(postgres_repo, monkeypatch):
+    project = postgres_repo.create_project(f"oracle-atomic-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    run_id = str(uuid.uuid4())
+    asset_id = str(uuid.uuid4())
+    frame_id = str(uuid.uuid4())
+    candidate_id = str(uuid.uuid4())
+    refined_id = str(uuid.uuid4())
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.runs
+                    (id, project_id, run_key, instrument, source_path, source_type)
+                    VALUES (%s, %s, %s, 'test', '/tmp/test', 'video')""",
+                (run_id, project_id, f"oracle-atomic-{uuid.uuid4().hex}"),
+            )
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.raw_assets
+                    (id, project_id, run_id, filename, path, kind, checksum, size_bytes)
+                    VALUES (%s, %s, %s, 'test.avi', '/tmp/test.avi', 'video', 'sha256:test', 1)""",
+                (asset_id, project_id, run_id),
+            )
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.frames
+                    (id, run_id, asset_id, frame_index, width, height, kvstore_hash, preview_thumbhash)
+                    VALUES (%s, %s, %s, 0, 1, 1, 'frame-key', %s)""",
+                (frame_id, run_id, asset_id, b"thumb"),
+            )
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.detection_candidate
+                    (id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h)
+                    VALUES (%s, %s, %s, 0, 0, 0, 1, 1)""",
+                (candidate_id, run_id, frame_id),
+            )
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.detections_refined
+                    (id, candidate_detection_id, run_id, frame_id, roi_index,
+                     bbox_x, bbox_y, bbox_w, bbox_h)
+                    VALUES (%s, %s, %s, %s, 0, 0, 0, 1, 1)""",
+                (refined_id, candidate_id, run_id, frame_id),
+            )
+        connection.commit()
+
+    artifact_id = str(uuid.uuid4())
+    inference_run = postgres_repo.create_classification_inference_run(
+        project_id=project_id,
+        job_id=None,
+        model_selector=artifact_id,
+        evidence_kind="classification",
+        artifact_id=artifact_id,
+        artifact_fingerprint="a" * 64,
+        output_schema_version="1.0.0",
+    )
+    inference_run_id = str(inference_run["id"])
+    request_id = str(uuid.uuid4())
+    item_id = str(uuid.uuid4())
+    input_sha256 = "b" * 64
+
+    other_project = postgres_repo.create_project(f"oracle-atomic-other-{uuid.uuid4().hex}")
+    other_artifact_id = str(uuid.uuid4())
+    other_inference_run = postgres_repo.create_classification_inference_run(
+        project_id=str(other_project["id"]),
+        job_id=None,
+        model_selector=other_artifact_id,
+        evidence_kind="classification",
+        artifact_id=other_artifact_id,
+        artifact_fingerprint="c" * 64,
+        output_schema_version="1.0.0",
+    )
+    with pytest.raises(ValueError, match="belong to the inference run project"):
+        postgres_repo.reserve_classification_inference_batch(
+            project_id=str(other_project["id"]),
+            inference_run_id=str(other_inference_run["id"]),
+            request_id=str(uuid.uuid4()),
+            batch_index=0,
+            items=[{
+                "refined_detection_id": refined_id,
+                "item_id": str(uuid.uuid4()),
+                "input_sha256": input_sha256,
+            }],
+        )
+
+    postgres_repo.reserve_classification_inference_batch(
+        project_id=project_id,
+        inference_run_id=inference_run_id,
+        request_id=request_id,
+        batch_index=0,
+        items=[{
+            "refined_detection_id": refined_id,
+            "item_id": item_id,
+            "input_sha256": input_sha256,
+        }],
+    )
+    model = {
+        "artifact_id": artifact_id,
+        "artifact_fingerprint": "a" * 64,
+        "task": "classification",
+    }
+    probabilities = [
+        {"class_index": 0, "label_name": "copepod", "probability": 0.9},
+        {"class_index": 1, "label_name": "other", "probability": 0.1},
+    ]
+    evidence_context = postgres_repo.prepare_classification_evidence_context(
+        project_id=project_id,
+        inference_run_id=inference_run_id,
+        model=model,
+        probabilities=probabilities,
+    )
+    result = {
+        "item_id": item_id,
+        "refined_detection_id": refined_id,
+        "input_sha256": input_sha256,
+        "status": "succeeded",
+    }
+    record = {
+        "refined_detection_id": refined_id,
+        "output": {
+            "decision": {"class_index": 0, "label_name": "copepod"},
+            "probabilities": probabilities,
+            "evidence": {},
+        },
+        "oracle_result": {"item_id": item_id, "input_sha256": input_sha256},
+    }
+
+    original_store = postgres_repo.store_classification_evidence_batch
+
+    def fail_evidence_write(**kwargs):
+        assert kwargs["_connection"] is not None
+        raise RuntimeError("simulated evidence insert failure")
+
+    monkeypatch.setattr(postgres_repo, "store_classification_evidence_batch", fail_evidence_write)
+    with pytest.raises(RuntimeError, match="simulated evidence insert failure"):
+        postgres_repo.finalize_classification_inference_batch(
+            project_id=project_id,
+            inference_run_id=inference_run_id,
+            request_id=request_id,
+            evidence_kind="classification",
+            results=[result],
+            classification_context=evidence_context,
+            classification_records=[record],
+        )
+    assert postgres_repo.list_classification_inference_batches(
+        project_id=project_id, inference_run_id=inference_run_id
+    )[0]["items"][0]["status"] == "reserved"
+
+    monkeypatch.setattr(postgres_repo, "store_classification_evidence_batch", original_store)
+    postgres_repo.finalize_classification_inference_batch(
+        project_id=project_id,
+        inference_run_id=inference_run_id,
+        request_id=request_id,
+        evidence_kind="classification",
+        results=[result],
+        classification_context=evidence_context,
+        classification_records=[record],
+    )
+    batch = postgres_repo.list_classification_inference_batches(
+        project_id=project_id, inference_run_id=inference_run_id
+    )[0]
+    assert batch["status"] == "complete"
+    assert batch["items"][0]["status"] == "succeeded"
+
+    later_record = {
+        **record,
+        "output": {
+            **record["output"],
+            "decision": {"class_index": 1, "label_name": "other"},
+        },
+    }
+    postgres_repo.finalize_classification_inference_batch(
+        project_id=project_id,
+        inference_run_id=inference_run_id,
+        request_id=request_id,
+        evidence_kind="classification",
+        results=[result],
+        classification_context=evidence_context,
+        classification_records=[later_record],
+    )
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT count(*) AS count, min(predicted_class_index) AS predicted_class_index
+                    FROM {postgres_repo.schema}.classification_evidence
+                    WHERE project_id = %s AND inference_run_id = %s
+                      AND refined_detection_id = %s""",
+                (project_id, inference_run_id, refined_id),
+            )
+            evidence = cursor.fetchone()
+            assert evidence["count"] == 1
+            assert evidence["predicted_class_index"] == 0
 
 
 def test_postgres_export_artifacts_are_project_scoped_and_attach_jobs(postgres_repo):
@@ -873,6 +1106,7 @@ def test_registry_source_overwrite_rejects_changed_bytes(postgres_repo, tmp_path
 
 
 def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
+    postgres_repo.ensure_default_project()
     run_id = str(uuid.uuid4())
     asset_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
@@ -1301,6 +1535,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
 
 
 def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(postgres_repo):
+    postgres_repo.ensure_default_project()
     run_id = str(uuid.uuid4())
     asset_id = str(uuid.uuid4())
     planned_run = PlannedRun(
@@ -1747,9 +1982,17 @@ def test_postgres_repository_delete_asset_removes_candidate_and_refined_detectio
                 mean_gray_value=2.0,
                 roi_payload=b"candidate-roi",
                 mask_payload=b"candidate-mask",
+                centroid_x=0.75,
+                centroid_y=1.25,
+                major_axis_center_x=0.5,
+                major_axis_center_y=1.0,
+                major_axis_orientation_degrees=30.0,
+                major_axis_direction_degrees=210.0,
             )
         ],
     )[0]
+    assert candidate["centroid_x"] == 0.75
+    assert candidate["major_axis_direction_degrees"] == 210.0
     refined = postgres_repo.upsert_refined_detections(
         [
             (
@@ -1766,6 +2009,12 @@ def test_postgres_repository_delete_asset_removes_candidate_and_refined_detectio
                     perimeter=8,
                     major_axis_length=2,
                     minor_axis_length=2,
+                    centroid_x=0.75,
+                    centroid_y=1.25,
+                    major_axis_center_x=0.5,
+                    major_axis_center_y=1.0,
+                    major_axis_orientation_degrees=30.0,
+                    major_axis_direction_degrees=210.0,
                     min_gray_value=1,
                     mean_gray_value=2.0,
                     roi_payload=b"refined-roi",
@@ -1775,6 +2024,8 @@ def test_postgres_repository_delete_asset_removes_candidate_and_refined_detectio
         ],
         project_id=project_id,
     )[0]
+    assert refined["centroid_y"] == 1.25
+    assert refined["major_axis_orientation_degrees"] == 30.0
 
     deleted = postgres_repo.delete_asset(asset_id, project_id=project_id)
 
@@ -1798,6 +2049,7 @@ def test_postgres_repository_delete_asset_removes_candidate_and_refined_detectio
 
 
 def test_postgres_repository_creates_and_deletes_project_scoped_live_frame_copy(postgres_repo):
+    postgres_repo.ensure_default_project()
     run_id = str(uuid.uuid4())
     asset_id = str(uuid.uuid4())
     planned_run = PlannedRun(
@@ -2094,6 +2346,7 @@ def test_postgres_repository_reclaims_only_empty_stale_series_planning_steps(pos
 
 
 def test_postgres_repository_cancel_jobs_filters_and_scopes(postgres_repo):
+    postgres_repo.ensure_default_project()
     other_project = postgres_repo.create_project(f"cancel-scope-{uuid.uuid4().hex}")
     queued_job = postgres_repo.create_job(
         PipelineStage.EXTRACT_FRAMES,
@@ -2246,6 +2499,7 @@ def test_postgres_repository_bulk_pause_and_resume_are_stage_scoped(postgres_rep
     assert postgres_repo.get_job(paused_id)["status"] == JobStatus.QUEUED.value
 
 def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
+    postgres_repo.ensure_default_project()
     run_id = str(uuid.uuid4())
     asset_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())

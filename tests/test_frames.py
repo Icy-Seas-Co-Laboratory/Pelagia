@@ -267,8 +267,8 @@ def test_parse_filename_timestamp_utc_handles_camera_names(filename, expected):
 def test_flatfield_correction_uses_column_profile_for_grayscale_data():
     data = np.array([[10, 20], [30, 80]], dtype=np.uint8)
 
-    corrected = flatfield_correction(data, q=0.5, axis=0)
-    row_corrected = flatfield_correction(data, q=0.5, axis=1)
+    corrected = flatfield_correction(data, q=0.5, axis=0, min_field_value=1)
+    row_corrected = flatfield_correction(data, q=0.5, axis=1, min_field_value=1)
 
     np.testing.assert_array_equal(corrected, np.array([[127, 102], [255, 255]], dtype=np.uint8))
     np.testing.assert_array_equal(row_corrected, np.array([[170, 255], [139, 255]], dtype=np.uint8))
@@ -778,7 +778,7 @@ def test_project_kvstore_roots_partition_frame_writes_and_reads(tmp_path):
     np.testing.assert_array_equal(retrieved.read(), data)
 
     other_context = context.for_project("22222222-2222-2222-2222-222222222222")
-    with pytest.raises(KeyError):
+    with pytest.raises(RuntimeError, match="KVStore is required"):
         retrieve_frame(str(row["id"]), context=other_context)
 
 
@@ -1243,7 +1243,8 @@ def test_apply_flatfield_correction_returns_corrected_runtime_frame():
         },
     )
 
-    corrected = apply_flatfield_correction(record, frame=frame, q=0.5, axis=0)
+    corrected = apply_flatfield_correction(record, frame=frame, q=0.5, axis=0,
+                                           min_field_value=1)
 
     np.testing.assert_array_equal(
         corrected.read(),

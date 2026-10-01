@@ -30,7 +30,15 @@ ROI statistics are analysis products: their principal tables use documented
 scientific columns. Non-core metadata is emitted once in `asset_metadata`,
 `frame_metadata`, and `roi_metadata` tables and joined through UUIDs; it is not
 repeated for every ROI. Oversized XLSX tables are partitioned into numbered
-worksheets in the same per-asset workbook. Telemetry bundles also include original source bytes, the import profile,
+worksheets in the same per-asset workbook.
+
+ROI statistics include the foreground centroid, the major-axis geometric
+midpoint, and major-axis angles in image coordinates (0° right, 90° down). The
+undirected orientation is in `[0, 180)`; the directed angle is in `[0, 360)`
+and points from the major-axis midpoint toward the foreground centroid. It is
+null when that direction is geometrically undefined.
+
+Telemetry bundles also include original source bytes, the import profile,
 catalog records, normalized observations, and timeline context for a future
 verified import workflow.
 

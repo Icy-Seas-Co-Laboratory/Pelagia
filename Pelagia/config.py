@@ -160,14 +160,16 @@ class OracleConfig:
     """Connection and batching policy for Oracle Builder inference."""
 
     enabled: bool = True
-    base_url: str = "http://127.0.0.1:8100"
-    default_mask_model: str = "pelagia-refiner"
-    default_classification_model: str = "pelagia-classifier"
+    base_url: str = "http://127.0.0.1:8110"
+    default_mask_model: str = ""
+    default_classification_model: str = ""
     api_token: str | None = None
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 120.0
-    max_items_per_request: int = 256
-    max_payload_bytes: int = 256 * 1024 * 1024
+    max_items_per_request: int = 64
+    max_payload_bytes: int = 32 * 1024 * 1024
+    max_output_bytes_per_item: int = 32 * 1024 * 1024
+    retry_attempts: int = 2
 
 
 @dataclass(slots=True)
@@ -494,7 +496,11 @@ class CoreConfig:
         if resolved_config_path is not None:
             path = Path(resolved_config_path)
             if path.exists():
-                _deep_update(settings, _load_toml_path(path))
+                overrides = _load_toml_path(path)
+                legacy_kvstore = overrides.get("kvstore")
+                if isinstance(legacy_kvstore, dict) and "root_path" in legacy_kvstore:
+                    legacy_kvstore.setdefault("directory", legacy_kvstore.pop("root_path"))
+                _deep_update(settings, overrides)
             elif config_path is not None:
                 raise FileNotFoundError(path)
 
@@ -622,6 +628,8 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "oracle", "read_timeout_seconds", "PELAGIA_ORACLE_READ_TIMEOUT_SECONDS", float)
     _set_from_env(settings, "oracle", "max_items_per_request", "PELAGIA_ORACLE_MAX_ITEMS_PER_REQUEST", int)
     _set_from_env(settings, "oracle", "max_payload_bytes", "PELAGIA_ORACLE_MAX_PAYLOAD_BYTES", int)
+    _set_from_env(settings, "oracle", "max_output_bytes_per_item", "PELAGIA_ORACLE_MAX_OUTPUT_BYTES_PER_ITEM", int)
+    _set_from_env(settings, "oracle", "retry_attempts", "PELAGIA_ORACLE_RETRY_ATTEMPTS", int)
 
     _set_from_env(settings, "auth", "enabled", "PELAGIA_AUTH_ENABLED", _env_bool)
     _set_from_env(settings, "auth", "session_ttl_seconds", "PELAGIA_AUTH_SESSION_TTL_SECONDS", int)
@@ -902,6 +910,8 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             read_timeout_seconds=float(oracle.get("read_timeout_seconds", OracleConfig.read_timeout_seconds)),
             max_items_per_request=int(oracle.get("max_items_per_request", OracleConfig.max_items_per_request)),
             max_payload_bytes=int(oracle.get("max_payload_bytes", OracleConfig.max_payload_bytes)),
+            max_output_bytes_per_item=int(oracle.get("max_output_bytes_per_item", OracleConfig.max_output_bytes_per_item)),
+            retry_attempts=int(oracle.get("retry_attempts", OracleConfig.retry_attempts)),
         ),
         auth=AuthConfig(
             enabled=bool(auth.get("enabled", AuthConfig.enabled)),

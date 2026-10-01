@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from ..config import CoreConfig
 from ..observability import DatabaseLogger
 from ..storage.blob_store import BlobStore, create_kvstore, initialize_kvstore
-from ..storage.postgres import PostgresRepository
+from ..storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository
 
 
 @dataclass(slots=True)
@@ -45,9 +46,11 @@ class AppContext:
             return None
         root_path = project.get("kvstore_root_path")
         if not root_path:
-            if self.kvstore is not None:
+            if resolved_project_id == DEFAULT_PROJECT_ID and self.kvstore is not None:
                 return self.kvstore
-            return None
+            if resolved_project_id == DEFAULT_PROJECT_ID:
+                return None
+            root_path = Path(self.config.kvstore.directory) / "projects" / resolved_project_id
         if self.active_project_id == resolved_project_id and self.kvstore is not None:
             return self.kvstore
         store = create_kvstore(root_path, self.config.kvstore)

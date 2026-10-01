@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Integrated image processing, storage, API, CLI, and worker tools."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "oracle-data-contracts>=0.2,<0.3",
+    "oracle-data-contracts>=0.3,<0.4",
     "numpy",
     "opencv-python>=4.10,<5",
     "psutil>=5.9,<8",

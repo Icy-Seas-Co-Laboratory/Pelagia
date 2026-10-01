@@ -163,8 +163,8 @@ def roi_refinement_capabilities(
     defaults = config.processing.roi_refinement
     allowed_encodings = list(config.image_data_storage.allowed_encodings)
     models = list(oracle_models or [])
-    model_refs = [str(model["alias"]) for model in models if model.get("alias")]
-    if config.oracle.default_mask_model not in model_refs:
+    model_refs = [str(model["artifact_id"]) for model in models if model.get("artifact_id")]
+    if config.oracle.default_mask_model and config.oracle.default_mask_model not in model_refs:
         model_refs.insert(0, config.oracle.default_mask_model)
     return {
         "pipeline_stage_order": [

@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from oracle_data_contracts.inference_v2 import InferenceItem as V2InferenceItem
 
 from Pelagia.config import CoreConfig
 from Pelagia.domain import DetectionRecord, FrameRecord, PipelineStage
@@ -52,6 +53,50 @@ class FakeRepository:
         self.heartbeats = []
         self.job_control = {"status": "leased", "control_reason": None}
         self.paused_jobs = []
+        self.oracle_batches = []
+        self.finalized_oracle_batches = []
+
+    def list_classification_inference_batches(self, **kwargs):
+        return list(self.oracle_batches)
+
+    def reserve_classification_inference_batch(self, **kwargs):
+        self.oracle_batches.append(kwargs)
+        return kwargs
+
+    def complete_classification_inference_batch(self, **kwargs):
+        return kwargs
+
+    def finalize_classification_inference_batch(self, **kwargs):
+        self.finalized_oracle_batches.append(kwargs)
+        self.complete_classification_inference_batch(
+            **{key: kwargs[key] for key in (
+                "project_id", "inference_run_id", "request_id", "results"
+            )}
+        )
+        results_by_item = {
+            str(result["item_id"]): result for result in kwargs["results"]
+        }
+        for batch in self.oracle_batches:
+            if batch["request_id"] != kwargs["request_id"]:
+                continue
+            for item in batch["items"]:
+                result = results_by_item.get(str(item["item_id"]))
+                if result is not None and item.get("status") != "succeeded":
+                    item["status"] = result["status"]
+        for method_name, context_key, records_key in (
+            ("store_classification_evidence_batch", "classification_context", "classification_records"),
+            ("store_embedding_evidence_batch", "embedding_context", "embedding_records"),
+            ("store_clustering_evidence_batch", "clustering_context", "clustering_records"),
+        ):
+            records = kwargs.get(records_key) or []
+            method = getattr(self, method_name, None)
+            if records and callable(method):
+                method(
+                    evidence_context=kwargs[context_key],
+                    records=records,
+                    batch_request_id=kwargs["request_id"],
+                )
+        return kwargs
 
     def get_asset(self, asset_id, **kwargs):
         self.project_calls.append(("get_asset", kwargs.get("project_id")))
@@ -319,6 +364,65 @@ def test_worker_runtime_profile_requires_explicit_non_mixed_stages():
     assert worker_runtime_profile([PipelineStage.SEGMENT, PipelineStage.ROI_REFINEMENT]) == "cpu"
 
 
+def _v2_evidence_oracle(legacy_oracle, *, model_task: str):
+    fingerprint = "f" * 64
+    outputs = {
+        "classification": ["class_probabilities", "primary_decision", "embedding", "embedding_normalized"],
+        "embedding": ["embedding", "embedding_normalized"],
+        "clustering": ["embedding", "embedding_normalized", "cluster_evidence"],
+    }[model_task]
+
+    class Adapter:
+        def get_model(self, artifact_id):
+            return {"artifact_id": artifact_id, "fingerprint_sha256": fingerprint,
+                    "capabilities": {"model_task": model_task, "request_task": "classification",
+                                     "output_schema_name": "oracle_builder.inference.v2.image_output",
+                                     "output_schema_version": "1.0.0", "default_outputs": outputs}}
+
+        def warm_model(self, artifact_id, pinned):
+            assert pinned == fingerprint
+            return {"model": {"artifact_id": artifact_id}}
+
+        def prepare_items(self, items, *, request_id):
+            return [V2InferenceItem.from_array(item.inputs["image"], item_id=item.item_id,
+                                                request_id=request_id) for item in items]
+
+        def predict_batch(self, artifact_id, items, *, fingerprint, task, outputs, request_id):
+            assert fingerprint == "f" * 64 and task == "classification"
+            assert set(outputs) == set(self.get_model(artifact_id)["capabilities"]["default_outputs"])
+            old_rows = legacy_oracle.predict_batch(artifact_id, items)
+            prepared = self.prepare_items(items, request_id=request_id)
+            result = []
+            for old, item in zip(old_rows, prepared, strict=True):
+                original = old.result["output"]
+                embedding = original.get("embedding")
+                normalized = original.get("embedding_normalized", True) if embedding is not None else None
+                evidence = original.get("evidence") or {}
+                cluster = evidence if model_task == "clustering" else original.get("clustering_evidence")
+                output = {
+                    "schema_name": "oracle_builder.inference.v2.image_output", "schema_version": "1.0.0",
+                    "type": "image_analysis", "model_task": model_task,
+                    "class_probabilities": {"classes": original["probabilities"]}
+                    if model_task == "classification" else None,
+                    "primary_decision": original.get("decision") if model_task == "classification" else None,
+                    "embedding": {"values": embedding, "dtype": "float32", "dimension": int(embedding.size),
+                                  "normalized": normalized} if embedding is not None else None,
+                    "embedding_normalized": normalized,
+                    "knn": evidence.get("knn") if model_task == "classification" else None,
+                    "prototype_similarity": evidence.get("prototype") if model_task == "classification" else None,
+                    "secondary_heads": None, "cluster_evidence": cluster, "diagnostics": None,
+                }
+                result.append(type("Response", (), {"transport_request_id": request_id, "result": {
+                    "request_id": request_id, "item_id": item.item_id, "input_sha256": item.input_sha256,
+                    "status": "ok", "result_id": old.result["result_id"], "duration_ms": old.result["execution"]["duration_ms"],
+                    "model": {"artifact_id": artifact_id, "artifact_fingerprint": fingerprint,
+                              "task": model_task}, "output": output,
+                }})())
+            return result
+
+    return Adapter()
+
+
 def test_classification_handler_persists_evidence_without_creating_human_labels():
     repo = FakeRepository()
     stored_evidence = []
@@ -364,7 +468,11 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
     ) or {"id": run_id, **values}
 
     class ClassificationOracle:
+        def __init__(self):
+            self.calls = 0
+
         def predict_batch(self, model_ref, items):
+            self.calls += 1
             assert model_ref == "classifier"
             assert items[0].resource_type == "refined_detection"
             np.testing.assert_array_equal(
@@ -416,9 +524,12 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
             return "embedding-key"
 
     kvstore = ClassificationKVStore()
+    legacy_oracle = ClassificationOracle()
     context = AppContext(
-        config=CoreConfig(), repository=repo, kvstore=kvstore, oracle=ClassificationOracle()
+        config=CoreConfig(), repository=repo, kvstore=kvstore,
+        oracle=_v2_evidence_oracle(legacy_oracle, model_task="classification")
     )
+    context._project_kvstores["project-1"] = kvstore
     result = classification_handler(
         {
             "id": "job-classify",
@@ -450,6 +561,19 @@ def test_classification_handler_persists_evidence_without_creating_human_labels(
     assert completed_runs[-1][1]["status"] == "complete"
     assert not hasattr(repo, "assign_curation_labels")
     assert repo.progress_updates[-1]["progress"]["total"] == 1
+
+    resumed = classification_handler(
+        {
+            "id": "job-classify",
+            "project_id": "project-1",
+            "stage": PipelineStage.CLASSIFY.value,
+            "payload": {"model_ref": "classifier", "roi_ids": []},
+        },
+        context,
+    )
+    assert resumed["detection_count"] == 1
+    assert legacy_oracle.calls == 1
+    assert len(stored_evidence) == 1
 
 
 def test_clustering_handler_persists_cluster_packet_without_classification_labels():
@@ -517,12 +641,14 @@ def test_clustering_handler_persists_cluster_packet_without_classification_label
             assert payload
             return "cluster-embedding-key"
 
+    kvstore = ClusteringKVStore()
     context = AppContext(
         config=CoreConfig(),
         repository=repo,
-        kvstore=ClusteringKVStore(),
-        oracle=ClusteringOracle(),
+        kvstore=kvstore,
+        oracle=_v2_evidence_oracle(ClusteringOracle(), model_task="clustering"),
     )
+    context._project_kvstores["project-1"] = kvstore
     result = classification_handler({
         "id": "job-cluster",
         "project_id": "project-1",
@@ -570,7 +696,10 @@ def test_embedding_handler_persists_embedding_product_without_cluster_evidence()
             assert payload
             return "embedding-key"
 
-    context = AppContext(config=CoreConfig(), repository=repo, kvstore=EmbeddingKVStore(), oracle=EmbeddingOracle())
+    kvstore = EmbeddingKVStore()
+    context = AppContext(config=CoreConfig(), repository=repo, kvstore=kvstore,
+                         oracle=_v2_evidence_oracle(EmbeddingOracle(), model_task="embedding"))
+    context._project_kvstores["project-1"] = kvstore
     result = classification_handler({
         "id": "job-embedding", "project_id": "project-1", "stage": PipelineStage.CLASSIFY.value,
         "payload": {"model_ref": "roi-embedding", "evidence_kind": "embedding", "roi_ids": []},
