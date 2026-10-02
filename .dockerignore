@@ -1,0 +1,14 @@
+.git
+.venv*
+.pelagia
+data
+logs
+reports
+config.toml
+*.pyc
+__pycache__
+.pytest_cache
+tests
+docs
+scripts
+uv.lock

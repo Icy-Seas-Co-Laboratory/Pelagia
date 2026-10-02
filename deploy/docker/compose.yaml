@@ -1,0 +1,96 @@
+name: pelagia
+
+x-backend: &backend
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+    additional_contexts:
+      oracle_contracts: ../../../oracle-builder/oracle_data_contracts
+  image: pelagia/backend:local
+  environment:
+    PELAGIA_DATABASE_DSN: postgresql://pelagia:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/pelagia
+    PELAGIA_KVSTORE_DIRECTORY: /var/lib/pelagia/kvstores
+    PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE: /var/lib/pelagia/kvstores
+    PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR: /var/lib/pelagia/import
+    PELAGIA_ARTIFACTS_LOCAL_ROOT: /var/lib/pelagia/artifacts
+    PELAGIA_ORACLE_BASE_URL: http://orchestrator:8110
+    PELAGIA_ORACLE_API_TOKEN: ${PELAGIA_ORACLE_API_TOKEN:-}
+  volumes:
+    - pelagia_data:/var/lib/pelagia
+  networks: [pelagia, oracle]
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: pelagia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: pelagia
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [pelagia]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pelagia -d pelagia"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/postgres', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    <<: *backend
+    command: ["pelagia", "worker_run", "--stages", "extract_frames,preprocess_frames,background_frames,segment,roi_refinement,roi_continuity,classify,feature_space_analysis,telemetry_import,registry_load,registry_export,registry_generate,export_bundle"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  view:
+    build:
+      context: ../../../PelagiaView
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        PUBLIC_PELAGIA_API_URL: /api
+    image: pelagia/view:local
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+    networks: [pelagia]
+    expose: ["3000"]
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2.10-alpine
+    ports:
+      - "${PELAGIA_BIND_ADDRESS:-127.0.0.1}:${PELAGIA_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [pelagia]
+    depends_on:
+      api:
+        condition: service_healthy
+      view:
+        condition: service_started
+    restart: unless-stopped
+
+networks:
+  pelagia:
+  oracle:
+    # Created by oracle-builder/deploy/docker/compose.yaml.
+    external: true
+    name: oracle-builder
+
+volumes:
+  postgres_data:
+  pelagia_data:

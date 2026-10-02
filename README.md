@@ -153,6 +153,12 @@ dev_project_key = "default"
 `PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`, `PELAGIA_AUTH_ENABLED`,
 `PELAGIA_AUTH_SESSION_TTL_SECONDS`, and `PELAGIA_AUTH_DEV_PROJECT_KEY`.
 
+### Docker deployment
+
+For a single-host deployment with PelagiaView, PostgreSQL, CPU workers, and
+Oracle Builder's existing Docker stack, see the
+[Docker deployment guide](deploy/docker/README.md).
+
 ### Initialize And Run The Backend
 
 Initialize the database schema and bootstrap the admin user:
