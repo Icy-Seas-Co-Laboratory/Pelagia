@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .builder import DatasetBuilder
+from .constants import FORMAT_VERSION, LIBRARY_VERSION, SCHEMA_VERSION
 from .dataset import Dataset
 from .exceptions import InterchangeError
 from .extraction import extract_frames
@@ -23,6 +24,11 @@ def _range(value: str) -> tuple[int | None, int | None]:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="pii", description="Scientific Image Interchange tools")
+    root.add_argument(
+        "--version",
+        action="version",
+        version=f"pii {LIBRARY_VERSION} (format {FORMAT_VERSION}, schema {SCHEMA_VERSION})",
+    )
     commands = root.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create", help="create a dataset, optionally ingesting a directory of videos")
     create.add_argument("output", type=Path, nargs="?"); create.add_argument("--title"); create.add_argument("--description", default="")

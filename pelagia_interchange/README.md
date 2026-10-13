@@ -8,6 +8,7 @@ From the Pelagia repository:
 
 ```bash
 python -m pip install ./pelagia_interchange
+pii --version
 pii --help
 ```
 

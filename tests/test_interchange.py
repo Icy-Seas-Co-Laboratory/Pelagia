@@ -16,6 +16,7 @@ from pelagia_interchange import (
     Manifest, Metadata, ShardWriter, StorageFormat, Validator,
 )
 from pelagia_interchange.cli import main
+from pelagia_interchange.constants import FORMAT_VERSION, LIBRARY_VERSION, SCHEMA_VERSION
 from pelagia_interchange.extraction import extract_frames
 from pelagia_interchange.ingestion import (
     VideoIngestionError,
@@ -30,6 +31,15 @@ from pelagia_interchange.util import hash_file
 
 JPEG = b"\xff\xd8synthetic-jpeg\xff\xd9"
 PNG = b"\x89PNG\r\n\x1a\nsynthetic"
+
+
+def test_pii_reports_library_and_format_versions(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as result:
+        main(["--version"])
+    assert result.value.code == 0
+    assert capsys.readouterr().out.strip() == (
+        f"pii {LIBRARY_VERSION} (format {FORMAT_VERSION}, schema {SCHEMA_VERSION})"
+    )
 
 
 def build(path: Path, *, count: int = 5, target: int = 10_000, cameras: tuple[str, ...] = ("port",)) -> Dataset:
