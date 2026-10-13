@@ -334,6 +334,13 @@ level = "INFO"
 console = true
 max_bytes = 10485760
 backup_count = 10
+# PostgreSQL operational events; workers delete expired rows in bounded batches.
+high_frequency_retention_days = 7
+job_event_retention_days = 90
+routine_log_retention_days = 90
+important_log_retention_days = 365
+cleanup_interval_seconds = 300
+cleanup_batch_size = 2000
 
 [artifacts]
 # Local runtime library for plugin manifests and future non-ML packs.

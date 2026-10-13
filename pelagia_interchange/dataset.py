@@ -111,6 +111,32 @@ class Dataset:
             "validation": self.manifest.validation,
         }
 
+    def manifest_summary(self) -> dict:
+        """Summarize declared package metadata without opening shards or walking the tree."""
+        timestamps = [(shard.get("first_timestamp"), shard.get("last_timestamp")) for shard in self.manifest.shards]
+        resource_bytes = sum(int(item["byte_size"]) for item in (*self.manifest.calibration, *self.manifest.previews))
+        return {
+            "format": self.manifest.format,
+            "format_version": self.manifest.format_version,
+            "schema_version": self.manifest.schema_version,
+            "dataset_uuid": self.manifest.dataset_uuid,
+            "state": self.manifest.state,
+            "title": self.metadata.title,
+            "collection": self.metadata.data.get("collection", {}),
+            "instruments": self.metadata.data.get("instruments", []),
+            "streams": self.metadata.data.get("streams", []),
+            "acquisition_segments": len(self.manifest.acquisition_segments),
+            "shards": len(self.manifest.shards),
+            "total_frames": self.frame_count,
+            "encoded_image_bytes": self.encoded_bytes,
+            "declared_data_bytes": sum(int(shard["byte_size"]) for shard in self.manifest.shards) + resource_bytes,
+            "timestamp_range_ns": {
+                "first": min((start for start, _ in timestamps if start is not None), default=None),
+                "last": max((end for _, end in timestamps if end is not None), default=None),
+            },
+            "validation": self.manifest.validation,
+        }
+
     def regenerate_checksums(self) -> Path:
         """Regenerate package checksums after an intentional metadata/history edit."""
         paths = sorted(path for path in self.root.rglob("*") if path.is_file()

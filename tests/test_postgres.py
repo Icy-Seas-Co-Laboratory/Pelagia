@@ -104,6 +104,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0026_clear_series_work_units",
             "0027_roi_orientation",
             "0028_oracle_v2_inference_provenance",
+            "0029_operational_log_retention",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -195,8 +196,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 28
-    assert status["migrations"]["applied_count"] == 28
+    assert status["migrations"]["available_count"] == 29
+    assert status["migrations"]["applied_count"] == 29
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -865,7 +866,7 @@ def test_postgres_worker_can_start_without_any_projects(postgres_repo):
         for event in events
         if event["payload"].get("worker_id") == "projectless-worker"
     }
-    assert {"worker.touched", "worker.shutdown_requested"} <= event_types
+    assert event_types == {"worker.shutdown_requested"}
     assert postgres_repo.list_logs(worker_id="projectless-worker") == []
 
 
@@ -1508,7 +1509,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
         for event in postgres_repo.list_job_events(limit=100)
         if event["payload"].get("worker_id") == "pytest-worker"
     ]
-    assert "worker.touched" in [event["event_type"] for event in worker_events]
+    assert "worker.touched" not in [event["event_type"] for event in worker_events]
 
     log_row = postgres_repo.append_log(
         event_type="pipeline.extract_timed",
@@ -1532,6 +1533,66 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     )
     assert logs[0]["payload"] == {"frame_count": 2}
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
+
+
+def test_postgres_operational_log_cleanup_is_bounded_and_preserves_recent_rows(postgres_repo):
+    project = postgres_repo.ensure_default_project()
+    project_id = str(project["id"])
+    old_progress = postgres_repo.append_job_event(None, "job.progress_updated", {"worker_id": "old"})
+    old_event = postgres_repo.append_job_event(None, "job.completed", {})
+    old_debug = postgres_repo.append_log(project_id=project_id, event_type="job.progress_updated", level="debug")
+    old_routine = postgres_repo.append_log(project_id=project_id, event_type="pipeline.completed", level="info")
+    old_routine_2 = postgres_repo.append_log(project_id=project_id, event_type="pipeline.completed", level="info")
+    old_important = postgres_repo.append_log(project_id=project_id, event_type="jobs.deleted", level="info")
+    recent = postgres_repo.append_log(project_id=project_id, event_type="pipeline.recent", level="info")
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            for table, row_id, age_days in (
+                ("job_events", old_progress["id"], 10),
+                ("job_events", old_event["id"], 100),
+                ("logs", old_debug["id"], 10),
+                ("logs", old_routine["id"], 100),
+                ("logs", old_routine_2["id"], 100),
+                ("logs", old_important["id"], 400),
+            ):
+                cursor.execute(
+                    f"UPDATE {postgres_repo.schema}.{table} SET created_at = NOW() - (%s * INTERVAL '1 day') WHERE id = %s",
+                    (age_days, row_id),
+                )
+        connection.commit()
+
+    postgres_repo.config.logging.cleanup_batch_size = 1
+    preview = postgres_repo.prune_operational_logs(dry_run=True)
+    assert preview["deleted"]["logs_routine"] == 2
+    assert all(count == 1 for name, count in preview["deleted"].items() if name != "logs_routine")
+    first_pass = postgres_repo.prune_operational_logs()
+    assert all(count == 1 for count in first_pass["deleted"].values())
+    assert postgres_repo.prune_operational_logs()["deleted"]["logs_routine"] == 1
+    assert postgres_repo.prune_operational_logs(dry_run=True)["deleted"] == {
+        name: 0 for name in preview["deleted"]
+    }
+    assert postgres_repo.list_logs(event_type="pipeline.recent")[0]["id"] == recent["id"]
+
+
+def test_postgres_job_telemetry_avoids_redundant_log_rows(postgres_repo):
+    project = postgres_repo.create_project(f"telemetry-{uuid.uuid4().hex}")
+    job = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))
+    claim = postgres_repo.claim_jobs("telemetry-worker", stages=[PipelineStage.EXTRACT_FRAMES], limit=1)[0]
+    job_id = str(job["id"])
+    lease_token = str(claim["lease_token"])
+
+    assert postgres_repo.heartbeat("telemetry-worker", job_id, lease_token=lease_token) is not None
+    assert postgres_repo.update_job_progress(
+        job_id, {"completed": 1}, worker_id="telemetry-worker", lease_token=lease_token,
+    ) is not None
+    postgres_repo.touch_worker("telemetry-worker", status="working", leased_job_id=job_id)
+
+    event_types = [row["event_type"] for row in postgres_repo.list_job_events(job_id=job_id)]
+    assert "job.progress_updated" in event_types
+    assert "job.heartbeat" not in event_types
+    assert postgres_repo.list_logs(job_id=job_id, event_type="job.progress_updated") == []
+    worker_events = postgres_repo.list_job_events(limit=100)
+    assert not any(row["event_type"] in {"worker.heartbeat", "worker.touched"} for row in worker_events)
 
 
 def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(postgres_repo):
@@ -2556,7 +2617,7 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     assert result["tables"]["processing_jobs"] == 1
     assert result["tables"]["worker_sessions"] == 1
     assert result["tables"]["models"] == 1
-    assert result["tables"]["job_events"] >= 2
+    assert result["tables"]["job_events"] >= 1
     assert result["exact_counts_collected"] is True
     assert postgres_repo.list_runs() == []
     assert postgres_repo.list_assets() == []

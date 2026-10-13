@@ -8155,6 +8155,8 @@ class PostgresRepository:
             (job_id, event_type, json.dumps(json_ready(payload or {}))),
         )
         row = cursor.fetchone()
+        if event_type == "job.progress_updated":
+            return row
         log_payload = dict(payload or {})
         project_id = log_payload.get("project_id")
         run_id = log_payload.get("run_id")
@@ -8312,6 +8314,54 @@ class PostgresRepository:
                     tuple(params),
                 )
                 return cursor.fetchall()
+
+    def prune_operational_logs(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Remove expired operational events in small, cross-worker coordinated batches."""
+        logging_config = self.config.logging
+        batch_size = logging_config.cleanup_batch_size
+        high_frequency = "event_type IN ('job.progress_updated', 'job.heartbeat', 'worker.heartbeat', 'worker.touched')"
+        important = "(level IN ('warning', 'error', 'critical') OR event_type = 'jobs.deleted')"
+        rules = (
+            ("job_events_high_frequency", "job_events", high_frequency, logging_config.high_frequency_retention_days),
+            ("job_events_other", "job_events", f"NOT ({high_frequency})", logging_config.job_event_retention_days),
+            ("logs_high_frequency", "logs", f"NOT {important} AND {high_frequency}", logging_config.high_frequency_retention_days),
+            ("logs_routine", "logs", f"NOT {important} AND NOT ({high_frequency})", logging_config.routine_log_retention_days),
+            ("logs_important", "logs", important, logging_config.important_log_retention_days),
+        )
+        result: dict[str, Any] = {"dry_run": dry_run, "acquired": False, "deleted": {}}
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                if not dry_run:
+                    cursor.execute(
+                        "SELECT pg_try_advisory_xact_lock(63827, hashtext(%s)) AS acquired",
+                        (self.schema,),
+                    )
+                    if not cursor.fetchone()["acquired"]:
+                        return result
+                result["acquired"] = True
+                for name, table, predicate, days in rules:
+                    cutoff = f"created_at < NOW() - (%s * INTERVAL '1 day') AND {predicate}"
+                    if dry_run:
+                        cursor.execute(f"SELECT count(*) AS total FROM {self.schema}.{table} WHERE {cutoff}", (days,))
+                        result["deleted"][name] = int(cursor.fetchone()["total"])
+                    else:
+                        cursor.execute(
+                            f"""
+                            WITH victims AS (
+                                SELECT id FROM {self.schema}.{table}
+                                WHERE {cutoff}
+                                ORDER BY created_at, id
+                                LIMIT %s
+                                FOR UPDATE SKIP LOCKED
+                            )
+                            DELETE FROM {self.schema}.{table} rows
+                            USING victims WHERE rows.id = victims.id
+                            """,
+                            (days, batch_size),
+                        )
+                        result["deleted"][name] = cursor.rowcount
+            connection.commit()
+        return result
 
     def set_job_priority(
         self,
@@ -8675,19 +8725,6 @@ class PostgresRepository:
                     ),
                 )
                 row = cursor.fetchone()
-                if row is not None:
-                    self._append_worker_event(
-                        cursor,
-                        "worker.touched",
-                        worker_id,
-                        {
-                            "pid": row.get("pid"),
-                            "status": row.get("status"),
-                            "leased_job_id": row.get("leased_job_id"),
-                            "capabilities": row.get("capabilities"),
-                            "shutdown_requested": row.get("shutdown_requested"),
-                        },
-                    )
             connection.commit()
         return row
 
@@ -8758,19 +8795,6 @@ class PostgresRepository:
                         RETURNING *;
                         """,
                         (job_id, worker_id),
-                    )
-                if job_row is not None:
-                    self._append_job_event(
-                        cursor,
-                        job_id,
-                        "job.heartbeat",
-                        {"worker_id": worker_id, "lease_token": lease_token},
-                    )
-                    self._append_worker_event(
-                        cursor,
-                        "worker.heartbeat",
-                        worker_id,
-                        {"job_id": job_id, "lease_token": lease_token},
                     )
             connection.commit()
         return job_row

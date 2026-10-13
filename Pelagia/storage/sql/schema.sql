@@ -1054,6 +1054,7 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_has_refined
 CREATE INDEX IF NOT EXISTS idx_{schema}_frame_processing_status_collections
     ON {schema}.frame_processing_status USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_job_id ON {schema}.job_events (job_id, id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_job_events_created_at ON {schema}.job_events (created_at, id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_job_dispatches_pending
     ON {schema}.processing_job_dispatches (available_at, created_at) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_{schema}_logs_created_at ON {schema}.logs (created_at DESC, id DESC);

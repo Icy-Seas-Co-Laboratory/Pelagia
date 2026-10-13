@@ -367,6 +367,7 @@ class Worker:
 
         stop = stop_event or Event()
         last_requeue_at = 0.0
+        last_cleanup_at: float | None = None
         self._touch("idle", stages=stages, shutdown_requested=False)
         try:
             while not stop.is_set():
@@ -377,6 +378,15 @@ class Worker:
                 if now - last_requeue_at >= requeue_interval_seconds:
                     self.context.repository.requeue_expired_jobs()
                     last_requeue_at = now
+
+                cleanup = getattr(self.context.repository, "prune_operational_logs", None)
+                cleanup_interval = self.context.config.logging.cleanup_interval_seconds
+                if callable(cleanup) and (last_cleanup_at is None or now - last_cleanup_at >= cleanup_interval):
+                    try:
+                        cleanup()
+                    except Exception:
+                        get_core_logger("worker").exception("Operational log cleanup failed")
+                    last_cleanup_at = now
 
                 claimed = self.run_once(stages=stages)
                 if claimed == 0:

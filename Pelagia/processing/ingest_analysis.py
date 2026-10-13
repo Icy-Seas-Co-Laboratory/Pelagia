@@ -300,7 +300,6 @@ def analyze_interchange_asset(
     if not is_interchange_dataset(resolved):
         raise ValueError(f"Path is not a pelagia_interchange dataset: {resolved}")
     dataset = Dataset.open(resolved)
-    package_size = sum(item.stat().st_size for item in resolved.rglob("*") if item.is_file())
     checksum_catalog = resolved / "checksums.sha256"
     checksum = f"sha256:{sha256_file(checksum_catalog)}"
     dataset_metadata = dict(dataset.metadata.data)
@@ -311,7 +310,20 @@ def analyze_interchange_asset(
     resolved_collections = normalize_collections(
         collections if collections is not None else [inferred_collection]
     )
-    summary = dataset.summary()
+    summary = dataset.manifest_summary()
+    metadata_bytes = sum(
+        (resolved / name).stat().st_size
+        for name in ("manifest.json", "metadata.toml", "history.jsonl", "checksums.sha256")
+    )
+    readme = resolved / "README.md"
+    if readme.is_file():
+        metadata_bytes += readme.stat().st_size
+    tools = resolved / "tools"
+    if tools.is_dir():
+        metadata_bytes += sum(path.stat().st_size for path in tools.iterdir() if path.is_file())
+    package_size = summary["declared_data_bytes"] + metadata_bytes
+    summary["package_bytes"] = package_size
+    summary["package_size_source"] = "manifest"
     asset_metadata = {
         **dict(metadata or {}),
         "analysis_endpoint": "POST /ingestion/analyze",

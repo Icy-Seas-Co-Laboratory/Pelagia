@@ -2079,6 +2079,8 @@ def test_worker_materializes_successor_dispatch_only_after_parent_completion():
 
 def test_worker_run_forever_requeues_and_stops_from_event():
     repo = FakeRepository()
+    cleanup_calls = []
+    repo.prune_operational_logs = lambda: cleanup_calls.append(True)
     stop_after_one_loop = []
 
     class StopEvent:
@@ -2102,6 +2104,7 @@ def test_worker_run_forever_requeues_and_stops_from_event():
     )
 
     assert repo.requeued >= 1
+    assert cleanup_calls == [True]
     assert repo.touches[0]["status"] == "idle"
     assert repo.touches[-1]["status"] == "stopped"
     assert repo.touches[-1]["shutdown_requested"] is False

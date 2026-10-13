@@ -550,3 +550,20 @@ def test_core_config_rejects_roi_codec_outside_deployment_allowlist(tmp_path):
 
     with pytest.raises(ValueError, match="ROI storage codecs must be included"):
         CoreConfig.load(config_path=config_path, use_env=False)
+
+
+def test_logging_retention_settings_and_positive_bounds(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[logging]\nhigh_frequency_retention_days = 5\ncleanup_batch_size = 25\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PELAGIA_LOG_IMPORTANT_RETENTION_DAYS", "730")
+    config = CoreConfig.load(config_path=config_path)
+    assert config.logging.high_frequency_retention_days == 5
+    assert config.logging.cleanup_batch_size == 25
+    assert config.logging.important_log_retention_days == 730
+
+    config_path.write_text("[logging]\ncleanup_interval_seconds = 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="logging.cleanup_interval_seconds must be positive"):
+        CoreConfig.load(config_path=config_path, use_env=False)

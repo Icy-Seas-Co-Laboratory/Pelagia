@@ -186,7 +186,7 @@ class AuthConfig:
 
 @dataclass(slots=True)
 class LoggingConfig:
-    """Operational file logging settings."""
+    """Operational file logging and database event retention settings."""
 
     log_path: Path = Path("./logs")
     file_name: str = "pelagia.log"
@@ -194,6 +194,21 @@ class LoggingConfig:
     console: bool = True
     max_bytes: int = 10 * 1024 * 1024
     backup_count: int = 10
+    high_frequency_retention_days: int = 7
+    job_event_retention_days: int = 90
+    routine_log_retention_days: int = 90
+    important_log_retention_days: int = 365
+    cleanup_interval_seconds: int = 300
+    cleanup_batch_size: int = 2000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "high_frequency_retention_days", "job_event_retention_days",
+            "routine_log_retention_days", "important_log_retention_days",
+            "cleanup_interval_seconds", "cleanup_batch_size",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"logging.{name} must be positive.")
 
 
 @dataclass(slots=True)
@@ -644,6 +659,15 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "logging", "console", "PELAGIA_LOG_CONSOLE", _env_bool)
     _set_from_env(settings, "logging", "max_bytes", "PELAGIA_LOG_MAX_BYTES", int)
     _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
+    for key, env_name in (
+        ("high_frequency_retention_days", "PELAGIA_LOG_HIGH_FREQUENCY_RETENTION_DAYS"),
+        ("job_event_retention_days", "PELAGIA_LOG_JOB_EVENT_RETENTION_DAYS"),
+        ("routine_log_retention_days", "PELAGIA_LOG_ROUTINE_RETENTION_DAYS"),
+        ("important_log_retention_days", "PELAGIA_LOG_IMPORTANT_RETENTION_DAYS"),
+        ("cleanup_interval_seconds", "PELAGIA_LOG_CLEANUP_INTERVAL_SECONDS"),
+        ("cleanup_batch_size", "PELAGIA_LOG_CLEANUP_BATCH_SIZE"),
+    ):
+        _set_from_env(settings, "logging", key, env_name, int)
 
     _set_from_env(settings, "artifacts", "local_root", "PELAGIA_ARTIFACTS_LOCAL_ROOT", Path)
     _set_from_env(settings, "artifacts.plugins", "builtin_enabled", "PELAGIA_ARTIFACT_PLUGINS_BUILTIN_ENABLED", _env_bool)
@@ -943,6 +967,12 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             console=bool(logging.get("console", LoggingConfig.console)),
             max_bytes=int(logging.get("max_bytes", LoggingConfig.max_bytes)),
             backup_count=int(logging.get("backup_count", LoggingConfig.backup_count)),
+            high_frequency_retention_days=int(logging.get("high_frequency_retention_days", LoggingConfig.high_frequency_retention_days)),
+            job_event_retention_days=int(logging.get("job_event_retention_days", LoggingConfig.job_event_retention_days)),
+            routine_log_retention_days=int(logging.get("routine_log_retention_days", LoggingConfig.routine_log_retention_days)),
+            important_log_retention_days=int(logging.get("important_log_retention_days", LoggingConfig.important_log_retention_days)),
+            cleanup_interval_seconds=int(logging.get("cleanup_interval_seconds", LoggingConfig.cleanup_interval_seconds)),
+            cleanup_batch_size=int(logging.get("cleanup_batch_size", LoggingConfig.cleanup_batch_size)),
         ),
         artifacts=ArtifactsConfig(
             local_root=Path(artifacts.get("local_root", ArtifactsConfig.local_root)),

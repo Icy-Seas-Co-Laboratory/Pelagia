@@ -102,6 +102,10 @@ if APIRouter is not None:
         projects = repository.list_user_projects(str(user["id"]))
         if projects:
             return projects[0]
+        if user.get("is_admin"):
+            projects = repository.list_projects(active_only=True, limit=1, offset=0)
+            if projects:
+                return projects[0]
         raise HTTPException(status_code=403, detail="User does not belong to any active project.")
 
     def _session_response(repository, token: str) -> dict[str, Any]:

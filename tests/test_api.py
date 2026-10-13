@@ -22,7 +22,7 @@ from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
-from pelagia_interchange import DatasetBuilder, StorageFormat
+from pelagia_interchange import Dataset, DatasetBuilder, StorageFormat
 
 
 class FakeRepository:
@@ -2116,6 +2116,22 @@ def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_
 
     assert switched.status_code == 200
     assert switched.json()["project"]["id"] == body["project"]["id"]
+
+
+def test_api_admin_without_membership_can_log_into_existing_project():
+    client, repository, _ = make_client(auth_enabled=True)
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+
+    assert login.status_code == 200
+    body = login.json()
+    assert body["project"]["id"] == "project-1"
+    assert "project_creation_required" not in body
+    assert ("user-admin", "project-1") not in repository.memberships
+    headers = {"Authorization": f"Bearer {body['token']}"}
+    projects = client.get("/projects", headers=headers)
+    assert projects.status_code == 200
+    assert [project["id"] for project in projects.json()["projects"]] == ["project-1", "project-2"]
 
 
 def test_api_project_delete_is_soft_delete_and_requires_manager():
@@ -5066,7 +5082,7 @@ def test_api_analyzes_image_sequence_before_ingestion(tmp_path):
     assert body["suggested_ingestion_request"]["flatfield_window_width"] == 1
 
 
-def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path):
+def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path, monkeypatch):
     client, repository, _ = make_client()
     headers = auth_headers(client)
     package = tmp_path / "import" / "deployment-42"
@@ -5085,18 +5101,26 @@ def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path):
         )
     client.app.state.context.config.file_browser.root_path_import_dir = package.parent
 
-    analyzed_response = client.post(
-        "/ingestion/analyze",
-        headers=headers,
-        json={"source_path": str(package), "kind": "auto"},
-    )
+    with monkeypatch.context() as patch:
+        def unexpected_scan(*_args, **_kwargs):
+            raise AssertionError("interchange assessment must not scan the package")
+
+        patch.setattr(Dataset, "summary", unexpected_scan)
+        patch.setattr(Path, "rglob", unexpected_scan)
+        analyzed_response = client.post(
+            "/ingestion/analyze",
+            headers=headers,
+            json={"source_path": str(package), "kind": "auto"},
+        )
 
     assert analyzed_response.status_code == 200
     asset = analyzed_response.json()["assets"][0]
     assert asset["kind"] == "interchange"
     assert asset["collections"] == ["Deployment 42"]
     assert asset["media_count"] == 1
+    assert asset["size_bytes"] == sum(path.stat().st_size for path in package.rglob("*") if path.is_file())
     assert asset["metadata"]["pelagia_interchange"]["dataset_uuid"]
+    assert asset["metadata"]["pelagia_interchange"]["summary"]["package_size_source"] == "manifest"
     assert analyzed_response.json()["suggested_ingestion_request"]["generate_backgrounds"] is False
     assert analyzed_response.json()["suggested_ingestion_request"]["generate_flatfield_profiles"] is False
 

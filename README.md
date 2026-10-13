@@ -228,6 +228,9 @@ default, the TOML stack uses:
 <repo>/.pelagia/run/<stack-name>/
 ```
 
+PostgreSQL job events and structured logs have separate age-based retention;
+see [operational log retention](docs/operational-logs.md).
+
 On shared Linux machines, set an explicit writable run directory. For example,
 if the repo is cloned at `/scratch/Pelagia`:
 
@@ -410,8 +413,12 @@ pelagia queue_ingest /data/deployment_042_interchange
 
 Pelagia recognizes the package from its manifest and required files, registers
 it as one raw asset, and uses the dataset title as the collection name unless a
-collection is supplied explicitly. Dataset metadata, source-file identities,
-stream identities, frame timestamps, timestamp provenance, and original frame
+collection is supplied explicitly. Frame counts and a manifest-based package
+size estimate are available during assessment without scanning the image
+shards. Full frame reads begin in the queued import job. The assessment does
+not establish package integrity; run interchange validation when that
+assurance is needed. Dataset metadata, source-file identities, stream
+identities, frame timestamps, timestamp provenance, and original frame
 numbers are retained. JPEG, PNG, JPEG XL, and JPEG XS frame payloads are copied
 directly into KVStore without re-encoding; unsupported but decodable image
 codecs fall back to the project's configured frame encoding. Each frame is
