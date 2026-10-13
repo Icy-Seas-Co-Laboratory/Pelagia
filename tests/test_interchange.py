@@ -6,6 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from pelagia_interchange.ingestion import (
     discover_videos,
     ingest_video_directory,
 )
+from pelagia_interchange.pipeline import FrameTask, OrderedFramePipeline
 from pelagia_interchange.util import hash_file
 
 JPEG = b"\xff\xd8synthetic-jpeg\xff\xd9"
@@ -112,6 +114,53 @@ def test_raw_frame_reader_handles_short_reads_and_rejects_truncation() -> None:
         list(_iter_raw_frames(Stream([b"abc"]), 4))
 
 
+def test_ordered_pipeline_limits_out_of_order_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    third_submitted = threading.Event()
+    written: list[int] = []
+
+    class Encoder:
+        def __init__(self, **kwargs):
+            pass
+
+        def encode(self, pixels, **kwargs):
+            if pixels == b"0":
+                first_started.set()
+                assert release_first.wait(5)
+            return JPEG + pixels
+
+        def close(self):
+            pass
+
+    class Builder:
+        def add_frame(self, **kwargs):
+            written.append(kwargs["frame_id"])
+
+    monkeypatch.setattr("pelagia_interchange.pipeline.TurboJPEGEncoder", Encoder)
+    pipeline = OrderedFramePipeline(
+        builder=Builder(), stream="port", source=object(), storage_format=StorageFormat("jpeg"),
+        width=1, height=1, pixel_format="gray", jpeg_quality=90, jpeg_subsampling="gray",
+        workers=2, queue_depth=2,
+    )
+    pipeline.start(first_source_frame=0)
+    try:
+        pipeline.submit(FrameTask(0, 0, b"0"))
+        assert first_started.wait(5)
+        pipeline.submit(FrameTask(1, 1, b"1"))
+        submitter = threading.Thread(target=lambda: (pipeline.submit(FrameTask(2, 2, b"2")), third_submitted.set()))
+        submitter.start()
+        assert not third_submitted.wait(0.1)
+        release_first.set()
+        assert third_submitted.wait(5)
+        submitter.join(5)
+        pipeline.close_input()
+        assert written == [0, 1, 2]
+    finally:
+        release_first.set()
+        pipeline.abort()
+
+
 def test_interactive_video_create_collects_and_confirms_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     videos = tmp_path / "videos"; videos.mkdir(); (videos / "a.mp4").write_bytes(b"video")
     output = tmp_path / "dataset"; answers = iter([str(videos), str(output), "Interactive title", "", "port", "1GB", "n", "y", "n", "y", "8", "320", "n", "", "y"])
@@ -139,15 +188,30 @@ def test_ingest_video_directory_end_to_end(tmp_path: Path, monkeypatch: pytest.M
                                check=False, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     shutil.copyfile(video, videos / "sample_2.mp4")
-    result = ingest_video_directory(videos, tmp_path / "dataset", title="Automatic import")
+    staging = tmp_path / "staging"; staging.mkdir()
+    from pelagia_interchange import ingestion as ingestion_module
+    original_probe = ingestion_module.probe_video
+    probed_paths: list[Path] = []
+
+    def record_probe(path, *, ffprobe):
+        probed_paths.append(Path(path))
+        return original_probe(path, ffprobe=ffprobe)
+
+    monkeypatch.setattr(ingestion_module, "probe_video", record_probe)
+    result = ingest_video_directory(videos, tmp_path / "dataset", title="Automatic import", staging_dir=staging)
     assert result.acquisition_segments == 2 and result.frames == 6 and result.dataset.frame_count == 6
-    assert result.previews == 6
+    assert result.previews == 2
+    assert list(staging.iterdir()) == []
+    assert len(probed_paths) == 2 and all(staging in path.parents for path in probed_paths)
     assert len(result.dataset.manifest.shards) == 1
-    assert len(result.dataset.manifest.previews) == 8
+    assert len(result.dataset.manifest.previews) == 4
     preview_index = json.loads((result.dataset.root / "preview" / "index.json").read_text())
-    assert [item["frame_id"] for item in preview_index["frames"]] == list(range(6))
+    assert [item["frame_id"] for item in preview_index["frames"]] == [0, 3]
     assert all(item["acquisition_segment_uuid"] for item in preview_index["frames"])
+    assert result.dataset.manifest.acquisition_segments[0]["import_provenance"]["original_absolute_path"] == str(video)
+    assert result.dataset.manifest.acquisition_segments[0]["import_provenance"]["file_hash"]["value"] == hash_file(video)
     assert result.dataset.manifest.acquisition_segments[0]["expected_frame_count"] == 3
+    assert next(event for event in result.dataset.history if event["operation"] == "frames_transcoded")["parameters"]["jpeg_workers"] == 1
     assert Validator(result.dataset.root).verify("archival", image_signatures=True).valid
     aligned = ingest_video_directory(videos, tmp_path / "source_aligned", title="Source aligned",
                                      source_file_boundary=True, generate_previews=False)
@@ -160,7 +224,14 @@ def test_ingest_video_directory_end_to_end(tmp_path: Path, monkeypatch: pytest.M
     assert Validator(optional.dataset.root).verify("archival").valid
     with pytest.raises(VideoIngestionError, match="preview failure"):
         ingest_video_directory(videos, tmp_path / "required_preview_failure", title="Required previews",
-                               require_previews=True)
+                               require_previews=True, staging_dir=staging)
+    from pelagia_interchange.scratch import scratch_root
+    failed_scratch = scratch_root(tmp_path / "required_preview_failure", staging)
+    assert DatasetBuilder.partials(tmp_path / "required_preview_failure",
+                                   partial_directory=failed_scratch / "partials")
+    assert main(["shards", str(tmp_path / "required_preview_failure"), "--partials",
+                 "--staging-dir", str(staging)]) == 0
+    assert not list(failed_scratch.glob("pii-stage-*"))
 
 
 def test_multiple_sources_cameras_and_ranges(tmp_path: Path) -> None:
@@ -341,6 +412,63 @@ def test_builder_resume_reopens_durable_partial_and_preserves_manifest(tmp_path:
     assert dataset.frame_count == 1001
     assert dataset.manifest.dataset_uuid == json.loads((path / "manifest.json").read_text())["dataset_uuid"]
     assert any(event["operation"] == "dataset_resumed" for event in dataset.history)
+
+
+def test_resume_inventories_a_copied_shard_after_interruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "dataset"
+    partials = tmp_path / "scratch"; partials.mkdir()
+    builder = DatasetBuilder(path, title="Interrupted copy", partial_directory=partials)
+    source = builder.register_source_file(original_filename="source.avi", frame_count=1)
+    builder.add_frame(stream="camera", source_file=source, frame_id=0, source_frame_number=0,
+                      encoded_bytes=JPEG, storage_format=StorageFormat("jpeg"))
+    with monkeypatch.context() as patch:
+        patch.setattr(builder, "_inventory_shard", lambda *args: (_ for _ in ()).throw(OSError("interrupted")))
+        with pytest.raises(OSError, match="interrupted"):
+            builder.finalize()
+    assert (path / "data" / "camera_000001.sqlite").is_file()
+    assert list(partials.glob("*.sqlite.partial"))
+    assert not Manifest.read(path / "manifest.json").shards
+    resumed = DatasetBuilder.resume(path, partial_directory=partials)
+    dataset = resumed.finalize()
+    assert dataset.frame_count == 1
+    assert not list(partials.glob("*.sqlite.partial"))
+    assert Validator(path).verify("archival").valid
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg tools unavailable")
+def test_video_resume_skips_staging_and_probe_for_completed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    videos = tmp_path / "videos"; videos.mkdir()
+    first = videos / "a.mp4"
+    completed = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x24:rate=5",
+                                "-frames:v", "3", "-pix_fmt", "yuv420p", str(first)],
+                               check=False, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    shutil.copyfile(first, videos / "b.mp4")
+    output = tmp_path / "dataset"
+    builder = DatasetBuilder(output, title="Resume")
+    source = builder.register_source_file(path=first, original_relative_path="a.mp4",
+                                          sha256=hash_file(first), frame_count=3)
+    for frame_id in range(3):
+        builder.add_frame(stream="camera", source_file=source, frame_id=frame_id,
+                          source_frame_number=frame_id, encoded_bytes=JPEG,
+                          storage_format=StorageFormat("jpeg"))
+    builder.boundary("camera")
+    builder.abort(message="interrupted before next video")
+    from pelagia_interchange import ingestion as ingestion_module
+    original_probe = ingestion_module.probe_video
+    probed: list[Path] = []
+
+    def record_probe(path, *, ffprobe):
+        probed.append(Path(path))
+        return original_probe(path, ffprobe=ffprobe)
+
+    monkeypatch.setattr(ingestion_module, "probe_video", record_probe)
+    dataset = ingest_video_directory(videos, output, resume=True, generate_previews=False).dataset
+    assert len(probed) == 1 and probed[0].name == "b.mp4"
+    assert dataset.frame_count == 6
+    assert Validator(output).verify("archival").valid
 
 
 def test_video_ingestion_resume_skips_durable_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

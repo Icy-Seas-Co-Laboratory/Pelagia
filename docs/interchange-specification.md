@@ -62,7 +62,7 @@ The schema-2 columns are normative:
 
 Schema 2 MUST provide indexes on `(acquisition_segment_id, acquisition_frame_number)` and `timestamp_ns`. Foreign-key relationships are `frames.acquisition_segment_id → acquisition_segments.acquisition_segment_id` and `frames.storage_id → storage_formats.storage_id`.
 
-Finalized shards MUST be treated as immutable. Repair SHOULD create a replacement shard, record provenance, replace the manifest record, and regenerate checksums. Construction MUST use a non-authoritative `.partial` name and only atomically expose and inventory a shard after transaction commit and integrity checking. Abandoned partials MUST NOT be destroyed automatically.
+Finalized shards MUST be treated as immutable. Repair SHOULD create a replacement shard, record provenance, replace the manifest record, and regenerate checksums. Construction MUST use a non-authoritative `.partial` name, which MAY reside outside the package on local scratch storage, and only atomically expose and inventory a shard after transaction commit and integrity checking. A cross-filesystem transfer MAY use a non-authoritative temporary file beside the final shard before an atomic rename. Abandoned partials MUST NOT be destroyed automatically.
 
 Implementations SHOULD provide a read-only partial-file inventory and a user-directed, recoverable quarantine operation. The reference commands are `pii shards DATASET --partials` and `pii shards DATASET --quarantine-partials RECOVERY_DIR`; neither interprets a partial as authoritative.
 

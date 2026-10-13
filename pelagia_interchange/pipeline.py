@@ -100,6 +100,8 @@ class OrderedFramePipeline:
         self.timestamp_source = timestamp_source
         self._tasks: queue.Queue[object] = queue.Queue(maxsize=queue_depth)
         self._results: queue.Queue[object] = queue.Queue(maxsize=queue_depth)
+        # Include encoded frames waiting for an earlier worker in the limit.
+        self._inflight = threading.BoundedSemaphore(queue_depth)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._failure: BaseException | None = None
@@ -130,6 +132,8 @@ class OrderedFramePipeline:
         if self._failure is not None:
             raise FramePipelineError("frame pipeline failed") from self._failure
         self._drain_ready()
+        while not self._inflight.acquire(blocking=False):
+            self._consume_one()
         while True:
             try:
                 self._tasks.put(task, timeout=0.05)
@@ -226,5 +230,6 @@ class OrderedFramePipeline:
             if frame.frame_id in self.preview_frame_ids:
                 self.preview_candidates.append(PreviewCandidate(frame.frame_id, frame.source_frame_number, frame.payload))
             self.frames_written += 1
+            self._inflight.release()
             assert self._next_source_frame is not None
             self._next_source_frame += 1

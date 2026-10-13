@@ -36,12 +36,15 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--jpeg-quality", type=int, default=90)
     create.add_argument("--jpeg-subsampling", choices=("444", "422", "420"), default="444")
     create.add_argument("--jpeg-workers", type=int, default=None)
-    create.add_argument("--preflight-workers", type=int, default=None)
+    create.add_argument("--preflight-workers", type=int, default=None,
+                        help="deprecated compatibility option; staging is sequential")
     create.add_argument("--queue-depth", type=int, default=None)
     create.add_argument("--turbojpeg-library", type=Path, metavar="PATH")
+    create.add_argument("--staging-dir", type=Path, metavar="DIRECTORY",
+                        help="local scratch parent for source copies and active SQLite shards")
     create.add_argument("--grayscale", action="store_true")
     create.add_argument("--no-source-hash", action="store_true"); create.add_argument("--source-file-boundary", action="store_true")
-    create.add_argument("--no-previews", action="store_true"); create.add_argument("--preview-count", type=int, default=12)
+    create.add_argument("--no-previews", action="store_true"); create.add_argument("--preview-count", type=int, default=1)
     create.add_argument("--preview-width", type=int, default=512); create.add_argument("--require-previews", action="store_true")
     create.add_argument("--resume", action="store_true", help="resume an incomplete video ingestion")
     inspect = commands.add_parser("inspect", help="summarize a dataset")
@@ -62,6 +65,7 @@ def parser() -> argparse.ArgumentParser:
     shards = commands.add_parser("shards", help="list finalized or abandoned partial shards")
     shards.add_argument("path", type=Path); shards.add_argument("--json", action="store_true")
     shards.add_argument("--partials", action="store_true"); shards.add_argument("--quarantine-partials", type=Path)
+    shards.add_argument("--staging-dir", type=Path, metavar="DIRECTORY")
     sources = commands.add_parser("sources", help="list acquisition segments")
     sources.add_argument("path", type=Path); sources.add_argument("--json", action="store_true")
     return root
@@ -129,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 preflight_workers=args.preflight_workers,
                                                 queue_depth=args.queue_depth,
                                                 turbojpeg_library=args.turbojpeg_library,
+                                                staging_dir=args.staging_dir,
                                                 hash_sources=not args.no_source_hash,
                                                 source_file_boundary=args.source_file_boundary,
                                                 generate_previews=not args.no_previews,
@@ -153,8 +158,12 @@ def main(argv: list[str] | None = None) -> int:
                 for issue in result.warnings: print(f"WARNING {issue.code}: {issue.message}")
             return 0 if result.valid else 2
         if args.command == "shards" and (args.partials or args.quarantine_partials):
-            records = ([str(path) for path in DatasetBuilder.quarantine_partials(args.path, args.quarantine_partials)]
-                       if args.quarantine_partials else [str(path) for path in DatasetBuilder.partials(args.path)])
+            from .scratch import scratch_root
+            partial_directory = scratch_root(args.path, args.staging_dir) / "partials"
+            records = ([str(path) for path in DatasetBuilder.quarantine_partials(
+                args.path, args.quarantine_partials, partial_directory=partial_directory)]
+                       if args.quarantine_partials else [str(path) for path in DatasetBuilder.partials(
+                           args.path, partial_directory=partial_directory)])
             _pretty(records) if args.json else [print(item) for item in records]
             return 0
         dataset = Dataset.open(args.path)

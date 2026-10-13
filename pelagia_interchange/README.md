@@ -28,9 +28,9 @@ pii inspect deployment_042
 pii verify deployment_042 --level structural
 ```
 
-FFprobe discovers import properties and frame counts; files are SHA-256 hashed concurrently; FFmpeg streams raw decoded frames; and libjpeg-turbo encodes bounded batches of JPEG payloads into immutable SQLite shards. The result is explicitly an `imported_video` acquisition segment: its retained BLOBs are canonical for that package, but the package does not claim they were direct camera outputs. One ordered SQLite writer owns each active shard while JPEG workers run in parallel. FFmpeg, FFprobe, and libjpeg-turbo are only needed for this legacy import path.
+Each video is copied to temporary local storage while its SHA-256 hash is calculated. FFprobe counts frames on that copy, FFmpeg streams raw decoded frames, and libjpeg-turbo encodes bounded batches of JPEG payloads into SQLite shards. The video copy is removed after that video finishes. Active shard files stay in local scratch until verified, then completed shards are copied into the output directory. Scratch defaults to a private OS temporary directory; use `--staging-dir` to choose local storage with room for the largest video and active shard. The result is explicitly an `imported_video` acquisition segment: its retained BLOBs are canonical for that package, but the package does not claim they were direct camera outputs. One ordered SQLite writer owns each active shard; JPEG encoding defaults to one worker and can be adjusted with `--jpeg-workers`. FFmpeg, FFprobe, and libjpeg-turbo are only needed for this legacy import path.
 
-Creation also produces up to 12 evenly spaced 512-pixel thumbnails, a contact sheet, and `preview/index.json` mapping derivatives to authoritative frame/acquisition identities. Previews are checksummed but explicitly non-authoritative.
+Creation also produces one 512-pixel thumbnail per video by default, a contact sheet, and `preview/index.json` mapping derivatives to authoritative frame/acquisition identities. Use `--preview-count` for more samples per video. Previews are checksummed but explicitly non-authoritative.
 
 For a guided workflow:
 
@@ -53,7 +53,7 @@ result = ingest_video_directory(
     shard_target_size="10GB",
     source_file_boundary=False,
     generate_previews=True,
-    preview_count=12,
+    preview_count=1,
     preview_width=512,
     progress=print,
 )
@@ -199,6 +199,6 @@ pii shards deployment_042 --partials
 pii shards deployment_042 --quarantine-partials ./partial-recovery
 ```
 
-An interrupted video ingestion can be resumed in place with `pii create --from-videos ... --resume`. SQLite recovers any stale rollback journal while reopening the partial shard, waits briefly for a live writer lock, and then continues only after the durable contiguous source-frame prefix. Finalized shards remain immutable. A lock held by another live process is reported rather than forcibly broken.
+An interrupted video ingestion can be resumed in place with `pii create --from-videos ... --resume`. Completed videos with recorded source hashes are verified without staging or probing again. SQLite recovers any stale rollback journal while reopening a local partial shard, waits briefly for a live writer lock, and then continues only after the durable contiguous source-frame prefix. Finalized shards remain immutable. A lock held by another live process is reported rather than forcibly broken. Use the same `--staging-dir` on resume and `pii shards --partials` if scratch was customized.
 
 The detailed [usage guide](../docs/interchange-usage.md), [normative specification](../docs/interchange-specification.md), and [annotated metadata example](../docs/metadata.example.toml) are in the repository. Every generated dataset also includes a durable README and dependency-free scripts under `tools/`.

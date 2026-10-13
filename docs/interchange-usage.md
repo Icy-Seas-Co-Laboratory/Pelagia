@@ -87,7 +87,7 @@ pii create \
 This workflow automatically:
 
 - discovers common video containers in deterministic filename order;
-- probes the first video stream in each file with FFprobe;
+- copies one video at a time to local scratch while hashing the source, then probes and decodes that copy;
 - records container, codec, pixel format, dimensions, rational frame rate, frame count, creation time when available, file size, relative source path, and source UUID;
 - calculates a streaming SHA-256 hash of every source video;
 - streams raw decoded frames from FFmpeg and transcodes them to standalone JPEG payloads with libjpeg-turbo worker threads;
@@ -95,10 +95,10 @@ This workflow automatically:
 - fills each SQLite shard across consecutive source videos until the configured target size is reached, then rolls over deterministically;
 - creates persistent shard and stream UUIDs;
 - records the FFmpeg decoder and libjpeg-turbo encoder parameters in `history.jsonl`;
-- generates a bounded representative preview set, contact sheet, and provenance index;
+- generates one preview per video by default, a contact sheet, and a provenance index;
 - finalizes the manifest, generated README, standalone tools, and package checksums.
 
-FFmpeg, FFprobe, and libjpeg-turbo must be installed for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset. The importer probes FFmpeg's supported options and uses either modern `-fps_mode passthrough` or the equivalent legacy `-vsync 0`; the selected frame-synchronization mode is recorded in dataset provenance. Use `--jpeg-quality`, `--jpeg-subsampling`, `--jpeg-workers`, and `--queue-depth` to control JPEG encoding and bounded in-flight work.
+FFmpeg, FFprobe, and libjpeg-turbo must be installed for video ingestion. They are external creation tools only; recipients do not need them to inspect, extract, or verify the resulting dataset. The importer probes FFmpeg's supported options and uses either modern `-fps_mode passthrough` or the equivalent legacy `-vsync 0`; the selected frame-synchronization mode is recorded in dataset provenance. Source staging and FFprobe run sequentially, so source media is read once during staging and frame counting runs on the local copy. Active SQLite shards also stay in local scratch until they pass integrity checking; completed shards are copied and verified into the requested output directory. The destination uses a brief unlisted `.tmp` transfer file so an interrupted copy cannot appear as a finalized shard. Scratch defaults to a private directory under the OS temporary location. Use `--staging-dir` to choose a local location with room for the largest source video and active shard. Source copies are removed after each video; partial shards remain available after an interruption. JPEG encoding defaults to one worker; use `--jpeg-workers` and `--queue-depth` to tune bounded in-flight work.
 
 Supported discovery extensions are `.avi`, `.mov`, `.mp4`, `.m4v`, `.mkv`, `.mpg`, `.mpeg`, `.mts`, and `.m2ts`. Add `--recursive` to search subdirectories:
 
@@ -110,7 +110,7 @@ pii create deployment_042 \
   --title "Deployment 042"
 ```
 
-Source files are hashed by default. `--no-source-hash` skips that potentially long pass, but source SHA-256 hashes are strongly recommended before an archival or raw-retirement decision.
+Source files are hashed during the staging copy by default. `--no-source-hash` skips that calculation but does not eliminate the copy. Source SHA-256 hashes are strongly recommended before an archival or raw-retirement decision.
 
 By default, a source-video boundary does not force a shard boundary. A shard may contain frames from several source videos, while every frame retains its `source_file_id` and `source_frame_number`. This avoids producing many undersized shards. To deliberately start a new shard for every source video, use `--source-file-boundary`:
 
@@ -143,11 +143,11 @@ pii create deployment_042 \
   --jpeg-workers 4
 ```
 
-The importer uses FFmpeg's error-exit behavior and reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap. Retry with `--resume` to reopen that package. The retry verifies source identity, re-decodes the input to the last durable source-frame prefix, and appends the remaining frames without changing finalized shards.
+The importer counts and probes each staged video immediately before decoding it, then reconciles FFprobe's expected decoded-frame count with the produced frames. A decode error or mismatch stops finalization and preserves the incomplete package and `.partial` shard for review; it does not silently close a sequence gap. Retry with `--resume` to reopen that package. The retry verifies source identity, re-decodes the input to the last durable source-frame prefix, and appends the remaining frames without changing finalized shards.
 
 ### Automatic previews
 
-Automatic creation generates previews by default. For each stream it selects up to 12 evenly spaced retained frame IDs and creates:
+Automatic creation generates one preview from the first frame of each video by default. Increase `--preview-count` to select evenly spaced frames within each video. It creates:
 
 ```text
 preview/
@@ -184,7 +184,7 @@ pii create deployment_042 \
   --require-previews
 ```
 
-Selection is deterministic for a fixed retained frame count: the first and last frames are included, with the remaining samples evenly spaced. This is a browsing aid, not a claim that the selected frames are scientifically representative.
+Selection is deterministic for a fixed frame count. With multiple previews per video, the first and last frames are included and the rest are evenly spaced. This is a browsing aid, not a claim that the selected frames are scientifically representative.
 
 The same automatic workflow is available as a Python API:
 
@@ -202,7 +202,7 @@ result = ingest_video_directory(
     grayscale=True,
     source_file_boundary=False,
     generate_previews=True,
-    preview_count=12,
+    preview_count=1,
     preview_width=512,
     require_previews=False,
     progress=print,
@@ -229,7 +229,7 @@ The prompts collect:
 - recursive discovery choice;
 - color or grayscale output;
 - whether each source video should force a new shard (default: no);
-- whether to generate previews, plus count and maximum width (default: yes, 12, 512 px);
+- whether to generate previews, plus count per video and maximum width (default: yes, 1, 512 px);
 - whether preview failure should fail creation (default: no);
 - optional existing `metadata.toml` path;
 - confirmation after displaying the discovered videos.
@@ -778,11 +778,12 @@ Appending history changes a checksummed file. Call `regenerate_checksums()` afte
 
 ## Recover from an interrupted build
 
-An interrupted build may leave `.sqlite.partial` files. They are not listed as authoritative shards and are never deleted automatically.
+An interrupted build may leave `.sqlite.partial` files in local scratch. They are not listed as authoritative shards and are never deleted automatically. The OS may clear its temporary directory, so use `--staging-dir` on long jobs that need durable local scratch; pass the same value to `pii create --resume` and `pii shards`.
 
 ```bash
 pii shards deployment_042 --partials
 pii shards deployment_042 --quarantine-partials ./partial-recovery
+# Add --staging-dir /local/scratch if a custom scratch location was used.
 ```
 
 For video ingestion, resume in place after confirming that the source directory is unchanged:
@@ -794,7 +795,7 @@ pii create deployment_042 \
   --resume
 ```
 
-The resume operation accepts `building` and `finalizing` packages, validates source hashes and probed frame counts where available, and keeps finalized shards immutable. SQLite rows committed before the interruption are durable; an interrupted batch may be replayed safely. It is intentionally conservative and stops when the input source or package state cannot be matched.
+The resume operation accepts `building` and `finalizing` packages and keeps finalized shards immutable. A fully retained source with a recorded hash is verified in one source-file read, without another scratch copy, frame count, or decode. A partially retained source is staged, probed, and decoded through its durable prefix before new rows are appended. SQLite rows committed before the interruption are durable; an interrupted batch may be replayed safely. If the OS has removed a local partial shard, resume starts again from the last finalized output shard. A shard copied before an interrupted manifest update is verified and inventoried on resume.
 
 For manual recovery, the quarantine command still moves each partial file intact to the requested directory. It fails rather than overwriting a file with the same name. Review partial databases independently before deciding whether to resume, salvage, or remove them.
 

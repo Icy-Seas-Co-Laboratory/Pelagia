@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +15,7 @@ from .history import History
 from .manifest import Manifest
 from .metadata import Metadata, default_metadata
 from .models import AcquisitionSegment, FrameRecord, HashRecord, SourceFile, StorageFormat, new_uuid
+from .scratch import scratch_root
 from .shard import ShardReader, ShardWriter
 from .tool_scripts import TOOL_FILES
 from .util import hash_file, parse_size, safe_relative_path, utc_now
@@ -25,9 +27,10 @@ class DatasetBuilder:
         shard_target_bytes: int | str = 10_000_000_000, shard_target_size: int | str | None = None,
         maximum_frame_count: int | None = None, source_file_boundary: bool = False,
         dataset_uuid: UUID | str | None = None, metadata: Metadata | Mapping[str, Any] | None = None,
-        resume: bool = False,
+        resume: bool = False, partial_directory: str | Path | None = None,
     ) -> None:
         self.output = Path(output)
+        self.partial_directory = Path(partial_directory) if partial_directory is not None else None
         self.shard_target_bytes = parse_size(shard_target_size or shard_target_bytes)
         self.maximum_frame_count = maximum_frame_count
         self.source_file_boundary = source_file_boundary
@@ -79,6 +82,7 @@ class DatasetBuilder:
         for directory in ("data", "calibration", "preview", "tools"):
             (self.output / directory).mkdir(parents=True, exist_ok=True)
         self._load_sources()
+        self._reconcile_sealed_partials()
         self._load_streams_and_shard_numbers()
         previous_state = self.manifest.state
         self.manifest.state = "building"
@@ -101,7 +105,7 @@ class DatasetBuilder:
         for record in self.manifest.shards:
             self.register_stream(record["stream_name"], stream_uuid=record["stream_uuid"])
             self._record_shard_number(record["stream_name"], record["relative_path"])
-        for path in self.partials(self.output):
+        for path in self._partial_paths():
             self._record_shard_number(self._slug_from_partial(path), path.name)
 
     def _record_shard_number(self, stream: str, relative_path: str) -> None:
@@ -236,15 +240,17 @@ class DatasetBuilder:
         self._shard_numbers[stream] = number
         filename = f"{self._slug(stream)}_{number:06d}.sqlite"
         final_path = self.output / "data" / filename
-        writer = (ShardWriter.resume(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream)
+        writer = (ShardWriter.resume(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream,
+                                     partial_path=partial)
                   if partial is not None else
-                  ShardWriter(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream))
+                  ShardWriter(final_path, stream_uuid=self._stream_uuid(stream), stream_name=stream,
+                              partial_directory=self.partial_directory))
         self._writers[stream] = writer
         return writer
 
     def _partial_for_stream(self, stream: str) -> Path | None:
         candidates: list[Path] = []
-        for path in self.partials(self.output):
+        for path in self._partial_paths():
             try:
                 metadata = ShardReader(path).metadata()
             except (FormatError, OSError):
@@ -260,6 +266,67 @@ class DatasetBuilder:
             raise FormatError(f"multiple partial shards are candidates for stream {stream!r}")
         return candidates[0] if candidates else None
 
+    def _partial_paths(self) -> list[Path]:
+        return self.partials(self.output, partial_directory=self.partial_directory)
+
+    @staticmethod
+    def _publish_local_shard(local: Path, final: Path) -> str:
+        """Copy a sealed shard without exposing incomplete bytes at its final name."""
+        digest = hash_file(local)
+        if final.exists():
+            if hash_file(final) != digest:
+                raise FormatError(f"unlisted destination shard differs from local partial: {final}")
+            return digest
+        transfer = final.with_name(final.name + ".tmp")
+        if transfer.exists():
+            transfer.unlink()  # An unlisted transfer interrupted before publication.
+        with local.open("rb") as reader, transfer.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=4 * 1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if hash_file(transfer) != digest:
+            raise FormatError(f"copied shard does not match local partial: {final}")
+        transfer.replace(final)
+        return digest
+
+    def _inventory_shard(self, final: Path, metadata: Mapping[str, Any], digest: str) -> None:
+        record = {
+            "shard_uuid": str(metadata["shard_uuid"]),
+            "relative_path": final.relative_to(self.output).as_posix(),
+            "byte_size": final.stat().st_size,
+            "file_hash": {"algorithm": "sha256", "target": "shard_file", "value": digest},
+            "stream_uuid": str(metadata["camera_or_stream_id"]),
+            "stream_name": str(metadata["camera_or_stream_name"]),
+            "first_frame": metadata["first_frame"], "last_frame": metadata["last_frame"],
+            "frame_count": metadata["frame_count"],
+            "first_timestamp": metadata["first_timestamp"],
+            "last_timestamp": metadata["last_timestamp"],
+            "encoded_bytes": metadata["encoded_bytes"],
+        }
+        self.manifest.shards.append(record)
+        self.manifest.write(self.output / "manifest.json")
+        self.history.append(operation="shard_finalized", outputs=[record])
+
+    def _reconcile_sealed_partials(self) -> None:
+        """Finish a shard whose local SQLite close or transfer preceded a crash."""
+        inventoried = {item["relative_path"]: item for item in self.manifest.shards}
+        for local in self._partial_paths():
+            if self.partial_directory is None or local.parent != self.partial_directory:
+                continue
+            metadata = ShardReader(local).metadata()
+            if "frame_count" not in metadata:
+                continue
+            final = self.output / "data" / local.name.removesuffix(".partial")
+            relative = final.relative_to(self.output).as_posix()
+            if relative in inventoried:
+                expected = inventoried[relative]["file_hash"]["value"]
+                if not final.is_file() or hash_file(final) != expected or hash_file(local) != expected:
+                    raise FormatError(f"inventoried shard differs from local sealed shard: {final}")
+            else:
+                digest = self._publish_local_shard(local, final)
+                self._inventory_shard(final, metadata, digest)
+            local.unlink()
+
     def _finalize_writer(self, stream: str) -> None:
         writer = self._writers.pop(stream, None)
         if writer is None:
@@ -268,25 +335,24 @@ class DatasetBuilder:
             writer.abandon()
             return
         shard = writer.finalize()
-        relative = shard.path.relative_to(self.output).as_posix()
-        record = {
-            "shard_uuid": str(shard.shard_uuid), "relative_path": relative,
-            "byte_size": shard.path.stat().st_size,
-            "file_hash": {"algorithm": "sha256", "target": "shard_file", "value": hash_file(shard.path)},
-            "stream_uuid": str(shard.stream_uuid), "stream_name": shard.stream_name,
-            "first_frame": shard.first_frame, "last_frame": shard.last_frame,
-            "frame_count": shard.frame_count, "first_timestamp": writer.first_timestamp,
-            "last_timestamp": writer.last_timestamp, "encoded_bytes": writer.encoded_bytes,
-        }
-        self.manifest.shards.append(record)
-        self.manifest.write(self.output / "manifest.json")
-        self.history.append(operation="shard_finalized", outputs=[record])
+        digest = (self._publish_local_shard(shard.path, writer.final_path)
+                  if shard.path != writer.final_path else hash_file(writer.final_path))
+        metadata = ShardReader(writer.final_path).metadata()
+        self._inventory_shard(writer.final_path, metadata, digest)
+        if shard.path != writer.final_path:
+            shard.path.unlink()
 
     def boundary(self, stream: str | None = None) -> None:
         for name in [stream] if stream is not None else list(self._writers):
             if name not in self._writers and self._partial_for_stream(name) is not None:
                 self._new_writer(name)
             self._finalize_writer(name)
+
+    def boundary_after_source(self, stream: str, source_file_id: int) -> None:
+        """Close a source-aligned partial only when it contains that source."""
+        partial = self._partial_for_stream(stream)
+        if partial is not None and ShardReader(partial).source_progress(source_file_id)["frame_count"]:
+            self.boundary(stream)
 
     def add_frame(
         self, *, stream: str, acquisition_segment: AcquisitionSegment | None = None,
@@ -423,7 +489,7 @@ Frame and timestamp ranges are inclusive. JPEG and PNG payloads are written with
 
 Verification levels become progressively more expensive: `quick` checks the package inventory and file hashes; `structural` also checks every SQLite database and its declared structure; `full` streams all frame records and hashes; `archival` adds strict source-count and completion-provenance requirements. An archival success is a mechanical integrity result, not authorization to delete original acquisitions. Retention policy, backups, scientific acceptance, and responsible-person approval remain separate decisions. These tools never delete source data.
 
-An interrupted writer leaves `data/*.sqlite.partial` files unlisted by the manifest. Video ingestion can resume these files with `pii create --from-videos INPUT --resume`; lower-level callers can use `DatasetBuilder.resume(output)`. With the package installed, list them using `pii shards . --partials` or move them intact to a recovery directory using `pii shards . --quarantine-partials RECOVERY_DIR`. They are never deleted automatically.
+An interrupted writer leaves non-authoritative `.sqlite.partial` files in its local scratch directory (or under `data/` for a direct low-level builder). Video ingestion can resume these files with `pii create --from-videos INPUT --resume`; lower-level callers can use `DatasetBuilder.resume(output)`. With the package installed, list them using `pii shards . --partials` or move them intact to a recovery directory using `pii shards . --quarantine-partials RECOVERY_DIR`. Use the same `--staging-dir` when inspecting a custom scratch location. Partial shards are never deleted automatically.
 
 Hashes always have an algorithm and semantic target. Frame hashes cover exact stored BLOB bytes; shard hashes cover complete finalized SQLite files. The checksum file covers every regular finalized package file except itself, so there is no self-reference. Editing the manifest, metadata, or history therefore requires checksum regeneration. Manifest shard hashes remain authoritative for shard-file integrity.
 
@@ -471,8 +537,11 @@ The normative reference is **Scientific Image Interchange Format 0.2**, maintain
         self._closed = True
 
     @staticmethod
-    def partials(path: str | Path) -> list[Path]:
-        return sorted(Path(path).glob("data/*.sqlite.partial"))
+    def partials(path: str | Path, *, partial_directory: str | Path | None = None) -> list[Path]:
+        output = Path(path)
+        local = (Path(partial_directory) if partial_directory is not None
+                 else scratch_root(output) / "partials")
+        return sorted(set(output.glob("data/*.sqlite.partial")) | set(local.glob("*.sqlite.partial")))
 
     def find_source_file(self, *, original_relative_path: str | None = None,
                          source_uuid: UUID | str | None = None) -> SourceFile | None:
@@ -497,7 +566,7 @@ The normative reference is **Scientific Image Interchange Format 0.2**, maintain
         total = 0; first = None; last = None; last_frame = None
         paths: list[Path] = [self.output / record["relative_path"] for record in self.manifest.shards
                              if record.get("stream_name") == stream]
-        paths.extend(path for path in self.partials(self.output) if self._partial_matches_stream(path, stream))
+        paths.extend(path for path in self._partial_paths() if self._partial_matches_stream(path, stream))
         ranges: list[tuple[int, int, int, int | None]] = []
         for path in paths:
             progress = ShardReader(path).source_progress(source_file_id)
@@ -526,7 +595,7 @@ The normative reference is **Scientific Image Interchange Format 0.2**, maintain
         maximum: int | None = None
         paths = [self.output / record["relative_path"] for record in self.manifest.shards
                  if record.get("stream_name") == stream]
-        paths.extend(path for path in self.partials(self.output) if self._partial_matches_stream(path, stream))
+        paths.extend(path for path in self._partial_paths() if self._partial_matches_stream(path, stream))
         for path in paths:
             value = ShardReader(path).aggregate_metadata()["last_frame"]
             if value is not None:
@@ -537,15 +606,16 @@ The normative reference is **Scientific Image Interchange Format 0.2**, maintain
         return 0 if maximum is None else int(maximum) + 1
 
     @staticmethod
-    def quarantine_partials(path: str | Path, destination: str | Path) -> list[Path]:
+    def quarantine_partials(path: str | Path, destination: str | Path, *,
+                            partial_directory: str | Path | None = None) -> list[Path]:
         """Move abandoned partial shards to a caller-selected recovery directory."""
         destination_path = Path(destination)
         destination_path.mkdir(parents=True, exist_ok=True)
         moved: list[Path] = []
-        for partial in DatasetBuilder.partials(path):
+        for partial in DatasetBuilder.partials(path, partial_directory=partial_directory):
             target = destination_path / partial.name
             if target.exists():
                 raise FileExistsError(target)
-            partial.replace(target)
+            shutil.move(str(partial), str(target))
             moved.append(target)
         return moved

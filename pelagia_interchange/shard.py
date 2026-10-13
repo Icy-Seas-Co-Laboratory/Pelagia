@@ -46,9 +46,11 @@ class Shard:
 class ShardWriter:
     """Streaming builder for one not-yet-authoritative SQLite shard."""
 
-    def __init__(self, final_path: Path, *, stream_uuid: UUID, stream_name: str, shard_uuid: UUID | None = None, batch_size: int = 1000) -> None:
+    def __init__(self, final_path: Path, *, stream_uuid: UUID, stream_name: str, shard_uuid: UUID | None = None,
+                 batch_size: int = 1000, partial_directory: Path | None = None) -> None:
         self.final_path = final_path
-        self.partial_path = final_path.with_name(final_path.name + ".partial")
+        self.partial_path = ((partial_directory or final_path.parent) / (final_path.name + ".partial"))
+        self._publish_on_finalize = partial_directory is None
         self.stream_uuid = stream_uuid
         self.stream_name = stream_name
         self.shard_uuid = shard_uuid or uuid4()
@@ -65,6 +67,7 @@ class ShardWriter:
         self.frame_count = 0
         self.encoded_bytes = 0
         self.final_path.parent.mkdir(parents=True, exist_ok=True)
+        self.partial_path.parent.mkdir(parents=True, exist_ok=True)
         if self.partial_path.exists() or self.final_path.exists():
             raise FileExistsError(self.partial_path if self.partial_path.exists() else self.final_path)
         self.connection = _connect(self.partial_path)
@@ -95,7 +98,7 @@ class ShardWriter:
     @classmethod
     def resume(
         cls, final_path: Path, *, stream_uuid: UUID, stream_name: str,
-        shard_uuid: UUID | None = None, batch_size: int = 1000,
+        shard_uuid: UUID | None = None, batch_size: int = 1000, partial_path: Path | None = None,
     ) -> "ShardWriter":
         """Reopen a durable partial shard and continue its current transaction.
 
@@ -104,14 +107,15 @@ class ShardWriter:
         otherwise supplied by the caller; the latter is the compatibility path
         for the original partial-shard implementation.
         """
-        partial_path = final_path.with_name(final_path.name + ".partial")
+        partial_path = partial_path or final_path.with_name(final_path.name + ".partial")
         if not partial_path.is_file():
             raise FileNotFoundError(partial_path)
-        if final_path.exists():
+        if final_path.exists() and partial_path.parent == final_path.parent:
             raise FileExistsError(final_path)
         self = cls.__new__(cls)
         self.final_path = final_path
         self.partial_path = partial_path
+        self._publish_on_finalize = partial_path.parent == final_path.parent
         self.stream_uuid = stream_uuid
         self.stream_name = stream_name
         self.batch_size = batch_size
@@ -281,8 +285,10 @@ class ShardWriter:
             self._closed = True
             raise
         self.connection.close(); self._closed = True
-        self.partial_path.replace(self.final_path)
-        return Shard(self.final_path, self.shard_uuid, self.stream_uuid, self.stream_name,
+        if self._publish_on_finalize:
+            self.partial_path.replace(self.final_path)
+        return Shard(self.final_path if self._publish_on_finalize else self.partial_path,
+                     self.shard_uuid, self.stream_uuid, self.stream_name,
                      self.first_frame, self.last_frame, self.frame_count)
 
     def abandon(self) -> Path:

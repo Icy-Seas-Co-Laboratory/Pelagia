@@ -1,13 +1,13 @@
 """Optional FFmpeg-backed ingestion of video directories."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import os
 import shutil
 import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
@@ -18,6 +18,7 @@ from .exceptions import InterchangeError
 from .metadata import Metadata
 from .models import StorageFormat
 from .pipeline import FrameTask, OrderedFramePipeline, PreviewCandidate
+from .scratch import scratch_root
 
 
 DEFAULT_FFMPEG_QSCALE = 2
@@ -51,19 +52,41 @@ class VideoIngestionResult:
     previews: int
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedVideo:
-    path: Path
-    probe: VideoProbe
-    source_hash: str | None
-
-
-def _default_workers(value: int | None, *, reserve: int = 0) -> int:
+def _default_workers(value: int | None) -> int:
     if value is not None:
         if value < 1:
             raise ValueError("worker counts must be positive")
         return value
-    return max(1, (os.cpu_count() or 1) - reserve)
+    return 1
+
+
+@contextmanager
+def _staged_video(source: Path, *, directory: Path | None, hash_source: bool) -> Iterator[tuple[Path, str | None]]:
+    """Read a source once from slow storage, then work from disposable local scratch."""
+    before = source.stat()
+    with tempfile.TemporaryDirectory(prefix="pii-stage-", dir=directory) as temporary:
+        staged = Path(temporary) / source.name
+        digest = hashlib.sha256() if hash_source else None
+        with source.open("rb") as reader, staged.open("wb") as writer:
+            while chunk := reader.read(4 * 1024 * 1024):
+                writer.write(chunk)
+                if digest is not None:
+                    digest.update(chunk)
+        after = source.stat()
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or
+                staged.stat().st_size != before.st_size):
+            raise VideoIngestionError(f"source changed while it was being staged: {source}")
+        yield staged, digest.hexdigest() if digest is not None else None
+
+
+def _verify_completed_source(path: Path, *, algorithm: str, expected: str) -> None:
+    before = path.stat()
+    actual = hash_file(path, algorithm)
+    after = path.stat()
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) !=
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or actual != expected):
+        raise VideoIngestionError(f"source changed since the incomplete package was created: {path}")
 
 
 def discover_videos(directory: str | Path, *, recursive: bool = False, extensions: Sequence[str] = DEFAULT_VIDEO_EXTENSIONS) -> list[Path]:
@@ -116,17 +139,6 @@ def probe_video(path: str | Path, *, ffprobe: str = "ffprobe") -> VideoProbe:
     return VideoProbe(Path(path), container.get("format_name"), stream.get("codec_name"), stream.get("pix_fmt"),
                       stream.get("width"), stream.get("height"), _fraction(stream.get("avg_frame_rate")),
                       frame_count, creation_time)
-
-
-def _prepare_video(path: Path, *, ffprobe: str, hash_sources: bool) -> _PreparedVideo:
-    """Probe and hash one source while detecting concurrent source mutation."""
-    before = path.stat()
-    probe = probe_video(path, ffprobe=ffprobe)
-    source_hash = hash_file(path) if hash_sources else None
-    after = path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        raise VideoIngestionError(f"source changed while it was being prepared: {path}")
-    return _PreparedVideo(path, probe, source_hash)
 
 
 def _iter_mjpeg(stream: object, *, maximum_frame_bytes: int = 256 * 1024 * 1024) -> Iterator[bytes]:
@@ -556,11 +568,11 @@ def ingest_video_directory(
     shard_target_size: int | str = "10GB", metadata: Metadata | None = None,
     ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", ffmpeg_qscale: int = DEFAULT_FFMPEG_QSCALE,
     grayscale: bool = False, hash_sources: bool = True, source_file_boundary: bool = False,
-    generate_previews: bool = True, preview_count: int = 12, preview_width: int = 512,
+    generate_previews: bool = True, preview_count: int = 1, preview_width: int = 512,
     require_previews: bool = False, resume: bool = False,
     jpeg_quality: int = 90, jpeg_subsampling: str = "444", jpeg_workers: int | None = None,
     preflight_workers: int | None = None, queue_depth: int | None = None,
-    turbojpeg_library: str | Path | None = None,
+    turbojpeg_library: str | Path | None = None, staging_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> VideoIngestionResult:
     """Archive videos using FFmpeg decoding and libjpeg-turbo encoding.
@@ -570,6 +582,7 @@ def ingest_video_directory(
     preserves a resumable durable prefix in any ``.sqlite.partial`` file.
     """
     del ffmpeg_qscale  # Kept as a source-compatible, deprecated argument.
+    _default_workers(preflight_workers)  # Validate the compatibility option; staging is sequential.
     root = Path(input_directory).resolve()
     videos = discover_videos(root, recursive=recursive)
     if not videos:
@@ -586,7 +599,10 @@ def ingest_video_directory(
         raise ValueError("preview_count must be positive")
     if generate_previews and not 32 <= preview_width <= 8192:
         raise ValueError("preview_width must be between 32 and 8192")
-    workers = _default_workers(jpeg_workers, reserve=1)
+    staging_base = Path(staging_dir).expanduser().resolve() if staging_dir is not None else None
+    if staging_base is not None and not staging_base.is_dir():
+        raise ValueError(f"staging directory does not exist: {staging_base}")
+    workers = _default_workers(jpeg_workers)
     depth = queue_depth if queue_depth is not None else max(2, workers * 2)
     if depth < 1:
         raise ValueError("queue_depth must be positive")
@@ -601,16 +617,8 @@ def ingest_video_directory(
         raise VideoIngestionError("libjpeg-turbo support is unavailable") from exc
     decoder_version = _ffmpeg_version(ffmpeg_path)
     timing_arguments, timing_mode = _passthrough_timing_arguments(ffmpeg_path)
+    staging_root = scratch_root(output, staging_base, create=True)
 
-    if progress:
-        progress(f"preparing {len(videos)} video source(s) with { _default_workers(preflight_workers) } worker(s)")
-    with ThreadPoolExecutor(max_workers=_default_workers(preflight_workers), thread_name_prefix="pelagia-preflight") as executor:
-        futures = [executor.submit(_prepare_video, video, ffprobe=ffprobe_path, hash_sources=hash_sources) for video in videos]
-        prepared = [future.result() for future in futures]
-    expected_total = sum(item.probe.frame_count for item in prepared)
-    sample_count = min(preview_count, expected_total)
-    selected = ({round(number * (expected_total - 1) / (sample_count - 1)) for number in range(sample_count)}
-                if generate_previews and sample_count > 1 else ({0} if generate_previews else set()))
     pixel_format = "gray8" if grayscale else "rgb24"
     storage = StorageFormat(
         codec="jpeg", quality=jpeg_quality, pixel_format=pixel_format, bit_depth=8,
@@ -626,7 +634,8 @@ def ingest_video_directory(
     preview_warnings: list[str] = []
     with DatasetBuilder(output, title=title or Path(output).name, description=description,
                         shard_target_size=shard_target_size, source_file_boundary=source_file_boundary,
-                        metadata=metadata, resume=resume) as builder:
+                        metadata=metadata, resume=resume,
+                        partial_directory=staging_root / "partials") as builder:
         if metadata is not None:
             if title:
                 builder.metadata.data.setdefault("dataset", {})["title"] = title
@@ -643,81 +652,97 @@ def ingest_video_directory(
             existing_stream.setdefault("storage_description", storage.description)
             existing_stream.setdefault("timestamp", {"source": "unknown", "interpolated": False})
         next_frame_id = builder.next_frame_id(stream) if resume else 0
-        for index, item in enumerate(prepared, 1):
-            video, probe, source_hash = item.path, item.probe, item.source_hash
+        for index, video in enumerate(videos, 1):
             relative_path = video.relative_to(root).as_posix()
             source = builder.find_source_file(original_relative_path=relative_path) if resume else None
-            if source is None:
-                source = builder.register_source_file(
-                    path=video, original_relative_path=relative_path, sha256=source_hash,
-                    container=probe.container, codec=probe.codec, pixel_format=probe.pixel_format,
-                    width=probe.width, height=probe.height, frame_rate=probe.frame_rate,
-                    frame_count=probe.frame_count, start_timestamp=probe.creation_time,
-                )
-            else:
-                if source.file_hash is not None and source_hash is not None and source.file_hash.value != source_hash:
-                    raise VideoIngestionError(f"source file changed since the incomplete package was created: {video}")
-                if source.frame_count is not None and source.frame_count != probe.frame_count:
-                    raise VideoIngestionError(f"probed frame count changed for source {video}: package has {source.frame_count}, input has {probe.frame_count}")
-                if source.width is not None and source.width != probe.width or source.height is not None and source.height != probe.height:
-                    raise VideoIngestionError(f"probed dimensions changed for source {video}")
-            state = builder.source_progress(stream, source.source_file_id) if resume else {"frame_count": 0, "last_source_frame": None}
-            durable_frames = int(state["frame_count"] or 0)
-            last_durable_source_frame = state["last_source_frame"]
-            resume_source_frame = (int(last_durable_source_frame) + 1
-                                   if last_durable_source_frame is not None else 0)
-            if durable_frames > probe.frame_count:
-                raise VideoIngestionError(f"incomplete package contains too many frames for source {video}")
-            if durable_frames == probe.frame_count:
-                if source_file_boundary:
-                    builder.boundary(stream)
-                continue
-            if progress:
-                progress(f"[{index}/{len(prepared)}] transcoding {probe.frame_count:,} frames from {video.name} with {workers} JPEG worker(s)")
-            first_frame_id = next_frame_id
-            decoded, retained, candidates = _transcode_raw_video(
-                video, probe=probe, ffmpeg=ffmpeg_path, timing_arguments=timing_arguments,
-                builder=builder, stream=stream, source=source, storage=storage,
-                first_frame_id=first_frame_id, resume_source_frame=resume_source_frame,
-                jpeg_quality=jpeg_quality, jpeg_subsampling=jpeg_subsampling, jpeg_workers=workers,
-                queue_depth=depth, turbojpeg_library=str(turbojpeg_library) if turbojpeg_library is not None else None,
-                preview_frame_ids=selected,
-            )
-            for candidate in candidates:
-                try:
-                    thumbnail = _thumbnail(candidate.payload, ffmpeg=ffmpeg_path, width=preview_width,
-                                           turbojpeg_library=turbojpeg_library)
-                    relative_name = f"streams/{DatasetBuilder._slug(stream)}/frame_{candidate.frame_id:012d}.jpg"
-                    builder.add_resource_bytes(
-                        thumbnail, kind="preview", relative_name=relative_name,
-                        description=f"Non-authoritative representative thumbnail for retained frame {candidate.frame_id}",
-                        attributes={"preview_kind": "representative_thumbnail", "stream_uuid": str(stream_uuid),
-                                    "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
-                                    "acquisition_frame_number": candidate.source_frame_number,
-                                    "selection_method": "evenly_spaced_retained_frame_ids", "preview_width_max": preview_width},
-                        replace=resume,
+            if source is not None and source.frame_count is not None and source.file_hash is not None:
+                completed = builder.source_progress(stream, source.source_file_id)["frame_count"]
+                if completed == source.frame_count:
+                    _verify_completed_source(video, algorithm=source.file_hash.algorithm,
+                                             expected=source.file_hash.value)
+                    if source_file_boundary:
+                        builder.boundary_after_source(stream, source.source_file_id)
+                    continue
+            with _staged_video(video, directory=staging_root, hash_source=hash_sources) as (staged, source_hash):
+                probe = probe_video(staged, ffprobe=ffprobe_path)
+                if source is None:
+                    source = builder.register_source_file(
+                        path=video, original_relative_path=relative_path, sha256=source_hash,
+                        container=probe.container, codec=probe.codec, pixel_format=probe.pixel_format,
+                        width=probe.width, height=probe.height, frame_rate=probe.frame_rate,
+                        frame_count=probe.frame_count, start_timestamp=probe.creation_time,
                     )
-                    preview_entries.append({"relative_path": f"preview/{relative_name}", "stream_uuid": str(stream_uuid),
-                                            "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
-                                            "acquisition_frame_number": candidate.source_frame_number, "timestamp_ns": None})
-                    thumbnail_payloads.append(thumbnail)
-                except VideoIngestionError as exc:
-                    if require_previews:
-                        raise
-                    preview_warnings.append(str(exc))
-            next_frame_id += retained
-            total_frames += retained
-            builder.history.append(operation="frames_transcoded", software="libjpeg-turbo", software_version=encoder_version or "unknown",
-                                   parameters={"codec": "jpeg", "quality": jpeg_quality,
-                                               "subsampling": "gray" if grayscale else jpeg_subsampling,
-                                               "decoder": "ffmpeg", "decoder_version": decoder_version,
-                                               "jpeg_workers": workers, "queue_depth": depth,
-                                               "source_file_boundary": source_file_boundary,
-                                               "frame_sync_mode": timing_mode},
-                                   inputs=[{"source_uuid": str(source.source_uuid)}],
-                                   outputs=[{"stream_uuid": str(stream_uuid), "first_frame": first_frame_id,
-                                             "last_frame": next_frame_id - 1, "frame_count": retained,
-                                             "skipped_durable_frames": resume_source_frame, "decoded_frames": decoded}])
+                else:
+                    if source.file_hash is not None and source_hash is not None and source.file_hash.value != source_hash:
+                        raise VideoIngestionError(f"source file changed since the incomplete package was created: {video}")
+                    if source.frame_count is not None and source.frame_count != probe.frame_count:
+                        raise VideoIngestionError(f"probed frame count changed for source {video}: package has {source.frame_count}, input has {probe.frame_count}")
+                    if source.width is not None and source.width != probe.width or source.height is not None and source.height != probe.height:
+                        raise VideoIngestionError(f"probed dimensions changed for source {video}")
+                state = builder.source_progress(stream, source.source_file_id) if resume else {"frame_count": 0, "last_source_frame": None}
+                durable_frames = int(state["frame_count"] or 0)
+                last_durable_source_frame = state["last_source_frame"]
+                resume_source_frame = (int(last_durable_source_frame) + 1
+                                       if last_durable_source_frame is not None else 0)
+                if durable_frames > probe.frame_count:
+                    raise VideoIngestionError(f"incomplete package contains too many frames for source {video}")
+                if durable_frames == probe.frame_count:
+                    if source_file_boundary:
+                        builder.boundary_after_source(stream, source.source_file_id)
+                    continue
+                if progress:
+                    progress(f"[{index}/{len(videos)}] transcoding {probe.frame_count:,} frames from {video.name} with {workers} JPEG worker(s)")
+                first_frame_id = next_frame_id
+                sample_count = min(preview_count, probe.frame_count) if generate_previews else 0
+                source_samples = ({round(number * (probe.frame_count - 1) / (sample_count - 1))
+                                   for number in range(sample_count)} if sample_count > 1
+                                  else ({0} if sample_count else set()))
+                selected = {first_frame_id + number - resume_source_frame for number in source_samples
+                            if number >= resume_source_frame}
+                decoded, retained, candidates = _transcode_raw_video(
+                    staged, probe=probe, ffmpeg=ffmpeg_path, timing_arguments=timing_arguments,
+                    builder=builder, stream=stream, source=source, storage=storage,
+                    first_frame_id=first_frame_id, resume_source_frame=resume_source_frame,
+                    jpeg_quality=jpeg_quality, jpeg_subsampling=jpeg_subsampling, jpeg_workers=workers,
+                    queue_depth=depth, turbojpeg_library=str(turbojpeg_library) if turbojpeg_library is not None else None,
+                    preview_frame_ids=selected,
+                )
+                for candidate in candidates:
+                    try:
+                        thumbnail = _thumbnail(candidate.payload, ffmpeg=ffmpeg_path, width=preview_width,
+                                               turbojpeg_library=turbojpeg_library)
+                        relative_name = f"streams/{DatasetBuilder._slug(stream)}/frame_{candidate.frame_id:012d}.jpg"
+                        builder.add_resource_bytes(
+                            thumbnail, kind="preview", relative_name=relative_name,
+                            description=f"Non-authoritative representative thumbnail for retained frame {candidate.frame_id}",
+                            attributes={"preview_kind": "representative_thumbnail", "stream_uuid": str(stream_uuid),
+                                        "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
+                                        "acquisition_frame_number": candidate.source_frame_number,
+                                        "selection_method": "evenly_spaced_retained_frame_ids", "preview_width_max": preview_width},
+                            replace=resume,
+                        )
+                        preview_entries.append({"relative_path": f"preview/{relative_name}", "stream_uuid": str(stream_uuid),
+                                                "frame_id": candidate.frame_id, "acquisition_segment_uuid": str(source.source_uuid),
+                                                "acquisition_frame_number": candidate.source_frame_number, "timestamp_ns": None})
+                        if len(thumbnail_payloads) < 24:
+                            thumbnail_payloads.append(thumbnail)
+                    except VideoIngestionError as exc:
+                        if require_previews:
+                            raise
+                        preview_warnings.append(str(exc))
+                next_frame_id += retained
+                total_frames += retained
+                builder.history.append(operation="frames_transcoded", software="libjpeg-turbo", software_version=encoder_version or "unknown",
+                                       parameters={"codec": "jpeg", "quality": jpeg_quality,
+                                                   "subsampling": "gray" if grayscale else jpeg_subsampling,
+                                                   "decoder": "ffmpeg", "decoder_version": decoder_version,
+                                                   "jpeg_workers": workers, "queue_depth": depth,
+                                                   "source_file_boundary": source_file_boundary,
+                                                   "frame_sync_mode": timing_mode},
+                                       inputs=[{"source_uuid": str(source.source_uuid)}],
+                                       outputs=[{"stream_uuid": str(stream_uuid), "first_frame": first_frame_id,
+                                                 "last_frame": next_frame_id - 1, "frame_count": retained,
+                                                 "skipped_durable_frames": resume_source_frame, "decoded_frames": decoded}])
         if generate_previews and preview_entries:
             index_document = {"preview_schema_version": "1", "authoritative": False,
                               "selection_method": "evenly_spaced_retained_frame_ids", "requested_count": preview_count,
@@ -731,10 +756,10 @@ def ingest_video_directory(
                                                turbojpeg_library=turbojpeg_library)
                 builder.add_resource_bytes(contact_sheet, kind="preview",
                                            relative_name=f"streams/{DatasetBuilder._slug(stream)}/contact_sheet.jpg",
-                                           description="Non-authoritative contact sheet of evenly spaced representative frames",
+                                           description="Non-authoritative contact sheet of up to 24 representative frames",
                                            attributes={"preview_kind": "contact_sheet", "stream_uuid": str(stream_uuid),
                                                        "selection_method": "evenly_spaced_retained_frame_ids",
-                                                       "frame_ids": [entry["frame_id"] for entry in preview_entries]}, replace=resume)
+                                                       "frame_ids": [entry["frame_id"] for entry in preview_entries[:24]]}, replace=resume)
             except VideoIngestionError as exc:
                 if require_previews:
                     raise
@@ -747,4 +772,9 @@ def ingest_video_directory(
         elif generate_previews and require_previews:
             raise VideoIngestionError("required previews could not be generated")
     dataset = Dataset.open(output)
-    return VideoIngestionResult(dataset, len(prepared), total_frames, len(preview_entries))
+    for directory in (staging_root / "partials", staging_root, staging_root.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return VideoIngestionResult(dataset, len(videos), total_frames, len(preview_entries))
