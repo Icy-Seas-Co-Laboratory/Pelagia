@@ -49,6 +49,23 @@ if typer is not None:
             return int(stat_size_bytes)
         return 0
 
+    def _interchange_shard_payloads(path: Path, payload: dict) -> list[dict]:
+        from pelagia_interchange import Dataset
+
+        dataset = Dataset.open(path)
+        shard_payloads = []
+        next_frame_index = 1
+        for shard in dataset.manifest.shards:
+            shard_payloads.append({
+                **payload,
+                "interchange_dataset_uuid": dataset.manifest.dataset_uuid,
+                "interchange_shard_uuid": str(shard["shard_uuid"]),
+                "interchange_shard_start_index": next_frame_index,
+                "interchange_shard_frame_count": int(shard["frame_count"]),
+            })
+            next_frame_index += int(shard["frame_count"])
+        return shard_payloads or [payload]
+
     def _config_from_options(
         kvstore_root: Optional[Path],
         database_dsn: Optional[str],
@@ -1363,12 +1380,7 @@ if typer is not None:
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to queue frame extraction.")
         project_id = _project_id_from_key(context, project_key)
-        job = PipelineService(context).queue(
-            PipelineStage.EXTRACT_FRAMES,
-            project_id=project_id,
-            run_id=resolved_run_id,
-            asset_id=resolved_asset_id,
-            payload=ExtractFramesCommand.from_payload({
+        payload = ExtractFramesCommand.from_payload({
                 "source_path": str(resolved),
                 "kind": (
                     AssetKind.INTERCHANGE.value
@@ -1396,14 +1408,26 @@ if typer is not None:
                 ),
                 "generate_backgrounds": False if is_interchange else None,
                 "generate_flatfield_profiles": False if is_interchange else None,
-            }).to_payload(),
-            summary=f"extract_frames queued for {resolved.name}",
-        )
+            }).to_payload()
+        shard_payloads = _interchange_shard_payloads(resolved, payload) if is_interchange else [payload]
+        jobs = [
+            PipelineService(context).queue(
+                PipelineStage.EXTRACT_FRAMES,
+                project_id=project_id,
+                run_id=resolved_run_id,
+                asset_id=resolved_asset_id,
+                payload=shard_payload,
+                summary=f"extract_frames queued for {resolved.name}"
+                + (f" shard {shard_payload['interchange_shard_uuid']}" if "interchange_shard_uuid" in shard_payload else ""),
+            )
+            for shard_payload in shard_payloads
+        ]
         result = {
             "run_id": resolved_run_id,
             "asset_id": resolved_asset_id,
             "run_key": resolved_run_key,
-            "job_id": job["id"],
+            "job_id": jobs[0]["id"],
+            "job_ids": [job["id"] for job in jobs],
             "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
             "source_path": str(resolved),
             "collections": normalized_collections,
@@ -1474,12 +1498,7 @@ if typer is not None:
                 project_key=project_key,
                 compute_checksum=compute_checksum,
             )
-            job = PipelineService(context).queue(
-                PipelineStage.EXTRACT_FRAMES,
-                project_id=project_id,
-                run_id=resolved_run_id,
-                asset_id=resolved_asset_id,
-                payload=ExtractFramesCommand.from_payload({
+            payload = ExtractFramesCommand.from_payload({
                     "source_path": str(source_path),
                     "kind": source.kind,
                     "recursive": source.recursive,
@@ -1504,21 +1523,35 @@ if typer is not None:
                     ),
                     "generate_backgrounds": False if source.kind == AssetKind.INTERCHANGE.value else None,
                     "generate_flatfield_profiles": False if source.kind == AssetKind.INTERCHANGE.value else None,
-                }).to_payload(),
-                summary=f"extract_frames queued for {source_path.name}",
+                }).to_payload()
+            shard_payloads = (
+                _interchange_shard_payloads(source_path, payload)
+                if source.kind == AssetKind.INTERCHANGE.value else [payload]
             )
-            queued.append(
-                {
-                    "run_id": resolved_run_id,
-                    "asset_id": resolved_asset_id,
-                    "run_key": resolved_run_key,
-                    "job_id": job["id"],
-                    "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
-                    "source_path": str(source_path),
-                    "kind": source.kind,
-                    "collections": source_collections,
-                }
-            )
+            for shard_payload in shard_payloads:
+                job = PipelineService(context).queue(
+                    PipelineStage.EXTRACT_FRAMES,
+                    project_id=project_id,
+                    run_id=resolved_run_id,
+                    asset_id=resolved_asset_id,
+                    payload=shard_payload,
+                    summary=f"extract_frames queued for {source_path.name}"
+                    + (f" shard {shard_payload['interchange_shard_uuid']}" if "interchange_shard_uuid" in shard_payload else ""),
+                )
+                queued.append(
+                    {
+                        "run_id": resolved_run_id,
+                        "asset_id": resolved_asset_id,
+                        "run_key": resolved_run_key,
+                        "job_id": job["id"],
+                        "queue_stage": PipelineStage.EXTRACT_FRAMES.value,
+                        "source_path": str(source_path),
+                        "kind": source.kind,
+                        "collections": source_collections,
+                        **({"interchange_shard_uuid": shard_payload["interchange_shard_uuid"]}
+                           if "interchange_shard_uuid" in shard_payload else {}),
+                    }
+                )
 
         _echo_json(
             {

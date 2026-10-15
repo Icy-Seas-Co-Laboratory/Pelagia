@@ -580,7 +580,14 @@ if APIRouter is not None:
                     status_code=422,
                     detail=f"Interchange asset path must be a complete pelagia_interchange dataset: {str(path)!r}.",
                 )
-            stat_size = path.stat().st_size if path.is_file() else sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            if asset.size_bytes is not None:
+                stat_size = asset.size_bytes
+            elif asset.kind == AssetKind.INTERCHANGE.value:
+                from pelagia_interchange import Dataset
+
+                stat_size = int(Dataset.open(path).manifest_summary()["declared_data_bytes"])
+            else:
+                stat_size = path.stat().st_size if path.is_file() else sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
             checksum, checksum_status = _checksum_for_asset(
                 path,
                 compute_checksum=False,
@@ -636,17 +643,39 @@ if APIRouter is not None:
                 collections=collections,
                 checksum_status=checksum_status,
             )
-            job = PipelineService(get_context(request)).queue(
-                PipelineStage.EXTRACT_FRAMES,
-                project_id=auth.project_id,
-                run_id=run_id,
-                asset_id=asset_id,
-                payload=payload,
-                summary=f"extract_frames queued for {Path(asset.path).name}",
-                submitted_by_user_id=auth.user_id,
-                submitted_by_username=auth.username,
-            )
-            jobs.append(job)
+            shard_payloads = [payload]
+            if asset.kind == AssetKind.INTERCHANGE.value and not (
+                payload.get("generate_backgrounds") or payload.get("generate_flatfield_profiles")
+            ):
+                from pelagia_interchange import Dataset
+
+                dataset = Dataset.open(Path(asset.path).expanduser().resolve())
+                shard_payloads = []
+                next_frame_index = 1
+                for shard in dataset.manifest.shards:
+                    shard_payloads.append({
+                        **payload,
+                        "interchange_dataset_uuid": dataset.manifest.dataset_uuid,
+                        "interchange_shard_uuid": str(shard["shard_uuid"]),
+                        "interchange_shard_start_index": next_frame_index,
+                        "interchange_shard_frame_count": int(shard["frame_count"]),
+                    })
+                    next_frame_index += int(shard["frame_count"])
+                if not shard_payloads:
+                    shard_payloads = [payload]
+            for shard_payload in shard_payloads:
+                job = PipelineService(get_context(request)).queue(
+                    PipelineStage.EXTRACT_FRAMES,
+                    project_id=auth.project_id,
+                    run_id=run_id,
+                    asset_id=asset_id,
+                    payload=shard_payload,
+                    summary=f"extract_frames queued for {Path(asset.path).name}"
+                    + (f" shard {shard_payload['interchange_shard_uuid']}" if "interchange_shard_uuid" in shard_payload else ""),
+                    submitted_by_user_id=auth.user_id,
+                    submitted_by_username=auth.username,
+                )
+                jobs.append(job)
 
         return as_response(
             {

@@ -1035,6 +1035,10 @@ def test_extract_frames_handler_uses_interchange_fast_path(monkeypatch, tmp_path
             "payload": {
                 "kind": "interchange", "generate_backgrounds": False,
                 "generate_flatfield_profiles": False,
+                "interchange_dataset_uuid": "dataset-1",
+                "interchange_shard_uuid": "shard-1",
+                "interchange_shard_start_index": 8,
+                "interchange_shard_frame_count": 2,
             },
         },
         context,
@@ -1043,6 +1047,11 @@ def test_extract_frames_handler_uses_interchange_fast_path(monkeypatch, tmp_path
     assert result["frame_ids"] == ["frame-20"]
     assert calls[0][0] == (str(package),)
     assert calls[0][1]["context"] is context
+    assert calls[0][1]["shard_uuid"] == "shard-1"
+    assert calls[0][1]["expected_dataset_uuid"] == "dataset-1"
+    assert calls[0][1]["expected_shard_start_index"] == 8
+    assert calls[0][1]["expected_shard_frame_count"] == 2
+    assert result["interchange_shard_uuid"] == "shard-1"
 
 
 def test_preprocess_frames_handler_stores_preprocessed_payloads(monkeypatch):

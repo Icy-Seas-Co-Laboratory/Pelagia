@@ -415,13 +415,19 @@ Pelagia recognizes the package from its manifest and required files, registers
 it as one raw asset, and uses the dataset title as the collection name unless a
 collection is supplied explicitly. Frame counts and a manifest-based package
 size estimate are available during assessment without scanning the image
-shards. Full frame reads begin in the queued import job. The assessment does
+shards. The queued import creates one worker job per shard, so multiple extract
+workers can import shards concurrently. Each job reads only its assigned shard;
+the package remains one raw asset. If background or flatfield generation is
+requested, import uses one job to preserve windows across shard boundaries.
+Full frame reads begin in the queued import jobs. The assessment does
 not establish package integrity; run interchange validation when that
 assurance is needed. Dataset metadata, source-file identities, stream
 identities, frame timestamps, timestamp provenance, and original frame
-numbers are retained. JPEG, PNG, JPEG XL, and JPEG XS frame payloads are copied
-directly into KVStore without re-encoding; unsupported but decodable image
-codecs fall back to the project's configured frame encoding. Each frame is
+numbers are retained. Compatible JPEG, PNG, JPEG XL, JPEG XS, raw array, and
+Zstandard array frame payloads are copied
+directly into KVStore without re-encoding, even when the project has a different
+default frame encoding. Unsupported but decodable image codecs fall back to the
+project's configured frame encoding. Each frame is
 decoded once for geometry validation and its browser thumbhash.
 
 Interchange imports disable background and flatfield generation by default for

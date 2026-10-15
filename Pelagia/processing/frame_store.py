@@ -175,9 +175,9 @@ def store_frame(
                 if not encoded_encoding:
                     raise ValueError("encoded_encoding is required with encoded_payload.")
                 kvstore_encoding = normalize_image_encoding(encoded_encoding)
-                if kvstore_encoding not in {"jpg", "png", "jxl", "jxs"}:
+                if kvstore_encoding not in {"jpg", "png", "jxl", "jxs", "raw", "zstd"}:
                     raise ValueError(
-                        "Encoded payload passthrough supports jpg, png, jxl, and jxs."
+                        "Encoded payload passthrough supports jpg, png, jxl, jxs, raw, and zstd."
                     )
                 payload = bytes(encoded_payload)
                 kvstore_format = encoded_format or kvstore_encoding
@@ -200,6 +200,9 @@ def store_frame(
         width, height = frame.get_size()
         source_frame_start, source_frame_end = frame.get_source_frame_range()
         captured_at = frame.timestamp if isinstance(frame.timestamp, datetime) else None
+        stored_quality = (
+            metadata.get("kvstore_quality") if encoded_payload is not None else requested_quality
+        )
 
         if not run_id or not asset_id:
             raise ValueError("Frame metadata must include run_id and asset_id.")
@@ -210,7 +213,7 @@ def store_frame(
                     "kvstore_hash": kvstore_key,
                     "kvstore_encoding": kvstore_encoding,
                     "kvstore_format": kvstore_format,
-                    "kvstore_quality": int(requested_quality),
+                    "kvstore_quality": None if stored_quality is None else int(stored_quality),
                     "dtype": str(array.dtype),
                     "shape": list(array.shape),
                     "width": width,

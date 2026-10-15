@@ -19,6 +19,7 @@ from ._logging import log_processing_event, processing_core_logger
 from .defaults import default_processing_config
 from .frame_model import FrameData
 from .frame_codec import decode_array_payload
+from .codec_registry import normalize_image_encoding
 from .frame_store import store_frame
 from .frame_time import parse_filename_timestamp_utc, timestamp_for_frame
 from .timing import measure_phase
@@ -556,19 +557,42 @@ def ingest_interchange_dataset(
     metadata: dict[str, Any] | None = None,
     progress_callback: IngestProgressCallback | None = None,
     frame_stored_callback: IngestFrameStoredCallback | None = None,
+    shard_uuid: str | None = None,
+    expected_dataset_uuid: str | None = None,
+    expected_shard_start_index: int | None = None,
+    expected_shard_frame_count: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Import a complete pelagia_interchange package without re-encoding native payloads."""
+    """Import one shard or a complete package, preserving compatible encoded payloads."""
     from pelagia_interchange import Dataset, FrameStatus
 
     root = Path(dataset_path).expanduser().resolve()
     dataset = Dataset.open(root)
+    if expected_dataset_uuid is not None and str(dataset.manifest.dataset_uuid) != expected_dataset_uuid:
+        raise ValueError("Interchange dataset changed after the import was queued.")
+    shard_offsets: dict[str, int] = {}
+    next_index = 1
+    for shard_record in dataset.manifest.shards:
+        shard_offsets[str(shard_record["shard_uuid"])] = next_index
+        next_index += int(shard_record["frame_count"])
+    if shard_uuid is not None and shard_uuid not in shard_offsets:
+        raise ValueError(f"Interchange shard {shard_uuid!r} was not found in the dataset manifest.")
+    if shard_uuid is not None and expected_shard_start_index is not None:
+        if shard_offsets[shard_uuid] != int(expected_shard_start_index):
+            raise ValueError("Interchange shard position changed after the import was queued.")
     source_files = {
         int(source["source_file_id"]): dict(source)
         for source in dataset.manifest.source_files
     }
-    total = dataset.frame_count
+    total = (dataset.frame_count if shard_uuid is None else next(
+        int(shard_record["frame_count"])
+        for shard_record in dataset.manifest.shards
+        if str(shard_record["shard_uuid"]) == shard_uuid
+    ))
+    if expected_shard_frame_count is not None and total != int(expected_shard_frame_count):
+        raise ValueError("Interchange shard frame count changed after the import was queued.")
     base_metadata = dict(metadata or {})
     base_metadata.pop("pelagia_interchange", None)
+    base_metadata.pop("kvstore_quality", None)
     dataset_uuid = str(dataset.manifest.dataset_uuid)
     base_metadata.update({
         "source_type": AssetKind.INTERCHANGE.value,
@@ -623,10 +647,13 @@ def ingest_interchange_dataset(
     stored_frames: list[dict[str, Any]] = []
     skipped = 0
     processed = 0
-    for shard, reader in dataset.iter_shards():
+    for shard, reader in dataset.iter_shards(shard=shard_uuid):
+        shard_start_index = shard_offsets[str(shard["shard_uuid"])]
+        shard_frames_read = 0
         stream_name = str(shard.get("stream_name") or shard.get("stream_uuid") or "camera")
         stream_uuid = shard.get("stream_uuid")
         for interchange_frame in reader.iter_frames():
+            shard_frames_read += 1
             processed += 1
             record = interchange_frame.record
             if record.status is not FrameStatus.VALID or record.encoded_bytes is None:
@@ -644,7 +671,7 @@ def ingest_interchange_dataset(
             decode_metadata = {
                 "kvstore_encoding": codec,
                 "shape": [record.height, record.width] if record.height and record.width else None,
-                "dtype": "uint8",
+                "dtype": "uint16" if record.storage_format.bit_depth == 16 else "uint8",
             }
             try:
                 image = decode_array_payload(record.encoded_bytes, decode_metadata)
@@ -664,7 +691,7 @@ def ingest_interchange_dataset(
             source_filename = str(source.get("original_filename") or f"source-{record.source_file_id}")
             frame_metadata = {
                 **base_metadata,
-                "frame_index": len(stored_frames) + 1,
+                "frame_index": shard_start_index + shard_frames_read - 1,
                 "interchange": {
                     "dataset_uuid": dataset_uuid,
                     "frame_id": record.frame_id,
@@ -700,13 +727,18 @@ def ingest_interchange_dataset(
                     },
                 },
             }
-            normalized_codec = {"jpeg": "jpg"}.get(codec, codec)
-            passthrough = normalized_codec in {"jpg", "png", "jxl", "jxs"}
+            try:
+                normalized_codec = normalize_image_encoding(codec)
+            except ValueError:
+                normalized_codec = codec
+            passthrough = normalized_codec in {"jpg", "png", "jxl", "jxs", "raw", "zstd"}
+            if passthrough and record.storage_format.quality is not None:
+                frame_metadata["kvstore_quality"] = record.storage_format.quality
             stored_row = store_frame(
                 FrameData(
                     sourcePath=str(root), filename=source_filename,
                     frameNumber=int(record.source_frame_number), data=image,
-                    tileNumber=len(stored_frames) + 1,
+                    tileNumber=shard_start_index + shard_frames_read - 1,
                     sourceFrameStart=int(record.source_frame_number),
                     sourceFrameEnd=int(record.source_frame_number),
                     frameType="interchange", timestamp=captured_at,
@@ -716,7 +748,11 @@ def ingest_interchange_dataset(
                 context=context,
                 encoded_payload=record.encoded_bytes if passthrough else None,
                 encoded_encoding=normalized_codec if passthrough else None,
-                encoded_format=normalized_codec if passthrough else None,
+                encoded_format=(
+                    {"raw": "raw_ndarray_c_order", "zstd": "zstd_ndarray_c_order"}.get(
+                        normalized_codec, normalized_codec
+                    ) if passthrough else None
+                ),
             )
             stored_frames.append(stored_row)
             if frame_stored_callback is not None:
@@ -724,9 +760,11 @@ def ingest_interchange_dataset(
             _emit_ingest_progress(progress_callback, "frame_stored", {
                 "source_path": str(root), "source_frame_count": total,
                 "source_frames_read": processed, "stored_frame_count": len(stored_frames),
-                "frame_index": len(stored_frames), "filename": source_filename,
+                "frame_index": shard_start_index + shard_frames_read - 1, "filename": source_filename,
                 "encoded_payload_passthrough": passthrough,
             })
+        if shard_frames_read != int(shard["frame_count"]):
+            raise ValueError(f"Interchange shard {shard['shard_uuid']} frame count differs from its manifest.")
 
     _emit_ingest_progress(progress_callback, "completed", {
         "source_path": str(root), "source_frame_count": total,

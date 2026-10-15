@@ -5140,6 +5140,40 @@ def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path, monkeyp
     assert repository.created_jobs[0]["payload"]["generate_backgrounds"] is False
 
 
+def test_api_queues_one_interchange_job_per_shard_without_scanning(tmp_path, monkeypatch):
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+    package = tmp_path / "interchange"
+    ok, encoded = cv2.imencode(".png", np.zeros((3, 4), dtype=np.uint8))
+    assert ok
+    with DatasetBuilder(package, title="Two shards", maximum_frame_count=1) as builder:
+        source = builder.register_source_file(original_filename="camera.avi", frame_count=2)
+        for number in range(2):
+            builder.add_frame(
+                stream="camera", source_file=source, frame_id=number,
+                source_frame_number=number, encoded_bytes=encoded.tobytes(),
+                storage_format=StorageFormat("png"), width=4, height=3,
+            )
+    shard_ids = [shard["shard_uuid"] for shard in Dataset.open(package).manifest.shards]
+    assert len(shard_ids) == 2
+    client.app.state.context.config.file_browser.root_path_import_dir = tmp_path
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rglob", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected scan")))
+        response = client.post(
+            "/ingestion/assets", headers=headers,
+            json={"assets": [{"path": str(package), "kind": "interchange"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["asset_count"] == 1
+    assert len(response.json()["jobs"]) == 2
+    assert [job["payload"]["interchange_shard_uuid"] for job in repository.created_jobs] == shard_ids
+    assert {job["payload"]["interchange_dataset_uuid"] for job in repository.created_jobs} == {
+        Dataset.open(package).manifest.dataset_uuid
+    }
+
+
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):
     client, _, _ = make_client()
     headers = auth_headers(client)

@@ -34,7 +34,7 @@ from Pelagia.storage.postgres import DEFAULT_PROJECT_ID
 from Pelagia.processing.ingest import convert_frame_to_grayscale, discover_ingest_sources
 from Pelagia.processing.ingest import ingest_image_folder, ingest_interchange_dataset, ingest_video_file
 from Pelagia.processing.ingest_analysis import analyze_ingest_path
-from pelagia_interchange import DatasetBuilder, StorageFormat
+from pelagia_interchange import Dataset, DatasetBuilder, FrameStatus, StorageFormat
 
 
 FRAME_ID = "00000000-0000-7000-8000-000000000042"
@@ -1380,6 +1380,76 @@ def test_interchange_dataset_analysis_and_direct_ingest_preserve_payload_and_tim
     assert frame_metadata["interchange"]["stream_name"] == "camera1"
     assert frame_metadata["interchange"]["timestamp"]["captured_at_source"] == "interchange.original_filename"
     assert "pelagia_interchange" not in frame_metadata
+    assert "kvstore_quality" not in frame_metadata
+
+
+def test_interchange_shard_import_has_stable_indexes_after_missing_frame(tmp_path):
+    package = tmp_path / "sharded-interchange"
+    image = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    ok, encoded = ingest_module.cv2.imencode(".png", image)
+    assert ok
+    payload = encoded.tobytes()
+    with DatasetBuilder(package, maximum_frame_count=1) as builder:
+        source = builder.register_source_file(original_filename="camera.avi", frame_count=3)
+        builder.add_frame(
+            stream="camera", source_file=source, frame_id=0,
+            source_frame_number=0, encoded_bytes=None, status=FrameStatus.MISSING,
+        )
+        for number in (1, 2):
+            builder.add_frame(
+                stream="camera", source_file=source, frame_id=number,
+                source_frame_number=number, encoded_bytes=payload,
+                storage_format=StorageFormat("image/png", quality=77), width=4, height=3,
+            )
+    dataset = Dataset.open(package)
+    shard_ids = [shard["shard_uuid"] for shard in dataset.manifest.shards]
+    assert len(shard_ids) == 3
+    ctx = FakeContext()
+    for shard_id in reversed(shard_ids):
+        ingest_interchange_dataset(
+            package, context=ctx,
+            run_id="00000000-0000-0000-0000-000000000001",
+            asset_id="00000000-0000-0000-0000-000000000002",
+            shard_uuid=shard_id,
+            expected_dataset_uuid=dataset.manifest.dataset_uuid,
+        )
+    assert [params[2] for params in ctx.repository.cursor_obj.params_history] == [3, 2]
+    assert ctx.kvstore.payload == payload
+    assert all(
+        json.loads(params[17])["kvstore_quality"] == 77
+        for params in ctx.repository.cursor_obj.params_history
+    )
+    with pytest.raises(ValueError, match="changed after"):
+        ingest_interchange_dataset(package, context=ctx, expected_dataset_uuid="wrong")
+
+
+@pytest.mark.parametrize("codec,bit_depth", [("raw", 8), ("raw", 16), ("zstd", 8), ("zstd", 16)])
+def test_interchange_import_preserves_compatible_array_payload(tmp_path, codec, bit_depth):
+    package = tmp_path / f"{codec}-{bit_depth}-interchange"
+    image = np.arange(12, dtype=np.uint16 if bit_depth == 16 else np.uint8).reshape(3, 4)
+    payload = image.tobytes()
+    if codec == "zstd":
+        zstandard = pytest.importorskip("zstandard")
+
+        payload = zstandard.ZstdCompressor().compress(payload)
+    with DatasetBuilder(package) as builder:
+        source = builder.register_source_file(original_filename="camera.avi", frame_count=1)
+        builder.add_frame(
+            stream="camera", source_file=source, frame_id=0,
+            source_frame_number=0, encoded_bytes=payload,
+            storage_format=StorageFormat(codec, bit_depth=bit_depth), width=4, height=3,
+        )
+    ctx = FakeContext()
+    ingest_interchange_dataset(
+        package, context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+    )
+    assert ctx.kvstore.payload == payload
+    frame_metadata = json.loads(ctx.repository.cursor_obj.params[17])
+    assert frame_metadata["kvstore_encoding"] == codec
+    assert frame_metadata["kvstore_format"] == f"{codec}_ndarray_c_order"
+    assert frame_metadata["encoded_payload_passthrough"] is True
 
 
 def test_interchange_ingest_uses_collection_metadata_for_missing_source_timestamp(tmp_path):

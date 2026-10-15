@@ -353,6 +353,10 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
             metadata=metadata,
             progress_callback=report_ingest_progress,
             frame_stored_callback=None if background_addon is None else background_addon.consume,
+            shard_uuid=payload.get("interchange_shard_uuid"),
+            expected_dataset_uuid=payload.get("interchange_dataset_uuid"),
+            expected_shard_start_index=payload.get("interchange_shard_start_index"),
+            expected_shard_frame_count=payload.get("interchange_shard_frame_count"),
         )
     elif source_is_folder or asset_kind == "image_sequence":
         frame_rows = ingest_module.ingest_image_folder(
@@ -446,6 +450,8 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_count": len(frame_rows),
         "frame_ids": [row.get("id") for row in frame_rows],
     }
+    if asset_kind == AssetKind.INTERCHANGE.value and payload.get("interchange_shard_uuid"):
+        result["interchange_shard_uuid"] = payload["interchange_shard_uuid"]
     if background_result is not None and background_result["updated_frame_count"]:
         result["field_generation"] = background_result
         if background_result["backgrounds_generated"]:
