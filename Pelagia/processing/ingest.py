@@ -551,6 +551,7 @@ def _interchange_captured_at(
 def ingest_interchange_dataset(
     dataset_path: str | os.PathLike[str],
     *,
+    n_tile: int = 1,
     context: AppContext | None = None,
     run_id: str | None = None,
     asset_id: str | None = None,
@@ -562,9 +563,13 @@ def ingest_interchange_dataset(
     expected_shard_start_index: int | None = None,
     expected_shard_frame_count: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Import one shard or a complete package, preserving compatible encoded payloads."""
+    """Import an archive, preserving encoded payloads when frames are not tiled."""
     from pelagia_interchange import Dataset, FrameStatus
 
+    if n_tile < 1:
+        raise ValueError("n_tile must be >= 1.")
+    if n_tile > 1 and shard_uuid is not None:
+        raise ValueError("Tiled interchange import must process the complete dataset in one job.")
     root = Path(dataset_path).expanduser().resolve()
     dataset = Dataset.open(root)
     if expected_dataset_uuid is not None and str(dataset.manifest.dataset_uuid) != expected_dataset_uuid:
@@ -647,16 +652,57 @@ def ingest_interchange_dataset(
     stored_frames: list[dict[str, Any]] = []
     skipped = 0
     processed = 0
+    tile_frames: list[tuple[np.ndarray, dict[str, Any], str, datetime | None, int, int, str]] = []
+    tile_number = 0
+
+    def store_tile() -> None:
+        nonlocal tile_number
+        if not tile_frames:
+            return
+        tile_number += 1
+        first, last = tile_frames[0], tile_frames[-1]
+        image = np.ascontiguousarray(np.vstack([member[0] for member in tile_frames]))
+        tile_metadata = dict(last[1])
+        tile_metadata["frame_index"] = tile_number
+        tile_metadata["interchange"] = {
+            **last[1]["interchange"],
+            "tile_frames": [member[1]["interchange"] for member in tile_frames],
+        }
+        stored_row = store_frame(
+            FrameData(
+                sourcePath=str(root), filename=last[2], frameNumber=last[5],
+                data=image, tileNumber=tile_number,
+                sourceFrameStart=first[5], sourceFrameEnd=last[5],
+                frameType="interchange", timestamp=last[3],
+                width=image.shape[1], height=image.shape[0], metadata=tile_metadata,
+            ),
+            context=context,
+        )
+        stored_frames.append(stored_row)
+        if frame_stored_callback is not None:
+            frame_stored_callback({**stored_row, "interchange_source_file_id": first[4]}, image)
+        _emit_ingest_progress(progress_callback, "frame_stored", {
+            "source_path": str(root), "source_frame_count": total,
+            "source_frames_read": processed, "stored_frame_count": len(stored_frames),
+            "frame_index": tile_number, "filename": last[2],
+            "source_frame_start": first[5], "source_frame_end": last[5],
+            "encoded_payload_passthrough": False,
+        })
+        tile_frames.clear()
+
     for shard, reader in dataset.iter_shards(shard=shard_uuid):
         shard_start_index = shard_offsets[str(shard["shard_uuid"])]
         shard_frames_read = 0
         stream_name = str(shard.get("stream_name") or shard.get("stream_uuid") or "camera")
         stream_uuid = shard.get("stream_uuid")
+        stream_key = str(stream_uuid or stream_name)
         for interchange_frame in reader.iter_frames():
             shard_frames_read += 1
             processed += 1
             record = interchange_frame.record
             if record.status is not FrameStatus.VALID or record.encoded_bytes is None:
+                if tile_frames:
+                    store_tile()
                 skipped += 1
                 _emit_ingest_progress(progress_callback, "frame_skipped", {
                     "source_path": str(root), "source_frame_count": total,
@@ -727,6 +773,22 @@ def ingest_interchange_dataset(
                     },
                 },
             }
+            if n_tile > 1:
+                tile_image = convert_frame_to_grayscale(image)
+                source_number = int(record.source_frame_number)
+                source_id = int(record.source_file_id)
+                if tile_frames and (
+                    tile_frames[-1][4] != source_id
+                    or tile_frames[-1][5] + 1 != source_number
+                    or tile_frames[-1][6] != stream_key
+                    or tile_frames[-1][0].shape[1] != tile_image.shape[1]
+                    or tile_frames[-1][0].dtype != tile_image.dtype
+                ):
+                    store_tile()
+                tile_frames.append((tile_image, frame_metadata, source_filename, captured_at, source_id, source_number, stream_key))
+                if len(tile_frames) == n_tile:
+                    store_tile()
+                continue
             try:
                 normalized_codec = normalize_image_encoding(codec)
             except ValueError:
@@ -756,7 +818,7 @@ def ingest_interchange_dataset(
             )
             stored_frames.append(stored_row)
             if frame_stored_callback is not None:
-                frame_stored_callback(stored_row, image)
+                frame_stored_callback({**stored_row, "interchange_source_file_id": int(record.source_file_id)}, image)
             _emit_ingest_progress(progress_callback, "frame_stored", {
                 "source_path": str(root), "source_frame_count": total,
                 "source_frames_read": processed, "stored_frame_count": len(stored_frames),
@@ -766,6 +828,8 @@ def ingest_interchange_dataset(
         if shard_frames_read != int(shard["frame_count"]):
             raise ValueError(f"Interchange shard {shard['shard_uuid']} frame count differs from its manifest.")
 
+    if tile_frames:
+        store_tile()
     _emit_ingest_progress(progress_callback, "completed", {
         "source_path": str(root), "source_frame_count": total,
         "source_frames_read": processed, "stored_frame_count": len(stored_frames),

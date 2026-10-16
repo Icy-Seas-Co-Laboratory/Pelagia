@@ -27,7 +27,7 @@ from ..processing.detection_refinement import (
     refined_storage_candidate_detection_id,
 )
 from ..processing.frame_correction import ensure_asset_background_windows
-from ..processing.ingest_background import MeanFieldIngestAddon
+from ..processing.ingest_background import MeanFieldIngestAddon, SourceGroupedMeanFieldIngestAddon
 from ..processing.frame_preprocess import preprocess_frame_for_segmentation
 from ..processing.frame_codec import decode_array_payload
 from ..processing.frame_store import frame_id_work_units, retrieve_frame, store_preprocessed_frames
@@ -211,6 +211,7 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     metadata.setdefault("collections", collections)
     metadata.setdefault("worker_job_id", str(job.get("id")))
     metadata.setdefault("worker_stage", PipelineStage.EXTRACT_FRAMES.value)
+    asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
     ingest_defaults = context.config.processing.video_ingest
     preprocessing_defaults = context.config.processing.preprocessing
     flatfield_defaults = context.config.processing.flatfield
@@ -225,7 +226,8 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
     )
     background_addon = None
     if generate_backgrounds or generate_flatfield_profiles:
-        background_addon = MeanFieldIngestAddon(
+        addon_class = SourceGroupedMeanFieldIngestAddon if asset_kind == AssetKind.INTERCHANGE.value else MeanFieldIngestAddon
+        background_addon = addon_class(
             context=context,
             project_id=project_id,
             window_stride=int(
@@ -343,10 +345,10 @@ def extract_frames_handler(job: dict[str, Any], context: AppContext) -> dict[str
         )
 
     source_is_folder = Path(str(source_path)).expanduser().is_dir()
-    asset_kind = str(asset.get("kind") or payload.get("kind") or "").lower()
     if asset_kind == AssetKind.INTERCHANGE.value:
         frame_rows = ingest_module.ingest_interchange_dataset(
             source_path,
+            n_tile=int(payload.get("n_tile", ingest_defaults.n_tile)),
             context=context,
             run_id=run_id,
             asset_id=asset_id,

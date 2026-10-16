@@ -176,7 +176,12 @@ def preprocess_frame_for_segmentation(
     resolved_crop_y = processing_defaults.crop_y if crop_y is None else crop_y
     resolved_crop_w = processing_defaults.crop_w if crop_w is None else crop_w
     resolved_crop_h = processing_defaults.crop_h if crop_h is None else crop_h
-    resolved_invert_intensity = processing_defaults.invert_intensity
+    source_polarity = (frame.metadata or {}).get("source_foreground_polarity")
+    resolved_invert_intensity = (
+        source_polarity == "dark"
+        if source_polarity == "dark" or source_polarity == "bright"
+        else processing_defaults.invert_intensity
+    )
 
     source_mask = mask if mask is not None else frame.mask
     source_background = frame.bkg

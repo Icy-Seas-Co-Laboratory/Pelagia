@@ -5,7 +5,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ...domain import AssetKind, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
 from ...processing.ingest_analysis import analyze_ingest_path
@@ -62,6 +62,7 @@ if APIRouter is not None:
         instrument: str = "api"
         compute_checksum: bool = False
         metadata: dict[str, Any] = Field(default_factory=dict)
+        source_foreground_polarity: Literal["dark", "bright"] | None = None
 
     class AnalyzeIngestionRequest(BaseModel):
         source_path: str
@@ -94,6 +95,7 @@ if APIRouter is not None:
         collections: str | list[str] | None = None
         media_count: int | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
+        source_foreground_polarity: Literal["dark", "bright"] | None = None
         n_tile: int | None = None
         image_encoding: str | None = None
         image_quality: int | None = None
@@ -287,7 +289,12 @@ if APIRouter is not None:
             image_encoding=getattr(global_body, "image_encoding", None),
             image_quality=getattr(global_body, "image_quality", None),
         )
-        n_tile = defaults["n_tile"] if asset.n_tile is None else asset.n_tile
+        if asset.n_tile is not None:
+            n_tile = asset.n_tile
+        elif asset.kind == AssetKind.INTERCHANGE.value and getattr(global_body, "n_tile", None) is None:
+            n_tile = 1
+        else:
+            n_tile = defaults["n_tile"]
         image_encoding = _normalize_image_encoding(asset.image_encoding) or defaults["image_encoding"]
         image_quality = _normalize_image_quality(asset.image_quality, defaults["image_quality"])
         background_encoding = _normalize_image_encoding(
@@ -597,6 +604,8 @@ if APIRouter is not None:
                 checksum_status = asset.checksum_status
             collections = normalize_collections(asset.collections)
             metadata = dict(asset.metadata or {})
+            if asset.source_foreground_polarity is not None:
+                metadata["source_foreground_polarity"] = asset.source_foreground_polarity
             metadata["project_id"] = auth.project_id
             metadata.setdefault("api_endpoint", "POST /ingestion/assets")
             metadata.setdefault("collections", collections)
@@ -644,7 +653,7 @@ if APIRouter is not None:
                 checksum_status=checksum_status,
             )
             shard_payloads = [payload]
-            if asset.kind == AssetKind.INTERCHANGE.value and not (
+            if asset.kind == AssetKind.INTERCHANGE.value and int(payload.get("n_tile", 1)) == 1 and not (
                 payload.get("generate_backgrounds") or payload.get("generate_flatfield_profiles")
             ):
                 from pelagia_interchange import Dataset
@@ -801,6 +810,8 @@ if APIRouter is not None:
             checksum = f"uncomputed:size={stat.st_size}:mtime_ns={stat.st_mtime_ns}"
             checksum_status = "deferred"
         asset_metadata = dict(body.metadata)
+        if body.source_foreground_polarity is not None:
+            asset_metadata["source_foreground_polarity"] = body.source_foreground_polarity
         asset_metadata["project_id"] = auth.project_id
         asset_metadata.setdefault("api_endpoint", "POST /ingestion/videos")
         asset_metadata.setdefault("collections", collections)

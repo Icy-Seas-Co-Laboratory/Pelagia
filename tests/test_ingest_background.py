@@ -3,7 +3,7 @@ import pytest
 
 from Pelagia.config import CoreConfig
 from Pelagia.processing.frame_codec import decode_array_payload
-from Pelagia.processing.ingest_background import MeanFieldIngestAddon
+from Pelagia.processing.ingest_background import MeanFieldIngestAddon, SourceGroupedMeanFieldIngestAddon
 from Pelagia.services.context import AppContext
 
 
@@ -92,6 +92,35 @@ def test_ingest_background_addon_streams_mean_windows_and_batches_assignments():
         "frame-3",
         "frame-4",
     ]
+
+
+def test_interchange_field_windows_do_not_cross_original_source_files():
+    repository = BackgroundRepository()
+    kvstore = BackgroundKVStore()
+    addon = SourceGroupedMeanFieldIngestAddon(
+        context=AppContext(config=CoreConfig(), repository=repository, kvstore=kvstore),
+        project_id=None,
+        window_stride=3,
+        window_width=3,
+        encoding="raw",
+        generate_backgrounds=True,
+        generate_flatfield_profiles=False,
+    )
+    for frame_index, source_id, value in ((1, 1, 10), (2, 1, 20), (3, 2, 100), (4, 2, 120)):
+        addon.consume(
+            {"id": f"frame-{frame_index}", "frame_index": frame_index, "interchange_source_file_id": source_id},
+            np.full((2, 2), value, dtype=np.uint8),
+        )
+
+    result = addon.finalize()
+    assert result["source_count"] == 2
+    assert result["updated_frame_count"] == 4
+    assert result["backgrounds_generated"] is True
+    assignments = [assignment for call, _project_id in repository.calls for assignment in call]
+    for assignment in assignments:
+        source_ids = {int(frame_id.split("-")[1]) <= 2 for frame_id in assignment["metadata"]["background_source_frame_ids"]}
+        assert len(source_ids) == 1
+        assert (int(assignment["frame_id"].split("-")[1]) <= 2) in source_ids
 
 
 def test_ingest_background_addon_can_generate_profiles_without_kvstore_writes():

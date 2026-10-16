@@ -1045,6 +1045,7 @@ def test_extract_frames_handler_uses_interchange_fast_path(monkeypatch, tmp_path
                 "interchange_shard_uuid": "shard-1",
                 "interchange_shard_start_index": 8,
                 "interchange_shard_frame_count": 2,
+                "n_tile": 1,
             },
         },
         context,
@@ -1057,6 +1058,7 @@ def test_extract_frames_handler_uses_interchange_fast_path(monkeypatch, tmp_path
     assert calls[0][1]["expected_dataset_uuid"] == "dataset-1"
     assert calls[0][1]["expected_shard_start_index"] == 8
     assert calls[0][1]["expected_shard_frame_count"] == 2
+    assert calls[0][1]["n_tile"] == 1
     assert result["interchange_shard_uuid"] == "shard-1"
 
 

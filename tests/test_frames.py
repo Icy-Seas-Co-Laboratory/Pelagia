@@ -417,6 +417,25 @@ def test_area_scan_preprocessing_divides_source_by_background_then_inverts():
     assert processed.metadata["intensity_inverted"] is True
 
 
+@pytest.mark.parametrize(
+    ("project_default", "source_polarity", "expected"),
+    [(True, "bright", 10), (False, "dark", 245), (True, None, 245)],
+)
+def test_preprocessing_respects_source_foreground_polarity(project_default, source_polarity, expected):
+    config = CoreConfig()
+    config.processing.preprocessing.invert_intensity = project_default
+    metadata = {} if source_polarity is None else {"source_foreground_polarity": source_polarity}
+    frame = FrameData(
+        sourcePath="/tmp", filename="source.png", frameNumber=1,
+        data=np.array([[10]], dtype=np.uint8), metadata=metadata,
+    )
+
+    processed = preprocess_frame_for_segmentation(frame, context=SimpleNamespace(config=config))
+
+    assert int(processed.read()[0, 0]) == expected
+    assert processed.metadata["intensity_inverted"] is (source_polarity == "dark" if source_polarity else project_default)
+
+
 def test_generate_background_for_frames_stores_mean_field(monkeypatch):
     class BackgroundKVStore:
         def __init__(self):
@@ -1421,6 +1440,70 @@ def test_interchange_shard_import_has_stable_indexes_after_missing_frame(tmp_pat
     )
     with pytest.raises(ValueError, match="changed after"):
         ingest_interchange_dataset(package, context=ctx, expected_dataset_uuid="wrong")
+
+
+def test_interchange_import_tiles_consecutive_frames_with_provenance(tmp_path):
+    package = tmp_path / "tiled-interchange"
+    images = [np.full((2, 3), value, dtype=np.uint8) for value in (10, 20, 30)]
+    with DatasetBuilder(package, maximum_frame_count=1) as builder:
+        source = builder.register_source_file(original_filename="camera.avi", frame_count=3)
+        for number, image in enumerate(images):
+            ok, encoded = ingest_module.cv2.imencode(".png", image)
+            assert ok
+            builder.add_frame(
+                stream="camera", source_file=source, frame_id=number,
+                source_frame_number=number, encoded_bytes=encoded.tobytes(),
+                storage_format=StorageFormat("png"), width=3, height=2,
+            )
+
+    ctx = FakeContext()
+    stored_images = []
+    rows = ingest_interchange_dataset(
+        package, n_tile=2, context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        frame_stored_callback=lambda _row, image: stored_images.append(image.copy()),
+    )
+
+    assert len(rows) == 2
+    np.testing.assert_array_equal(stored_images[0], np.vstack(images[:2]))
+    np.testing.assert_array_equal(stored_images[1], images[2])
+    first, second = ctx.repository.cursor_obj.params_history
+    assert [first[2], second[2]] == [1, 2]
+    assert first[4:6] == (3, 4)
+    first_metadata = json.loads(first[17])
+    assert (first_metadata["source_frame_start"], first_metadata["source_frame_end"]) == (0, 1)
+    assert [frame["frame_id"] for frame in first_metadata["interchange"]["tile_frames"]] == [0, 1]
+    assert first_metadata.get("encoded_payload_passthrough") is not True
+    assert second[4:6] == (3, 2)
+
+
+def test_interchange_tiling_does_not_join_distinct_source_files(tmp_path):
+    package = tmp_path / "two-source-interchange"
+    with DatasetBuilder(package) as builder:
+        for source_name, value in (("first.avi", 10), ("second.avi", 20)):
+            source = builder.register_source_file(original_filename=source_name, frame_count=1)
+            image = np.full((2, 3), value, dtype=np.uint8)
+            ok, encoded = ingest_module.cv2.imencode(".png", image)
+            assert ok
+            builder.add_frame(
+                stream="camera", source_file=source, frame_id=value,
+                source_frame_number=0, encoded_bytes=encoded.tobytes(),
+                storage_format=StorageFormat("png"), width=3, height=2,
+            )
+
+    ctx = FakeContext()
+    stored_images = []
+    rows = ingest_interchange_dataset(
+        package, n_tile=2, context=ctx,
+        run_id="00000000-0000-0000-0000-000000000001",
+        asset_id="00000000-0000-0000-0000-000000000002",
+        frame_stored_callback=lambda row, image: stored_images.append((row["interchange_source_file_id"], image.copy())),
+    )
+
+    assert len(rows) == 2
+    assert stored_images[0][0] != stored_images[1][0]
+    assert [image.shape for _, image in stored_images] == [(2, 3), (2, 3)]
 
 
 @pytest.mark.parametrize("codec,bit_depth", [("raw", 8), ("raw", 16), ("zstd", 8), ("zstd", 16)])

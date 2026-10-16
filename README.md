@@ -417,8 +417,10 @@ collection is supplied explicitly. Frame counts and a manifest-based package
 size estimate are available during assessment without scanning the image
 shards. The queued import creates one worker job per shard, so multiple extract
 workers can import shards concurrently. Each job reads only its assigned shard;
-the package remains one raw asset. If background or flatfield generation is
-requested, import uses one job to preserve windows across shard boundaries.
+the package remains one raw asset. If background or flatfield generation or
+multi-frame tiling is requested, import uses one job to preserve windows and
+tiles across shard boundaries. Tiling stacks consecutive compatible frames
+from the same source vertically; each tile records its member frame provenance.
 Full frame reads begin in the queued import jobs. The assessment does
 not establish package integrity; run interchange validation when that
 assurance is needed. Dataset metadata, source-file identities, stream
@@ -567,6 +569,10 @@ without correction. Preprocessing and segmentation requests now expose only
 `min_field_value`, `max_field_value`, `apply_mask`, and the `crop_*` controls for
 this stage. Quantile, axis, correction-toggle, ad-hoc background-selection, and
 inversion request parameters have been removed.
+At ingestion, video and interchange assets may set `source_foreground_polarity`
+to `dark` or `bright`. Dark foreground is inverted during preprocessing;
+bright foreground is kept. Assets without this value use the configured
+`invert_intensity` default. Source frames remain unchanged.
 When neither switch is supplied, effective correction settings choose one mode,
 with background generation taking precedence over flatfield profiles.
 

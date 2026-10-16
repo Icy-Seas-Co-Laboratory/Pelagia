@@ -4940,6 +4940,7 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
         json={
             "source_path": str(video_path),
             "n_tile": 2,
+            "source_foreground_polarity": "dark",
             "enqueue_segment": True,
             "roi_padding": 4,
         },
@@ -4953,6 +4954,7 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
     assert body["job"]["stage"] == "extract_frames"
     assert repository.registered_runs[0].manifest.assets[0].path == str(video_path.resolve())
     assert repository.registered_runs[0].manifest.assets[0].collections == ["none"]
+    assert repository.registered_runs[0].manifest.assets[0].metadata["source_foreground_polarity"] == "dark"
     assert repository.registered_runs[0].manifest.assets[0].metadata["checksum_status"] == "deferred"
     assert repository.created_jobs[0]["payload"]["checksum_status"] == "deferred"
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
@@ -5128,7 +5130,7 @@ def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path, monkeyp
         "/ingestion/assets",
         headers=headers,
         json={
-            "assets": [asset],
+            "assets": [{**asset, "source_foreground_polarity": "bright"}],
         },
     )
 
@@ -5136,6 +5138,7 @@ def test_api_analyzes_and_queues_interchange_as_one_collection(tmp_path, monkeyp
     registered = repository.registered_runs[0].manifest.assets[0]
     assert registered.kind.value == "interchange"
     assert registered.collections == ["Deployment 42"]
+    assert registered.metadata["source_foreground_polarity"] == "bright"
     assert repository.created_jobs[0]["payload"]["kind"] == "interchange"
     assert repository.created_jobs[0]["payload"]["generate_backgrounds"] is False
 
@@ -5172,6 +5175,24 @@ def test_api_queues_one_interchange_job_per_shard_without_scanning(tmp_path, mon
     assert {job["payload"]["interchange_dataset_uuid"] for job in repository.created_jobs} == {
         Dataset.open(package).manifest.dataset_uuid
     }
+
+    tiled = client.post(
+        "/ingestion/assets", headers=headers,
+        json={"assets": [{
+            "path": str(package), "kind": "interchange", "n_tile": 2,
+            "generate_backgrounds": True,
+            "background_window_width": 3,
+            "background_window_stride": 1,
+        }]},
+    )
+    assert tiled.status_code == 200
+    assert len(tiled.json()["jobs"]) == 1
+    payload = repository.created_jobs[-1]["payload"]
+    assert payload["n_tile"] == 2
+    assert payload["generate_backgrounds"] is True
+    assert payload["background_window_width"] == 3
+    assert payload["background_window_stride"] == 1
+    assert "interchange_shard_uuid" not in payload
 
 
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):

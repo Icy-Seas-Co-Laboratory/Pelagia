@@ -43,6 +43,41 @@ class _BufferedAssignmentRepository:
         return getattr(self.repository, name)
 
 
+class SourceGroupedMeanFieldIngestAddon:
+    """Keep interchange field windows within each original source file."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._kwargs = kwargs
+        self._sources: dict[int, MeanFieldIngestAddon] = {}
+
+    def consume(self, frame_row: dict[str, Any], array: np.ndarray) -> None:
+        source_id = frame_row.get("interchange_source_file_id")
+        if source_id is None:
+            raise ValueError("Interchange field generation requires a source-file ID.")
+        addon = self._sources.get(int(source_id))
+        if addon is None:
+            addon = MeanFieldIngestAddon(**self._kwargs)
+            self._sources[int(source_id)] = addon
+        addon.consume(frame_row, array)
+
+    def finalize(self) -> dict[str, Any]:
+        results = [addon.finalize() for addon in self._sources.values()]
+        return {
+            "method": "mean",
+            "window_count": sum(int(result["window_count"]) for result in results),
+            "background_window_count": sum(
+                int(result.get("background_window_count", result["window_count"])) for result in results
+            ) if self._kwargs.get("generate_backgrounds") else 0,
+            "flatfield_window_count": sum(
+                int(result.get("flatfield_window_count", result["window_count"])) for result in results
+            ) if self._kwargs.get("generate_flatfield_profiles") else 0,
+            "updated_frame_count": sum(int(result["updated_frame_count"]) for result in results),
+            "backgrounds_generated": bool(self._kwargs.get("generate_backgrounds")),
+            "flatfield_profiles_generated": bool(self._kwargs.get("generate_flatfield_profiles")),
+            "source_count": len(results),
+        }
+
+
 class MeanFieldIngestAddon:
     """Accumulate aligned image means and axis-aware sensor profiles during ingestion."""
 
