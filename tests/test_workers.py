@@ -18,6 +18,7 @@ from Pelagia.workers.handlers import (
     roi_refinement_handler,
 )
 from Pelagia.workers.worker import Worker
+from Pelagia.workers.memory import MemoryAvailability
 from Pelagia.workers.progress import JobPauseRequested, JobProgressReporter
 from Pelagia.workers.runtime import worker_runtime_profile
 
@@ -53,6 +54,7 @@ class FakeRepository:
         self.heartbeats = []
         self.job_control = {"status": "leased", "control_reason": None}
         self.paused_jobs = []
+        self.deferred_jobs = []
         self.oracle_batches = []
         self.finalized_oracle_batches = []
 
@@ -137,6 +139,10 @@ class FakeRepository:
         self.paused_jobs.append((job_id, kwargs))
         self.job_control = None
         return {"id": job_id, "status": "paused"}
+
+    def defer_unstarted_job(self, job_id, **kwargs):
+        self.deferred_jobs.append((job_id, kwargs))
+        return {"id": job_id, "status": "queued"}
 
     def update_job_progress(self, job_id, progress, summary=None, log_message=None, **kwargs):
         self.progress_updates.append(
@@ -2029,6 +2035,55 @@ def test_worker_run_once_stops_when_shutdown_requested():
 
     assert worker.run_once(stages=[PipelineStage.EXTRACT_FRAMES]) == 0
     assert repo.touches[-1]["status"] == "stopped"
+
+
+def test_worker_defers_claims_under_memory_pressure_and_resumes(monkeypatch):
+    repo = FakeRepository()
+    claims = []
+    repo.claim_jobs = lambda *args, **kwargs: claims.append(True) or []
+    memory = MemoryAvailability("host", 19, 100)
+    monkeypatch.setattr("Pelagia.workers.worker.available_memory", lambda: memory)
+    worker = Worker(context=make_context(repo), handlers=default_handler_registry(), worker_id="worker-1")
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
+    assert repo.touches[-1]["status"] == "idle"
+    assert claims == []
+
+    memory = MemoryAvailability("host", 20, 100)
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
+    assert claims == [True]
+    assert worker._memory_pressure_logged is False
+
+
+def test_worker_defers_claims_when_memory_probe_fails(monkeypatch):
+    repo = FakeRepository()
+    repo.claim_jobs = lambda *args, **kwargs: pytest.fail("worker must not claim a job")
+    def failed_probe():
+        raise OSError("unavailable")
+    monkeypatch.setattr("Pelagia.workers.worker.available_memory", failed_probe)
+    worker = Worker(context=make_context(repo), handlers=default_handler_registry(), worker_id="worker-1")
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
+    assert worker._memory_pressure_logged is True
+
+
+def test_worker_defers_claim_if_memory_falls_after_claim(monkeypatch):
+    repo = FakeRepository()
+    repo.claimed_jobs = [{
+        "id": "job-1", "lease_token": "lease-1", "stage": PipelineStage.SEGMENT.value,
+    }]
+    readings = iter((MemoryAvailability("host", 21, 100), MemoryAvailability("host", 19, 100)))
+    monkeypatch.setattr("Pelagia.workers.worker.available_memory", lambda: next(readings))
+    registry = HandlerRegistry()
+    registry.register(PipelineStage.SEGMENT, lambda job, context: pytest.fail("handler must not start"))
+    worker = Worker(context=make_context(repo), handlers=registry, worker_id="worker-1")
+
+    assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
+    assert repo.deferred_jobs == [
+        ("job-1", {"worker_id": "worker-1", "lease_token": "lease-1"}),
+    ]
+    assert repo.completed == []
+    assert repo.failures == []
 
 
 def test_worker_treats_checkpoint_pause_as_controlled_exit():

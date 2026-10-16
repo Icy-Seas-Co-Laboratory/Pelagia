@@ -8952,6 +8952,46 @@ class PostgresRepository:
 
         return rows
 
+    def defer_unstarted_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+    ) -> dict[str, Any] | None:
+        """Return a claim to the queue when memory fell before handler entry.
+
+        The claim is fenced, and no handler has run, so this is not a failed
+        attempt. A short delay avoids immediate reclaims during rapid swings.
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.schema}.processing_jobs
+                    SET status = 'queued',
+                        worker_id = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        available_at = NOW() + INTERVAL '5 seconds',
+                        attempt_count = GREATEST(0, attempt_count - 1),
+                        started_at = CASE WHEN attempt_count <= 1 THEN NULL ELSE started_at END,
+                        updated_at = NOW()
+                    WHERE id = %s AND worker_id = %s AND lease_token = %s::uuid
+                      AND status = 'leased' AND control_reason IS NULL
+                    RETURNING *;
+                    """,
+                    (job_id, worker_id, lease_token),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    self._append_job_event(
+                        cursor, job_id, "job.deferred",
+                        {"reason": "memory_pressure", "worker_id": worker_id},
+                    )
+            connection.commit()
+        return row
+
     def complete_job(
         self,
         job_id: str,

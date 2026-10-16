@@ -441,6 +441,11 @@ when they cannot safely be converted to `captured_at`.
 ## Jobs And Workers
 
 Pelagia uses Postgres-backed jobs to coordinate long-running processing. Workers are independent processes that claim jobs for specific stages, heartbeat while active, write job events, and can be stopped through worker-session state.
+Workers defer new claims while available host or container memory is below 20%.
+They resume claiming automatically after memory recovers. Set
+`PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION` to adjust the threshold (for
+example, `0.25` for 25%). Running jobs finish their current work, so worker
+concurrency still needs to fit the server's peak memory budget.
 
 Each claim carries a rotated lease token. Workers use that token when renewing a
 lease, reporting progress, or finishing work, so a worker that loses a lease

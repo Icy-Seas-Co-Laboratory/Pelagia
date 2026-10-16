@@ -2316,6 +2316,38 @@ def test_postgres_repository_schedules_retry_and_replays_dead_letter(postgres_re
     assert postgres_repo.claim_jobs("another-worker")[0]["id"] == job["id"]
 
 
+def test_postgres_repository_defers_unstarted_job_without_spending_attempt(postgres_repo):
+    project = postgres_repo.create_project(f"memory-defer-{uuid.uuid4().hex}")
+    job = postgres_repo.create_job(PipelineStage.SEGMENT, project_id=str(project["id"]))
+    claim = postgres_repo.claim_jobs("memory-worker", stages=[PipelineStage.SEGMENT])[0]
+    token = str(claim["lease_token"])
+
+    assert postgres_repo.defer_unstarted_job(
+        str(job["id"]), worker_id="other-worker", lease_token=token,
+    ) is None
+    deferred = postgres_repo.defer_unstarted_job(
+        str(job["id"]), worker_id="memory-worker", lease_token=token,
+    )
+
+    assert deferred is not None
+    assert deferred["status"] == JobStatus.QUEUED.value
+    assert deferred["attempt_count"] == 0
+    assert deferred["worker_id"] is None
+    assert deferred["lease_token"] is None
+    assert deferred["available_at"] > deferred["updated_at"]
+    assert postgres_repo.claim_jobs("another-worker", stages=[PipelineStage.SEGMENT]) == []
+    assert postgres_repo.list_job_events(job_id=str(job["id"]))[0]["event_type"] == "job.deferred"
+
+    paused_job = postgres_repo.create_job(PipelineStage.SEGMENT, project_id=str(project["id"]))
+    paused_claim = postgres_repo.claim_jobs("memory-worker", stages=[PipelineStage.SEGMENT])[0]
+    postgres_repo.pause_job(str(paused_job["id"]), reason="operator")
+    assert postgres_repo.defer_unstarted_job(
+        str(paused_job["id"]), worker_id="memory-worker",
+        lease_token=str(paused_claim["lease_token"]),
+    ) is None
+    assert postgres_repo.get_job(str(paused_job["id"]))["control_reason"] == "pause_requested:operator"
+
+
 def test_postgres_repository_materializes_idempotent_successor_dispatch(postgres_repo):
     project = postgres_repo.create_project(f"successor-dispatch-{uuid.uuid4().hex}")
     parent = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))

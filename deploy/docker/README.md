@@ -6,6 +6,13 @@ Docker Compose stack, including its orchestrator, private runtime workers, and
 separate durable data root. Both stacks use the `oracle-builder` Docker network.
 The browser reaches Pelagia through `/api`; only Pelagia calls Oracle Builder.
 
+Workers check available host memory and any Docker cgroup memory limit before
+claiming each new job. They leave jobs queued while either has less than 20%
+available, then claim work again automatically when memory recovers. Override
+the fraction with `PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION=0.25` in `.env`.
+Running jobs finish their current work; size
+the worker pool so those jobs and PostgreSQL have enough memory at peak load.
+
 ## Prerequisites
 
 - Docker Engine with Compose v2.17+ and BuildKit (`docker compose version`).

@@ -20,6 +20,8 @@ max_attempts = 3
 max_claim_count = 1
 lease_seconds = 300
 heartbeat_interval_seconds = 30
+# Do not claim new jobs when host or container available memory falls below 20%.
+min_available_memory_fraction = 0.20
 # Retryable failures are rescheduled with exponential backoff and bounded jitter.
 retry_backoff_base_seconds = 15
 retry_backoff_max_seconds = 900

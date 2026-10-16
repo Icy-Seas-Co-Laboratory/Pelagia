@@ -14,6 +14,7 @@ from ..domain import PipelineStage
 from ..observability import get_core_logger
 from ..services.context import AppContext
 from .common import mark_job_frame_stage_failed
+from .memory import available_memory
 from .progress import JobCancellationRequested, JobLeaseLost, JobPauseRequested
 from .registry import HandlerRegistry
 from .runtime import worker_runtime_profile
@@ -26,6 +27,35 @@ class Worker:
     context: AppContext
     handlers: HandlerRegistry
     worker_id: str = field(default_factory=lambda: f"worker-{socket.gethostname()}")
+    _memory_pressure_logged: bool = field(default=False, init=False, repr=False)
+
+    def _can_claim_job(self) -> bool:
+        minimum = self.context.config.queue.min_available_memory_fraction
+        if minimum == 0:
+            return True
+        logger = get_core_logger("worker")
+        try:
+            memory = available_memory()
+        except (OSError, ValueError) as exc:
+            if not self._memory_pressure_logged:
+                logger.error("Worker %s cannot measure available memory; deferring new jobs: %s", self.worker_id, exc)
+            self._memory_pressure_logged = True
+            return False
+        if memory.fraction < minimum:
+            if not self._memory_pressure_logged:
+                logger.warning(
+                    "Worker %s deferring new jobs: %s available memory %.1f%% is below %.1f%%",
+                    self.worker_id, memory.source, 100 * memory.fraction, 100 * minimum,
+                )
+            self._memory_pressure_logged = True
+            return False
+        if self._memory_pressure_logged:
+            logger.info(
+                "Worker %s resuming job claims: %s available memory %.1f%%",
+                self.worker_id, memory.source, 100 * memory.fraction,
+            )
+        self._memory_pressure_logged = False
+        return True
 
     def _capabilities(self, stages: list[PipelineStage] | None = None) -> list[str]:
         return [stage.value for stage in stages or []]
@@ -220,11 +250,12 @@ class Worker:
             return 0
 
         self._touch("idle", stages=stages)
+        if not self._can_claim_job():
+            return 0
         jobs = self.context.repository.claim_jobs(self.worker_id, stages=stages)
         for job in jobs:
             project_id = None if job.get("project_id") is None else str(job.get("project_id"))
             job_context = self.context.for_project(project_id)
-            self._touch("working", stages=stages, leased_job_id=str(job["id"]))
             started = time.perf_counter()
             job_id = str(job["id"])
             lease_token = None if job.get("lease_token") is None else str(job["lease_token"])
@@ -233,6 +264,24 @@ class Worker:
             # their updates against a re-claimed lease.
             job["_worker_id"] = self.worker_id
             job["_lease_token"] = lease_token
+            if not self._can_claim_job():
+                if lease_token is None:
+                    raise RuntimeError("Cannot defer a job without a fenced lease token")
+                if self._acknowledge_requested_pause(job_id, lease_token):
+                    self._touch("idle", stages=stages)
+                    continue
+                deferred = self.context.repository.defer_unstarted_job(
+                    job_id, worker_id=self.worker_id, lease_token=lease_token,
+                )
+                if deferred is None:
+                    self._acknowledge_requested_pause(job_id, lease_token)
+                    get_core_logger("worker").warning(
+                        "Worker %s lost lease while deferring job %s for memory pressure",
+                        self.worker_id, job_id,
+                    )
+                self._touch("idle", stages=stages)
+                continue
+            self._touch("working", stages=stages, leased_job_id=job_id)
             stage = job.get("stage")
             run_id = None if job.get("run_id") is None else str(job.get("run_id"))
             asset_id = None if job.get("asset_id") is None else str(job.get("asset_id"))

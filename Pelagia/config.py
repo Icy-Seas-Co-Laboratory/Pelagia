@@ -53,10 +53,16 @@ class QueueConfig:
     max_claim_count: int = 1
     lease_seconds: int = 300
     heartbeat_interval_seconds: int = 30
+    # Workers do not claim new jobs below this available-memory fraction.
+    min_available_memory_fraction: float = 0.20
     # Retry delays are calculated from the claimed-attempt number and capped.
     retry_backoff_base_seconds: int = 15
     retry_backoff_max_seconds: int = 900
     retry_backoff_jitter_seconds: int = 5
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.min_available_memory_fraction < 1:
+            raise ValueError("queue.min_available_memory_fraction must be between 0 and 1 (exclusive)")
 
 
 @dataclass(slots=True)
@@ -603,6 +609,7 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "queue", "max_claim_count", "PELAGIA_QUEUE_MAX_CLAIM_COUNT", int)
     _set_from_env(settings, "queue", "lease_seconds", "PELAGIA_QUEUE_LEASE_SECONDS", int)
     _set_from_env(settings, "queue", "heartbeat_interval_seconds", "PELAGIA_QUEUE_HEARTBEAT_SECONDS", int)
+    _set_from_env(settings, "queue", "min_available_memory_fraction", "PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION", float)
     _set_from_env(settings, "queue", "retry_backoff_base_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_BASE_SECONDS", int)
     _set_from_env(settings, "queue", "retry_backoff_max_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_MAX_SECONDS", int)
     _set_from_env(settings, "queue", "retry_backoff_jitter_seconds", "PELAGIA_QUEUE_RETRY_BACKOFF_JITTER_SECONDS", int)
@@ -863,6 +870,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             lease_seconds=int(queue.get("lease_seconds", QueueConfig.lease_seconds)),
             heartbeat_interval_seconds=int(
                 queue.get("heartbeat_interval_seconds", QueueConfig.heartbeat_interval_seconds)
+            ),
+            min_available_memory_fraction=float(
+                queue.get("min_available_memory_fraction", QueueConfig.min_available_memory_fraction)
             ),
             retry_backoff_base_seconds=int(
                 queue.get("retry_backoff_base_seconds", QueueConfig.retry_backoff_base_seconds)

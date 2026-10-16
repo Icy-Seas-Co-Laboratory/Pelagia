@@ -106,6 +106,17 @@ def test_video_ingest_thread_defaults_and_env_overrides(monkeypatch):
     assert overridden.processing.video_ingest.decoder_threads == 3
 
 
+def test_worker_memory_admission_threshold(monkeypatch):
+    assert CoreConfig.load(local_config_path=None, use_env=False).queue.min_available_memory_fraction == 0.20
+
+    monkeypatch.setenv("PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION", "0.25")
+    assert CoreConfig.load(local_config_path=None).queue.min_available_memory_fraction == 0.25
+
+    monkeypatch.setenv("PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION", "1")
+    with pytest.raises(ValueError, match="min_available_memory_fraction"):
+        CoreConfig.load(local_config_path=None)
+
+
 def test_logging_config_defaults_to_core_file_logger():
     config = LoggingConfig()
 
