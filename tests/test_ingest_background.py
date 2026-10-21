@@ -193,6 +193,63 @@ def test_ingest_background_addon_stacks_horizontally_for_row_profiles():
     assert assignment["flatfield_metadata"]["stack_axis"] == 1
 
 
+@pytest.mark.parametrize("axis", [0, 1])
+def test_even_flatfield_window_combines_four_frames_along_selected_axis(axis):
+    repository = BackgroundRepository()
+    addon = MeanFieldIngestAddon(
+        context=AppContext(config=CoreConfig(), repository=repository, kvstore=BackgroundKVStore()),
+        project_id=None,
+        window_stride=4,
+        window_width=4,
+        generate_backgrounds=False,
+        generate_flatfield_profiles=True,
+        flatfield_axis=axis,
+    )
+    arrays = [np.array([[value, value + 2], [value + 4, value + 6]], dtype=np.uint8) for value in (10, 20, 30, 40)]
+    for frame_index, array in enumerate(arrays, start=1):
+        addon.consume({"id": f"frame-{frame_index}", "frame_index": frame_index}, array)
+
+    result = addon.finalize()
+
+    assert result["window_count"] == 1
+    assignments = repository.calls[0][0]
+    assert len(assignments) == 4
+    expected = np.mean(np.concatenate(arrays, axis=axis), axis=axis)
+    for assignment in assignments:
+        np.testing.assert_allclose(assignment["flatfield_profile"], expected)
+        assert assignment["flatfield_metadata"]["source_frame_ids"] == [f"frame-{index}" for index in range(1, 5)]
+        assert assignment["flatfield_metadata"]["stack_axis"] == axis
+        assert assignment["flatfield_metadata"]["window_start"] == 1
+        assert assignment["flatfield_metadata"]["window_end"] == 4
+
+
+def test_even_background_window_combines_four_frames():
+    repository = BackgroundRepository()
+    kvstore = BackgroundKVStore()
+    addon = MeanFieldIngestAddon(
+        context=AppContext(config=CoreConfig(), repository=repository, kvstore=kvstore),
+        project_id=None,
+        window_stride=4,
+        window_width=4,
+        encoding="raw",
+        generate_backgrounds=True,
+        generate_flatfield_profiles=False,
+    )
+    for frame_index, value in enumerate((10, 20, 30, 40), start=1):
+        addon.consume(
+            {"id": f"frame-{frame_index}", "frame_index": frame_index},
+            np.full((2, 2), value, dtype=np.uint8),
+        )
+
+    assert addon.finalize()["window_count"] == 1
+    assignments = repository.calls[0][0]
+    assert len(assignments) == 4
+    assert {assignment["payload_ref"] for assignment in assignments} == {"background-1"}
+    assert assignments[0]["metadata"]["background_source_frame_ids"] == [f"frame-{index}" for index in range(1, 5)]
+    decoded = decode_array_payload(kvstore.payloads["background-1"], assignments[0]["metadata"])
+    np.testing.assert_array_equal(decoded, np.full((2, 2), 25, dtype=np.uint8))
+
+
 def test_ingest_background_addon_supports_independent_output_windows():
     repository = BackgroundRepository()
     addon = MeanFieldIngestAddon(

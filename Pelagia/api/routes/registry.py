@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import shutil
+import base64
+import binascii
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -73,6 +75,24 @@ if APIRouter is not None:
         item_ids: list[str] = Field(min_length=1)
         tag_id: str
         assigned: bool = True
+
+    class SpatialBoxRequest(BaseModel):
+        x: int
+        y: int
+        w: int = Field(gt=0)
+        h: int = Field(gt=0)
+
+    class GeometryUpdateRequest(BaseModel):
+        bbox: SpatialBoxRequest
+        expected_updated_at: str = Field(min_length=1)
+
+    class MaskRevisionRequest(BaseModel):
+        mask_png_base64: str = Field(min_length=1)
+        # Required even when null: null means the caller observed no current revision.
+        expected_current_annotation_id: str | None
+        method: str = Field(default="manual-erase", min_length=1, max_length=100)
+        parameters: dict[str, Any] = Field(default_factory=dict)
+        notes: str | None = Field(default=None, max_length=4000)
 
     def service(request: Request, *, write: bool = False) -> RegistryWorkspaceService:
         auth = require_project_write(request) if write else require_project_read(request)
@@ -197,6 +217,52 @@ if APIRouter is not None:
         try: payload, media = service(request).image(item_id, size)
         except KeyError as exc: raise HTTPException(404, "Image not found") from exc
         return Response(payload, media_type=media, headers={"Cache-Control": "private, max-age=3600"})
+
+    @router.patch("/items/{item_id}/geometry")
+    def update_item_geometry(request: Request, item_id: str, body: GeometryUpdateRequest):
+        try:
+            return as_response(service(request, write=True).update_geometry(
+                item_id, body.bbox.model_dump(), expected_updated_at=body.expected_updated_at,
+            ))
+        except KeyError as exc:
+            raise HTTPException(404, "Item not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+
+    @router.get("/items/{item_id}/masks")
+    def masks(request: Request, item_id: str):
+        try:
+            return as_response(service(request).mask_layers(item_id))
+        except KeyError as exc:
+            raise HTTPException(404, "Item not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+
+    @router.get("/items/{item_id}/masks/{layer}")
+    def mask_image(request: Request, item_id: str, layer: Literal["candidate", "current"]):
+        try:
+            payload, media = service(request).mask_image(item_id, layer)
+        except KeyError as exc:
+            raise HTTPException(404, "Mask layer not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+        return Response(payload, media_type=media, headers={"Cache-Control": "private, max-age=3600"})
+
+    @router.post("/items/{item_id}/masks", status_code=201)
+    def save_mask(request: Request, item_id: str, body: MaskRevisionRequest):
+        try:
+            try:
+                payload = base64.b64decode(body.mask_png_base64, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(422, "mask_png_base64 must be valid base64") from exc
+            return as_response(service(request, write=True).save_mask_revision(
+                item_id, payload, expected_current_annotation_id=body.expected_current_annotation_id,
+                method=body.method, parameters=body.parameters, notes=body.notes,
+            ))
+        except KeyError as exc:
+            raise HTTPException(404, "Item not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
 
     @router.get("/labels")
     def labels(request: Request, include_deprecated: bool = True): return as_response(service(request).labels(include_deprecated))

@@ -1348,6 +1348,59 @@ def test_registry_workspace_catalog_and_activation(monkeypatch):
     assert client.post("/registry/workspaces/missing/activate").status_code == 404
 
 
+def test_registry_roi_geometry_and_mask_routes_use_revision_tokens(monkeypatch):
+    from Pelagia.api.routes import registry as registry_routes
+
+    client, _, _ = make_client()
+    calls = []
+    monkeypatch.setattr(
+        registry_routes.RegistryWorkspaceService,
+        "update_geometry",
+        lambda self, item_id, bbox, *, expected_updated_at=None: calls.append(
+            ("geometry", item_id, bbox, expected_updated_at)
+        ) or {"item_id": item_id, "bbox": bbox, "updated_at": "new"},
+    )
+    monkeypatch.setattr(
+        registry_routes.RegistryWorkspaceService,
+        "mask_layers",
+        lambda self, item_id: {"candidate": None, "current": None},
+    )
+    monkeypatch.setattr(
+        registry_routes.RegistryWorkspaceService,
+        "save_mask_revision",
+        lambda self, item_id, payload, **values: calls.append(("mask", item_id, payload, values)) or {
+            "annotation_id": "mask-annotation", "asset_id": "mask-asset", "updated_at": "new"
+        },
+    )
+
+    geometry = client.patch("/registry/items/item-1/geometry", json={
+        "bbox": {"x": 4, "y": 8, "w": 12, "h": 16}, "expected_updated_at": "old",
+    })
+    assert geometry.status_code == 200
+    assert calls[0] == ("geometry", "item-1", {"x": 4, "y": 8, "w": 12, "h": 16}, "old")
+    assert client.get("/registry/items/item-1/masks").json() == {"candidate": None, "current": None}
+
+    import base64
+    saved = client.post("/registry/items/item-1/masks", json={
+        "mask_png_base64": base64.b64encode(b"png-bytes").decode(),
+        "expected_current_annotation_id": None,
+    })
+    assert saved.status_code == 201
+    assert calls[1][0:3] == ("mask", "item-1", b"png-bytes")
+    assert calls[1][3]["expected_current_annotation_id"] is None
+    assert client.post("/registry/items/item-1/masks", json={"mask_png_base64": "eA=="}).status_code == 422
+
+    from Pelagia.services.registry_transfer import RegistryTransferError
+    monkeypatch.setattr(
+        registry_routes.RegistryWorkspaceService,
+        "update_geometry",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RegistryTransferError("Item geometry changed; reload before saving")),
+    )
+    assert client.patch("/registry/items/item-1/geometry", json={
+        "bbox": {"x": 4, "y": 8, "w": 12, "h": 16}, "expected_updated_at": "old",
+    }).status_code == 409
+
+
 def test_curation_registry_dataset_preview_and_generation_are_consistent(tmp_path, monkeypatch):
     from Pelagia.api.routes import curation as curation_routes
 
@@ -5193,6 +5246,22 @@ def test_api_queues_one_interchange_job_per_shard_without_scanning(tmp_path, mon
     assert payload["background_window_width"] == 3
     assert payload["background_window_stride"] == 1
     assert "interchange_shard_uuid" not in payload
+
+    line_scan = client.post(
+        "/ingestion/assets", headers=headers,
+        json={"assets": [{
+            "path": str(package), "kind": "interchange",
+            "generate_backgrounds": False,
+            "generate_flatfield_profiles": True,
+            "flatfield_axis": 0,
+            "flatfield_window_width": 4,
+            "flatfield_window_stride": 4,
+        }]},
+    )
+    assert line_scan.status_code == 200
+    assert len(line_scan.json()["jobs"]) == 1
+    payload = repository.created_jobs[-1]["payload"]
+    assert (payload["flatfield_axis"], payload["flatfield_window_width"], payload["flatfield_window_stride"]) == (0, 4, 4)
 
 
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):

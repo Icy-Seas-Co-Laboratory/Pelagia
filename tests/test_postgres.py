@@ -105,6 +105,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0027_roi_orientation",
             "0028_oracle_v2_inference_provenance",
             "0029_operational_log_retention",
+            "0030_registry_mask_revision_integrity",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -196,8 +197,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 29
-    assert status["migrations"]["applied_count"] == 29
+    assert status["migrations"]["available_count"] == 30
+    assert status["migrations"]["applied_count"] == 30
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -935,6 +936,9 @@ def test_postgres_imports_default_curation_labels_idempotently(postgres_repo):
 
 @pytest.mark.parametrize("dataset_type", ["classification", "mask_refinement"])
 def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path, dataset_type):
+    import cv2
+    import numpy as np
+
     source = tmp_path / f"{dataset_type}-source.sqlite"
     destination = tmp_path / f"{dataset_type}-export.sqlite"
     with sqlite3.connect(source) as connection:
@@ -962,7 +966,17 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
         )
         relation = "classification_items" if dataset_type == "classification" else "mask_refinement_items"
         columns = "item_id,image_asset_id" if dataset_type == "classification" else "item_id,image_asset_id,candidate_mask_asset_id"
-        values = (item_id, asset_id) if dataset_type == "classification" else (item_id, asset_id, None)
+        candidate_id = None
+        if dataset_type == "mask_refinement":
+            candidate_id = str(uuid.uuid4())
+            candidate_payload = np.ones((12, 16), dtype=np.uint8).tobytes()
+            connection.execute(
+                """INSERT INTO assets (
+                   asset_id,dataset_id,content_sha256,payload,encoding,media_type,shape_json,dtype,metadata_json,created_at
+                   ) VALUES (?,?,?,?,'raw','application/octet-stream','[12, 16]','uint8','{}','2026-08-19T00:00:00Z')""",
+                (candidate_id, info["dataset_id"], hashlib.sha256(candidate_payload).hexdigest(), candidate_payload),
+            )
+        values = (item_id, asset_id) if dataset_type == "classification" else (item_id, asset_id, candidate_id)
         connection.execute(
             f"INSERT INTO {relation} ({columns}) VALUES ({','.join('?' for _ in values)})", values
         )
@@ -975,6 +989,31 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
     registry_item = workspace.list_items(limit=10, offset=0)["items"][0]
     assert registry_item["bbox"] == {"x": 102, "y": 203, "w": 5, "h": 6}
     assert registry_item["crop_bbox"] == {"x": 100, "y": 200, "w": 16, "h": 12}
+    updated = workspace.update_geometry(
+        item_id, {"x": 103, "y": 204, "w": 6, "h": 5}, expected_updated_at=registry_item["updated_at"],
+    )
+    assert updated["bbox"] == {"x": 103, "y": 204, "w": 6, "h": 5}
+    if dataset_type == "mask_refinement":
+        assert workspace.mask_layers(item_id)["candidate"]["asset_id"] == candidate_id
+        candidate_display, media_type = workspace.mask_image(item_id, "candidate")
+        assert media_type == "image/png"
+        assert np.all(cv2.imdecode(np.frombuffer(candidate_display, dtype=np.uint8), cv2.IMREAD_UNCHANGED) == 255)
+        edited_mask = np.full((12, 16), 255, dtype=np.uint8)
+        edited_mask[2:5, 3:7] = 0
+        ok, encoded = cv2.imencode(".png", edited_mask)
+        assert ok
+        saved = workspace.save_mask_revision(
+            item_id, encoded.tobytes(), expected_current_annotation_id=None,
+            method="manual-erase", parameters={"brush_radius_px": 2}, notes=None,
+        )
+        repeated = workspace.save_mask_revision(
+            item_id, encoded.tobytes(), expected_current_annotation_id=saved["annotation_id"],
+            method="manual-erase", parameters={"brush_radius_px": 2}, notes=None,
+        )
+        assert repeated["asset_id"] == saved["asset_id"]
+        assert repeated["parent_annotation_id"] == saved["annotation_id"]
+        assert workspace.mask_layers(item_id)["current"]["annotation_id"] == repeated["annotation_id"]
+        assert workspace.mask_layers(item_id)["candidate"]["asset_id"] == candidate_id
     assert RegistryWorkspaceService(postgres_repo, scope["project_id"], "other-user").active_workspace() is None
     label = workspace.add_label({"name": "copepod", "display_name": "Copepod"})
     assert label["name"] == "copepod"
@@ -986,7 +1025,11 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
         assert validate_database(connection)["valid"] is True
         assert connection.execute(
             "SELECT bbox_x,bbox_y,bbox_w,bbox_h,crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h FROM item_geometry"
-        ).fetchone() == (102, 203, 5, 6, 100, 200, 16, 12)
+        ).fetchone() == (103, 204, 6, 5, 100, 200, 16, 12)
+        if dataset_type == "mask_refinement":
+            assert connection.execute("SELECT candidate_mask_asset_id FROM mask_refinement_items").fetchone()[0] == candidate_id
+            assert connection.execute("SELECT count(*) FROM mask_annotations WHERE is_current=1").fetchone()[0] == 1
+            assert connection.execute("SELECT count(*) FROM mask_annotations").fetchone()[0] == 2
         label_table = "classification_labels" if dataset_type == "classification" else "annotation_labels"
         assert connection.execute(f"SELECT count(*) FROM {label_table}").fetchone()[0] == 1
     assert exported["parent_revision_id"]
@@ -1001,6 +1044,11 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
     reloaded = load_sqlite_workspace(postgres_repo, destination, **scope)
     assert reloaded["reused"] is False
     assert reloaded["workspace_id"] != loaded["workspace_id"]
+    reloaded_workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
+    assert reloaded_workspace.item_detail(item_id)["bbox"] == {"x": 103, "y": 204, "w": 6, "h": 5}
+    if dataset_type == "mask_refinement":
+        assert reloaded_workspace.mask_layers(item_id)["candidate"]["asset_id"] == candidate_id
+        assert reloaded_workspace.mask_layers(item_id)["current"]["annotation_id"] == repeated["annotation_id"]
 
 
 def test_registry_workspace_has_one_active_owner_project_workspace(postgres_repo):

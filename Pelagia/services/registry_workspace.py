@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ..processing.frame_codec import decode_array_payload
 from .registry_transfer import RegistryTransferError, _jsonb
 
 
@@ -416,7 +418,7 @@ class RegistryWorkspaceService:
                 AND me.inference_run_id=%s WHERE {where}"""
             cursor.execute("SELECT count(DISTINCT i.item_id) total " + base, params_with_source)
             total = cursor.fetchone()["total"]
-            cursor.execute(f"""SELECT i.item_id,i.source_key,i.sample_weight,i.metadata,image.shape,image.encoding,image.media_type,
+            cursor.execute(f"""SELECT i.item_id,i.source_key,i.sample_weight,i.metadata,i.updated_at,image.shape,image.encoding,image.media_type,
               i.coordinate_space,i.bbox_x,i.bbox_y,i.bbox_w,i.bbox_h,
               i.crop_bbox_x,i.crop_bbox_y,i.crop_bbox_w,i.crop_bbox_h,i.spatial_metadata,
               a.annotation_id,a.label_id,a.annotator,a.created_at annotation_created_at,a.status annotation_status,a.method annotation_source,
@@ -489,6 +491,7 @@ class RegistryWorkspaceService:
               FROM {self.schema}.registry_descriptor_annotations a JOIN {self.schema}.registry_descriptors d ON d.workspace_id=a.workspace_id AND d.descriptor_id=a.descriptor_id
               WHERE a.workspace_id=%s AND a.item_id=%s AND a.is_current AND a.status='accepted'""", (workspace["id"], item_id))
             item["tags"] = list(cursor.fetchall())
+        item["mask_layers"] = self.mask_layers(item_id)
         return item
 
     def image(self, item_id: str, size: int | None = None) -> tuple[bytes, str]:
@@ -506,6 +509,280 @@ class RegistryWorkspaceService:
         scale = min(1.0, size / max(image.shape[:2])); resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         ok, encoded = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 86])
         return (encoded.tobytes(), "image/jpeg") if ok else (payload, media)
+
+    @staticmethod
+    def _image_dimensions(item: dict[str, Any]) -> tuple[int, int]:
+        shape = item.get("shape")
+        if not isinstance(shape, (list, tuple)) or len(shape) < 2:
+            raise RegistryTransferError("Registry image asset is missing its two-dimensional shape")
+        height, width = int(shape[0]), int(shape[1])
+        if height <= 0 or width <= 0:
+            raise RegistryTransferError("Registry image asset has an invalid shape")
+        return height, width
+
+    def _locked_item(self, cursor, workspace_id: Any, item_id: str) -> dict[str, Any]:
+        cursor.execute(
+            f"""SELECT i.*,image.shape FROM {self.schema}.registry_items i
+              JOIN {self.schema}.registry_assets image
+                ON image.workspace_id=i.workspace_id AND image.asset_id=i.image_asset_id
+              WHERE i.workspace_id=%s AND i.item_id=%s FOR UPDATE""",
+            (workspace_id, item_id),
+        )
+        item = cursor.fetchone()
+        if not item:
+            raise KeyError(item_id)
+        self._attach_geometry(item)
+        return item
+
+    @staticmethod
+    def _require_asset_matches_crop(item: dict[str, Any]) -> tuple[int, int]:
+        height, width = RegistryWorkspaceService._image_dimensions(item)
+        crop = item.get("crop_bbox")
+        if not crop or (crop["w"], crop["h"]) != (width, height):
+            raise RegistryTransferError(
+                "Stored ROI image dimensions do not match its crop geometry; reload a valid dataset before editing"
+            )
+        return height, width
+
+    def _record_item_edit_event(self, cursor, workspace: dict[str, Any], event_type: str,
+                                item_id: str, details: dict[str, Any]) -> None:
+        cursor.execute(
+            f"""INSERT INTO {self.schema}.registry_dataset_events
+              (workspace_id,event_id,revision_id,event_type,created_at,actor,details)
+              VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (workspace["id"], str(uuid.uuid4()), workspace["revision_id"], event_type,
+             utc_now(), self.owner_username, _jsonb({"item_id": item_id, **details})),
+        )
+
+    def update_geometry(self, item_id: str, bbox: dict[str, Any], *,
+                        expected_updated_at: str) -> dict[str, Any]:
+        """Update canonical bbox geometry while retaining the immutable ROI image crop."""
+        required = ("x", "y", "w", "h")
+        if set(bbox) != set(required) or any(isinstance(bbox[key], bool) for key in required):
+            raise RegistryTransferError("Bounding box must contain integer x, y, w, and h values")
+        try:
+            resolved = {key: int(bbox[key]) for key in required}
+        except (TypeError, ValueError) as exc:
+            raise RegistryTransferError("Bounding box must contain integer x, y, w, and h values") from exc
+        if resolved["w"] <= 0 or resolved["h"] <= 0:
+            raise RegistryTransferError("Bounding box width and height must be positive")
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            workspace = self._workspace(cursor, for_update=True)
+            item = self._locked_item(cursor, workspace["id"], item_id)
+            self._require_asset_matches_crop(item)
+            if expected_updated_at != item["updated_at"]:
+                raise RegistryTransferError("Item geometry changed; reload before saving")
+            crop = item["crop_bbox"]
+            if (resolved["x"] < crop["x"] or resolved["y"] < crop["y"]
+                    or resolved["x"] + resolved["w"] > crop["x"] + crop["w"]
+                    or resolved["y"] + resolved["h"] > crop["y"] + crop["h"]):
+                raise RegistryTransferError("Bounding box must remain within the stored ROI crop")
+            updated_at = utc_now()
+            cursor.execute(
+                f"""UPDATE {self.schema}.registry_items
+                  SET bbox_x=%s,bbox_y=%s,bbox_w=%s,bbox_h=%s,updated_at=%s
+                  WHERE workspace_id=%s AND item_id=%s""",
+                (resolved["x"], resolved["y"], resolved["w"], resolved["h"], updated_at,
+                 workspace["id"], item_id),
+            )
+            self._record_item_edit_event(cursor, workspace, "registry.item_geometry_updated", item_id, {
+                "coordinate_space": item["coordinate_space"], "bbox": resolved,
+                "previous_bbox": item["bbox"],
+            })
+            self._dirty(cursor, workspace["id"])
+            connection.commit()
+        return self.item_detail(item_id)
+
+    def mask_layers(self, item_id: str) -> dict[str, Any]:
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            workspace = self._workspace(cursor)
+            cursor.execute(
+                f"""SELECT i.item_id,i.candidate_mask_asset_id,image.shape image_shape,
+                    candidate.asset_id candidate_asset_id,candidate.media_type candidate_media_type,candidate.shape candidate_shape,
+                    current.annotation_id current_annotation_id,current.created_at current_created_at,
+                    current.annotator current_annotator,current.method current_method,
+                    edited.asset_id current_asset_id,edited.media_type current_media_type,edited.shape current_shape
+                  FROM {self.schema}.registry_items i
+                  JOIN {self.schema}.registry_assets image
+                    ON image.workspace_id=i.workspace_id AND image.asset_id=i.image_asset_id
+                  LEFT JOIN {self.schema}.registry_assets candidate
+                    ON candidate.workspace_id=i.workspace_id AND candidate.asset_id=i.candidate_mask_asset_id
+                  LEFT JOIN LATERAL (
+                    SELECT * FROM {self.schema}.registry_mask_annotations annotation
+                    WHERE annotation.workspace_id=i.workspace_id AND annotation.item_id=i.item_id AND annotation.is_current
+                    ORDER BY annotation.created_at DESC,annotation.annotation_id DESC LIMIT 1
+                  ) current ON true
+                  LEFT JOIN {self.schema}.registry_assets edited
+                    ON edited.workspace_id=current.workspace_id AND edited.asset_id=current.mask_asset_id
+                  WHERE i.workspace_id=%s AND i.item_id=%s""",
+                (workspace["id"], item_id),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise KeyError(item_id)
+        image_shape = row["image_shape"]
+        if not isinstance(image_shape, list) or len(image_shape) < 2:
+            raise RegistryTransferError("Registry ROI image is missing its shape")
+        expected_shape = image_shape[:2]
+        for layer_name in ("candidate", "current"):
+            shape = row[f"{layer_name}_shape"]
+            if shape is not None and shape != expected_shape:
+                raise RegistryTransferError(f"{layer_name.capitalize()} mask dimensions do not match the ROI image")
+        candidate = None
+        if row["candidate_mask_asset_id"]:
+            if not row["candidate_asset_id"]:
+                raise RegistryTransferError("Registry item refers to a missing candidate mask asset")
+            candidate = {"asset_id": row["candidate_asset_id"], "media_type": row["candidate_media_type"],
+                         "shape": row["candidate_shape"],
+                         "url": f"/registry/items/{item_id}/masks/candidate?v={row['candidate_asset_id']}"}
+        current = None
+        if row["current_annotation_id"]:
+            if not row["current_asset_id"]:
+                raise RegistryTransferError("Registry mask annotation refers to a missing mask asset")
+            current = {"annotation_id": row["current_annotation_id"], "asset_id": row["current_asset_id"],
+                       "media_type": row["current_media_type"], "shape": row["current_shape"],
+                       "created_at": row["current_created_at"], "annotator": row["current_annotator"],
+                       "method": row["current_method"],
+                       "url": f"/registry/items/{item_id}/masks/current?v={row['current_asset_id']}"}
+        return {"candidate": candidate, "current": current}
+
+    def mask_image(self, item_id: str, layer: str) -> tuple[bytes, str]:
+        if layer not in {"candidate", "current"}:
+            raise KeyError(layer)
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            workspace = self._workspace(cursor)
+            if layer == "candidate":
+                cursor.execute(
+                    f"""SELECT asset.payload,asset.media_type,asset.encoding,asset.shape,asset.dtype,
+                        image.shape image_shape FROM {self.schema}.registry_items i
+                      JOIN {self.schema}.registry_assets image ON image.workspace_id=i.workspace_id
+                        AND image.asset_id=i.image_asset_id
+                      JOIN {self.schema}.registry_assets asset ON asset.workspace_id=i.workspace_id
+                        AND asset.asset_id=i.candidate_mask_asset_id
+                      WHERE i.workspace_id=%s AND i.item_id=%s""",
+                    (workspace["id"], item_id),
+                )
+            else:
+                cursor.execute(
+                    f"""SELECT asset.payload,asset.media_type,asset.encoding,asset.shape,asset.dtype,
+                        image.shape image_shape FROM {self.schema}.registry_mask_annotations annotation
+                      JOIN {self.schema}.registry_items item ON item.workspace_id=annotation.workspace_id
+                        AND item.item_id=annotation.item_id
+                      JOIN {self.schema}.registry_assets image ON image.workspace_id=item.workspace_id
+                        AND image.asset_id=item.image_asset_id
+                      JOIN {self.schema}.registry_assets asset ON asset.workspace_id=annotation.workspace_id
+                        AND asset.asset_id=annotation.mask_asset_id
+                      WHERE annotation.workspace_id=%s AND annotation.item_id=%s AND annotation.is_current""",
+                    (workspace["id"], item_id),
+                )
+            row = cursor.fetchone()
+        if not row or row["payload"] is None:
+            raise KeyError(item_id)
+        try:
+            mask = decode_array_payload(bytes(row["payload"]), {
+                "kvstore_encoding": row["encoding"], "dtype": row["dtype"], "shape": row["shape"],
+            })
+        except (ValueError, RuntimeError) as exc:
+            raise RegistryTransferError("Stored mask could not be decoded for display") from exc
+        if (mask.ndim != 2 or mask.dtype not in (np.uint8, np.bool_)
+                or tuple(mask.shape) != tuple(row["image_shape"][:2])
+                or not np.isin(mask, (0, 1, 255)).all()):
+            raise RegistryTransferError("Stored mask must be binary and match the ROI image dimensions")
+        display_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        ok, encoded = cv2.imencode(".png", display_mask)
+        if not ok:
+            raise RegistryTransferError("Stored mask could not be encoded for display")
+        return encoded.tobytes(), "image/png"
+
+    def save_mask_revision(self, item_id: str, payload: bytes, *, expected_current_annotation_id: str | None,
+                           method: str, parameters: dict[str, Any], notes: str | None) -> dict[str, Any]:
+        """Store an immutable, binary PNG mask and append a current mask annotation revision."""
+        png_signature = b"\x89PNG\r\n\x1a\n"
+        if not payload.startswith(png_signature):
+            raise RegistryTransferError("Editable masks must be supplied as PNG images")
+        mask = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        # Browser canvases encode ImageData as RGBA PNG.  Accept an opaque
+        # grayscale canvas and canonicalize it to the single-channel contract.
+        if mask is not None and mask.ndim == 3 and mask.dtype == np.uint8 and mask.shape[2] == 4:
+            blue, green, red, alpha = cv2.split(mask)
+            if not (np.array_equal(blue, green) and np.array_equal(green, red) and np.all(alpha == 255)):
+                raise RegistryTransferError("Editable RGBA masks must be opaque grayscale images")
+            mask = blue
+        if mask is None or mask.ndim != 2 or mask.dtype != np.uint8:
+            raise RegistryTransferError("Editable masks must be 8-bit single-channel or opaque grayscale RGBA PNG images")
+        if not np.isin(mask, (0, 255)).all():
+            raise RegistryTransferError("Editable masks must contain only 0 and 255 pixel values")
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            workspace = self._workspace(cursor, for_update=True)
+            if workspace["dataset_type"] != "mask_refinement":
+                raise RegistryTransferError("Mask revisions are only available for mask-refinement datasets")
+            item = self._locked_item(cursor, workspace["id"], item_id)
+            height, width = self._require_asset_matches_crop(item)
+            if tuple(mask.shape) != (height, width):
+                raise RegistryTransferError("Editable mask dimensions must match the stored ROI image")
+            cursor.execute(
+                f"""SELECT * FROM {self.schema}.registry_mask_annotations
+                  WHERE workspace_id=%s AND item_id=%s AND is_current FOR UPDATE""",
+                (workspace["id"], item_id),
+            )
+            previous = cursor.fetchone()
+            actual = previous["annotation_id"] if previous else None
+            if expected_current_annotation_id != actual:
+                raise RegistryTransferError("Mask revision changed; reload before saving")
+            ok, encoded = cv2.imencode(".png", mask, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            if not ok:
+                raise RegistryTransferError("Unable to encode editable mask as PNG")
+            normalized = encoded.tobytes()
+            annotation_id, created_at = str(uuid.uuid4()), utc_now()
+            digest = hashlib.sha256(normalized).hexdigest()
+            # The portable contract uniquely identifies an asset by dataset,
+            # digest, and encoding. Reuse identical bytes so a repeated or
+            # reverted edit remains exportable as a valid revision.
+            cursor.execute(
+                f"""SELECT asset_id FROM {self.schema}.registry_assets
+                  WHERE workspace_id=%s AND content_sha256=%s AND encoding='png' LIMIT 1""",
+                (workspace["id"], digest),
+            )
+            existing_asset = cursor.fetchone()
+            if existing_asset:
+                asset_id = existing_asset["asset_id"]
+            else:
+                asset_id = f"mask-{uuid.uuid4()}"
+                asset_metadata = {"registry": {"role": "edited_mask", "item_id": item_id,
+                                                 "parent_annotation_id": actual, "source": "registry_roi_editor"}}
+                cursor.execute(
+                    f"""INSERT INTO {self.schema}.registry_assets
+                      (workspace_id,asset_id,content_sha256,payload,encoding,media_type,shape,dtype,metadata,created_at)
+                      VALUES (%s,%s,%s,%s,'png','image/png',%s,'uint8',%s,%s)""",
+                    (workspace["id"], asset_id, digest, normalized, _jsonb([height, width]), _jsonb(asset_metadata), created_at),
+                )
+            if previous:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.registry_mask_annotations SET is_current=false
+                      WHERE workspace_id=%s AND annotation_id=%s""",
+                    (workspace["id"], previous["annotation_id"]),
+                )
+            validation = {"shape": [height, width], "dtype": "uint8", "binary_values": [0, 255],
+                          "content_sha256": digest}
+            cursor.execute(
+                f"""INSERT INTO {self.schema}.registry_mask_annotations
+                  (workspace_id,annotation_id,item_id,mask_asset_id,created_at,annotator,method,
+                   parameters,validation,status,is_current,parent_annotation_id,notes)
+                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'accepted',true,%s,%s)""",
+                (workspace["id"], annotation_id, item_id, asset_id, created_at, self.owner_username, method,
+                 _jsonb(parameters), _jsonb(validation), actual, notes),
+            )
+            updated_at = utc_now()
+            cursor.execute(f"UPDATE {self.schema}.registry_items SET updated_at=%s WHERE workspace_id=%s AND item_id=%s",
+                           (updated_at, workspace["id"], item_id))
+            self._record_item_edit_event(cursor, workspace, "registry.mask_revision_created", item_id, {
+                "annotation_id": annotation_id, "mask_asset_id": asset_id,
+                "parent_annotation_id": actual, "content_sha256": digest, "method": method,
+            })
+            self._dirty(cursor, workspace["id"])
+            connection.commit()
+        return {"annotation_id": annotation_id, "asset_id": asset_id, "parent_annotation_id": actual,
+                "updated_at": updated_at}
 
     def assign(self, item_ids: list[str], label_id: str, actor: str, *, remove: bool = False) -> list[dict[str, Any]]:
         created = []; operation_id = str(uuid.uuid4())

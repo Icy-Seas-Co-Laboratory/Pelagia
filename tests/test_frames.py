@@ -2,6 +2,7 @@ import io
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -2104,3 +2105,34 @@ def test_discover_ingest_sources_finds_image_folders_and_video_files(tmp_path):
 
     assert [source.kind for source in sources] == ["image_sequence", "video"]
     assert [source.path for source in sources] == [image_dir.resolve(), video_path.resolve()]
+
+
+def test_discover_ingest_sources_recursively_finds_interchange_and_prunes_its_contents(tmp_path):
+    image_dir = tmp_path / "frames"
+    image_dir.mkdir()
+    (image_dir / "frame_001.png").write_bytes(b"not-a-real-image")
+    video_path = tmp_path / "camera.mkv"
+    video_path.write_bytes(b"not-a-real-video")
+
+    package = tmp_path / "archive" / "deployment"
+    package.parent.mkdir()
+    with DatasetBuilder(package, title="Deployment"):
+        pass
+    # These represent package internals that happen to use supported extensions.
+    # Discovery must keep the archive as one asset rather than queueing them too.
+    (package / "data" / "encoded-frame.png").write_bytes(b"package-frame")
+    (package / "data" / "source.avi").write_bytes(b"package-video")
+
+    sources = discover_ingest_sources(tmp_path, recursive=True)
+    assets = analyze_ingest_path(tmp_path, recursive=True)
+
+    assert [(source.kind, source.path) for source in sources] == [
+        ("image_sequence", image_dir.resolve()),
+        ("interchange", package.resolve()),
+        ("video", video_path.resolve()),
+    ]
+    assert [(asset.kind, Path(asset.path)) for asset in assets] == [
+        ("image_sequence", image_dir.resolve()),
+        ("interchange", package.resolve()),
+        ("video", video_path.resolve()),
+    ]

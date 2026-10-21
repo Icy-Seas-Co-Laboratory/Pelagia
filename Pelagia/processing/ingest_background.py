@@ -150,14 +150,9 @@ class MeanFieldIngestAddon:
             window_width = resolved_flatfield_width
         self.window_stride = int(window_stride)
         self.window_width = int(window_width)
-        if (
-            self.window_stride < 1
-            or self.window_width < 1
-            or self.window_stride % 2 == 0
-            or self.window_width % 2 == 0
-        ):
+        if self.window_stride < 1 or self.window_width < 1 or self.window_stride > self.window_width:
             raise ValueError(
-                "background_window_stride and background_window_width must be positive odd integers."
+                "background_window_stride and background_window_width must be positive integers with stride no larger than width."
             )
         self.encoding = str(encoding)
         self.generate_backgrounds = bool(generate_backgrounds)
@@ -174,6 +169,10 @@ class MeanFieldIngestAddon:
         )
         self._application_half_width = self.window_stride // 2
         self._source_half_width = self.window_width // 2
+        self._anchored_windows = self.window_stride % 2 == 0 or self.window_width % 2 == 0
+        self._source_left_width = (self.window_width - 1) // 2
+        self._source_right_width = self.window_width - 1 - self._source_left_width
+        self._first_frame_index: int | None = None
         self._nominal_shape: tuple[int, ...] | None = None
         self._source_dtype: np.dtype[Any] | None = None
         self._shape_counts: dict[tuple[int, ...], int] = {}
@@ -194,6 +193,8 @@ class MeanFieldIngestAddon:
         if self._last_frame_index is not None and frame_index <= self._last_frame_index:
             raise ValueError("Ingestion background frames must arrive in increasing frame-index order.")
         self._last_frame_index = frame_index
+        if self._first_frame_index is None:
+            self._first_frame_index = frame_index
 
         source = np.asarray(array)
         if source.ndim < 2:
@@ -204,7 +205,13 @@ class MeanFieldIngestAddon:
             self._nominal_shape = shape
             self._source_dtype = source.dtype
 
-        center = ((frame_index + self._application_half_width) // self.window_stride) * self.window_stride
+        if self._anchored_windows:
+            center = (
+                self._first_frame_index + self._source_left_width
+                + ((frame_index - self._first_frame_index) // self.window_stride) * self.window_stride
+            )
+        else:
+            center = ((frame_index + self._application_half_width) // self.window_stride) * self.window_stride
         self._assignments.append((frame_id, center))
         self._target_centers.add(center)
 
@@ -267,7 +274,7 @@ class MeanFieldIngestAddon:
             value
             for value in self._windows
             if value in self._target_centers
-            and frame_index > value + self._source_half_width
+            and frame_index > value + (self._source_right_width if self._anchored_windows else self._source_half_width)
         ]
         for completed_center in completed_centers:
             self._store_window(completed_center)
@@ -401,6 +408,12 @@ class MeanFieldIngestAddon:
         }
 
     def _source_centers(self, frame_index: int) -> range:
+        if self._anchored_windows:
+            assert self._first_frame_index is not None
+            first = max(0, math.ceil((frame_index - self.window_width + 1 - self._first_frame_index) / self.window_stride))
+            last = (frame_index - self._first_frame_index) // self.window_stride
+            origin = self._first_frame_index + self._source_left_width
+            return range(origin + first * self.window_stride, origin + (last + 1) * self.window_stride, self.window_stride)
         first = math.ceil((frame_index - self._source_half_width) / self.window_stride)
         last = math.floor((frame_index + self._source_half_width) / self.window_stride)
         return range(max(0, first) * self.window_stride, (last + 1) * self.window_stride, self.window_stride)
@@ -413,12 +426,12 @@ class MeanFieldIngestAddon:
         window_metadata = {
             "method": "mean",
             "window_center": center,
-            "window_start": center - self._source_half_width,
-            "window_end": center + self._source_half_width,
+            "window_start": center - (self._source_left_width if self._anchored_windows else self._source_half_width),
+            "window_end": center + (self._source_right_width if self._anchored_windows else self._source_half_width),
             "window_stride": self.window_stride,
             "window_width": self.window_width,
-            "application_start": center - self._application_half_width,
-            "application_end": center + self._application_half_width,
+            "application_start": center - (self._source_left_width if self._anchored_windows else self._application_half_width),
+            "application_end": center - self._source_left_width + self.window_stride - 1 if self._anchored_windows else center + self._application_half_width,
         }
         output: dict[str, Any] = {}
         if accumulator.profile_total is not None and accumulator.profile_frame_count:

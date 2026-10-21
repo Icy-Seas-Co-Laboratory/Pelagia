@@ -217,10 +217,10 @@ if APIRouter is not None:
         return quality
 
     def _validate_background_windows(stride: int, width: int) -> None:
-        if stride < 1 or width < 1 or stride % 2 == 0 or width % 2 == 0:
+        if stride < 1 or width < 1 or stride > width:
             raise HTTPException(
                 status_code=422,
-                detail="background_window_stride and background_window_width must be positive odd integers.",
+                detail="background_window_stride and background_window_width must be positive integers with stride no larger than width.",
             )
 
     def _validate_flatfield_axis(value: int) -> int:

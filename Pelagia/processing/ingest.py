@@ -357,10 +357,12 @@ def discover_ingest_sources(
     recursive: bool = True,
 ) -> list[IngestSource]:
     """
-    Discover video files and image-sequence folders below a path.
+    Discover interchange datasets, video files, and image-sequence folders below a path.
 
     Image folders are represented as one source per directory containing
     supported image files directly. Video files are represented individually.
+    An interchange dataset is a single source and its contents are not
+    discovered again as image or video sources.
     """
     root = Path(input_path).expanduser().resolve()
     if not root.exists():
@@ -379,28 +381,40 @@ def discover_ingest_sources(
         return [IngestSource(path=root, kind=AssetKind.INTERCHANGE.value)]
 
     sources: list[IngestSource] = []
-    folders = [root]
-    if recursive:
-        folders.extend(path for path in root.rglob("*") if path.is_dir())
 
-    seen_folders: set[Path] = set()
-    for folder in folders:
-        if folder in seen_folders:
-            continue
+    # ``os.walk(topdown=True)`` lets us remove a package directory before it is
+    # descended into.  A dataset may contain encoded frame files, but those are
+    # part of the package asset rather than independently importable sequences.
+    for current, directory_names, file_names in os.walk(root, topdown=True):
+        folder = Path(current)
+        directory_names.sort(key=str.lower)
+        file_names.sort(key=str.lower)
+
+        package_directories = [
+            name for name in directory_names if is_interchange_dataset(folder / name)
+        ]
+        for name in package_directories:
+            sources.append(
+                IngestSource(path=(folder / name).resolve(), kind=AssetKind.INTERCHANGE.value)
+            )
+        directory_names[:] = [name for name in directory_names if name not in package_directories]
+
         if _direct_image_files(folder):
             sources.append(
                 IngestSource(
                     path=folder,
-                    kind="image_sequence",
+                    kind=AssetKind.IMAGE_SEQUENCE.value,
                     recursive=False,
                 )
             )
-            seen_folders.add(folder)
 
-    video_iterator = root.rglob("*") if recursive else root.iterdir()
-    for path in video_iterator:
-        if path.is_file() and is_supported_video_file(path):
-            sources.append(IngestSource(path=path, kind="video"))
+        for name in file_names:
+            path = folder / name
+            if is_supported_video_file(path):
+                sources.append(IngestSource(path=path, kind=AssetKind.VIDEO.value))
+
+        if not recursive:
+            directory_names.clear()
 
     return sorted(sources, key=lambda source: (source.kind, str(source.path).lower()))
 

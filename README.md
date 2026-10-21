@@ -52,6 +52,13 @@ the source file is not modified. Registry edits are recorded in PostgreSQL and
 can be exported as a new child SQLite revision, explicitly written back to the
 current source (with a backup and hash guard), or purged from PostgreSQL. The
 portable schema remains owned by the existing `oracle_data_contracts` package.
+In the Registry gallery, open an ROI with its magnifying-glass button to inspect
+the full-resolution image, pixel scale, and measurements. Edit mode lets you
+adjust the object bounding box inside the stored crop. For mask-refinement
+items, the candidate and current masks can be viewed as separate layers; saved
+eraser strokes create a new mask annotation while retaining the candidate mask
+and earlier annotations. Identical mask bytes reuse an existing asset. Image
+inversion changes only the display.
 Run at least one worker with `registry_load,registry_export,registry_generate` capabilities.
 
 ### Prerequisites
@@ -404,8 +411,11 @@ This keeps the boundary clear: large source frames can remain cold and only be f
 
 ### Importing Pelagia interchange datasets
 
-A complete `pelagia_interchange` directory can be selected on the Ingestion
-page or queued directly:
+The Ingestion page uses one Analyze and queue workflow for interchange
+datasets, video files, and image-sequence folders. Select a path to search
+recursively; every complete interchange directory found beneath it appears as
+one analyzed asset alongside any videos and image folders. A complete package
+can also be queued directly:
 
 ```bash
 pelagia queue_ingest /data/deployment_042_interchange
@@ -559,7 +569,13 @@ means, but can still contribute to flatfield profiles. `flatfield_axis=0` is the
 default: frames are effectively stacked vertically, their widths must match, and
 column means are stored. With `flatfield_axis=1`, frames are effectively stacked
 horizontally, their heights must match, and row means are stored. The stacking is
-accumulated without allocating a concatenated image.
+accumulated without allocating a concatenated image. Ingestion field window
+widths and strides may be any positive integers with stride no larger than
+width. For example, width 4 and stride 4 combine four consecutive frames
+per flatfield profile; axis 0 averages their stacked columns and axis 1
+averages their stacked rows. A final incomplete window uses the available
+frames and records its contributing frame IDs. Windows count stored frames;
+when multi-frame tiling is enabled, a window of 4 spans four stored tiles.
 
 Preprocessing no longer estimates correction fields. It automatically applies
 an ingestion-generated mean background when one is attached to the frame;
