@@ -1409,6 +1409,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                     current={"phase": "resuming", "batch": batch_number,
                              "batch_count": batch_count},
                     message=f"Recovered completed batch {batch_number} of {batch_count}",
+                    reset_rate=True,
                 )
                 batch_index += 1
                 continue

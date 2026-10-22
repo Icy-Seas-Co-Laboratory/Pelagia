@@ -608,6 +608,44 @@ do not include that optional codec.
 Preview requests return a small PNG placeholder and accept `preview_max_dim`, for example
 `GET /assets/{asset_id}/framedata/{frame_num}?format=preview&preview_max_dim=128`.
 
+Frame metadata carries standard ThumbHash placeholders as
+`preview_thumbhash_base64` (and `preprocessed_preview_thumbhash_base64` when
+available). Their encoder input is controlled separately by
+`[processing.thumbhash].max_dim` / `PELAGIA_THUMBHASH_MAX_DIM`: an integer from
+1 to 100, default 100. Generation preserves aspect ratio without upscaling,
+resizes grayscale/BGR/BGRA data with bilinear interpolation before RGBA expansion,
+and passes a compact byte buffer to the encoder. Non-uint8 inputs retain
+full-source min/max normalization and uint8 quantization before resizing.
+Bilinear resizing prioritizes throughput for these graphical placeholders;
+aliasing and missed small features are acceptable. Lower limits reduce encoder
+work but can change placeholder appearance.
+Encoding uses the pinned `fast-thumbhash-rs` native implementation, which borrows
+the RGBA byte buffer and releases the GIL during encoding. Transparent BGRA is
+supported. New hashes remain standard ThumbHash payloads, but floating-point
+differences can change bytes compared with the former Python encoder; they are
+display placeholders, not content identifiers. Very small or single-row/column
+inputs can also show larger decoded differences from numerical rounding in the
+undersampled transform. Existing stored hashes are left intact. The encoder
+version is pinned in `pyproject.toml` and `uv.lock` for
+reproducibility.
+
+Update environments with `./scripts/pelagia_env sync dev` (or `sync cpu`). The
+former `thumbhash` distribution and `fast-thumbhash-rs` share the `thumbhash`
+import namespace and must not be installed together. The managed sync removes
+the old distribution. Version 0.1.0 provides Python 3.12 wheels for macOS arm64
+and Linux x86_64 (glibc 2.28+); Linux arm64 requires a Rust source build or an
+internally built wheel.
+
+Benchmark the actual production image dimensions with
+`.venv/bin/python scripts/benchmark_thumbhash.py --input frame.png`. The JSON
+result separates the encoder call (including the Python/Rust boundary) from
+complete ThumbHash generation; image decoding is excluded. Without `--input`,
+use `--width`, `--height`, `--channels`, and `--dtype` for seeded synthetic data.
+Use `--threads` to request production OpenCV parallelism; the result records both
+requested and reported counts because some OpenCV backends ignore this setting.
+Non-uint8 normalization still scans the full source image and can dominate
+the resize and native encoder costs.
+
 ## Configuration
 
 Pelagia loads configuration in this order:

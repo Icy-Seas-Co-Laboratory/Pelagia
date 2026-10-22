@@ -17,6 +17,7 @@ ROI_REFINEMENT_DETECTIONS_PER_JOB = 10_000
 # Keep the recovery timeout deliberately conservative: a second director must
 # never reclaim work that a healthy planner is still materialising.
 PROCESSING_SERIES_PLANNING_TIMEOUT_SECONDS = 15 * 60
+PROCESSING_SUBMISSION_CLAIM_SECONDS = 60 * 60
 _TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "dead_lettered", "cancelled"})
 
 
@@ -87,14 +88,192 @@ class ProcessingSeriesRequest:
     submitted_by_username: str | None = None
 
 
+class ProcessingSubmissionConflict(ValueError):
+    """A caller reused an idempotency key for a different request."""
+
+
+class ProcessingSubmissionService:
+    """Durably accept criteria requests before expanding frames or detections.
+
+    Planning intentionally happens in this dispatcher, after the HTTP response.
+    The stored criteria are evaluated here, so browser navigation cannot cancel
+    a request and a restarted API process can reclaim abandoned planning.
+    """
+
+    def __init__(self, context: AppContext):
+        if context.repository is None:
+            raise RuntimeError("Processing submissions require a PostgresRepository.")
+        self.context = context
+        self.repository = context.repository
+
+    def submit(
+        self,
+        *,
+        kind: str,
+        request: dict[str, Any],
+        request_id: str,
+        project_id: str,
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+    ) -> dict[str, Any]:
+        # Reject structural errors before creating a durable accepted row. The
+        # potentially large criteria expansion remains entirely asynchronous.
+        persisted_request = dict(request)
+        if kind == "queue":
+            stage = str(persisted_request.get("stage") or "")
+            if stage not in {"preprocess_frames", "segment", "roi_refinement"}:
+                raise ValueError(f"Unsupported processing stage: {stage}.")
+            filters = dict(persisted_request.get("filters") or {})
+            if stage == "preprocess_frames":
+                filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
+            elif stage == "segment":
+                filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed"]
+            else:
+                filters["refinement_state"] = filters.get("refinement_state") or ["unrefined"]
+            persisted_request["filters"] = filters
+        elif kind == "series":
+            steps = tuple(dict(step) for step in persisted_request.get("steps") or ())
+            selection = dict(persisted_request.get("selection") or persisted_request.get("targets") or {})
+            ProcessingQueueService._validate_series_steps(steps)
+            ProcessingQueueService._validate_series_selection(selection)
+            if str(persisted_request.get("failure_policy") or "fail_fast") not in {"fail_fast", "continue"}:
+                raise ValueError("failure_policy must be one of: fail_fast, continue.")
+            normalized_steps = []
+            for step in steps:
+                stage = str(step["stage"])
+                filters = dict(step.get("filters") or {})
+                if stage == "preprocess_frames":
+                    filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
+                elif stage == "segment":
+                    filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed"]
+                else:
+                    filters["refinement_state"] = filters.get("refinement_state") or ["unrefined"]
+                normalized_steps.append(ProcessingQueueService._resolve_series_step_options(
+                    {**step, "filters": filters},
+                    dict(persisted_request.get("preset_snapshot") or {}),
+                ))
+            persisted_request["steps"] = normalized_steps
+            persisted_request["selection"] = selection
+        else:
+            raise ValueError("Processing submission kind must be 'queue' or 'series'.")
+        try:
+            submission, _created = self.repository.create_processing_submission(
+                project_id=project_id, request_id=request_id, kind=kind, request=persisted_request,
+                submitted_by_user_id=submitted_by_user_id,
+                submitted_by_username=submitted_by_username,
+            )
+        except ValueError as exc:
+            if "request_id was already used" in str(exc):
+                raise ProcessingSubmissionConflict(str(exc)) from exc
+            raise
+        return submission
+
+    def dispatch(self, *, limit: int = 1) -> int:
+        """Run a bounded number of claims; safe in every API process."""
+        completed = 0
+        for _ in range(min(max(1, int(limit)), 25)):
+            submission = self.repository.claim_processing_submission(
+                lease_seconds=PROCESSING_SUBMISSION_CLAIM_SECONDS,
+            )
+            if submission is None:
+                break
+            self._dispatch_claimed(submission)
+            completed += 1
+        return completed
+
+    def _dispatch_claimed(self, submission: dict[str, Any]) -> None:
+        submission_id, claim_token = str(submission["id"]), str(submission["claim_token"])
+        project_id = str(submission["project_id"])
+        try:
+            # Criteria evaluation, job/series creation, work-unit attachment,
+            # and the fenced success transition share one transaction.  The
+            # repository also takes the per-project transaction advisory lock,
+            # so overlapping submissions observe the eligibility changes made
+            # by the preceding materialization without holding another pooled
+            # connection or exposing partially-created work after a crash.
+            with self.repository.processing_submission_transaction(
+                submission_id,
+                project_id=project_id,
+                claim_token=claim_token,
+            ) as connection:
+                # Another process may have reclaimed an expired lease between
+                # claim selection and transaction entry.  A stale claimant
+                # must never fall back to ordinary per-operation commits.
+                if connection is None:
+                    return
+                body = dict(submission.get("request") or {})
+                queue = ProcessingQueueService(self.context, _connection=connection)
+                if submission["kind"] == "queue":
+                    request = PreprocessQueueRequest(
+                        filters=dict(body.get("filters") or {}), options=dict(body.get("options") or {}),
+                        priority=body.get("priority"), dry_run=False,
+                        submitted_by_user_id=submission.get("submitted_by_user_id"),
+                        submitted_by_username=submission.get("submitted_by_username"),
+                    )
+                    stage = str(body["stage"])
+                    if stage == "preprocess_frames":
+                        result = queue.queue_preprocess(request, project_id=project_id)
+                    elif stage == "segment":
+                        result = queue.queue_segment(request, project_id=project_id)
+                    elif stage == "roi_refinement":
+                        result = queue.queue_roi_refinement(request, project_id=project_id)
+                    else:
+                        raise ValueError(f"Unsupported processing stage: {stage}.")
+                elif submission["kind"] == "series":
+                    steps = tuple(dict(step) for step in body.get("steps") or ())
+                    series = queue.create_series(
+                        ProcessingSeriesRequest(
+                            steps=steps, selection=dict(body.get("selection") or body.get("targets") or {}),
+                            preset_snapshot=dict(body.get("preset_snapshot") or {}),
+                            failure_policy=str(body.get("failure_policy") or "fail_fast"), priority=body.get("priority"),
+                            dry_run=False, submitted_by_user_id=submission.get("submitted_by_user_id"),
+                            submitted_by_username=submission.get("submitted_by_username"),
+                        ),
+                        project_id=project_id,
+                    )
+                    result = {"series": series, "dry_run": False}
+                else:  # protected by the database constraint, retained for old databases
+                    raise ValueError("Unsupported processing submission kind.")
+                # A submission response remains cheap even when one criteria
+                # set becomes thousands of queue jobs.  Queue/status owns the
+                # complete, paginated view.
+                job_ids = result.get("job_ids") if isinstance(result, dict) else None
+                if isinstance(job_ids, list) and len(job_ids) > 100:
+                    result = {**result, "job_ids": job_ids[:100], "job_ids_truncated": True}
+                batch_sizes = result.get("batch_sizes") if isinstance(result, dict) else None
+                if isinstance(batch_sizes, list) and len(batch_sizes) > 100:
+                    result = {
+                        **result,
+                        "batch_sizes": batch_sizes[:100],
+                        "batch_sizes_truncated": True,
+                    }
+                completed = self.repository.complete_processing_submission(
+                    submission_id,
+                    claim_token=claim_token,
+                    result=result,
+                    _connection=connection,
+                )
+                if completed is None:
+                    raise RuntimeError("Processing submission claim was lost during materialization.")
+        except Exception as exc:
+            self.repository.fail_processing_submission(submission_id, claim_token=claim_token, error=str(exc))
+
+
 class ProcessingQueueService:
     """Resolve work units and create efficiently ordered processing jobs."""
 
-    def __init__(self, context: AppContext):
+    def __init__(self, context: AppContext, *, _connection=None):
         if context.repository is None:
             raise RuntimeError("Processing queue operations require a PostgresRepository.")
         self.context = context
         self.repository = context.repository
+        self._connection = _connection
+
+    def _repository_call(self, method_name: str, /, *args: Any, **kwargs: Any):
+        """Keep all materialization operations on the dispatch transaction."""
+        if self._connection is not None:
+            kwargs["_connection"] = self._connection
+        return getattr(self.repository, method_name)(*args, **kwargs)
 
     def queue_preprocess(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
         filters = {**request.filters}
@@ -116,7 +295,8 @@ class ProcessingQueueService:
         }
         if request.dry_run:
             return result
-        created = self.repository.create_preprocess_jobs(
+        created = self._repository_call(
+            "create_preprocess_jobs",
             project_id=project_id,
             jobs=planned_jobs,
             eligible_statuses=filters["preprocessing_status"],
@@ -169,13 +349,21 @@ class ProcessingQueueService:
                 "steps": planned_steps,
                 "eligibility": self._eligibility(planned_steps),
             }
-        series = self.repository.create_processing_series(
+        series = self._repository_call(
+            "create_processing_series",
             project_id=project_id, steps=steps, selection=request.selection or {},
             preset_snapshot=request.preset_snapshot or {}, failure_policy=request.failure_policy,
             priority=request.priority, submitted_by_user_id=request.submitted_by_user_id,
             submitted_by_username=request.submitted_by_username,
         )
-        return self.advance_series(str(series["id"]), project_id=project_id) or series
+        advanced = self.advance_series(str(series["id"]), project_id=project_id)
+        if self._connection is not None and advanced is not None:
+            # The full series projection normally uses several read operations.
+            # During submission materialization, return the newly-created row
+            # plus the status established by this transaction and let later
+            # GET requests build the expanded projection after commit.
+            return {**series, **advanced}
+        return advanced or series
 
     @staticmethod
     def _eligibility(planned_steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -306,18 +494,26 @@ class ProcessingQueueService:
     def advance_series(self, series_id: str, *, project_id: str) -> dict[str, Any] | None:
         """Plan queued steps one at a time, recursively passing empty selections."""
         while True:
-            step = self.repository.claim_processing_series_step(series_id, project_id=project_id)
+            step = self._repository_call("claim_processing_series_step", series_id, project_id=project_id)
             if step is None:
-                return self.repository.get_processing_series(series_id, project_id=project_id)
+                if self._connection is not None:
+                    # This transactional path is used only while creating a new
+                    # series. Reaching the end means every empty step was
+                    # recorded as skipped and attach marked the series done.
+                    return {"id": series_id, "project_id": project_id, "status": "succeeded"}
+                return self._repository_call("get_processing_series", series_id, project_id=project_id)
             result = self._plan_step(step, project_id=project_id, dry_run=False)
-            self.repository.attach_processing_work_units(
+            self._repository_call(
+                "attach_processing_work_units",
                 series_id=series_id, step_id=str(step["id"]), job_ids=result.get("job_ids", []),
                 matched_count=int(result["matched_count"]),
             )
             # An empty selection is explicitly recorded as skipped and the next
             # stage can be evaluated immediately.  Nonempty work awaits workers.
             if result.get("job_ids"):
-                return self.repository.get_processing_series(series_id, project_id=project_id)
+                if self._connection is not None:
+                    return {"id": series_id, "project_id": project_id, "status": "active"}
+                return self._repository_call("get_processing_series", series_id, project_id=project_id)
 
     def _plan_step(self, step: dict[str, Any], *, project_id: str, dry_run: bool) -> dict[str, Any]:
         request = PreprocessQueueRequest(
@@ -411,7 +607,8 @@ class ProcessingQueueService:
             assets, runs = {str(row["asset_id"]) for row in batch}, {str(row["run_id"]) for row in batch if row.get("run_id")}
             payload = command(selection=FrameSelection(frame_ids=tuple(frame_ids)), options=dict(request.options)).to_payload()
             jobs.append(
-                self.repository.create_job(
+                self._repository_call(
+                    "create_job",
                     stage,
                     project_id=project_id,
                     run_id=next(iter(runs)) if len(runs) == 1 else None,
@@ -453,7 +650,8 @@ class ProcessingQueueService:
             assets, runs = {str(row["asset_id"]) for row in batch}, {str(row["run_id"]) for row in batch if row.get("run_id")}
             payload = RoiRefinementCommand(detection_ids=tuple(detection_ids), options=dict(request.options)).to_payload()
             jobs.append(
-                self.repository.create_job(
+                self._repository_call(
+                    "create_job",
                     "roi_refinement",
                     project_id=project_id,
                     run_id=next(iter(runs)) if len(runs) == 1 else None,
@@ -472,12 +670,16 @@ class ProcessingQueueService:
         asset_ids = [str(asset_id) for asset_id in filters.get("asset_ids") or [] if asset_id]
         asset_ids = list(dict.fromkeys(asset_ids))
         base_filters = {key: value for key, value in filters.items() if key != "asset_ids"}
-        planner = getattr(self.repository, method_name)
         if not asset_ids:
-            return planner(project_id=project_id, filters=base_filters, **kwargs)
+            return self._repository_call(method_name, project_id=project_id, filters=base_filters, **kwargs)
         rows: list[dict[str, Any]] = []
         for asset_id in asset_ids:
-            rows.extend(planner(project_id=project_id, filters={**base_filters, "asset_id": asset_id}, **kwargs))
+            rows.extend(self._repository_call(
+                method_name,
+                project_id=project_id,
+                filters={**base_filters, "asset_id": asset_id},
+                **kwargs,
+            ))
         return rows
 
     @staticmethod

@@ -82,7 +82,7 @@ class FrameRepository(RepositoryScope):
 class JobRepository(RepositoryScope):
     operations = frozenset(
         {
-            "list_jobs", "summarize_jobs", "get_job", "create_job",
+            "list_jobs", "summarize_jobs", "get_queue_status_snapshot", "get_job", "create_job",
             "update_job_payload", "update_job_progress", "append_job_event",
             "append_log", "list_job_events", "list_logs", "set_job_priority",
             "pause_job", "finalize_paused_job", "resume_job", "get_status_summary",
@@ -97,6 +97,9 @@ class JobRepository(RepositoryScope):
             "attach_processing_work_units", "advance_processing_series_for_job",
             "pause_processing_series", "resume_processing_series", "cancel_processing_series",
             "retry_processing_series",
+            "create_processing_submission", "get_processing_submission", "list_processing_submissions",
+            "claim_processing_submission", "complete_processing_submission", "fail_processing_submission",
+            "processing_submission_transaction",
             "create_export_artifact", "attach_export_artifact_job", "get_export_artifact",
             "list_export_artifacts", "update_export_artifact", "begin_export_attempt",
             "update_export_attempt_product", "finish_export_attempt",

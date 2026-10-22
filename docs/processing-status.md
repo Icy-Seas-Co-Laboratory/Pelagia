@@ -4,6 +4,12 @@ Pelagia maintains a project-scoped frame processing status projection so clients
 can filter large frame sets without first compiling job, frame, detection, and
 ROI state on the frontend.
 
+This projection describes stored frame coverage, not queue throughput. For job
+counts, active work, progress, rates, and ETA, use the authoritative
+[`/jobs/status` snapshot](queue-status.md). A frame can already have a stored
+artifact while another job is reprocessing it, so coverage and queue progress
+are intentionally distinct metrics.
+
 The projection is stored in PostgreSQL in `frame_processing_status`. It has one
 row per project and frame. Each row tracks:
 

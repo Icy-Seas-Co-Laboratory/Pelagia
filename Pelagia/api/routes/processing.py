@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 try:
     from fastapi import APIRouter, HTTPException, Request
-    from pydantic import BaseModel, ConfigDict, Field
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -14,10 +15,15 @@ except ImportError:  # pragma: no cover
 if APIRouter is not None:
     from ..auth import require_project_write, scoped_project_id
     from ...services.context import AppContext
-    from ...services.processing_queue import PreprocessQueueRequest, ProcessingQueueService, ProcessingSeriesRequest as ProcessingSeriesServiceRequest
+    from ...services.processing_queue import (
+        PreprocessQueueRequest, ProcessingQueueService, ProcessingSeriesRequest as ProcessingSeriesServiceRequest,
+        ProcessingSubmissionConflict, ProcessingSubmissionService,
+    )
     from ._common import as_response, get_context
 
     class ProcessingQueueFilters(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         run_id: str | None = None
         asset_ids: list[str] = Field(default_factory=list)
         frame_ids: list[str] = Field(default_factory=list)
@@ -59,6 +65,13 @@ if APIRouter is not None:
     class SeriesReasonRequest(BaseModel):
         reason: str | None = None
 
+    class ProcessingSubmissionRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        request_id: UUID
+        kind: Literal["queue", "series"]
+        request: dict[str, Any]
+
     router = APIRouter(prefix="/processing", tags=["processing"])
 
     @router.post("/queue")
@@ -81,13 +94,12 @@ if APIRouter is not None:
                 result = service.queue_segment(queue_request, project_id=auth.project_id)
             else:
                 result = service.queue_roi_refinement(queue_request, project_id=auth.project_id)
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, ValidationError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return as_response(result)
 
-    @router.post("/series")
-    def create_processing_series(request: Request, body: ProcessingSeriesRequest) -> dict:
-        auth = require_project_write(request)
+    def _series_request_payload(body: ProcessingSeriesRequest) -> dict[str, Any]:
+        """Return the persisted, resolved series input used by both endpoints."""
         selection = dict(body.selection or body.targets or {})
         common_filters = {
             "asset_ids": selection.get("asset_ids") or [],
@@ -103,9 +115,59 @@ if APIRouter is not None:
             filters = step.filters.model_dump() if hasattr(step.filters, "model_dump") else step.filters.dict()
             filters = {**common_filters, **{key: value for key, value in filters.items() if value not in (None, [], {})}}
             steps.append({"stage": step.stage, "filters": filters, "options": step.options, "failure_policy": step.failure_policy})
+        return {
+            "steps": steps, "selection": selection, "preset_snapshot": body.preset_snapshot,
+            "failure_policy": body.failure_policy, "priority": body.priority, "dry_run": body.dry_run,
+        }
+
+    @router.post("/submissions", status_code=202)
+    def submit_processing(request: Request, body: ProcessingSubmissionRequest) -> dict:
+        """Accept a criteria-based request without synchronously enumerating units."""
+        auth = require_project_write(request)
+        try:
+            if body.kind == "queue":
+                queue_body = ProcessingQueueRequest(**body.request)
+                if queue_body.dry_run:
+                    raise ValueError("dry_run is not supported for durable processing submissions.")
+                persisted_request = queue_body.model_dump() if hasattr(queue_body, "model_dump") else queue_body.dict()
+            else:
+                series_body = ProcessingSeriesRequest(**body.request)
+                if series_body.dry_run:
+                    raise ValueError("dry_run is not supported for durable processing submissions.")
+                persisted_request = _series_request_payload(series_body)
+            submission = ProcessingSubmissionService(get_context(request)).submit(
+                kind=body.kind, request=persisted_request, request_id=str(body.request_id), project_id=auth.project_id,
+                submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+            )
+        except ProcessingSubmissionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (KeyError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"submission": as_response(submission)}
+
+    @router.get("/submissions")
+    def list_processing_submissions(request: Request, limit: int = 50) -> dict:
+        repository = get_context(request).repository
+        return {"submissions": as_response(repository.list_processing_submissions(
+            project_id=scoped_project_id(request), limit=limit,
+        ))}
+
+    @router.get("/submissions/{submission_id}")
+    def get_processing_submission(request: Request, submission_id: str) -> dict:
+        submission = get_context(request).repository.get_processing_submission(
+            submission_id, project_id=scoped_project_id(request),
+        )
+        if submission is None:
+            raise HTTPException(status_code=404, detail=f"Processing submission {submission_id!r} was not found.")
+        return {"submission": as_response(submission)}
+
+    @router.post("/series")
+    def create_processing_series(request: Request, body: ProcessingSeriesRequest) -> dict:
+        auth = require_project_write(request)
+        payload = _series_request_payload(body)
         try:
             result = ProcessingQueueService(get_context(request)).create_series(
-                ProcessingSeriesServiceRequest(steps=tuple(steps), selection=selection, preset_snapshot=body.preset_snapshot,
+                ProcessingSeriesServiceRequest(steps=tuple(payload["steps"]), selection=payload["selection"], preset_snapshot=body.preset_snapshot,
                                         failure_policy=body.failure_policy, priority=body.priority,
                                         dry_run=body.dry_run, submitted_by_user_id=auth.user_id, submitted_by_username=auth.username),
                 project_id=auth.project_id,

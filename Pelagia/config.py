@@ -408,6 +408,11 @@ class ThumbhashProcessingConfig:
 
     max_dim: int = 100
 
+    def __post_init__(self) -> None:
+        self.max_dim = int(self.max_dim)
+        if not 1 <= self.max_dim <= 100:
+            raise ValueError("processing.thumbhash.max_dim must be between 1 and 100.")
+
 
 @dataclass(slots=True)
 class RoiRefinementProcessingConfig:

@@ -3140,6 +3140,172 @@ def test_api_rejects_processing_series_without_a_bounded_target():
     assert response.json()["detail"] == "A processing series requires at least one asset, frame, or collection target."
 
 
+@pytest.mark.parametrize("kind", ["queue", "series"])
+def test_api_accepts_durable_processing_criteria_without_planning(monkeypatch, kind):
+    client, repository, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+    calls = []
+
+    class FakeSubmissionService:
+        def __init__(self, context):
+            assert context.repository is repository
+
+        def submit(self, **kwargs):
+            calls.append(kwargs)
+            return {"id": "submission-1", "status": "accepted", "result": None, **kwargs}
+
+    def forbidden_planning(*args, **kwargs):
+        pytest.fail("Acceptance must not enumerate frames or create processing jobs")
+
+    monkeypatch.setattr("Pelagia.api.routes.processing.ProcessingSubmissionService", FakeSubmissionService)
+    monkeypatch.setattr(repository, "create_job", forbidden_planning)
+    monkeypatch.setattr(repository, "plan_preprocess_frames", forbidden_planning, raising=False)
+    request = {
+        "stage": "preprocess_frames",
+        "filters": {"collection": ["tow-1"], "preprocessing_status": ["unknown", "failed"]},
+        "options": {"apply_mask": True},
+    } if kind == "queue" else {
+        "selection": {"collections": ["tow-1"]},
+        "steps": [{"stage": "preprocess_frames", "options": {"apply_mask": True}}],
+    }
+    response = client.post("/processing/submissions", headers=headers, json={
+        "request_id": "ac7abebf-7521-4426-9753-b58fa00e8f7c", "kind": kind, "request": request,
+    })
+
+    assert response.status_code == 202, response.text
+    assert response.json()["submission"]["status"] == "accepted"
+    assert response.json()["submission"]["result"] is None
+    assert len(calls) == 1
+    assert calls[0]["project_id"] == "project-1"
+    assert calls[0]["submitted_by_user_id"] == "user-1"
+    assert calls[0]["submitted_by_username"] == "ada"
+    assert calls[0]["kind"] == kind
+    saved = calls[0]["request"]
+    if kind == "queue":
+        assert saved["filters"]["collection"] == ["tow-1"]
+        assert saved["filters"]["preprocessing_status"] == ["unknown", "failed"]
+        assert not saved["filters"].get("frame_ids")
+    else:
+        assert saved["selection"]["collections"] == ["tow-1"]
+
+
+@pytest.mark.parametrize("invalid", [
+    {"request_id": "not-a-uuid"},
+    {"request": {"stage": "nonexistent", "filters": {}}},
+    {"request": {"stage": "segment", "filters": {"misspelled_gate": ["succeeded"]}}},
+    {"request": {"stage": "segment", "dry_run": True}},
+    {"project_id": "another-project"},
+])
+def test_api_rejects_invalid_durable_processing_submission(monkeypatch, invalid):
+    client, _, _ = make_client()
+
+    class ForbiddenSubmissionService:
+        def __init__(self, context):
+            pass
+
+        def submit(self, **kwargs):
+            pytest.fail("Invalid submissions must not be persisted")
+
+    monkeypatch.setattr("Pelagia.api.routes.processing.ProcessingSubmissionService", ForbiddenSubmissionService)
+    response = client.post("/processing/submissions", json={
+        "request_id": "ac7abebf-7521-4426-9753-b58fa00e8f7c", "kind": "queue",
+        "request": {"stage": "segment", "filters": {"collection": ["tow-1"]}},
+        **invalid,
+    })
+    assert response.status_code == 422, response.text
+
+
+def test_api_processing_submission_reads_are_project_scoped(monkeypatch):
+    client, repository, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+    reads = []
+
+    def list_submissions(*, project_id, limit=50, **kwargs):
+        reads.append(("list", project_id))
+        return [{"id": "submission-1", "project_id": project_id, "status": "planning"}]
+
+    def get_submission(submission_id, *, project_id):
+        reads.append(("get", project_id))
+        return None
+
+    monkeypatch.setattr(repository, "list_processing_submissions", list_submissions, raising=False)
+    monkeypatch.setattr(repository, "get_processing_submission", get_submission, raising=False)
+    listed = client.get("/processing/submissions", headers=headers)
+    missing = client.get("/processing/submissions/42803b26-35a9-46a4-ad1f-5d28e5b4daa5", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["submissions"][0]["status"] == "planning"
+    assert missing.status_code == 404
+    assert reads == [("list", "project-1"), ("get", "project-1")]
+
+
+def test_api_processing_submission_requires_authentication():
+    client, _, _ = make_client(auth_enabled=True)
+    response = client.post("/processing/submissions", json={
+        "request_id": "ac7abebf-7521-4426-9753-b58fa00e8f7c", "kind": "queue",
+        "request": {"stage": "segment", "filters": {"collection": ["tow-1"]}},
+    })
+    assert response.status_code == 401
+
+
+def test_api_processing_submission_requires_project_write_access():
+    client, repository, _ = make_client(auth_enabled=True)
+    repository.memberships[("user-1", "project-1")] = "viewer"
+    headers = auth_headers(client)
+    response = client.post("/processing/submissions", headers=headers, json={
+        "request_id": "ac7abebf-7521-4426-9753-b58fa00e8f7c", "kind": "queue",
+        "request": {"stage": "segment", "filters": {"collection": ["tow-1"]}},
+    })
+    assert response.status_code == 403
+
+
+def test_api_processing_submission_conflicting_retry_returns_409(monkeypatch):
+    from Pelagia.services.processing_queue import ProcessingSubmissionConflict
+
+    client, _, _ = make_client()
+
+    class ConflictingSubmissionService:
+        def __init__(self, context):
+            pass
+
+        def submit(self, **kwargs):
+            raise ProcessingSubmissionConflict("request_id was already used for a different request")
+
+    monkeypatch.setattr("Pelagia.api.routes.processing.ProcessingSubmissionService", ConflictingSubmissionService)
+    response = client.post("/processing/submissions", json={
+        "request_id": "ac7abebf-7521-4426-9753-b58fa00e8f7c", "kind": "queue",
+        "request": {"stage": "segment", "filters": {"collection": ["tow-1"]}},
+    })
+    assert response.status_code == 409
+
+
+def test_api_lifespan_dispatches_submissions_without_browser_polling(monkeypatch):
+    from threading import Event
+    from types import SimpleNamespace
+
+    dispatched = Event()
+    closed = Event()
+    context = SimpleNamespace(
+        repository=SimpleNamespace(claim_processing_submission=lambda **kwargs: None),
+        close=closed.set,
+    )
+
+    class FakeSubmissionService:
+        def __init__(self, supplied_context):
+            assert supplied_context is context
+
+        def dispatch(self, *, limit):
+            assert not closed.is_set()
+            dispatched.set()
+            return 0
+
+    monkeypatch.setattr(AppContext, "from_config", classmethod(lambda cls, config: context))
+    monkeypatch.setattr("Pelagia.services.processing_queue.ProcessingSubmissionService", FakeSubmissionService)
+    with TestClient(create_app(CoreConfig())):
+        assert dispatched.wait(timeout=3), "Durable planning must run without a browser request"
+        assert not closed.is_set()
+    assert closed.is_set()
+
+
 def test_api_create_queue_job_rejects_cross_project_asset():
     client, repository, _ = make_client()
     headers = auth_headers(client, username="admin", project_key="other")
@@ -3183,6 +3349,43 @@ def test_api_lists_jobs_with_details_when_requested():
     assert job["include_details"] is True
     assert job["payload"]["frame_ids"] == ["frame-1"]
     assert job["result"]["detection_ids"] == ["det-1"]
+
+
+def test_api_queue_status_is_project_scoped_and_forwards_filters():
+    client, repository, _ = make_client(auth_enabled=True)
+    captured = {}
+
+    def get_queue_status_snapshot(**kwargs):
+        captured.update(kwargs)
+        return {
+            "as_of": datetime.now(timezone.utc),
+            "total": {"job_count": 0},
+            "by_stage": [],
+            "work_groups": [],
+            "jobs": [],
+            "recent_failures": [],
+        }
+
+    repository.get_queue_status_snapshot = get_queue_status_snapshot
+    response = client.get(
+        "/jobs/status?stage=segment&status=queued&job_limit=12",
+        headers=auth_headers(client, username="admin", project_key="other"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["scope"]["project_id"] == "project-2"
+    assert captured["project_id"] == "project-2"
+    assert captured["stages"] == ["segment"]
+    assert captured["statuses"] == ["queued"]
+    assert captured["job_limit"] == 12
+
+
+def test_api_queue_status_rejects_oversized_limits_before_storage_access():
+    client, _, _ = make_client(auth_enabled=True)
+
+    response = client.get("/jobs/status?job_limit=251", headers=auth_headers(client))
+
+    assert response.status_code == 422
 
 
 def test_api_streams_project_scoped_job_event_replay():

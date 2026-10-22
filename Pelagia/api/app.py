@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from ..config import CoreConfig
@@ -28,9 +29,33 @@ def create_app(config: CoreConfig | None = None):
 
     @asynccontextmanager
     async def lifespan(_app):
+        stop_dispatcher = asyncio.Event()
+
+        async def dispatch_processing_submissions() -> None:
+            # The durable table is the source of truth.  This loop only reduces
+            # time-to-planning; a restarted process reclaims expired claims.
+            if context.repository is None or not hasattr(context.repository, "claim_processing_submission"):
+                return
+            from ..services.processing_queue import ProcessingSubmissionService
+
+            service = ProcessingSubmissionService(context)
+            while not stop_dispatcher.is_set():
+                try:
+                    dispatched = await asyncio.to_thread(service.dispatch, limit=1)
+                except Exception:  # leave the durable row for the next pass
+                    core_logger.exception("Processing submission dispatcher pass failed")
+                    dispatched = 0
+                try:
+                    await asyncio.wait_for(stop_dispatcher.wait(), timeout=0.05 if dispatched else 0.5)
+                except TimeoutError:
+                    pass
+
+        dispatcher_task = asyncio.create_task(dispatch_processing_submissions())
         try:
             yield
         finally:
+            stop_dispatcher.set()
+            await dispatcher_task
             context.close()
 
     app = FastAPI(

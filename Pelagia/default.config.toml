@@ -253,7 +253,7 @@ image_encoding = "jpg"
 image_quality = 90
 
 [processing.thumbhash]
-# Maximum image dimension used before computing preview thumbhashes.
+# Maximum image dimension before RGBA expansion and ThumbHash encoding (1-100).
 max_dim = 100
 
 [processing.roi_refinement]

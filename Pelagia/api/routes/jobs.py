@@ -16,9 +16,10 @@ except ImportError:  # pragma: no cover
 
 
 if APIRouter is not None:
-    from ..schemas import JobDetailResponse, JobsClearResponse, JobsListResponse, JobsSummaryResponse
+    from ..schemas import JobDetailResponse, JobsClearResponse, JobsListResponse, JobsSummaryResponse, QueueStatusResponse
     from ..auth import require_project_write, scoped_project_id
     from ...services.pipeline import PipelineService
+    from ...services.queue_status import QueueStatusService
     from ._common import as_response, get_context, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -191,6 +192,38 @@ if APIRouter is not None:
                 worker_id=worker_id,
                 include_recent=include_recent,
                 recent_limit=_bounded_limit(recent_limit),
+            )
+        )
+
+    @router.get("/status", response_model=QueueStatusResponse, response_model_exclude_none=True)
+    def queue_status(
+        request: Request,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        status: list[str] | None = Query(None),
+        stage: list[str] | None = Query(None),
+        ids: list[str] | None = Query(None),
+        worker_id: str | None = None,
+        job_limit: int = Query(50, ge=1, le=250),
+        recent_failure_limit: int = Query(10, ge=0, le=100),
+    ) -> dict[str, Any]:
+        """Return one authoritative, internally consistent queue snapshot."""
+        statuses = _enum_values(status, JobStatus, "status")
+        stages = _enum_values(stage, PipelineStage, "stage")
+        job_ids = _uuid_values(ids)
+        if len(job_ids) > 250:
+            raise HTTPException(status_code=422, detail="At most 250 job ids may be requested.")
+        return as_response(
+            QueueStatusService(get_repository(request)).snapshot(
+                project_id=scoped_project_id(request),
+                run_id=run_id,
+                asset_id=asset_id,
+                statuses=statuses,
+                stages=stages,
+                job_ids=job_ids,
+                worker_id=worker_id,
+                job_limit=job_limit,
+                recent_failure_limit=recent_failure_limit,
             )
         )
 

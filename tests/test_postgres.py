@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import os
 import sqlite3
 from threading import Barrier
@@ -106,6 +107,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0028_oracle_v2_inference_provenance",
             "0029_operational_log_retention",
             "0030_registry_mask_revision_integrity",
+            "0031_processing_submissions",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -197,8 +199,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 30
-    assert status["migrations"]["applied_count"] == 30
+    assert status["migrations"]["available_count"] == 31
+    assert status["migrations"]["applied_count"] == 31
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -517,6 +519,48 @@ def test_processing_series_is_project_scoped_and_advances_terminal_steps(postgre
     assert second is not None
     postgres_repo.attach_processing_work_units(series_id=str(series["id"]), step_id=str(second["id"]), job_ids=[], matched_count=0)
     assert postgres_repo.get_processing_series(str(series["id"]), project_id=str(project["id"]))["status"] == "succeeded"
+
+
+def test_processing_submission_is_idempotent_scoped_and_fenced(postgres_repo):
+    project = postgres_repo.create_project(f"submission-{uuid.uuid4().hex}")
+    other = postgres_repo.create_project(f"submission-other-{uuid.uuid4().hex}")
+    request_id = str(uuid.uuid4())
+    request = {"stage": "segment", "filters": {"collection": ["tow-a"]}, "options": {}}
+
+    first, created = postgres_repo.create_processing_submission(
+        project_id=str(project["id"]), request_id=request_id, kind="queue", request=request,
+    )
+    repeated, created_again = postgres_repo.create_processing_submission(
+        project_id=str(project["id"]), request_id=request_id, kind="queue", request=request,
+    )
+    assert created is True
+    assert created_again is False
+    assert repeated["id"] == first["id"]
+    with pytest.raises(ValueError, match="different processing submission"):
+        postgres_repo.create_processing_submission(
+            project_id=str(project["id"]), request_id=request_id, kind="queue", request={**request, "priority": 2},
+        )
+    scoped_other, other_created = postgres_repo.create_processing_submission(
+        project_id=str(other["id"]), request_id=request_id, kind="queue", request=request,
+    )
+    assert other_created is True
+    assert scoped_other["id"] != first["id"]
+
+    claimed = postgres_repo.claim_processing_submission()
+    assert claimed is not None and claimed["id"] == first["id"]
+    stale = postgres_repo.complete_processing_submission(
+        str(claimed["id"]), claim_token=str(uuid.uuid4()), result={"job_count": 0},
+    )
+    assert stale is None
+    with postgres_repo.processing_submission_transaction(
+        str(claimed["id"]), claim_token=str(claimed["claim_token"]), project_id=str(project["id"]),
+    ) as connection:
+        assert connection is not None
+        completed = postgres_repo.complete_processing_submission(
+            str(claimed["id"]), claim_token=str(claimed["claim_token"]), result={"job_count": 0}, _connection=connection,
+        )
+        assert completed is not None
+    assert postgres_repo.get_processing_submission(str(first["id"]), project_id=str(project["id"]))["status"] == "succeeded"
 
 
 def test_processing_series_failure_policy_and_retry(postgres_repo):
@@ -1152,6 +1196,112 @@ def test_registry_source_overwrite_rejects_changed_bytes(postgres_repo, tmp_path
 
     workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
     assert workspace.active_workspace()["status"] == "loaded"
+
+
+def test_queue_status_snapshot_is_complete_bounded_and_consistent_during_writes(postgres_repo):
+    project = postgres_repo.create_project(f"queue-status-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    rows = []
+    for index in range(1001):
+        unit = "frames" if index % 2 == 0 else "rois"
+        stage = PipelineStage.SEGMENT.value if unit == "frames" else PipelineStage.ROI_REFINEMENT.value
+        progress = {
+            "schema_version": 2,
+            "attempt_count": 0,
+            "unit": unit,
+            "total": 10,
+            "total_known": True,
+            "completed": 10 if index < 1000 else 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        rows.append((project_id, stage, "succeeded" if index < 1000 else "queued", json.dumps(progress)))
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""INSERT INTO {postgres_repo.schema}.processing_jobs (project_id, stage, status, progress)
+                VALUES (%s::uuid, %s::{postgres_repo.schema}.stage_name,
+                    %s::{postgres_repo.schema}.job_status, %s::jsonb)""",
+                rows,
+            )
+        connection.commit()
+
+    snapshot = postgres_repo.get_queue_status_snapshot(project_id=project_id, job_limit=7)
+
+    assert snapshot["total"]["job_count"] == 1001
+    assert len(snapshot["jobs"]) == 7
+    assert sum(row["job_count"] for row in snapshot["by_stage"]) == 1001
+    assert sum(row["job_count"] for row in snapshot["work_groups"]) == 1001
+    assert {(row["stage"], row["unit"]) for row in snapshot["work_groups"]} == {
+        (PipelineStage.SEGMENT.value, "frames"),
+        (PipelineStage.ROI_REFINEMENT.value, "rois"),
+    }
+    # Active rows sort ahead of recent history even with a small display bound.
+    assert snapshot["jobs"][0]["status"] == JobStatus.QUEUED.value
+
+    def writer():
+        for _ in range(20):
+            postgres_repo.create_job(PipelineStage.SEGMENT, project_id=project_id, payload={})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(writer)
+        while not future.done():
+            concurrent = postgres_repo.get_queue_status_snapshot(project_id=project_id, job_limit=3)
+            total = concurrent["total"]["job_count"]
+            assert sum(row["job_count"] for row in concurrent["by_stage"]) == total
+            assert sum(row["job_count"] for row in concurrent["work_groups"]) == total
+        future.result()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        snapshots = list(executor.map(
+            lambda _: postgres_repo.get_queue_status_snapshot(project_id=project_id, job_limit=3),
+            range(4),
+        ))
+    assert {item["total"]["job_count"] for item in snapshots} == {1021}
+
+
+def test_queue_status_job_and_group_estimates_agree_on_unavailable_work(postgres_repo):
+    from Pelagia.services.queue_status import QueueStatusService
+
+    project = postgres_repo.create_project(f"queue-estimates-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    service = QueueStatusService(postgres_repo)
+    now = datetime.now(timezone.utc)
+    for scenario in ("healthy", "expired_lease", "stale_progress", "finalizing", "unknown_total"):
+        job_id = str(uuid.uuid4())
+        progress = {
+            "unit": "frames", "total": 10, "completed": 5,
+            "attempt_count": 0, "rates": {"units_per_second": 2},
+            "recorded_at": (now - timedelta(minutes=20) if scenario == "stale_progress" else now).isoformat(),
+        }
+        if scenario == "finalizing":
+            progress["completed"] = 10
+        if scenario == "unknown_total":
+            # Legacy workers used zero before learning the total. Group and
+            # individual normalization must interpret that identically.
+            progress["total"] = 0
+        expiry = now - timedelta(seconds=5) if scenario == "expired_lease" else now + timedelta(minutes=10)
+        with postgres_repo.connect() as connection:
+            connection.execute(
+                f"""INSERT INTO {postgres_repo.schema}.processing_jobs
+                    (id, project_id, stage, status, progress, lease_expires_at)
+                    VALUES (%s, %s, 'segment', 'working', %s::jsonb, %s)""",
+                (job_id, project_id, json.dumps(progress), expiry),
+            )
+            connection.commit()
+        result = service.snapshot(project_id=project_id, job_ids=[job_id])
+        job_progress = result["jobs"]["items"][0]["progress"]
+        group = result["work_groups"][0]
+        if scenario == "healthy":
+            assert job_progress["rate"]["units_per_second"] == group["rate"]["units_per_second"] == 2
+            assert job_progress["eta"]["seconds"] == group["eta"]["seconds"] == 2.5
+        else:
+            assert job_progress["eta"]["reason"] == group["eta"]["reason"] == scenario
+            assert job_progress["eta"]["seconds"] is None
+            assert group["eta"]["seconds"] is None
+        if scenario == "unknown_total":
+            assert group["active_progress"]["percent"] is None
+            assert result["health"]["progress_coverage_percent"] == 0
 
 
 def test_postgres_repository_registers_frames_and_jobs(postgres_repo):

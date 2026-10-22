@@ -186,6 +186,26 @@ class JobsSummaryResponse(FlexibleModel):
     recent_jobs: list[JobSummary] = Field(default_factory=list)
 
 
+class QueueStatusJobs(FlexibleModel):
+    items: list[JobSummary] = Field(default_factory=list)
+    limit: int
+    matching_count: int
+    truncated: bool
+
+
+class QueueStatusResponse(FlexibleModel):
+    schema_version: int
+    snapshot_id: str
+    as_of: datetime
+    scope: dict[str, Any]
+    total: dict[str, Any]
+    by_stage: list[dict[str, Any]] = Field(default_factory=list)
+    work_groups: list[dict[str, Any]] = Field(default_factory=list)
+    health: dict[str, Any]
+    jobs: QueueStatusJobs
+    recent_failures: list[JobSummary] = Field(default_factory=list)
+
+
 class JobDetailResponse(FlexibleModel):
     job: JobSummary
 

@@ -1,6 +1,18 @@
 import pytest
 
-from Pelagia.config import CoreConfig, FrameStorageProcessingConfig, ImageDataStorageConfig, LoggingConfig
+from Pelagia.config import (
+    CoreConfig,
+    FrameStorageProcessingConfig,
+    ImageDataStorageConfig,
+    LoggingConfig,
+    ThumbhashProcessingConfig,
+)
+
+
+@pytest.mark.parametrize("max_dim", [0, -1, 101])
+def test_thumbhash_processing_config_rejects_invalid_dimensions(max_dim):
+    with pytest.raises(ValueError, match="thumbhash.max_dim"):
+        ThumbhashProcessingConfig(max_dim=max_dim)
 
 
 def test_image_data_storage_config_defaults_to_jpg_quality_90():

@@ -68,6 +68,7 @@ REQUIRED_SCHEMA_TABLES = (
     "processing_series",
     "processing_series_steps",
     "processing_work_units",
+    "processing_submissions",
     "project_processing_status_snapshots",
     "frame_processing_status",
     "worker_sessions",
@@ -1596,6 +1597,213 @@ class PostgresRepository:
             "by_stage": [self._job_summary_row(row) for row in by_stage],
             "by_status": by_status,
             "recent_jobs": recent_jobs,
+        }
+
+    def get_queue_status_snapshot(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        stages: Sequence[str] | None = None,
+        job_ids: Sequence[str] | None = None,
+        worker_id: str | None = None,
+        job_limit: int = 50,
+        recent_failure_limit: int = 10,
+    ) -> dict[str, Any]:
+        """Read a complete queue status model from one repeatable-read snapshot."""
+        if not project_id:
+            raise ValueError("project_id is required for queue status snapshots.")
+        clauses, params = self._job_filter_clauses(
+            project_id=project_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            statuses=statuses,
+            stages=stages,
+            job_ids=job_ids,
+            worker_id=worker_id,
+        )
+        where = f"WHERE {' AND '.join(clauses)}"
+        job_limit = min(max(1, int(job_limit)), 250)
+        recent_failure_limit = min(max(0, int(recent_failure_limit)), 100)
+        # Progress freshness measures observations, independently of the lease
+        # heartbeat. A healthy long-running step can have an unavailable ETA.
+        stale_seconds = 120
+
+        def numeric_jsonb(key: str, *, fallback: str = "0") -> str:
+            return f"""CASE WHEN progress ? '{key}' AND progress->>'{key}' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                THEN (progress->>'{key}')::numeric ELSE {fallback} END"""
+
+        current_attempt = """(
+            NOT (progress ? 'attempt_count')
+            OR (progress->>'attempt_count' ~ '^[0-9]+$' AND (progress->>'attempt_count')::integer = attempt_count)
+        )"""
+        known_total = f"""(
+            {current_attempt}
+            AND progress ? 'total'
+            AND progress->>'total' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+            AND {numeric_jsonb('total')} >= 0
+            AND COALESCE(progress->>'total_known', CASE WHEN {numeric_jsonb('total')} > 0 THEN 'true' ELSE 'false' END) = 'true'
+        )"""
+        active_status = "status IN ('queued', 'leased', 'working', 'paused')"
+        terminal_status = "status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')"
+        finalizing = f"""status IN ('leased', 'working') AND (
+            progress->>'phase' = 'finalizing'
+            OR ({known_total} AND {numeric_jsonb('completed')} >= {numeric_jsonb('total')})
+        )"""
+        progress_observed_at = """CASE
+            WHEN progress->>'recorded_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]'
+                THEN (progress->>'recorded_at')::timestamptz
+            WHEN progress->>'observed_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]'
+                THEN (progress->>'observed_at')::timestamptz
+            ELSE updated_at
+        END"""
+        blocked = f"""status = 'queued' AND EXISTS (
+            SELECT 1 FROM {self.schema}.processing_job_dependencies status_deps
+            JOIN {self.schema}.processing_jobs status_upstream ON status_upstream.id = status_deps.depends_on_job_id
+            WHERE status_deps.job_id = {self.schema}.processing_jobs.id
+              AND status_upstream.status <> 'succeeded'
+        )"""
+        recent_rate = """CASE
+            WHEN progress->'rate_sample'->>'completed_delta' ~ '^[0-9]+(\\.[0-9]+)?$'
+              AND progress->'rate_sample'->>'elapsed_seconds' ~ '^[0-9]+(\\.[0-9]+)?$'
+              AND (progress->'rate_sample'->>'elapsed_seconds')::numeric > 0
+            THEN (progress->'rate_sample'->>'completed_delta')::numeric
+                / (progress->'rate_sample'->>'elapsed_seconds')::numeric
+            WHEN progress->'rates'->>'units_per_second' ~ '^[0-9]+(\\.[0-9]+)?$'
+            THEN (progress->'rates'->>'units_per_second')::numeric
+            ELSE 0
+        END"""
+        count_select = f"""
+            COUNT(*)::bigint AS job_count,
+            COUNT(*) FILTER (WHERE status IN ('queued', 'leased', 'working', 'paused'))::bigint AS active,
+            COUNT(*) FILTER (WHERE status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered'))::bigint AS historical,
+            COUNT(*) FILTER (WHERE status = 'queued')::bigint AS queued,
+            COUNT(*) FILTER (WHERE status = 'leased')::bigint AS leased,
+            COUNT(*) FILTER (WHERE status = 'working')::bigint AS working,
+            COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
+            COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
+            COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed,
+            COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
+            COUNT(*) FILTER (WHERE status = 'dead_lettered')::bigint AS dead_lettered,
+            COUNT(*) FILTER (WHERE {known_total})::bigint AS known_total_jobs,
+            COUNT(*) FILTER (WHERE NOT ({known_total}))::bigint AS unknown_total_jobs,
+            SUM(CASE WHEN {known_total} THEN {numeric_jsonb('total')} ELSE 0 END) AS known_total_units,
+            SUM(CASE WHEN {current_attempt} THEN {numeric_jsonb('completed')} ELSE 0 END) AS completed_units,
+            SUM(CASE WHEN {current_attempt} THEN {numeric_jsonb('failed')} ELSE 0 END) AS failed_units,
+            SUM(CASE WHEN {current_attempt} THEN {numeric_jsonb('skipped')} ELSE 0 END) AS skipped_units
+        """
+        compact_columns = """
+            id, run_id, asset_id, stage, status, priority, attempt_count, max_attempts,
+            worker_id, submitted_by_user_id, submitted_by_username, summary, progress,
+            control_reason, error_message, created_at, updated_at, started_at, finished_at,
+            lease_expires_at
+        """
+
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cursor.execute("SELECT NOW() AS as_of")
+                as_of = (cursor.fetchone() or {}).get("as_of")
+                cursor.execute(
+                    f"""
+                    SELECT {count_select},
+                        COUNT(*) FILTER (WHERE {active_status} AND {known_total})::bigint AS active_known_total_jobs,
+                        EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status = 'queued'))) AS oldest_queued_age_seconds,
+                        COUNT(*) FILTER (WHERE status IN ('leased', 'working') AND lease_expires_at < NOW())::bigint AS expired_leases,
+                        COUNT(*) FILTER (WHERE status IN ('leased', 'working')
+                            AND {progress_observed_at} < NOW() - (%s * INTERVAL '1 second'))::bigint AS stale_active_jobs,
+                        COUNT(*) FILTER (WHERE status IN ('queued', 'leased', 'working', 'paused')
+                            AND (control_reason LIKE 'pause_requested:%%' OR control_reason LIKE 'cancel_requested:%%'))::bigint AS pending_controls
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    """,
+                    (stale_seconds, *params),
+                )
+                total = cursor.fetchone() or {}
+                cursor.execute(
+                    f"""
+                    SELECT stage, {count_select}
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    GROUP BY stage
+                    ORDER BY stage
+                    """,
+                    tuple(params),
+                )
+                by_stage = cursor.fetchall()
+                cursor.execute(
+                    f"""
+                    SELECT stage, COALESCE(NULLIF(progress->>'unit', ''), 'unknown') AS unit,
+                        {count_select},
+                        COUNT(*) FILTER (WHERE status IN ('queued', 'leased', 'working', 'paused')
+                            AND NOT ({known_total}))::bigint AS unknown_active_jobs,
+                        COUNT(*) FILTER (WHERE {blocked})::bigint AS blocked_jobs,
+                        COUNT(*) FILTER (WHERE {finalizing})::bigint AS finalizing_jobs,
+                        COUNT(*) FILTER (WHERE status IN ('leased', 'working') AND lease_expires_at < NOW())::bigint AS expired_lease_jobs,
+                        COUNT(*) FILTER (WHERE status IN ('leased', 'working')
+                            AND {progress_observed_at} < NOW() - (%s * INTERVAL '1 second'))::bigint AS stale_progress_jobs,
+                        COUNT(*) FILTER (WHERE {active_status} AND {known_total})::bigint AS active_known_total_jobs,
+                        SUM(CASE WHEN {active_status} AND {known_total} THEN {numeric_jsonb('total')} ELSE 0 END) AS active_known_total_units,
+                        SUM(CASE WHEN {active_status} AND {current_attempt} THEN {numeric_jsonb('completed')} ELSE 0 END) AS active_completed_units,
+                        SUM(CASE WHEN {active_status} AND {current_attempt} THEN {numeric_jsonb('failed')} ELSE 0 END) AS active_failed_units,
+                        SUM(CASE WHEN {active_status} AND {current_attempt} THEN {numeric_jsonb('skipped')} ELSE 0 END) AS active_skipped_units,
+                        COUNT(*) FILTER (WHERE {terminal_status} AND {known_total})::bigint AS historical_known_total_jobs,
+                        COUNT(*) FILTER (WHERE {terminal_status} AND NOT ({known_total}))::bigint AS historical_unknown_total_jobs,
+                        SUM(CASE WHEN {terminal_status} AND {known_total} THEN {numeric_jsonb('total')} ELSE 0 END) AS historical_known_total_units,
+                        SUM(CASE WHEN {terminal_status} AND {current_attempt} THEN {numeric_jsonb('completed')} ELSE 0 END) AS historical_completed_units,
+                        SUM(CASE WHEN {terminal_status} AND {current_attempt} THEN {numeric_jsonb('failed')} ELSE 0 END) AS historical_failed_units,
+                        SUM(CASE WHEN {terminal_status} AND {current_attempt} THEN {numeric_jsonb('skipped')} ELSE 0 END) AS historical_skipped_units,
+                        SUM(CASE WHEN status IN ('queued', 'leased', 'working', 'paused') AND {known_total}
+                            THEN GREATEST(0, {numeric_jsonb('total')} - {numeric_jsonb('completed')}) ELSE 0 END) AS remaining_units,
+                        SUM(CASE WHEN status IN ('leased', 'working') AND {current_attempt}
+                            AND (lease_expires_at IS NULL OR lease_expires_at >= NOW())
+                            AND NOT COALESCE(({finalizing}), false)
+                            AND {progress_observed_at} >= NOW() - (%s * INTERVAL '1 second')
+                            THEN {recent_rate} ELSE 0 END) AS units_per_second,
+                        MAX({progress_observed_at}) FILTER (WHERE status IN ('leased', 'working')) AS rate_observed_at
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    GROUP BY stage, COALESCE(NULLIF(progress->>'unit', ''), 'unknown')
+                    ORDER BY stage, unit
+                    """,
+                    (stale_seconds, stale_seconds, *params),
+                )
+                work_groups = cursor.fetchall()
+                cursor.execute(
+                    f"""
+                    SELECT {compact_columns}
+                    FROM {self.schema}.processing_jobs
+                    {where}
+                    ORDER BY CASE WHEN status IN ('queued', 'leased', 'working', 'paused') THEN 0 ELSE 1 END,
+                        updated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (*params, job_limit),
+                )
+                jobs = cursor.fetchall()
+                recent_failures: list[dict[str, Any]] = []
+                if recent_failure_limit:
+                    cursor.execute(
+                        f"""
+                        SELECT {compact_columns}
+                        FROM {self.schema}.processing_jobs
+                        {where} AND status IN ('failed', 'dead_lettered')
+                        ORDER BY COALESCE(finished_at, updated_at) DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (*params, recent_failure_limit),
+                    )
+                    recent_failures = cursor.fetchall()
+        return {
+            "as_of": as_of,
+            "stale_after_seconds": stale_seconds,
+            "total": total,
+            "by_stage": by_stage,
+            "work_groups": work_groups,
+            "jobs": jobs,
+            "recent_failures": recent_failures,
         }
 
     def _progress_aggregate_sql(self) -> str:
@@ -7245,11 +7453,12 @@ class PostgresRepository:
         submitted_by_user_id: str | None = None,
         submitted_by_username: str | None = None,
         idempotency_key: str | None = None,
+        _connection=None,
     ) -> dict[str, Any]:
         stage_value = stage.value if isinstance(stage, PipelineStage) else stage
         status_value = status.value if isinstance(status, JobStatus) else status
         resolved_project_id = self._required_project_id(project_id, "create_job")
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 resolved_payload = payload or {}
                 payload_frame_ids = [
@@ -7290,7 +7499,6 @@ class PostgresRepository:
                     )
                     existing = cursor.fetchone()
                     if existing is not None:
-                        connection.commit()
                         return existing
                 insert_conflict_sql = "ON CONFLICT DO NOTHING" if idempotency_key is not None else ""
                 cursor.execute(
@@ -7327,7 +7535,6 @@ class PostgresRepository:
                         (resolved_project_id, idempotency_key),
                     )
                     row = cursor.fetchone()
-                    connection.commit()
                     if row is not None:
                         return row
                 if row is None:
@@ -7376,7 +7583,6 @@ class PostgresRepository:
                         cursor,
                         project_id=resolved_project_id,
                     )
-            connection.commit()
         return row
 
     def enqueue_feature_space_analysis(
@@ -7447,6 +7653,164 @@ class PostgresRepository:
 
     # Processing series deliberately wrap, rather than alter, ordinary jobs.  This
     # keeps historical queue rows and direct job APIs compatible with series work.
+    def create_processing_submission(
+        self,
+        *,
+        project_id: str,
+        request_id: str,
+        kind: str,
+        request: Mapping[str, Any],
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist a criteria request before a dispatcher expands its units.
+
+        The project/request key is the idempotency boundary.  Reusing it with
+        different canonical input is deliberately an error rather than a
+        surprising second submission.
+        """
+        if kind not in {"queue", "series"}:
+            raise ValueError("Processing submission kind must be 'queue' or 'series'.")
+        resolved_project_id = self._required_project_id(project_id, "create_processing_submission")
+        canonical_request = json.dumps(json_ready(dict(request)), sort_keys=True, separators=(",", ":"))
+        request_hash = hashlib.sha256(f"{kind}:{canonical_request}".encode("utf-8")).hexdigest()
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                # Plain MVCC read deliberately avoids waiting on a dispatcher
+                # transaction that has locked this row while materializing it.
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.processing_submissions WHERE project_id = %s AND request_id = %s",
+                    (resolved_project_id, request_id),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing["kind"] != kind or existing["request_hash"] != request_hash:
+                        raise ValueError("request_id was already used with a different processing submission.")
+                    return existing, False
+                cursor.execute(
+                    f"""INSERT INTO {self.schema}.processing_submissions
+                    (project_id, request_id, kind, request, request_hash, submitted_by_user_id, submitted_by_username)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                    ON CONFLICT (project_id, request_id) DO NOTHING RETURNING *""",
+                    (resolved_project_id, request_id, kind, canonical_request, request_hash,
+                     submitted_by_user_id, submitted_by_username),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        f"SELECT * FROM {self.schema}.processing_submissions WHERE project_id = %s AND request_id = %s",
+                        (resolved_project_id, request_id),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise RuntimeError("Processing submission idempotency lookup failed.")
+                    if row["kind"] != kind or row["request_hash"] != request_hash:
+                        raise ValueError("request_id was already used with a different processing submission.")
+                    connection.commit()
+                    return row, False
+            connection.commit()
+        return row, True
+
+    def get_processing_submission(self, submission_id: str, *, project_id: str) -> dict[str, Any] | None:
+        resolved_project_id = self._required_project_id(project_id, "get_processing_submission")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM {self.schema}.processing_submissions WHERE id = %s AND project_id = %s",
+                    (submission_id, resolved_project_id),
+                )
+                return cursor.fetchone()
+
+    def list_processing_submissions(self, *, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        resolved_project_id = self._required_project_id(project_id, "list_processing_submissions")
+        bounded_limit = min(max(1, int(limit)), 250)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.processing_submissions WHERE project_id = %s
+                    ORDER BY (status IN ('accepted', 'planning')) DESC, created_at DESC, id DESC LIMIT %s""",
+                    (resolved_project_id, bounded_limit),
+                )
+                return cursor.fetchall()
+
+    def claim_processing_submission(self, *, lease_seconds: float = 300.0) -> dict[str, Any] | None:
+        """Claim one accepted or abandoned submission using a fenced durable lease."""
+        timeout = max(1.0, float(lease_seconds))
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH candidate AS (
+                        SELECT id FROM {self.schema}.processing_submissions
+                        WHERE status = 'accepted'
+                           OR (status = 'planning' AND claim_expires_at < NOW())
+                        ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1
+                    ) UPDATE {self.schema}.processing_submissions submission
+                    SET status = 'planning', claim_token = gen_random_uuid(),
+                        claim_expires_at = NOW() + (%s * INTERVAL '1 second'), error = NULL
+                    FROM candidate WHERE submission.id = candidate.id
+                    RETURNING submission.*""",
+                    (timeout,),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    @contextmanager
+    def processing_submission_transaction(self, submission_id: str, *, claim_token: str, project_id: str):
+        """Yield one fenced materialization transaction, or ``None`` if stale.
+
+        The xact advisory lock serializes overlapping criteria per project
+        without holding a dedicated connection while workers expand a request.
+        All planner reads, job writes, and submission completion must share the
+        yielded connection so an interruption rolls back as one unit.
+        """
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (
+                    f"{self.schema}:processing-submission:{project_id}",
+                ))
+                cursor.execute(
+                    f"""SELECT id FROM {self.schema}.processing_submissions
+                    WHERE id = %s AND project_id = %s AND status = 'planning' AND claim_token = %s FOR UPDATE""",
+                    (submission_id, project_id, claim_token),
+                )
+                valid = cursor.fetchone() is not None
+            try:
+                yield connection if valid else None
+            except Exception:
+                connection.rollback()
+                raise
+            else:
+                if valid:
+                    connection.commit()
+
+    def complete_processing_submission(self, submission_id: str, *, claim_token: str, result: Mapping[str, Any], _connection=None) -> dict[str, Any] | None:
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_submissions
+                    SET status = 'succeeded', result = %s::jsonb, error = NULL,
+                        claim_token = NULL, claim_expires_at = NULL, finished_at = NOW()
+                    WHERE id = %s AND status = 'planning' AND claim_token = %s RETURNING *""",
+                    (json.dumps(json_ready(dict(result))), submission_id, claim_token),
+                )
+                row = cursor.fetchone()
+        return row
+
+    def fail_processing_submission(self, submission_id: str, *, claim_token: str, error: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_submissions
+                    SET status = 'failed', error = %s, claim_token = NULL,
+                        claim_expires_at = NULL, finished_at = NOW()
+                    WHERE id = %s AND status = 'planning' AND claim_token = %s RETURNING *""",
+                    (error[:4000], submission_id, claim_token),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
     def create_processing_series(
         self,
         *,
@@ -7458,13 +7822,14 @@ class PostgresRepository:
         priority: int | None = None,
         submitted_by_user_id: str | None = None,
         submitted_by_username: str | None = None,
+        _connection=None,
     ) -> dict[str, Any]:
         if failure_policy not in {"fail_fast", "continue"}:
             raise ValueError("failure_policy must be one of: fail_fast, continue.")
         if not steps:
             raise ValueError("A processing series requires at least one step.")
         resolved_project_id = self._required_project_id(project_id, "create_processing_series")
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""INSERT INTO {self.schema}.processing_series
@@ -7485,22 +7850,23 @@ class PostgresRepository:
                         (series["id"], index, stage, json.dumps(json_ready(step.get("filters") or {})),
                          json.dumps(json_ready(step.get("options") or {})), step.get("failure_policy")),
                     )
-            connection.commit()
+        if _connection is not None:
+            return series
         return self.get_processing_series(str(series["id"]), project_id=resolved_project_id) or series
 
-    def get_processing_series(self, series_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
+    def get_processing_series(self, series_id: str, *, project_id: str | None = None, _connection=None) -> dict[str, Any] | None:
         clauses, params = ["id = %s"], [series_id]
         if project_id is not None:
             clauses.append("project_id = %s")
             params.append(project_id)
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"SELECT * FROM {self.schema}.processing_series WHERE {' AND '.join(clauses)}", tuple(params))
                 series = cursor.fetchone()
         if series is None:
             return None
-        steps = self.list_processing_series_steps(series_id, project_id=project_id)
-        with self.connect() as connection:
+        steps = self.list_processing_series_steps(series_id, project_id=project_id, _connection=_connection)
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""SELECT
@@ -7561,8 +7927,8 @@ class PostgresRepository:
                 ids = [str(row["id"]) for row in cursor.fetchall()]
         return [self.get_processing_series(series_id, project_id=resolved_project_id) for series_id in ids]
 
-    def list_processing_series_steps(self, series_id: str, *, project_id: str | None = None) -> list[dict[str, Any]]:
-        with self.connect() as connection:
+    def list_processing_series_steps(self, series_id: str, *, project_id: str | None = None, _connection=None) -> list[dict[str, Any]]:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""SELECT steps.* FROM {self.schema}.processing_series_steps steps
@@ -7583,9 +7949,9 @@ class PostgresRepository:
                     ORDER BY units.created_at, units.id""", (series_id, project_id, project_id))
                 return cursor.fetchall()
 
-    def claim_processing_series_step(self, series_id: str, *, project_id: str) -> dict[str, Any] | None:
+    def claim_processing_series_step(self, series_id: str, *, project_id: str, _connection=None) -> dict[str, Any] | None:
         """Atomically grant one director the next step; callers may safely retry."""
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""WITH candidate AS (
@@ -7609,7 +7975,6 @@ class PostgresRepository:
                 step = cursor.fetchone()
                 if step is not None:
                     cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'active', updated_at = NOW() WHERE id = %s", (series_id,))
-            connection.commit()
         return step
 
     def reclaim_stale_processing_series_planning_steps(
@@ -7664,8 +8029,8 @@ class PostgresRepository:
             connection.commit()
         return rows
 
-    def attach_processing_work_units(self, *, series_id: str, step_id: str, job_ids: Sequence[str], matched_count: int) -> None:
-        with self.connect() as connection:
+    def attach_processing_work_units(self, *, series_id: str, step_id: str, job_ids: Sequence[str], matched_count: int, _connection=None) -> None:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 if job_ids:
                     cursor.executemany(
@@ -7683,7 +8048,6 @@ class PostgresRepository:
                         WHERE series_id = %s AND status IN ('queued', 'planning', 'active') LIMIT 1""", (series_id,))
                     if cursor.fetchone() is None:
                         cursor.execute(f"UPDATE {self.schema}.processing_series SET status = 'succeeded', finished_at = NOW(), updated_at = NOW() WHERE id = %s", (series_id,))
-            connection.commit()
 
     def finish_processing_series_step(self, step_id: str, *, failed: bool, failure_policy: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -7792,6 +8156,7 @@ class PostgresRepository:
         *,
         project_id: str,
         filters: dict[str, Any],
+        _connection=None,
     ) -> list[dict[str, Any]]:
         """Resolve project frames for backend-owned preprocessing queue planning."""
         resolved_project_id = self._required_project_id(project_id, "plan_preprocess_frames")
@@ -7810,7 +8175,7 @@ class PostgresRepository:
         if collections:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -7826,7 +8191,7 @@ class PostgresRepository:
                 )
                 return cursor.fetchall()
 
-    def plan_segment_frames(self, *, project_id: str, filters: dict[str, Any], payload_kind: str) -> list[dict[str, Any]]:
+    def plan_segment_frames(self, *, project_id: str, filters: dict[str, Any], payload_kind: str, _connection=None) -> list[dict[str, Any]]:
         resolved_project_id = self._required_project_id(project_id, "plan_segment_frames")
         clauses, params = self._frame_status_filters(
             project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
@@ -7839,19 +8204,22 @@ class PostgresRepository:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
         payload_ref = "COALESCE(frames.preprocessed_payload_ref, frames.preprocessed_kvstore_hash)" if payload_kind in {"preprocessed", "processed", "corrected"} else "COALESCE(frames.payload_ref, frames.kvstore_hash)"
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index, {payload_ref} AS payload_ref
                     FROM {self.schema}.frame_processing_status status JOIN {self.schema}.frames frames ON frames.id = status.frame_id
                     WHERE {' AND '.join(clauses)} ORDER BY {payload_ref} ASC NULLS LAST, status.frame_id ASC""", tuple(params))
                 return cursor.fetchall()
 
-    def plan_roi_refinement_detections(self, *, project_id: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    def plan_roi_refinement_detections(self, *, project_id: str, filters: dict[str, Any], _connection=None) -> list[dict[str, Any]]:
         resolved_project_id = self._required_project_id(project_id, "plan_roi_refinement_detections")
         clauses, params = self._frame_status_filters(
             project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
             asset_ids=filters.get("asset_ids"), frame_ids=filters.get("frame_ids"), collection=None,
-            roi_refinement_status=filters.get("roi_refinement_status"), start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
+            roi_refinement_status=filters.get("roi_refinement_status"),
+            candidate_detection_status=filters.get("candidate_detection_status"),
+            preprocessing_status=filters.get("preprocessing_status"),
+            start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
         )
         collections = [str(value) for value in filters.get("collection") or [] if value]
         if collections:
@@ -7863,7 +8231,7 @@ class PostgresRepository:
         )
         if refinement_clause:
             clauses.append(refinement_clause)
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id, detections.roi_index
                     FROM {self.schema}.detection_candidate detections
@@ -7895,13 +8263,14 @@ class PostgresRepository:
         priority: int | None = None,
         submitted_by_user_id: str | None = None,
         submitted_by_username: str | None = None,
+        _connection=None,
     ) -> list[dict[str, Any]]:
         """Create planned preprocessing jobs and queue their frames atomically."""
         if not jobs:
             return []
         resolved_project_id = self._required_project_id(project_id, "create_preprocess_jobs")
         created: list[dict[str, Any]] = []
-        with self.connect() as connection:
+        with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 all_frame_ids = [frame_id for job in jobs for frame_id in job["frame_ids"]]
                 self._ensure_project_scope(cursor, resolved_project_id, frame_ids=all_frame_ids)
@@ -7963,7 +8332,6 @@ class PostgresRepository:
                     )
                     created.append(row)
                 self._touch_processing_status_snapshot_in_cursor(cursor, project_id=resolved_project_id)
-            connection.commit()
         return created
 
     def update_job_payload(self, job_id: str, payload: dict[str, Any], summary: str | None = None) -> dict[str, Any] | None:
@@ -8016,7 +8384,7 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     UPDATE {self.schema}.processing_jobs
-                    SET progress = %s::jsonb,
+                    SET progress = jsonb_set(%s::jsonb, '{{recorded_at}}', to_jsonb(NOW()), true),
                         summary = COALESCE(%s, summary),
                         logs_tail = COALESCE(%s::jsonb, logs_tail),
                         updated_at = NOW()
