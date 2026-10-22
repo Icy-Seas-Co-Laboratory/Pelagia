@@ -263,6 +263,21 @@ default_method = "heuristic_edge_v1"
 heuristic_gradient_percentile = 90.0
 heuristic_axis_exclusion_degrees = 10.0
 heuristic_max_growth_pixels = 32
+# Gradient-aware seeded expansion options for heuristic_v2.
+v2_max_growth_pixels = 32
+v2_threshold_step = 4.0
+# Null derives the intensity floor from local background noise.
+v2_minimum_foreground_intensity = null
+v2_minimum_boundary_coverage = 0.55
+v2_stable_area_growth_ratio = 0.35
+# Direct seed-constrained graph cut. Null estimates gradient scale per crop.
+v3_max_growth_pixels = 32
+v3_foreground_fraction = 0.10
+v3_intensity_weight = 2.0
+v3_boundary_weight = 3.0
+v3_growth_penalty = 0.20
+v3_gradient_sigma = null
+v3_max_graph_pixels = 100000
 max_iterations = 5
 # Crop growth distance when a refined mask touches an uncovered edge.
 expansion_pixels = 256

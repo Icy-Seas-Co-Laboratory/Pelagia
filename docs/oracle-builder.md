@@ -4,6 +4,26 @@ Pelagia owns ROI inputs, project scope, processing jobs, human labels, and
 evidence storage. Oracle Builder owns sealed model artifacts, model execution,
 preprocessing, tiling, and thresholding. Pelagia never imports TensorFlow or
 Keras. The default ROI refiner is Pelagia's CPU-only `heuristic_edge_v1`.
+Select `method="heuristic_v2"` to expand each original candidate seed through
+successively lower intensity thresholds. It scores boundary contrast and growth
+stability, retains every seed pixel, and excludes neighboring candidate seeds.
+Candidate generation records a scalar foreground threshold when its method has
+one; v2 uses that threshold for stored processed ROI payloads and otherwise
+infers a starting level from the seed. The original candidate mask is supplied
+again on every crop-expansion iteration for all refiners.
+Select `method="heuristic_v3"` for a seed-constrained minimum cut over pixel
+intensity and eight-neighbor gradient costs. V3 allows different portions of
+the outer boundary to have different intensities. It keeps candidate pixels
+immutable, excludes neighboring seeds, and removes disconnected foreground
+islands after optimization. `v3_max_graph_pixels` bounds graph memory; crops
+that exceed it fail explicitly so the search limit can be adjusted.
+
+Every refinement method runs a split/merge assessment before publication.
+Configured residual discovery and overlap reconciliation then apply, except
+that v2 and v3 retain separate candidate identities. After publication, Pelagia
+automatically reassesses cross-frame connections for assets declared as line
+scans; other assets are skipped. The assessment run is recorded with the
+refinement result.
 
 ## Interactive V2 contract
 

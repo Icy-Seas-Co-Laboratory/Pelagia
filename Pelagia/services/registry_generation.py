@@ -122,10 +122,10 @@ def _selection_sql(repository, project_id: str, selection: Mapping[str, Any]) ->
         )
 
     if selection.get("min_area") is not None:
-        clauses.append("refined.area >= %s")
+        clauses.append("(refined.bbox_w::double precision * refined.bbox_h) >= %s")
         params.append(float(selection["min_area"]))
     if selection.get("max_area") is not None:
-        clauses.append("refined.area <= %s")
+        clauses.append("(refined.bbox_w::double precision * refined.bbox_h) <= %s")
         params.append(float(selection["max_area"]))
 
     joins = f"""

@@ -65,12 +65,10 @@ def assemble_candidate_rois(
             if assembly_stats is not None
             else nullcontext()
         ):
-            candidates = assemble_contours(binary)
-        if assembly_stats is not None:
-            assembly_stats.update(
-                source_component_count=len(candidates),
-                materialized_candidate_count=len(candidates),
-                filtered_before_materialization_count=0,
+            candidates = assemble_contours(
+                binary,
+                filter_options=filter_options,
+                assembly_stats=assembly_stats,
             )
         return candidates
     raise ValueError(f"Unsupported ROI assembly method {method!r}.")
@@ -145,6 +143,11 @@ def assemble_connected_components(
                         "assembly_method": "connected_components",
                         "component_label": int(label),
                         "mask_coordinate_space": "bbox_local",
+                        "roi_measurements": {
+                            "version": 1,
+                            "area_method": "bounding_box",
+                            "perimeter_method": "opencv_external_contours",
+                        },
                     },
                 )
             )
@@ -159,15 +162,30 @@ def assemble_connected_components(
     return candidates
 
 
-def assemble_contours(mask: np.ndarray) -> list[CandidateRoi]:
+def assemble_contours(
+    mask: np.ndarray,
+    *,
+    filter_options: dict[str, int | float | None] | None = None,
+    assembly_stats: dict[str, int | float] | None = None,
+) -> list[CandidateRoi]:
     """Assemble ROIs from external contours."""
     binary = as_binary_mask(mask)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    source_component_count = sum(1 for contour in contours if contour.size)
+    options = filter_options or {}
     candidates: list[CandidateRoi] = []
     for contour in contours:
         if contour.size == 0:
             continue
         x, y, width, height = cv2.boundingRect(contour)
+        area = float(width * height)
+        if not component_statistics_pass_filters(
+            area=area,
+            width=int(width),
+            height=int(height),
+            **options,
+        ):
+            continue
         # Shift only the contour used to draw the local mask; retain the frame contour below.
         local_contour = np.ascontiguousarray(contour - np.array([[[x, y]]], dtype=contour.dtype))
         component_mask = np.zeros((int(height), int(width)), dtype=np.uint8)
@@ -179,7 +197,7 @@ def assemble_contours(mask: np.ndarray) -> list[CandidateRoi]:
                 bbox_y=int(y),
                 bbox_w=int(width),
                 bbox_h=int(height),
-                area=float(cv2.contourArea(contour)),
+                area=area,
                 perimeter=float(cv2.arcLength(contour, True)),
                 mask=np.ascontiguousarray(component_mask),
                 contour=np.ascontiguousarray(contour),
@@ -188,8 +206,19 @@ def assemble_contours(mask: np.ndarray) -> list[CandidateRoi]:
                 metadata={
                     "assembly_method": "contours",
                     "mask_coordinate_space": "bbox_local",
+                    "roi_measurements": {
+                        "version": 1,
+                        "area_method": "bounding_box",
+                        "perimeter_method": "opencv_external_contours",
+                    },
                 },
             )
+        )
+    if assembly_stats is not None:
+        assembly_stats.update(
+            source_component_count=source_component_count,
+            materialized_candidate_count=len(candidates),
+            filtered_before_materialization_count=source_component_count - len(candidates),
         )
     return candidates
 

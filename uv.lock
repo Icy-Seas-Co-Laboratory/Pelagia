@@ -345,6 +345,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "oracle-data-contracts" },
     { name = "psutil" },
+    { name = "scipy" },
     { name = "umap-learn" },
     { name = "zstandard" },
 ]
@@ -386,6 +387,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
     { name = "pytest", marker = "extra == 'test'" },
+    { name = "scipy", specifier = ">=1.14,<2" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.12,<1" },
     { name = "umap-learn", specifier = ">=0.5.7,<0.6" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.30,<1" },

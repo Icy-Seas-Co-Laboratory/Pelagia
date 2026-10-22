@@ -9,6 +9,7 @@ from Pelagia.processing.detection_recording import (
     choose_roi_encoding,
 )
 from Pelagia.processing.frame_model import FrameData
+from Pelagia.processing.frame_threshold import effective_foreground_intensity_threshold
 from Pelagia.processing.roi_assembly import assemble_candidate_rois
 from Pelagia.processing.roi_filter import filter_candidate_rois
 from Pelagia.processing.timing import collect_result_timings
@@ -55,6 +56,18 @@ def test_connected_components_filter_before_masks_and_contours(monkeypatch):
     ]
     np.testing.assert_array_equal(actual[0].mask, expected[0].mask)
     np.testing.assert_array_equal(actual[0].contour, expected[0].contour)
+
+
+def test_candidate_threshold_provenance_uses_only_matching_intensity_space():
+    image = np.array([[10, 10], [20, 100]], dtype=np.uint8)
+    assert effective_foreground_intensity_threshold(image, method="manual", threshold=50) == 50.0
+    assert effective_foreground_intensity_threshold(
+        image, method="percentile_background",
+        percentile_background_percentile=50,
+        percentile_min_contrast=15,
+    ) == 30.0
+    assert effective_foreground_intensity_threshold(image, method="canny") is None
+    assert effective_foreground_intensity_threshold(image.astype(np.uint16), method="manual", threshold=50) is None
 
 
 def test_recording_with_resolved_options_does_not_load_defaults(monkeypatch):
@@ -142,7 +155,7 @@ def test_standalone_recording_loads_one_default_snapshot(monkeypatch):
     ) == "jpg"
 
 
-def test_prefilter_matches_postfilter_at_all_geometric_boundaries():
+def test_prefilter_matches_postfilter_at_bbox_geometric_boundaries():
     mask = np.zeros((35, 50), dtype=np.uint8)
     mask[1:5, 1:5] = 255
     mask[10:16, 10:18] = 255
@@ -151,8 +164,8 @@ def test_prefilter_matches_postfilter_at_all_geometric_boundaries():
     mask[22:28, 32:40] = 0
     for connectivity in (4, 8):
         for dimension, boundary in (
-            ('area', 48), ('perimeter', 28), ('width', 8),
-            ('height', 6), ('width_plus_height', 14),
+            ('area', 48), ('width', 8), ('height', 6),
+            ('width_plus_height', 14),
         ):
             for prefix in ('min', 'max'):
                 options = {f'{prefix}_{dimension}': boundary}

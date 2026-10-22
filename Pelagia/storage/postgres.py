@@ -3350,8 +3350,8 @@ class PostgresRepository:
             ("detections.bbox_w", "<=", max_bbox_w),
             ("detections.bbox_h", ">=", min_bbox_h),
             ("detections.bbox_h", "<=", max_bbox_h),
-            ("detections.area", ">=", min_area),
-            ("detections.area", "<=", max_area),
+            ("(detections.bbox_w::double precision * detections.bbox_h)", ">=", min_area),
+            ("(detections.bbox_w::double precision * detections.bbox_h)", "<=", max_area),
             ("detections.perimeter", ">=", min_perimeter),
             ("detections.perimeter", "<=", max_perimeter),
         ]
@@ -3410,7 +3410,7 @@ class PostgresRepository:
         direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
         sort_key = str(sort_by or "asset_frame").lower()
         order_by_options = {
-            "area": f"detections.area {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
+            "area": f"(detections.bbox_w::double precision * detections.bbox_h) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
             "byte_size": f"octet_length(detections.roi_payload) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
             "id": f"detections.id {direction}",
             "asset_frame": f"assets.filename {direction} NULLS LAST, frames.frame_index {direction}, detections.roi_index {direction}",
@@ -3615,6 +3615,51 @@ class PostgresRepository:
                 rows_by_id = {str(row["id"]): row for row in cursor.fetchall()}
         return [rows_by_id[detection_id] for detection_id in resolved_ids if detection_id in rows_by_id]
 
+    def get_frame_candidate_seed_records(
+        self,
+        frame_ids: Sequence[str],
+        *,
+        project_id: str | None = None,
+        run_ids: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load candidate seed masks for identity-aware refinement without ROI payloads."""
+        resolved_ids = list(dict.fromkeys(str(frame_id) for frame_id in frame_ids))
+        if not resolved_ids:
+            return []
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                clauses = ["detections.frame_id = ANY(%s)"]
+                params: list[Any] = [resolved_ids]
+                if project_id is not None:
+                    clauses.append("assets.project_id = %s")
+                    params.append(project_id)
+                if run_ids is not None:
+                    clauses.append("detections.run_id = ANY(%s)")
+                    params.append(list(dict.fromkeys(str(run_id) for run_id in run_ids)))
+                cursor.execute(
+                    f"""
+                    SELECT detections.id, detections.run_id, detections.frame_id,
+                           detections.roi_index, detections.bbox_x, detections.bbox_y,
+                           detections.bbox_w, detections.bbox_h,
+                           detections.crop_bbox_x, detections.crop_bbox_y,
+                           detections.crop_bbox_w, detections.crop_bbox_h,
+                           detections.mask_payload, detections.mask_encoding,
+                           detections.mask_format, detections.mask_dtype,
+                           detections.mask_shape,
+                           CASE WHEN detections.mask_payload IS NULL
+                                THEN detections.roi_payload ELSE NULL END AS roi_payload,
+                           detections.roi_encoding, detections.roi_format,
+                           detections.roi_dtype, detections.roi_shape
+                    FROM {self.schema}.detection_candidate detections
+                    JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY detections.frame_id, detections.roi_index, detections.id
+                    """,
+                    tuple(params),
+                )
+                return cursor.fetchall()
+
     def get_detection(self, detection_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         rows = self.get_detections([detection_id], project_id=project_id)
         return rows[0] if rows else None
@@ -3682,6 +3727,43 @@ class PostgresRepository:
                     tuple(params),
                 )
                 return cursor.fetchone()
+
+    def list_refined_detections(
+        self, frame_id: str, *, project_id: str | None = None,
+        limit: int = 500, offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List persisted refined identities, including every split child."""
+        clauses = ["refined.frame_id = %s"]
+        params: list[Any] = [frame_id]
+        if project_id:
+            clauses.append("assets.project_id = %s")
+            params.append(project_id)
+        params.extend([limit, offset])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT refined.id, refined.run_id, refined.frame_id, refined.roi_index,
+                           refined.candidate_detection_id, refined.refinement_method,
+                           refined.bbox_x, refined.bbox_y, refined.bbox_w, refined.bbox_h,
+                           refined.crop_bbox_x, refined.crop_bbox_y, refined.crop_bbox_w, refined.crop_bbox_h,
+                           refined.area, refined.perimeter, refined.metadata,
+                           refined.roi_encoding, refined.roi_format, refined.roi_shape, refined.roi_dtype,
+                           refined.mask_encoding, refined.mask_format, refined.mask_shape, refined.mask_dtype,
+                           octet_length(refined.roi_payload) AS roi_payload_bytes,
+                           octet_length(refined.mask_payload) AS mask_payload_bytes,
+                           CASE WHEN refined.metadata->'roi_measurements'->>'version' = '1'
+                                     AND refined.metadata->'roi_measurements'->>'area_method' = 'opencv_external_contours'
+                                THEN NULL ELSE refined.mask_payload END AS mask_payload,
+                           frames.asset_id, frames.frame_index,
+                           frames.captured_at, assets.filename AS asset_filename
+                    FROM {self.schema}.detections_refined refined
+                    JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY refined.roi_index ASC, refined.id ASC
+                    LIMIT %s OFFSET %s
+                """, tuple(params))
+                return cursor.fetchall()
 
     def list_detection_records(self, asset_id: str) -> list[DetectionRecord]:
         return [DetectionRecord.from_row(row) for row in self.list_detections(asset_id)]
@@ -5350,8 +5432,8 @@ class PostgresRepository:
         order = {
             "oldest": "refined.created_at ASC, refined.id ASC",
             "newest": "refined.created_at DESC, refined.id DESC",
-            "area_asc": "refined.area ASC NULLS LAST, refined.id ASC",
-            "area_desc": "refined.area DESC NULLS LAST, refined.id ASC",
+            "area_asc": "(refined.bbox_w::double precision * refined.bbox_h) ASC NULLS LAST, refined.id ASC",
+            "area_desc": "(refined.bbox_w::double precision * refined.bbox_h) DESC NULLS LAST, refined.id ASC",
             "confidence_asc": "evidence.confidence ASC NULLS FIRST, refined.id ASC",
             "confidence_desc": "evidence.confidence DESC NULLS LAST, refined.id ASC",
             "disagreement": "(coalesce(evidence.prototype_class_index <> evidence.predicted_class_index, false)::int + coalesce(evidence.knn_class_index <> evidence.predicted_class_index, false)::int) DESC, refined.id ASC",
@@ -5721,6 +5803,9 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           CASE WHEN refined.metadata->'roi_measurements'->>'version' = '1'
+                                     AND refined.metadata->'roi_measurements'->>'area_method' = 'opencv_external_contours'
+                                THEN refined.area ELSE NULL END AS contour_area,
                            refined.bbox_w, refined.bbox_h, refined.roi_shape, refined.created_at,
                            assets.id AS asset_id, assets.filename AS asset_filename,
                            coalesce(labels.display_name, labels.name) AS label_display_name,
@@ -5879,6 +5964,9 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           CASE WHEN refined.metadata->'roi_measurements'->>'version' = '1'
+                                     AND refined.metadata->'roi_measurements'->>'area_method' = 'opencv_external_contours'
+                                THEN refined.area ELSE NULL END AS contour_area,
                            refined.roi_shape, refined.created_at,
                            assets.id AS asset_id, assets.filename AS asset_filename,
                            coalesce(labels.display_name, labels.name) AS label_display_name,
@@ -5950,6 +6038,9 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     SELECT refined.id, refined.frame_id, refined.roi_index, refined.area,
+                           CASE WHEN refined.metadata->'roi_measurements'->>'version' = '1'
+                                     AND refined.metadata->'roi_measurements'->>'area_method' = 'opencv_external_contours'
+                                THEN refined.area ELSE NULL END AS contour_area,
                            refined.roi_shape, refined.created_at,
                            assets.id AS asset_id, assets.filename AS asset_filename,
                            coalesce(annotations_labels.display_name, annotations_labels.name)
@@ -6292,11 +6383,11 @@ class PostgresRepository:
 
         min_area = filters.get("min_area")
         if min_area is not None:
-            clauses.append("refined.area >= %s")
+            clauses.append("(refined.bbox_w::double precision * refined.bbox_h) >= %s")
             where_params.append(float(min_area))
         max_area = filters.get("max_area")
         if max_area is not None:
-            clauses.append("refined.area <= %s")
+            clauses.append("(refined.bbox_w::double precision * refined.bbox_h) <= %s")
             where_params.append(float(max_area))
         search = str(filters.get("search") or "").strip()
         if search:

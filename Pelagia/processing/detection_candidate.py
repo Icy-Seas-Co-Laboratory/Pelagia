@@ -17,10 +17,10 @@ from .detection_recording import (
 )
 from .frame_model import FrameData
 from .frame_preprocess import as_grayscale_array, preprocess_frame_for_segmentation
-from .frame_threshold import calculate_threshold_mask
+from .frame_threshold import calculate_threshold_mask, effective_foreground_intensity_threshold
 from .mask_augmentation import as_binary_mask, augment_mask
 from .roi_assembly import assemble_candidate_rois
-from .roi_filter import filter_candidate_rois, should_store_roi_payload
+from .roi_filter import should_store_roi_payload
 from .timing import measure_phase
 
 
@@ -787,6 +787,16 @@ def segment_frame(
         frame = threshold_result.processed_frame
         gray = threshold_result.gray
         threshold_mask = threshold_result.threshold_mask
+        candidate_generation_threshold = effective_foreground_intensity_threshold(
+            gray,
+            method=resolved_threshold_method,
+            threshold=threshold,
+            manual_threshold=resolved_manual_threshold,
+            thresholding_maximum_value=resolved_thresholding_maximum_value,
+            bounded_otsu_min_contrast=resolved_bounded_otsu_min_contrast,
+            percentile_background_percentile=resolved_percentile_background_percentile,
+            percentile_min_contrast=resolved_percentile_min_contrast,
+        )
         stage_durations_ms = dict(threshold_result.stage_durations_ms)
         stage_durations_ms["configuration_resolution"] = configuration_resolution_ms
         stage_started = time.perf_counter()
@@ -826,10 +836,7 @@ def segment_frame(
                 "max_height": resolved_max_height,
                 "min_width_plus_height": resolved_min_width_plus_height,
                 "max_width_plus_height": resolved_max_width_plus_height,
-            }
-            if str(resolved_roi_assembly_method).replace("-", "_").lower()
-            in {"connected_components", "components", "connected_component"}
-            else None,
+            },
             assembly_stats=assembly_stats,
         )
         labeling_ms = float(assembly_stats.get("connected_component_labeling_ms", 0.0))
@@ -839,19 +846,7 @@ def segment_frame(
         stage_durations_ms["roi_assembly"] = (time.perf_counter() - assembly_started) * 1000
         stage_started = time.perf_counter()
         with measure_phase("segmentation.roi_filter"):
-            candidates = filter_candidate_rois(
-                assembled_candidates,
-                min_area=resolved_min_area,
-                max_area=resolved_max_area,
-                min_perimeter=resolved_min_perimeter,
-                max_perimeter=resolved_max_perimeter,
-                min_width=resolved_min_width,
-                max_width=resolved_max_width,
-                min_height=resolved_min_height,
-                max_height=resolved_max_height,
-                min_width_plus_height=resolved_min_width_plus_height,
-                max_width_plus_height=resolved_max_width_plus_height,
-            )
+            candidates = assembled_candidates
         filtered_candidate_count = len(candidates)
         if max_detections is not None:
             candidates = candidates[:max(0, int(max_detections))]
@@ -883,6 +878,12 @@ def segment_frame(
                     always_store_mask=bool(encode_payloads) and bool(resolved_always_store_mask),
                     extra_metadata={
                         "threshold_method": resolved_threshold_method,
+                        "candidate_generation_threshold": candidate_generation_threshold,
+                        "candidate_generation_threshold_source": (
+                            resolved_threshold_method
+                            if candidate_generation_threshold is not None
+                            else "seed_inferred"
+                        ),
                         "mask_augmentation_steps": resolved_mask_augmentation_steps,
                         "payloads_encoded": bool(encode_payloads),
                     },

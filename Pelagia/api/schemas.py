@@ -66,6 +66,9 @@ class DetectionSummary(FlexibleModel):
     crop_bbox: BBox | None = None
     area: float | None = None
     perimeter: float | None = None
+    bbox_area: float | None = None
+    contour_area: float | None = None
+    contour_perimeter: float | None = None
     roi_encoding: str | None = None
     roi_format: str | None = None
     roi_payload_bytes: int | None = None

@@ -90,6 +90,7 @@ class FakeRepository:
         self.frame_stage_status_updates = []
         self.frame_status_count_refreshes = []
         self.processing_status_snapshot_touches = []
+        self.candidate_seed_queries = []
         self.resource_projects = {
             "run-1": "project-1",
             "asset-1": "project-1",
@@ -513,6 +514,14 @@ class FakeRepository:
                 crop_bbox_h=2,
             )
         return None
+
+    def get_frame_candidate_seed_records(self, frame_ids, **kwargs):
+        self.candidate_seed_queries.append((list(frame_ids), kwargs.get("project_id")))
+        return [
+            self.get_detection("det-1", **kwargs)
+            for frame_id in frame_ids
+            if frame_id == "frame-1"
+        ]
 
     def get_refined_detection_for_candidate(self, detection_id, **kwargs):
         if detection_id != "det-1":
@@ -2479,7 +2488,13 @@ def test_api_roi_refinement_options_are_ui_ready():
         "recording",
     ]
     assert body["supported"]["inference_backend"] == "pelagia_builtin"
-    assert body["supported"]["methods"] == ["heuristic_edge_v1", "oracle", "identity"]
+    assert body["supported"]["methods"] == [
+        "heuristic_edge_v1",
+        "heuristic_v2",
+        "heuristic_v3",
+        "oracle",
+        "identity",
+    ]
     assert "test-refiner" in body["supported"]["model_refs"]
     assert body["supported"]["oracle"]["status"] == "ready"
     reconciliation_fields = {field["key"]: field for field in body["fields"]["reconciliation"]}
@@ -2605,6 +2620,63 @@ def test_api_identity_refinement_promotes_candidate_without_oracle():
     assert refined["metadata"]["identity_promotion"] is True
     assert refined["metadata"]["refinement_bypassed"] is True
     assert "oracle_model" not in refined["metadata"]
+
+
+@pytest.mark.parametrize("method,growth_field", [
+    ("heuristic_v2", "v2_max_growth_pixels"),
+    ("heuristic_v3", "v3_max_growth_pixels"),
+])
+def test_api_roi_refinement_seeded_heuristics_assess_connections(monkeypatch, method, growth_field):
+    from Pelagia.api.routes import roi_refinement as roi_refinement_route
+
+    assessments = []
+    monkeypatch.setattr(
+        roi_refinement_route,
+        "assess_refined_roi_connections",
+        lambda **kwargs: assessments.append(kwargs) or {"assessed_asset_count": 0, "runs": []},
+    )
+    client, repository, _ = make_client()
+    original_get_detection = repository.get_detection
+
+    def consistent_detection(detection_id, **kwargs):
+        row = original_get_detection(detection_id, **kwargs)
+        if row is not None:
+            row.update(
+                {
+                    "bbox_x": 0,
+                    "bbox_y": 0,
+                    "bbox_w": 2,
+                    "bbox_h": 2,
+                    "crop_bbox_x": 0,
+                    "crop_bbox_y": 0,
+                    "crop_bbox_w": 2,
+                    "crop_bbox_h": 2,
+                }
+            )
+        return row
+
+    repository.get_detection = consistent_detection
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "method": method,
+            growth_field: 0,
+            "allow_frame_expansion": False,
+            "encoding": "raw",
+            "store": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["method"] == method
+    assert body["inference_backend"] == "pelagia_builtin"
+    assert body["refined_detections"][0]["metadata"]["refinement_algorithm"] == method
+    assert repository.candidate_seed_queries == [(["frame-1"], "project-1")]
+    assert assessments and assessments[0]["asset_ids"] == {"asset-1"}
+    assert body["connection_assessment"] == {"assessed_asset_count": 0, "runs": []}
 
 
 def test_api_roi_refinement_rejects_missing_roi_payload():
@@ -2735,6 +2807,59 @@ def test_api_queue_roi_refinement_job_dry_run():
     assert body["dry_run"] is True
     assert body["payload"]["detection_ids"] == ["det-1"]
     assert body["model_ref"] == "test-refiner"
+
+
+def test_api_queue_roi_refinement_v2_job_carries_v2_parameters_without_oracle_model():
+    client, repo, _ = make_client()
+    headers = auth_headers(client)
+
+    response = client.post(
+        "/roi-refinement/jobs",
+        headers=headers,
+        json={
+            "detection_ids": ["det-1"],
+            "method": "heuristic_v2",
+            "v2_max_growth_pixels": 12,
+            "v2_threshold_step": 3,
+            "v2_minimum_boundary_coverage": 0.7,
+            "allow_frame_expansion": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["job"]["payload"]
+    assert payload["method"] == "heuristic_v2"
+    assert payload["v2_max_growth_pixels"] == 12
+    assert payload["v2_threshold_step"] == 3
+    assert payload["v2_minimum_boundary_coverage"] == 0.7
+    assert payload["allow_frame_expansion"] is False
+    assert "model_ref" not in payload
+    assert repo.created_jobs[-1]["payload"] == payload
+
+
+def test_api_queue_roi_refinement_v3_job_carries_graph_parameters():
+    client, repo, _ = make_client()
+    response = client.post(
+        "/roi-refinement/jobs",
+        headers=auth_headers(client),
+        json={
+            "detection_ids": ["det-1"],
+            "method": "heuristic_v3",
+            "v3_max_growth_pixels": 20,
+            "v3_boundary_weight": 4.5,
+            "v3_growth_penalty": 0.1,
+            "allow_frame_expansion": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()["job"]["payload"]
+    assert payload["method"] == "heuristic_v3"
+    assert payload["v3_max_growth_pixels"] == 20
+    assert payload["v3_boundary_weight"] == 4.5
+    assert payload["v3_growth_penalty"] == 0.1
+    assert "model_ref" not in payload
+    assert repo.created_jobs[-1]["payload"] == payload
 
 
 def test_api_preprocessing_options_are_ui_ready():
@@ -5724,3 +5849,28 @@ def test_api_search_endpoints_forward_optional_filters():
     assert worker["capability"] == "extract_frames"
     assert worker["limit"] == 4
     assert worker["offset"] == 8
+
+
+def test_api_refined_frame_listing_keeps_split_records_and_project_scope(monkeypatch):
+    client, repository, _ = make_client()
+    calls = []
+
+    def listing(frame_id, **kwargs):
+        calls.append((frame_id, kwargs))
+        return [repository._detection_row(
+            id=f"refined-split-{index}", candidate_detection_id="det-1",
+            area=12, bbox_w=4, bbox_h=3,
+            mask_payload=np.full((3, 4), 255, dtype=np.uint8).tobytes(),
+            mask_shape=[3, 4],
+        ) for index in range(2)]
+
+    monkeypatch.setattr(repository, "list_refined_detections", listing, raising=False)
+    response = client.get("/refined-detections?frame_id=frame-1&limit=2&offset=2")
+    assert response.status_code == 200
+    result = response.json()
+    assert calls == [("frame-1", {"project_id": "project-1", "limit": 2, "offset": 2})]
+    assert [row["id"] for row in result["detections"]] == ["refined-split-0", "refined-split-1"]
+    assert all(row["contour_area"] == 6 and row["bbox_area"] == 12 for row in result["detections"])
+    assert all("mask_payload" not in row for row in result["detections"])
+    assert result["page"]["next_offset"] == 4
+    assert client.get("/refined-detections?frame_id=frame-1&limit=0").status_code == 422

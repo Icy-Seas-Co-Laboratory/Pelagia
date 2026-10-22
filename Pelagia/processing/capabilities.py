@@ -179,7 +179,7 @@ def roi_refinement_capabilities(
         "supported": {
             "inference_backends": ["pelagia_builtin", "oracle_builder", "none"],
             "inference_backend": "pelagia_builtin",
-            "methods": ["heuristic_edge_v1", "oracle", "identity"],
+            "methods": ["heuristic_edge_v1", "heuristic_v2", "heuristic_v3", "oracle", "identity"],
             "model_refs": model_refs,
             "models": models,
             "oracle": oracle_health or {"enabled": config.oracle.enabled, "status": "unknown"},
@@ -197,13 +197,29 @@ def roi_refinement_capabilities(
                 _field("detection_ids", "Detection IDs", "string-list", request_field_name="detection_ids"),
             ],
             "model_selection": [
-                _field("method", "Refinement Method", "enum", options=["heuristic_edge_v1", "oracle", "identity"], default=defaults.default_method),
+                _field("method", "Refinement Method", "enum", options=["heuristic_edge_v1", "heuristic_v2", "heuristic_v3", "oracle", "identity"], default=defaults.default_method),
                 _field("model_ref", "Oracle Model", "enum", options=model_refs, config_section="oracle"),
             ],
             "heuristic_edge": [
                 _field("heuristic_gradient_percentile", "Strong Gradient Percentile", "number", minimum=0, maximum=100, step=1, config_section="processing.roi_refinement"),
                 _field("heuristic_axis_exclusion_degrees", "Axis Exclusion Degrees", "number", minimum=0, maximum=44, step=1, config_section="processing.roi_refinement"),
                 _field("heuristic_max_growth_pixels", "Maximum Seed Growth", "integer", minimum=0, step=1, config_section="processing.roi_refinement"),
+            ],
+            "heuristic_v2": [
+                _field("v2_max_growth_pixels", "Maximum Seed Growth", "integer", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("v2_threshold_step", "Intensity Threshold Step", "number", minimum=0.01, step=0.1, config_section="processing.roi_refinement"),
+                _field("v2_minimum_foreground_intensity", "Minimum Foreground Intensity", "nullable-number", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("v2_minimum_boundary_coverage", "Minimum Boundary Coverage", "number", minimum=0, maximum=1, step=0.01, config_section="processing.roi_refinement"),
+                _field("v2_stable_area_growth_ratio", "Stable Area Growth Ratio", "number", minimum=0, step=0.01, config_section="processing.roi_refinement"),
+            ],
+            "heuristic_v3": [
+                _field("v3_max_growth_pixels", "Maximum Seed Growth", "integer", minimum=0, step=1, config_section="processing.roi_refinement"),
+                _field("v3_foreground_fraction", "Foreground Reference Fraction", "number", minimum=0.01, maximum=0.99, step=0.01, config_section="processing.roi_refinement"),
+                _field("v3_intensity_weight", "Intensity Weight", "number", minimum=0, step=0.1, config_section="processing.roi_refinement"),
+                _field("v3_boundary_weight", "Boundary Weight", "number", minimum=0, step=0.1, config_section="processing.roi_refinement"),
+                _field("v3_growth_penalty", "Growth Penalty", "number", minimum=0, step=0.05, config_section="processing.roi_refinement"),
+                _field("v3_gradient_sigma", "Gradient Scale", "nullable-number", minimum=0.01, step=0.5, config_section="processing.roi_refinement"),
+                _field("v3_max_graph_pixels", "Maximum Graph Pixels", "integer", minimum=1, step=1, config_section="processing.roi_refinement"),
             ],
             "expansion": [
                 _field("allow_frame_expansion", "Allow Frame Expansion", "boolean", default=True),

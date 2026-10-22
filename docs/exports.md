@@ -38,6 +38,16 @@ undirected orientation is in `[0, 180)`; the directed angle is in `[0, 360)`
 and points from the major-axis midpoint toward the foreground centroid. It is
 null when that direction is geometrically undefined.
 
+New refined records define `object_area_px2` as summed OpenCV external-contour
+area and `perimeter_px` as summed external closed arc length; their metadata
+records measurement version `1`. Historical refined rows can contain the former
+foreground-pixel area. Detection APIs expose explicit `bbox_area`,
+`contour_area`, and `contour_perimeter` fields and may remeasure a decodable
+legacy mask at read time without changing the stored row. Exports remain
+reproducible snapshots of persisted measurements: they do not silently rewrite
+historical `object_area_px2` values. Regenerate refinement outputs when an
+export requires the versioned contour-area definition.
+
 Telemetry bundles also include original source bytes, the import profile,
 catalog records, normalized observations, and timeline context for a future
 verified import workflow.

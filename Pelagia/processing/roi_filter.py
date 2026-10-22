@@ -65,8 +65,9 @@ def candidate_passes_filters(
     max_width_plus_height: int | float | None = None,
 ) -> bool:
     """Return true when one candidate satisfies all configured filters."""
-    return component_statistics_pass_filters(
-        area=candidate.area,
+    return _geometric_measurements_pass_filters(
+        area=int(candidate.bbox_w) * int(candidate.bbox_h),
+        perimeter=candidate.perimeter,
         width=candidate.bbox_w,
         height=candidate.bbox_h,
         min_area=min_area,
@@ -98,15 +99,50 @@ def component_statistics_pass_filters(
     min_width_plus_height: int | float | None = None,
     max_width_plus_height: int | float | None = None,
 ) -> bool:
-    """Apply candidate geometric filters to connected-component statistics.
+    """Apply the fast generation gate to connected-component statistics.
 
-    Connected-component candidates define area and perimeter as bounding-box
-    measurements, so all candidate filters can be evaluated before allocating
-    a component mask or extracting a contour.
+    Both area and perimeter use bounding-box measurements here so components
+    can be rejected before allocating a local mask or extracting a contour.
+    Explicit calls that filter materialized ROIs use contour perimeter.
     """
+    return _geometric_measurements_pass_filters(
+        area=area,
+        perimeter=(2 * width) + (2 * height),
+        width=width,
+        height=height,
+        min_area=min_area,
+        max_area=max_area,
+        min_perimeter=min_perimeter,
+        max_perimeter=max_perimeter,
+        min_width=min_width,
+        max_width=max_width,
+        min_height=min_height,
+        max_height=max_height,
+        min_width_plus_height=min_width_plus_height,
+        max_width_plus_height=max_width_plus_height,
+    )
+
+
+def _geometric_measurements_pass_filters(
+    *,
+    area: int | float,
+    perimeter: int | float,
+    width: int,
+    height: int,
+    min_area: int | float | None = None,
+    max_area: int | float | None = None,
+    min_perimeter: int | float | None = None,
+    max_perimeter: int | float | None = None,
+    min_width: int | float | None = None,
+    max_width: int | float | None = None,
+    min_height: int | float | None = None,
+    max_height: int | float | None = None,
+    min_width_plus_height: int | float | None = None,
+    max_width_plus_height: int | float | None = None,
+) -> bool:
     checks = (
         (area, min_area, max_area),
-        ((2 * width) + (2 * height), min_perimeter, max_perimeter),
+        (perimeter, min_perimeter, max_perimeter),
         (width, min_width, max_width),
         (height, min_height, max_height),
         (width + height, min_width_plus_height, max_width_plus_height),

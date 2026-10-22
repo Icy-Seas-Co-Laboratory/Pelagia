@@ -30,7 +30,7 @@ if APIRouter is not None:
     from ...services.registry_generation import preview_registry_dataset
     from ...services.telemetry import parse_telemetry_filters
     from ...services.taxonomy import default_taxonomy_dictionary
-    from ._common import as_response, get_context, get_repository
+    from ._common import as_response, detection_summary, get_context, get_repository
 
     class LabelCreate(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -447,6 +447,11 @@ if APIRouter is not None:
         row = get_repository(request).get_curation_roi(roi_id, project_id=auth.project_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Curatable ROI was not found")
+        refined = get_repository(request).get_refined_detection(roi_id, project_id=auth.project_id)
+        if refined is not None:
+            measurements = detection_summary(refined)
+            for key in ("bbox_area", "contour_area", "contour_perimeter"):
+                row[key] = measurements[key]
         return {"roi": as_response(_with_urls(row))}
 
     @router.get("/feature-space/sources")

@@ -257,6 +257,22 @@ if APIRouter is not None:
             "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
         }
 
+    @refined_router.get("", response_model=DetectionsListResponse)
+    def list_refined_detections(
+        request: Request,
+        frame_id: str,
+        limit: int = Query(default=500, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        rows = get_repository(request).list_refined_detections(
+            frame_id, project_id=scoped_project_id(request), limit=limit, offset=offset,
+        )
+        summaries = [detection_summary(row) for row in rows]
+        return {
+            "detections": summaries,
+            "page": page_metadata(limit=limit, offset=offset, count=len(summaries)),
+        }
+
     @refined_router.get("/{refined_detection_id}", response_model=DetectionDetailResponse)
     def get_refined_detection(request: Request, refined_detection_id: str) -> dict:
         detection = get_repository(request).get_refined_detection(

@@ -176,6 +176,34 @@ def detection_summary(row: Any, *, include_payload: bool = False) -> dict[str, A
             "w": item.get("crop_bbox_w"),
             "h": item.get("crop_bbox_h"),
         }
+    # Explicit measurements prevent legacy `area` values (which have mixed
+    # historical meanings) from being presented as contour measurements.
+    width, height = item.get("bbox_w"), item.get("bbox_h")
+    item["bbox_area"] = float(width) * float(height) if width is not None and height is not None else None
+    item["contour_area"] = None
+    item["contour_perimeter"] = item.get("perimeter")
+    measurements = metadata.get("roi_measurements") or {}
+    if (isinstance(measurements, dict) and measurements.get("version") == 1
+            and measurements.get("area_method") == "opencv_external_contours"):
+        item["contour_area"] = item.get("area")
+    elif item.get("candidate_detection_id") is not None:
+        raw = _as_dict(row)
+        if raw.get("mask_payload") is not None:
+            from ...processing.frame_codec import decode_array_payload
+            from ...processing.roi_measurements import measure_mask_contours
+
+            try:
+                mask = decode_array_payload(raw["mask_payload"], {
+                    "kvstore_encoding": raw.get("mask_encoding"),
+                    "kvstore_format": raw.get("mask_format"),
+                    "dtype": raw.get("mask_dtype"),
+                    "shape": raw.get("mask_shape"),
+                })
+                item["contour_area"], item["contour_perimeter"] = measure_mask_contours(mask)
+            except Exception:
+                # Missing/undecodable historical masks are unknown, never zero
+                # and never relabeled foreground-pixel counts.
+                pass
     _add_refined_detection_contract(item)
     return as_response(item)
 

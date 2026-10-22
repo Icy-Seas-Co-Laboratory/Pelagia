@@ -438,6 +438,18 @@ class RoiRefinementProcessingConfig:
     heuristic_gradient_percentile: float = 90.0
     heuristic_axis_exclusion_degrees: float = 10.0
     heuristic_max_growth_pixels: int = 32
+    v2_max_growth_pixels: int = 32
+    v2_threshold_step: float = 4.0
+    v2_minimum_foreground_intensity: float | None = None
+    v2_minimum_boundary_coverage: float = 0.55
+    v2_stable_area_growth_ratio: float = 0.35
+    v3_max_growth_pixels: int = 32
+    v3_foreground_fraction: float = 0.10
+    v3_intensity_weight: float = 2.0
+    v3_boundary_weight: float = 3.0
+    v3_growth_penalty: float = 0.20
+    v3_gradient_sigma: float | None = None
+    v3_max_graph_pixels: int = 100_000
 
 
 @dataclass(slots=True)
@@ -812,6 +824,18 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "processing.roi_refinement", "residual_min_height", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_HEIGHT", float)
     _set_from_env(settings, "processing.roi_refinement", "residual_min_width_plus_height", "PELAGIA_ROI_REFINEMENT_RESIDUAL_MIN_WIDTH_PLUS_HEIGHT", float)
     _set_from_env(settings, "processing.roi_refinement", "residual_padding", "PELAGIA_ROI_REFINEMENT_RESIDUAL_PADDING", int)
+    _set_from_env(settings, "processing.roi_refinement", "v2_max_growth_pixels", "PELAGIA_ROI_REFINEMENT_V2_MAX_GROWTH_PIXELS", int)
+    _set_from_env(settings, "processing.roi_refinement", "v2_threshold_step", "PELAGIA_ROI_REFINEMENT_V2_THRESHOLD_STEP", float)
+    _set_from_env(settings, "processing.roi_refinement", "v2_minimum_foreground_intensity", "PELAGIA_ROI_REFINEMENT_V2_MINIMUM_FOREGROUND_INTENSITY", float)
+    _set_from_env(settings, "processing.roi_refinement", "v2_minimum_boundary_coverage", "PELAGIA_ROI_REFINEMENT_V2_MINIMUM_BOUNDARY_COVERAGE", float)
+    _set_from_env(settings, "processing.roi_refinement", "v2_stable_area_growth_ratio", "PELAGIA_ROI_REFINEMENT_V2_STABLE_AREA_GROWTH_RATIO", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_max_growth_pixels", "PELAGIA_ROI_REFINEMENT_V3_MAX_GROWTH_PIXELS", int)
+    _set_from_env(settings, "processing.roi_refinement", "v3_foreground_fraction", "PELAGIA_ROI_REFINEMENT_V3_FOREGROUND_FRACTION", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_intensity_weight", "PELAGIA_ROI_REFINEMENT_V3_INTENSITY_WEIGHT", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_boundary_weight", "PELAGIA_ROI_REFINEMENT_V3_BOUNDARY_WEIGHT", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_growth_penalty", "PELAGIA_ROI_REFINEMENT_V3_GROWTH_PENALTY", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_gradient_sigma", "PELAGIA_ROI_REFINEMENT_V3_GRADIENT_SIGMA", float)
+    _set_from_env(settings, "processing.roi_refinement", "v3_max_graph_pixels", "PELAGIA_ROI_REFINEMENT_V3_MAX_GRAPH_PIXELS", int)
 
 
 def _env_bool(value: str) -> bool:
@@ -1504,6 +1528,43 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
                         RoiRefinementProcessingConfig.heuristic_max_growth_pixels,
                     )
                 ),
+                v2_max_growth_pixels=int(
+                    roi_refinement.get(
+                        "v2_max_growth_pixels",
+                        RoiRefinementProcessingConfig.v2_max_growth_pixels,
+                    )
+                ),
+                v2_threshold_step=float(
+                    roi_refinement.get(
+                        "v2_threshold_step",
+                        RoiRefinementProcessingConfig.v2_threshold_step,
+                    )
+                ),
+                v2_minimum_foreground_intensity=_optional_float(
+                    roi_refinement.get(
+                        "v2_minimum_foreground_intensity",
+                        RoiRefinementProcessingConfig.v2_minimum_foreground_intensity,
+                    )
+                ),
+                v2_minimum_boundary_coverage=float(
+                    roi_refinement.get(
+                        "v2_minimum_boundary_coverage",
+                        RoiRefinementProcessingConfig.v2_minimum_boundary_coverage,
+                    )
+                ),
+                v2_stable_area_growth_ratio=float(
+                    roi_refinement.get(
+                        "v2_stable_area_growth_ratio",
+                        RoiRefinementProcessingConfig.v2_stable_area_growth_ratio,
+                    )
+                ),
+                v3_max_growth_pixels=int(roi_refinement.get("v3_max_growth_pixels", RoiRefinementProcessingConfig.v3_max_growth_pixels)),
+                v3_foreground_fraction=float(roi_refinement.get("v3_foreground_fraction", RoiRefinementProcessingConfig.v3_foreground_fraction)),
+                v3_intensity_weight=float(roi_refinement.get("v3_intensity_weight", RoiRefinementProcessingConfig.v3_intensity_weight)),
+                v3_boundary_weight=float(roi_refinement.get("v3_boundary_weight", RoiRefinementProcessingConfig.v3_boundary_weight)),
+                v3_growth_penalty=float(roi_refinement.get("v3_growth_penalty", RoiRefinementProcessingConfig.v3_growth_penalty)),
+                v3_gradient_sigma=_optional_float(roi_refinement.get("v3_gradient_sigma", RoiRefinementProcessingConfig.v3_gradient_sigma)),
+                v3_max_graph_pixels=int(roi_refinement.get("v3_max_graph_pixels", RoiRefinementProcessingConfig.v3_max_graph_pixels)),
             ),
             roi_continuity=RoiContinuityProcessingConfig(
                 enabled=bool(

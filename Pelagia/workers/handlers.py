@@ -36,6 +36,12 @@ from ..processing.heuristic_refinement import (
     HeuristicEdgeRefinementBackend,
     HeuristicEdgeRefinementParameters,
 )
+from ..processing.heuristic_refinement_v2 import (
+    HEURISTIC_V2_METHOD_NAME, HeuristicV2RefinementBackend, HeuristicV2RefinementParameters,
+)
+from ..processing.heuristic_refinement_v3 import (
+    HEURISTIC_V3_METHOD_NAME, HeuristicV3RefinementBackend, HeuristicV3RefinementParameters,
+)
 from ..processing.oracle_client import OracleInferenceClient, OracleInferenceItem, OracleRoiRefinementBackend
 from ..processing.oracle_evidence import json_image_output, normalize_image_output, IMAGE_OUTPUT_VERSION
 from ..processing.roi_continuity import (
@@ -46,6 +52,7 @@ from ..processing.segmentation_options import resolve_segmentation_options, segm
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
 from ..services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
+from ..services.roi_connection_assessment import assess_refined_roi_connections
 from ..services.job_commands import (
     ExtractFramesCommand,
     ClassificationCommand,
@@ -1045,7 +1052,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     defaults = context.config.processing.roi_refinement
     requested_method = str(payload.get("method") or defaults.default_method).strip().lower()
-    if requested_method not in {"oracle", "identity", HEURISTIC_EDGE_METHOD_NAME}:
+    if requested_method not in {"oracle", "identity", HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
         raise ValueError(f"Unsupported ROI refinement method: {requested_method!r}.")
     backend = None
     method = "identity"
@@ -1084,6 +1091,26 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             )
         )
         method = backend.method_name
+    elif requested_method == HEURISTIC_V2_METHOD_NAME:
+        backend = HeuristicV2RefinementBackend(HeuristicV2RefinementParameters(
+            max_growth_pixels=int(payload.get("v2_max_growth_pixels", defaults.v2_max_growth_pixels)),
+            threshold_step=float(payload.get("v2_threshold_step", defaults.v2_threshold_step)),
+            minimum_foreground_intensity=payload.get("v2_minimum_foreground_intensity", defaults.v2_minimum_foreground_intensity),
+            minimum_boundary_coverage=float(payload.get("v2_minimum_boundary_coverage", defaults.v2_minimum_boundary_coverage)),
+            stable_area_growth_ratio=float(payload.get("v2_stable_area_growth_ratio", defaults.v2_stable_area_growth_ratio)),
+        ))
+        method = backend.method_name
+    elif requested_method == HEURISTIC_V3_METHOD_NAME:
+        backend = HeuristicV3RefinementBackend(HeuristicV3RefinementParameters(
+            max_growth_pixels=int(payload.get("v3_max_growth_pixels", defaults.v3_max_growth_pixels)),
+            foreground_fraction=float(payload.get("v3_foreground_fraction", defaults.v3_foreground_fraction)),
+            intensity_weight=float(payload.get("v3_intensity_weight", defaults.v3_intensity_weight)),
+            boundary_weight=float(payload.get("v3_boundary_weight", defaults.v3_boundary_weight)),
+            growth_penalty=float(payload.get("v3_growth_penalty", defaults.v3_growth_penalty)),
+            gradient_sigma=payload.get("v3_gradient_sigma", defaults.v3_gradient_sigma),
+            max_graph_pixels=int(payload.get("v3_max_graph_pixels", defaults.v3_max_graph_pixels)),
+        ))
+        method = backend.method_name
     with measure_phase("refinement.options_resolution"):
         options = _roi_refinement_options_from_payload(payload, context)
         storage = resolve_project_storage_settings(context, project_id)
@@ -1091,6 +1118,8 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             validate_allowed_storage_encodings(context, options.encoding)
     allow_frame_expansion = bool(payload.get("allow_frame_expansion", True))
     expansion_payload_kind = str(payload.get("expansion_frame_payload_kind", "preprocessed"))
+    if requested_method in {HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME} and expansion_payload_kind != "preprocessed":
+        raise ValueError(f"{requested_method} requires preprocessed frame intensities for crop expansion.")
     frame_loader = None
     if allow_frame_expansion:
         # Expansion can revisit one frame for many ROIs, so retain one decoded frame per job.
@@ -1108,9 +1137,19 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
 
     with measure_phase("refinement.record_construction"):
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
+        all_candidate_seeds = None
+        if requested_method in {HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
+            all_candidate_seeds = [
+                DetectionRecord.from_row(row)
+                for row in context.repository.get_frame_candidate_seed_records(
+                    candidate_frame_ids,
+                    project_id=project_id,
+                    run_ids=sorted({record.run_id for record in detection_records}),
+                )
+            ]
     progress.checkpoint()
     results = (
-        identity_refine_detections(detection_records, frame_loader=frame_loader)
+        identity_refine_detections(detection_records, frame_loader=frame_loader, options=options)
         if requested_method == "identity"
         else refine_detections(
             detection_records,
@@ -1118,6 +1157,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
             frame_loader=frame_loader,
             options=options,
             method=method,
+            all_candidate_seeds=all_candidate_seeds,
         )
     )
     refined_records = [
@@ -1148,6 +1188,15 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         )
     run_ids = sorted({record.run_id for record in detection_records})
     frame_ids = sorted({record.frame_id for record in detection_records})
+    with measure_phase("refinement.connection_assessment"):
+        connection_assessment = assess_refined_roi_connections(
+            repository=context.repository,
+            project_id=project_id,
+            asset_ids={str(row["asset_id"]) for row in candidate_rows if row.get("asset_id")},
+            defaults=context.config.processing.roi_continuity,
+            run_id=run_ids[0] if len(run_ids) == 1 else None,
+            job_id=None if job.get("id") is None else str(job.get("id")),
+        )
     _mark_frame_stage_status(
         context,
         project_id=project_id,
@@ -1181,6 +1230,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "detection_count": len(detection_records),
         "refined_count": len(refined_records),
         "stored_count": len(stored),
+        "connection_assessment": connection_assessment,
         "synthetic_refined_count": sum(
             1 for result in results if result.candidate_detection.metadata.get("synthetic_candidate")
         ),
@@ -1189,11 +1239,11 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "frame_ids": frame_ids,
         "inference_backend": (
             "none" if requested_method == "identity"
-            else "pelagia_builtin" if requested_method == HEURISTIC_EDGE_METHOD_NAME
+            else "pelagia_builtin" if requested_method in {HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}
             else "oracle_builder"
         ),
         "model_ref": (
-            None if requested_method in {"identity", HEURISTIC_EDGE_METHOD_NAME}
+            None if requested_method in {"identity", HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}
             else payload.get("model_ref") or context.config.oracle.default_mask_model
         ),
         "method": requested_method,

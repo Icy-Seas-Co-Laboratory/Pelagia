@@ -37,6 +37,46 @@ def otsu_threshold_value(gray: np.ndarray) -> float:
     return float(threshold_value)
 
 
+def effective_foreground_intensity_threshold(
+    gray: np.ndarray,
+    *,
+    method: str,
+    threshold: int | float | ThresholdFn | None = None,
+    manual_threshold: int | float | None = None,
+    thresholding_maximum_value: int | float | None = None,
+    bounded_otsu_min_contrast: int | float = 50,
+    percentile_background_percentile: int | float = 50,
+    percentile_min_contrast: int | float = 50,
+) -> float | None:
+    """Return the absolute cutoff only when candidate foreground uses one.
+
+    Adaptive, edge, hysteresis, and combined masks cannot be represented by a
+    single foreground intensity cutoff. Non-uint8 frames are also excluded:
+    candidate thresholding normalizes them, while refinement reads their
+    original intensity units.
+    """
+    image = np.asarray(gray)
+    if image.dtype != np.uint8 or callable(threshold):
+        return None
+    resolved = str(method).replace("-", "_").lower()
+    if resolved == "manual":
+        value = threshold if threshold is not None else manual_threshold
+        return None if value is None else float(value)
+    if resolved in {"otsu", "bounded_otsu"}:
+        value = otsu_threshold_value(image)
+        if thresholding_maximum_value is not None:
+            value = min(value, float(thresholding_maximum_value))
+        if resolved == "bounded_otsu":
+            background = float(np.median(image))
+            if value - background < float(bounded_otsu_min_contrast):
+                value = min(255.0, background + float(bounded_otsu_min_contrast))
+        return value
+    if resolved == "percentile_background":
+        background = float(np.percentile(image, percentile_background_percentile))
+        return min(255.0, background + float(percentile_min_contrast))
+    return None
+
+
 def threshold_otsu(
     gray: np.ndarray,
     *,

@@ -21,6 +21,12 @@ if APIRouter is not None:
         HeuristicEdgeRefinementBackend,
         HeuristicEdgeRefinementParameters,
     )
+    from ...processing.heuristic_refinement_v2 import (
+        HEURISTIC_V2_METHOD_NAME, HeuristicV2RefinementBackend, HeuristicV2RefinementParameters,
+    )
+    from ...processing.heuristic_refinement_v3 import (
+        HEURISTIC_V3_METHOD_NAME, HeuristicV3RefinementBackend, HeuristicV3RefinementParameters,
+    )
     from ...processing.oracle_client import (
         OracleInferenceClient,
         OracleInferenceError,
@@ -31,6 +37,7 @@ if APIRouter is not None:
     from ...processing.capabilities import roi_refinement_capabilities
     from ...services.job_commands import RoiContinuityCommand, RoiRefinementCommand
     from ...services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
+    from ...services.roi_connection_assessment import assess_refined_roi_connections
     from ...services.pipeline import PipelineService
     from ._common import (
         as_response,
@@ -48,7 +55,7 @@ if APIRouter is not None:
         model_config = ConfigDict(protected_namespaces=(), extra="forbid")
 
         detection_ids: list[str] = Field(default_factory=list)
-        method: Literal["oracle", "identity", "heuristic_edge_v1"] = "heuristic_edge_v1"
+        method: Literal["oracle", "identity", "heuristic_edge_v1", "heuristic_v2", "heuristic_v3"] = "heuristic_edge_v1"
         model_ref: str | None = None
         max_iterations: int | None = None
         expansion_pixels: int | None = None
@@ -69,6 +76,18 @@ if APIRouter is not None:
         heuristic_gradient_percentile: float | None = None
         heuristic_axis_exclusion_degrees: float | None = None
         heuristic_max_growth_pixels: int | None = None
+        v2_max_growth_pixels: int | None = None
+        v2_threshold_step: float | None = None
+        v2_minimum_foreground_intensity: float | None = None
+        v2_minimum_boundary_coverage: float | None = None
+        v2_stable_area_growth_ratio: float | None = None
+        v3_max_growth_pixels: int | None = None
+        v3_foreground_fraction: float | None = None
+        v3_intensity_weight: float | None = None
+        v3_boundary_weight: float | None = None
+        v3_growth_penalty: float | None = None
+        v3_gradient_sigma: float | None = None
+        v3_max_graph_pixels: int | None = None
         allow_frame_expansion: bool = True
         store: bool = True
         dry_run: bool = False
@@ -193,12 +212,12 @@ if APIRouter is not None:
                 "method": "identity",
                 "refinement_method": "identity",
             }
-        if body.method == HEURISTIC_EDGE_METHOD_NAME:
+        if body.method in {HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
             return {
                 "inference_backend": "pelagia_builtin",
                 "model_ref": None,
-                "method": HEURISTIC_EDGE_METHOD_NAME,
-                "refinement_method": HEURISTIC_EDGE_METHOD_NAME,
+                "method": body.method,
+                "refinement_method": body.method,
             }
         return {
             "inference_backend": "oracle_builder",
@@ -223,6 +242,24 @@ if APIRouter is not None:
 
     def _resolve_heuristic_backend(request: Request, body: RoiRefinementRequest):
         defaults = get_context(request).config.processing.roi_refinement
+        if body.method == HEURISTIC_V3_METHOD_NAME:
+            return HeuristicV3RefinementBackend(HeuristicV3RefinementParameters(
+                max_growth_pixels=defaults.v3_max_growth_pixels if body.v3_max_growth_pixels is None else body.v3_max_growth_pixels,
+                foreground_fraction=defaults.v3_foreground_fraction if body.v3_foreground_fraction is None else body.v3_foreground_fraction,
+                intensity_weight=defaults.v3_intensity_weight if body.v3_intensity_weight is None else body.v3_intensity_weight,
+                boundary_weight=defaults.v3_boundary_weight if body.v3_boundary_weight is None else body.v3_boundary_weight,
+                growth_penalty=defaults.v3_growth_penalty if body.v3_growth_penalty is None else body.v3_growth_penalty,
+                gradient_sigma=defaults.v3_gradient_sigma if body.v3_gradient_sigma is None else body.v3_gradient_sigma,
+                max_graph_pixels=defaults.v3_max_graph_pixels if body.v3_max_graph_pixels is None else body.v3_max_graph_pixels,
+            ))
+        if body.method == HEURISTIC_V2_METHOD_NAME:
+            return HeuristicV2RefinementBackend(HeuristicV2RefinementParameters(
+                max_growth_pixels=defaults.v2_max_growth_pixels if body.v2_max_growth_pixels is None else body.v2_max_growth_pixels,
+                threshold_step=defaults.v2_threshold_step if body.v2_threshold_step is None else body.v2_threshold_step,
+                minimum_foreground_intensity=defaults.v2_minimum_foreground_intensity if body.v2_minimum_foreground_intensity is None else body.v2_minimum_foreground_intensity,
+                minimum_boundary_coverage=defaults.v2_minimum_boundary_coverage if body.v2_minimum_boundary_coverage is None else body.v2_minimum_boundary_coverage,
+                stable_area_growth_ratio=defaults.v2_stable_area_growth_ratio if body.v2_stable_area_growth_ratio is None else body.v2_stable_area_growth_ratio,
+            ))
         return HeuristicEdgeRefinementBackend(
             HeuristicEdgeRefinementParameters(
                 gradient_percentile=(
@@ -341,14 +378,28 @@ if APIRouter is not None:
                     ),
                 )
 
-        backend = (
-            None if body.method == "identity"
-            else _resolve_heuristic_backend(request, body)
-            if body.method == HEURISTIC_EDGE_METHOD_NAME
-            else _resolve_backend(request, body)
-        )
+        try:
+            backend = (
+                None if body.method == "identity"
+                else _resolve_heuristic_backend(request, body)
+                if body.method in {HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}
+                else _resolve_backend(request, body)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         method = "identity" if body.method == "identity" else backend.method_name
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
+        all_candidate_seeds = None
+        if body.method in {HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
+            frame_ids = sorted({record.frame_id for record in detection_records})
+            all_candidate_seeds = [
+                DetectionRecord.from_row(row)
+                for row in repository.get_frame_candidate_seed_records(
+                    frame_ids,
+                    project_id=project_id,
+                    run_ids=sorted({record.run_id for record in detection_records}),
+                )
+            ]
 
         frame_loader = None
         if body.allow_frame_expansion:
@@ -366,7 +417,7 @@ if APIRouter is not None:
 
         try:
             results = (
-                identity_refine_detections(detection_records, frame_loader=frame_loader)
+                identity_refine_detections(detection_records, frame_loader=frame_loader, options=options)
                 if body.method == "identity"
                 else refine_detections(
                     detection_records,
@@ -374,6 +425,7 @@ if APIRouter is not None:
                     frame_loader=frame_loader,
                     options=options,
                     method=method,
+                    all_candidate_seeds=all_candidate_seeds,
                 )
             )
             storage = resolve_project_storage_settings(context, project_id)
@@ -413,6 +465,17 @@ if APIRouter is not None:
                 frame_ids = list(
                     dict.fromkeys(str(row["frame_id"]) for row in stored_rows if row.get("frame_id"))
                 )
+                connection_assessment = assess_refined_roi_connections(
+                    repository=repository,
+                    project_id=project_id,
+                    asset_ids={str(row["asset_id"]) for row in candidate_rows if row.get("asset_id")},
+                    defaults=context.config.processing.roi_continuity,
+                    run_id=(
+                        detection_records[0].run_id
+                        if len({record.run_id for record in detection_records}) == 1
+                        else None
+                    ),
+                )
                 mark_frame_stage_status(
                     repository,
                     project_id=project_id,
@@ -437,6 +500,7 @@ if APIRouter is not None:
                 "candidate_count": len(candidate_rows),
                 "refined_count": len(refined_records),
                 "stored_count": len(stored_rows),
+                "connection_assessment": connection_assessment if body.store else None,
                 "synthetic_refined_count": sum(
                     1 for result in results if result.candidate_detection.metadata.get("synthetic_candidate")
                 ),
@@ -492,7 +556,7 @@ if APIRouter is not None:
             "detection_ids": body.detection_ids,
             "method": body.method,
             "model_ref": (
-                None if body.method in {"identity", HEURISTIC_EDGE_METHOD_NAME}
+                None if body.method in {"identity", HEURISTIC_EDGE_METHOD_NAME, HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}
                 else body.model_ref or context.config.oracle.default_mask_model
             ),
             "model_fingerprint": model_fingerprint,
@@ -515,6 +579,18 @@ if APIRouter is not None:
             "heuristic_gradient_percentile": body.heuristic_gradient_percentile,
             "heuristic_axis_exclusion_degrees": body.heuristic_axis_exclusion_degrees,
             "heuristic_max_growth_pixels": body.heuristic_max_growth_pixels,
+            "v2_max_growth_pixels": body.v2_max_growth_pixels,
+            "v2_threshold_step": body.v2_threshold_step,
+            "v2_minimum_foreground_intensity": body.v2_minimum_foreground_intensity,
+            "v2_minimum_boundary_coverage": body.v2_minimum_boundary_coverage,
+            "v2_stable_area_growth_ratio": body.v2_stable_area_growth_ratio,
+            "v3_max_growth_pixels": body.v3_max_growth_pixels,
+            "v3_foreground_fraction": body.v3_foreground_fraction,
+            "v3_intensity_weight": body.v3_intensity_weight,
+            "v3_boundary_weight": body.v3_boundary_weight,
+            "v3_growth_penalty": body.v3_growth_penalty,
+            "v3_gradient_sigma": body.v3_gradient_sigma,
+            "v3_max_graph_pixels": body.v3_max_graph_pixels,
             "allow_frame_expansion": body.allow_frame_expansion,
         }
         payload = {key: value for key, value in payload.items() if value is not None}

@@ -226,6 +226,14 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_refinement.residual_roi_assembly_connectivity == 8
     assert config.processing.roi_refinement.residual_min_area is None
     assert config.processing.roi_refinement.residual_padding is None
+    assert config.processing.roi_refinement.v2_max_growth_pixels == 32
+    assert config.processing.roi_refinement.v2_threshold_step == 4
+    assert config.processing.roi_refinement.v2_minimum_foreground_intensity is None
+    assert config.processing.roi_refinement.v2_minimum_boundary_coverage == 0.55
+    assert config.processing.roi_refinement.v2_stable_area_growth_ratio == 0.35
+    assert config.processing.roi_refinement.v3_max_growth_pixels == 32
+    assert config.processing.roi_refinement.v3_growth_penalty == 0.2
+    assert config.processing.roi_refinement.v3_gradient_sigma is None
     assert config.logging.log_path.as_posix() == "logs"
     assert config.logging.file_name == "pelagia.log"
     assert config.logging.level == "INFO"
@@ -344,6 +352,18 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
         residual_min_height = 2
         residual_min_width_plus_height = 5
         residual_padding = 1
+        v2_max_growth_pixels = 40
+        v2_threshold_step = 3
+        v2_minimum_foreground_intensity = 9.5
+        v2_minimum_boundary_coverage = 0.75
+        v2_stable_area_growth_ratio = 1.5
+        v3_max_growth_pixels = 24
+        v3_foreground_fraction = 0.3
+        v3_intensity_weight = 2.5
+        v3_boundary_weight = 4.0
+        v3_growth_penalty = 0.1
+        v3_gradient_sigma = 9.0
+        v3_max_graph_pixels = 50000
         """,
         encoding="utf-8",
     )
@@ -428,6 +448,18 @@ def test_core_config_loads_explicit_toml_overrides(tmp_path):
     assert config.processing.roi_refinement.residual_min_height == 2.0
     assert config.processing.roi_refinement.residual_min_width_plus_height == 5.0
     assert config.processing.roi_refinement.residual_padding == 1
+    assert config.processing.roi_refinement.v2_max_growth_pixels == 40
+    assert config.processing.roi_refinement.v2_threshold_step == 3
+    assert config.processing.roi_refinement.v2_minimum_foreground_intensity == 9.5
+    assert config.processing.roi_refinement.v2_minimum_boundary_coverage == 0.75
+    assert config.processing.roi_refinement.v2_stable_area_growth_ratio == 1.5
+    assert config.processing.roi_refinement.v3_max_growth_pixels == 24
+    assert config.processing.roi_refinement.v3_foreground_fraction == 0.3
+    assert config.processing.roi_refinement.v3_intensity_weight == 2.5
+    assert config.processing.roi_refinement.v3_boundary_weight == 4.0
+    assert config.processing.roi_refinement.v3_growth_penalty == 0.1
+    assert config.processing.roi_refinement.v3_gradient_sigma == 9.0
+    assert config.processing.roi_refinement.v3_max_graph_pixels == 50000
 
 
 def test_core_config_env_overrides_toml(monkeypatch, tmp_path):

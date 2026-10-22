@@ -58,6 +58,7 @@ class FakeRepository:
         self.deferred_jobs = []
         self.oracle_batches = []
         self.finalized_oracle_batches = []
+        self.candidate_seed_queries = []
 
     def list_classification_inference_batches(self, **kwargs):
         return list(self.oracle_batches)
@@ -271,6 +272,14 @@ class FakeRepository:
             row
             for detection_id in detection_ids
             if (row := self.get_detection(detection_id, **kwargs)) is not None
+        ]
+
+    def get_frame_candidate_seed_records(self, frame_ids, **kwargs):
+        self.candidate_seed_queries.append((list(frame_ids), kwargs.get("project_id")))
+        return [
+            self.get_detection("det-1", **kwargs)
+            for frame_id in frame_ids
+            if frame_id == "frame-1"
         ]
 
     def upsert_refined_detections(self, refined_detections, *, job_id=None, project_id=None):
@@ -1742,6 +1751,76 @@ def test_roi_refinement_handler_identity_promotes_without_oracle():
     assert stored.metadata["refinement_bypassed"] is True
     assert result["timings"]["phase_counts"].get("refinement.model_inference", 0) == 0
     assert sum(operation == "get_detections" for operation, _ in repo.project_calls) == 1
+
+
+def test_roi_refinement_handler_v2_loads_consistent_candidate_seeds_and_assesses_connections(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    assessments = []
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.assess_refined_roi_connections",
+        lambda **kwargs: assessments.append(kwargs) or {"assessed_asset_count": 0, "runs": []},
+    )
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-v2",
+            "project_id": "project-1",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "method": "heuristic_v2",
+                "v2_max_growth_pixels": 0,
+                "allow_frame_expansion": False,
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["method"] == "heuristic_v2"
+    assert result["refinement_method"] == "heuristic_v2"
+    assert result["inference_backend"] == "pelagia_builtin"
+    assert repo.candidate_seed_queries == [(["frame-1"], "project-1")]
+    stored = repo.refined_detections[0][0][1]
+    assert (stored.crop_bbox_x, stored.crop_bbox_y, stored.crop_bbox_w, stored.crop_bbox_h) == (0, 0, 2, 2)
+    assert stored.metadata["refinement_algorithm"] == "heuristic_v2"
+    assert assessments and assessments[0]["asset_ids"] == {"asset-1"}
+    assert result["connection_assessment"] == {"assessed_asset_count": 0, "runs": []}
+
+
+def test_roi_refinement_handler_v3_uses_graph_cut_and_candidate_seed_query(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.assess_refined_roi_connections",
+        lambda **_kwargs: {"assessed_asset_count": 0, "runs": []},
+    )
+
+    result = roi_refinement_handler(
+        {
+            "id": "job-v3",
+            "project_id": "project-1",
+            "stage": PipelineStage.ROI_REFINEMENT.value,
+            "run_id": "run-1",
+            "asset_id": "asset-1",
+            "payload": {
+                "detection_ids": ["det-1"],
+                "method": "heuristic_v3",
+                "v3_max_growth_pixels": 0,
+                "allow_frame_expansion": False,
+                "encoding": "raw",
+            },
+        },
+        context,
+    )
+
+    assert result["method"] == "heuristic_v3"
+    assert result["inference_backend"] == "pelagia_builtin"
+    assert repo.candidate_seed_queries == [(["frame-1"], "project-1")]
+    assert repo.refined_detections[0][0][1].metadata["refinement_algorithm"] == "heuristic_v3"
 
 
 def test_roi_refinement_handler_preserves_project_id():

@@ -1759,6 +1759,7 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
                         "detection_stage": "refined",
                         "refinement_method": "identity",
                         "refinement_role": "residual_child",
+                        "roi_measurements": {"version": 1, "area_method": "opencv_external_contours"},
                     },
                 ),
             )
@@ -1767,6 +1768,18 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert len(refined_again) == 1
     assert refined_again[0]["candidate_detection_id"] == filtered_detections[0]["id"]
     assert refined_again[0]["id"] != refined[0]["id"]
+    listed_refined = postgres_repo.list_refined_detections(str(inserted_frames[0]["id"]), limit=10)
+    assert [row["id"] for row in listed_refined] == [refined[0]["id"], refined_again[0]["id"]]
+    assert all("roi_payload" not in row for row in listed_refined)
+    assert listed_refined[0]["mask_payload"] == b"refined-mask"
+    assert listed_refined[1]["mask_payload"] is None
+    assert listed_refined[1]["mask_payload_bytes"] == len(b"refined-mask-child")
+    assert postgres_repo.list_refined_detections(
+        str(inserted_frames[0]["id"]), limit=1, offset=1,
+    )[0]["id"] == refined_again[0]["id"]
+    assert postgres_repo.list_refined_detections(
+        str(inserted_frames[0]["id"]), project_id=str(uuid.uuid4()),
+    ) == []
     latest_refined = postgres_repo.get_refined_detection_for_candidate(str(filtered_detections[0]["id"]))
     assert latest_refined is not None
     assert latest_refined["candidate_detection_id"] == filtered_detections[0]["id"]

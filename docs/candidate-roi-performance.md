@@ -1,10 +1,12 @@
 # Candidate ROI performance
 
-Candidate generation preserves the connected-component filter definitions:
-`area` is bounding-box width × height, and the perimeter filter uses
-2 × (width + height). These are distinct from foreground-pixel area and the
-stored contour perimeter. Threshold equality is accepted. The contour assembly
-method retains its contour-area definition.
+Candidate generation uses a fast connected-component gate: `area` is
+bounding-box width × height, and perimeter is 2 × (width + height). Both
+connected-component and contour assembly apply that gate without a second
+contour-perimeter pass during candidate generation. Standalone filtering of
+materialized ROIs keeps bounding-box area but applies the external-contour
+perimeter. Threshold equality is accepted. Candidate records produced by either
+assembly method store bounding-box area and external-contour perimeter.
 
 Connected-component statistics are filtered before allocating local masks and
 extracting contours. Component traversal order and final one-based ROI indices
@@ -17,6 +19,12 @@ cache. Mask orientation uses binary-image moments for the centroid and
 population covariance, with each row’s foreground endpoints for the projected
 extent. Its coordinate conventions, degeneracy tolerances, and provenance method
 remain unchanged.
+
+Refined ROI records store the sum of OpenCV external-contour areas and closed
+arc lengths. They do not use foreground-pixel count as the displayed area.
+`metadata.roi_measurements` records version `1` and the area/perimeter method so
+new measurements can be distinguished from historical rows. The external-contour convention does not subtract holes from area and does
+not include inner hole boundaries in perimeter.
 
 ## Reproducible processing benchmark
 

@@ -15,7 +15,7 @@ from .frame_codec import decode_array_payload, encode_array_payload
 from .frame_model import FrameData
 from .frame_preprocess import as_binary_mask, as_grayscale_array
 from .roi_assembly import assemble_candidate_rois
-from .roi_filter import filter_candidate_rois
+from .roi_measurements import external_mask_contours, measure_contours
 from .timing import measure_phase
 
 
@@ -38,6 +38,8 @@ class RoiRefinementInput:
     image: np.ndarray
     candidate_mask: np.ndarray
     metadata: dict[str, Any] = field(default_factory=dict)
+    competing_seed_mask: np.ndarray | None = None
+    candidate_generation_threshold: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +211,11 @@ class DetectionRefinementResult:
             {
                 "major_axis_orientation_method": "pca_mask_extent_centroid_direction_v1",
                 "major_axis_orientation_coordinate_system": "image_px_x_right_y_down",
+                "roi_measurements": {
+                    "version": 1,
+                    "area_method": "opencv_external_contours",
+                    "perimeter_method": "opencv_external_contours",
+                },
             }
         )
         return replace(
@@ -511,13 +518,14 @@ def refine_detection(
     boundary_expansion_required = False
     last_tiles: list[RoiTile] = []
     refined_mask = candidate_mask
+    tile_seed = candidate_mask
 
     for iteration in range(resolved_options.max_iterations):
         with measure_phase("refinement.tile_build"):
             last_tiles = build_roi_tiles(
                 detection,
                 roi,
-                refined_mask,
+                tile_seed,
                 options=resolved_options,
                 crop_bbox=crop_bbox,
             )
@@ -553,10 +561,18 @@ def refine_detection(
         if new_crop_bbox == crop_bbox:
             break
         with measure_phase("refinement.roi_expansion"):
+            previous_roi = roi
             roi, refined_mask = _expand_roi_and_mask_from_frame(
                 full_frame,
-                current_roi=roi,
+                current_roi=previous_roi,
                 current_mask=refined_mask,
+                current_crop_bbox=crop_bbox,
+                new_crop_bbox=new_crop_bbox,
+            )
+            _, tile_seed = _expand_roi_and_mask_from_frame(
+                full_frame,
+                current_roi=previous_roi,
+                current_mask=tile_seed,
                 current_crop_bbox=crop_bbox,
                 new_crop_bbox=new_crop_bbox,
             )
@@ -606,8 +622,9 @@ def identity_refine_detections(
     detections: Iterable[DetectionRecord],
     *,
     frame_loader: FrameLoader | None = None,
+    options: RoiRefinementOptions | None = None,
 ) -> list[DetectionRefinementResult]:
-    """Promote candidate ROIs unchanged, without model inference or reconciliation."""
+    """Promote candidate ROIs unchanged and run the shared ROI assessment."""
 
     results: list[DetectionRefinementResult] = []
     for detection in detections:
@@ -658,7 +675,10 @@ def identity_refine_detections(
                 },
             )
         )
-    return results
+    with measure_phase("refinement.split_merge_assessment"):
+        assess_split_merge_refinements(results)
+    with measure_phase("refinement.overlap_reconciliation"):
+        return reconcile_overlapping_refinements(results, options=options)
 
 
 def _refine_detections_with_backend(
@@ -668,6 +688,7 @@ def _refine_detections_with_backend(
     frame_loader: FrameLoader | None,
     options: RoiRefinementOptions,
     method: str | None,
+    all_candidate_seeds: Iterable[DetectionRecord] | None = None,
 ) -> list[DetectionRefinementResult]:
     """Refine whole crops in iteration batches while Pelagia owns expansion."""
     states: list[_BackendRefinementState] = []
@@ -707,6 +728,78 @@ def _refine_detections_with_backend(
             )
         )
 
+    # Project original seeds, not intermediate refinements, into each crop.
+    # This preserves identity even after an ROI expands and the backend is run
+    # again on a larger portion of the source frame.
+    seed_records = list(all_candidate_seeds or detections) if getattr(backend, "protects_candidate_identity", False) else []
+    known_ids = {_detection_identifier(record) for record in seed_records}
+    if getattr(backend, "protects_candidate_identity", False):
+        seed_records.extend(
+            state.detection for state in states
+            if _detection_identifier(state.detection) not in known_ids
+        )
+    selected_masks = {
+        _detection_identifier(state.detection): state.candidate_mask
+        for state in states
+    }
+    seeds_by_frame: dict[tuple[str, str], list[tuple[str, tuple[int, int, int, int], np.ndarray]]] = {}
+    for record in seed_records:
+        identifier = _detection_identifier(record)
+        mask = selected_masks.get(identifier)
+        if mask is None:
+            if record.mask_payload is None and record.roi_payload is None:
+                if frame_loader is None:
+                    raise ValueError(
+                        f"Candidate seed {identifier!r} has no stored mask or ROI payload "
+                        "and frame loading is disabled."
+                    )
+                peer_roi = _crop_detection_roi_from_frame(
+                    record, as_grayscale_array(frame_loader(record.frame_id))
+                )
+                mask = decode_detection_candidate_mask(record, roi=peer_roi)
+            else:
+                mask = decode_detection_candidate_mask(record)
+        bbox = _detection_crop_bbox(record, mask.shape)
+        if mask.shape[:2] != (bbox[3], bbox[2]):
+            raise ValueError(f"Candidate seed {identifier!r} does not match its crop bbox.")
+        seeds_by_frame.setdefault((record.frame_id, record.run_id), []).append((identifier, bbox, mask))
+
+    def competing_seeds(state: _BackendRefinementState) -> np.ndarray:
+        result = np.zeros(state.roi.shape[:2], dtype=np.uint8)
+        crop_x, crop_y, crop_w, crop_h = state.crop_bbox
+        own_id = _detection_identifier(state.detection)
+        for identifier, (seed_x, seed_y, seed_w, seed_h), mask in seeds_by_frame.get((state.detection.frame_id, state.detection.run_id), []):
+            if identifier == own_id:
+                continue
+            x0 = max(crop_x, seed_x)
+            y0 = max(crop_y, seed_y)
+            x1 = min(crop_x + crop_w, seed_x + seed_w)
+            y1 = min(crop_y + crop_h, seed_y + seed_h)
+            if x0 < x1 and y0 < y1:
+                result[y0-crop_y:y1-crop_y, x0-crop_x:x1-crop_x] |= mask[
+                    y0-seed_y:y1-seed_y, x0-seed_x:x1-seed_x
+                ]
+        return result
+
+    def original_seed(state: _BackendRefinementState) -> np.ndarray:
+        """Place the immutable candidate mask in the current expanded crop."""
+        if state.roi.shape[:2] == state.candidate_mask.shape[:2] and not state.expansion_count:
+            return state.candidate_mask.copy()
+        result = np.zeros(state.roi.shape[:2], dtype=np.uint8)
+        seed_x, seed_y, seed_w, seed_h = _detection_crop_bbox(
+            state.detection, state.candidate_mask.shape
+        )
+        crop_x, crop_y, crop_w, crop_h = state.crop_bbox
+        x0 = max(crop_x, seed_x)
+        y0 = max(crop_y, seed_y)
+        x1 = min(crop_x + crop_w, seed_x + seed_w)
+        y1 = min(crop_y + crop_h, seed_y + seed_h)
+        if x0 < x1 and y0 < y1:
+            result[y0-crop_y:y1-crop_y, x0-crop_x:x1-crop_x] = state.candidate_mask[
+                y0-seed_y:y1-seed_y, x0-seed_x:x1-seed_x
+            ]
+        return result
+
     active = list(range(len(states)))
     for iteration in range(options.max_iterations):
         if not active:
@@ -715,12 +808,24 @@ def _refine_detections_with_backend(
             RoiRefinementInput(
                 detection_id=_detection_identifier(states[index].detection),
                 image=np.ascontiguousarray(states[index].roi),
-                candidate_mask=np.ascontiguousarray(states[index].refined_mask),
+                candidate_mask=original_seed(states[index]),
+                competing_seed_mask=(
+                    competing_seeds(states[index])
+                    if getattr(backend, "protects_candidate_identity", False)
+                    else None
+                ),
+                candidate_generation_threshold=(
+                    states[index].detection.metadata.get("candidate_generation_threshold")
+                    if getattr(backend, "protects_candidate_identity", False)
+                    and states[index].roi_source == "payload"
+                    else None
+                ),
                 metadata={
                     "frame_id": states[index].detection.frame_id,
                     "roi_index": states[index].detection.roi_index,
                     "crop_bbox": list(states[index].crop_bbox),
                     "expansion_iteration": iteration,
+                    "seed_policy": "original_candidate_v1",
                 },
             )
             for index in active
@@ -817,6 +922,7 @@ def refine_detections(
     frame_loader: FrameLoader | None = None,
     options: RoiRefinementOptions | None = None,
     method: str | None = None,
+    all_candidate_seeds: Iterable[DetectionRecord] | None = None,
 ) -> list[DetectionRefinementResult]:
     """Refine a batch of candidate detections and reconcile duplicate overlaps."""
     resolved_options = options or RoiRefinementOptions()
@@ -828,6 +934,7 @@ def refine_detections(
             frame_loader=frame_loader,
             options=resolved_options,
             method=method,
+            all_candidate_seeds=all_candidate_seeds,
         )
     else:
         results = [
@@ -853,8 +960,42 @@ def refine_detections(
         )
     with measure_phase("refinement.result_filter"):
         results = _non_empty_refinement_results(results)
+    with measure_phase("refinement.split_merge_assessment"):
+        assess_split_merge_refinements(results)
     with measure_phase("refinement.overlap_reconciliation"):
-        return reconcile_overlapping_refinements(results, options=resolved_options)
+        return reconcile_overlapping_refinements(
+            results,
+            options=replace(resolved_options, overlap_reconciliation_enabled=False)
+            if getattr(backend, "protects_candidate_identity", False)
+            else resolved_options,
+        )
+
+
+def assess_split_merge_refinements(
+    results: Iterable[DetectionRefinementResult],
+) -> None:
+    """Record component and overlap evidence before optional reconciliation."""
+    resolved = list(results)
+    for result in resolved:
+        candidate = as_binary_mask(result.candidate_mask)
+        refined = as_binary_mask(result.refined_mask)
+        candidate_components = int(cv2.connectedComponents(candidate, connectivity=8)[0] - 1)
+        refined_components = int(cv2.connectedComponents(refined, connectivity=8)[0] - 1)
+        result.metadata["split_merge_assessment"] = {
+            "candidate_component_count": candidate_components,
+            "refined_component_count": refined_components,
+            "candidate_pixels": int(np.count_nonzero(candidate)),
+            "refined_pixels": int(np.count_nonzero(refined)),
+            "overlaps": [],
+        }
+    for index, left in enumerate(resolved):
+        for right in resolved[index + 1:]:
+            if left.candidate_detection.frame_id != right.candidate_detection.frame_id:
+                continue
+            metrics = _refined_overlap_metrics(left, right)
+            if metrics["intersection_area"]:
+                left.metadata["split_merge_assessment"]["overlaps"].append(metrics)
+                right.metadata["split_merge_assessment"]["overlaps"].append(metrics)
 
 
 def discover_residual_refinements(
@@ -1055,15 +1196,15 @@ def _residual_candidate_detections(
             residual_mask,
             method=str(assembly_method),
             connectivity=options.residual_roi_assembly_connectivity,
+            filter_options={
+                "min_area": options.residual_min_area,
+                "min_width": options.residual_min_width,
+                "min_height": options.residual_min_height,
+                "min_width_plus_height": options.residual_min_width_plus_height,
+            },
         )
     with measure_phase("refinement.residual_filter"):
-        candidates = filter_candidate_rois(
-            assembled,
-            min_area=options.residual_min_area,
-            min_width=options.residual_min_width,
-            min_height=options.residual_min_height,
-            min_width_plus_height=options.residual_min_width_plus_height,
-        )
+        candidates = assembled
     result.metadata["residual_discovery_remaining_pixels"] = int(np.count_nonzero(residual_mask))
     result.metadata["residual_discovery_candidate_count"] = len(candidates)
     if not candidates:
@@ -1462,11 +1603,10 @@ def _mask_bbox_in_frame(mask: np.ndarray, crop_bbox: tuple[int, int, int, int]) 
 
 def _mask_measurements(mask: np.ndarray) -> tuple[float, float, float, float]:
     binary = as_binary_mask(mask)
-    area = float(np.count_nonzero(binary))
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = external_mask_contours(binary)
+    area, perimeter = measure_contours(contours)
     if not contours:
         return area, 0.0, 0.0, 0.0
-    perimeter = float(sum(cv2.arcLength(contour, True) for contour in contours))
     largest = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(largest)
     if len(largest) >= 5:
