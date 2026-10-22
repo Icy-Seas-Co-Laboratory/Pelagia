@@ -69,6 +69,13 @@ def measure_phase(phase: str) -> Iterator[None]:
         collector.record(phase, (time.perf_counter() - started) * 1000)
 
 
+def record_phase_duration(phase: str, duration_ms: float) -> None:
+    """Record a pre-measured leaf phase when a context manager is impractical."""
+    collector = _ACTIVE_COLLECTOR.get()
+    if collector is not None:
+        collector.record(phase, duration_ms)
+
+
 _Result = TypeVar("_Result", bound=dict[str, Any])
 
 

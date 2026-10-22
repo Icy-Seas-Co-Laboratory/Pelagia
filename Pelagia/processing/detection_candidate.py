@@ -515,7 +515,13 @@ def segment_frame(
 ) -> list[DetectionRecord]:
     """Segment one frame into connected-component ROI detection records."""
     started = time.perf_counter()
-    config = context.config.processing if context is not None and getattr(context, "config", None) is not None else default_processing_config()
+    configuration_started = time.perf_counter()
+    with measure_phase("segmentation.configuration_load"):
+        config = (
+            context.config.processing
+            if context is not None and getattr(context, "config", None) is not None
+            else default_processing_config()
+        )
     mask_defaults = config.mask_augmentation
     assembly_defaults = config.roi_assembly
     filter_defaults = config.roi_filter
@@ -670,6 +676,7 @@ def segment_frame(
     resolved_sobel_percentile = thresholding_defaults.sobel_percentile if sobel_percentile is None else sobel_percentile
     resolved_sobel_threshold = thresholding_defaults.sobel_threshold if sobel_threshold is None else sobel_threshold
     resolved_sobel_kernel_size = thresholding_defaults.sobel_kernel_size if sobel_kernel_size is None else sobel_kernel_size
+    configuration_resolution_ms = (time.perf_counter() - configuration_started) * 1000
 
     frame_id = _frame_metadata_value(frame, "frame_id")
     run_id = _frame_metadata_value(frame, "run_id")
@@ -781,6 +788,7 @@ def segment_frame(
         gray = threshold_result.gray
         threshold_mask = threshold_result.threshold_mask
         stage_durations_ms = dict(threshold_result.stage_durations_ms)
+        stage_durations_ms["configuration_resolution"] = configuration_resolution_ms
         stage_started = time.perf_counter()
         with measure_phase("segmentation.mask_augmentation"):
             augmented_mask = augment_mask(
@@ -801,14 +809,34 @@ def segment_frame(
                 clear_border=resolved_clear_border,
             )
         stage_durations_ms["mask_augmentation"] = (time.perf_counter() - stage_started) * 1000
-        stage_started = time.perf_counter()
-        with measure_phase("segmentation.roi_assembly"):
-            assembled_candidates = assemble_candidate_rois(
-                augmented_mask,
-                method=str(resolved_roi_assembly_method),
-                connectivity=int(resolved_roi_assembly_connectivity),
-            )
-        stage_durations_ms["roi_assembly"] = (time.perf_counter() - stage_started) * 1000
+        assembly_stats: dict[str, int | float] = {}
+        assembly_started = time.perf_counter()
+        assembled_candidates = assemble_candidate_rois(
+            augmented_mask,
+            method=str(resolved_roi_assembly_method),
+            connectivity=int(resolved_roi_assembly_connectivity),
+            filter_options={
+                "min_area": resolved_min_area,
+                "max_area": resolved_max_area,
+                "min_perimeter": resolved_min_perimeter,
+                "max_perimeter": resolved_max_perimeter,
+                "min_width": resolved_min_width,
+                "max_width": resolved_max_width,
+                "min_height": resolved_min_height,
+                "max_height": resolved_max_height,
+                "min_width_plus_height": resolved_min_width_plus_height,
+                "max_width_plus_height": resolved_max_width_plus_height,
+            }
+            if str(resolved_roi_assembly_method).replace("-", "_").lower()
+            in {"connected_components", "components", "connected_component"}
+            else None,
+            assembly_stats=assembly_stats,
+        )
+        labeling_ms = float(assembly_stats.get("connected_component_labeling_ms", 0.0))
+        materialization_ms = float(assembly_stats.get("connected_component_materialization_ms", 0.0))
+        stage_durations_ms["connected_component_labeling"] = labeling_ms
+        stage_durations_ms["connected_component_materialization"] = materialization_ms
+        stage_durations_ms["roi_assembly"] = (time.perf_counter() - assembly_started) * 1000
         stage_started = time.perf_counter()
         with measure_phase("segmentation.roi_filter"):
             candidates = filter_candidate_rois(
@@ -865,7 +893,16 @@ def segment_frame(
             "stage_counts": {
                 "threshold_foreground_pixels": int(np.count_nonzero(threshold_mask)),
                 "augmented_foreground_pixels": int(np.count_nonzero(augmented_mask)),
+                "source_component_count": int(
+                    assembly_stats.get("source_component_count", len(assembled_candidates))
+                ),
                 "assembled_candidate_count": len(assembled_candidates),
+                "materialized_candidate_count": int(
+                    assembly_stats.get("materialized_candidate_count", len(assembled_candidates))
+                ),
+                "filtered_before_materialization_count": int(
+                    assembly_stats.get("filtered_before_materialization_count", 0)
+                ),
                 "filtered_candidate_count": filtered_candidate_count,
                 "recordable_candidate_count": len(candidates),
                 "recorded_detection_count": len(roi_records),
@@ -920,7 +957,9 @@ def segment_frame(
         duration_ms=duration_ms,
         payload={
             **payload_base,
-            "source_component_count": len(assembled_candidates),
+            "source_component_count": int(
+                assembly_stats.get("source_component_count", len(assembled_candidates))
+            ),
             "detection_count": len(roi_records),
             "frame_shape": list(gray.shape),
         },

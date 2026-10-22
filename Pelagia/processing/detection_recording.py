@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 import cv2
@@ -14,7 +15,7 @@ from .frame_codec import encode_array_payload
 from .frame_model import FrameData
 from .mask_augmentation import as_binary_mask
 from .roi_assembly import CandidateRoi
-from .timing import measure_phase
+from .timing import measure_phase, record_phase_duration
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,7 @@ def build_candidate_detection_record(
     extra_metadata: dict[str, Any] | None = None,
 ) -> DetectionRecord:
     """Build a candidate DetectionRecord from an assembled ROI."""
+    preparation_started = time.perf_counter()
     processed_data = processed_frame.read()
     if processed_data is None:
         raise ValueError("Processed frame has no image data to record.")
@@ -112,18 +114,42 @@ def build_candidate_detection_record(
         raise ValueError("Source frame metadata must include frame_id before storing ROIs.")
     if run_id is None:
         raise ValueError("Source frame metadata must include run_id before storing ROIs.")
+    record_phase_duration(
+        "segmentation.record_preparation",
+        (time.perf_counter() - preparation_started) * 1000,
+    )
 
     encoding_reference = roi_array if roi_array is not None else object_array
+    # Candidate generation passes fully resolved recording options, so loading
+    # defaults here would repeat configuration work once for every ROI. Keep
+    # standalone callers backward compatible by resolving all absent values
+    # from one snapshot before selecting the codec.
+    defaults = None
+    if (
+        not small_roi_encoding
+        or not large_roi_encoding
+        or large_roi_min_pixels is None
+        or roi_quality is None
+        or not mask_encoding
+    ):
+        with measure_phase("segmentation.recording_configuration_load"):
+            defaults = default_processing_config().roi_recording
+    resolved_small_roi_encoding = small_roi_encoding or defaults.small_roi_encoding
+    resolved_large_roi_encoding = large_roi_encoding or defaults.large_roi_encoding
+    resolved_large_roi_min_pixels = (
+        defaults.large_roi_min_pixels
+        if large_roi_min_pixels is None
+        else int(large_roi_min_pixels)
+    )
+    selected_quality = defaults.roi_quality if roi_quality is None else int(roi_quality)
+    selected_mask_encoding = str(mask_encoding or defaults.mask_encoding)
     selected_encoding = choose_roi_encoding(
         encoding_reference,
         encoding,
-        small_roi_encoding=small_roi_encoding,
-        large_roi_encoding=large_roi_encoding,
-        large_roi_min_pixels=large_roi_min_pixels,
+        small_roi_encoding=resolved_small_roi_encoding,
+        large_roi_encoding=resolved_large_roi_encoding,
+        large_roi_min_pixels=resolved_large_roi_min_pixels,
     )
-    defaults = default_processing_config().roi_recording
-    selected_quality = defaults.roi_quality if roi_quality is None else int(roi_quality)
-    selected_mask_encoding = str(mask_encoding or defaults.mask_encoding)
     if store_roi_payload:
         if roi_array is None:
             raise RuntimeError("ROI payload was requested but no ROI array was prepared.")
@@ -159,13 +185,16 @@ def build_candidate_detection_record(
         mask_dtype = None
         mask_shape = []
 
-    min_gray, mean_gray = component_gray_stats(object_array, object_mask)
-    major_axis, minor_axis = component_axis_lengths(
-        candidate.contour,
-        candidate.bbox_w,
-        candidate.bbox_h,
-    )
-    orientation = component_major_axis_orientation(object_mask)
+    with measure_phase("segmentation.component_measurements"):
+        min_gray, mean_gray = component_gray_stats(object_array, object_mask)
+        major_axis, minor_axis = component_axis_lengths(
+            candidate.contour,
+            candidate.bbox_w,
+            candidate.bbox_h,
+        )
+    with measure_phase("segmentation.orientation"):
+        orientation = component_major_axis_orientation(object_mask)
+    finalize_started = time.perf_counter()
 
     # Cropped/preprocessed frames carry their original-frame offset in bbox_x/y.
     frame_x_offset = int(getattr(processed_frame, "bbox_x", 0) or 0)
@@ -222,14 +251,16 @@ def build_candidate_detection_record(
             "roi_storage_policy": {
                 "selected_encoding": selected_encoding,
                 "pixel_count": int(encoding_reference.shape[0] * encoding_reference.shape[1]),
-                "large_min_pixels": int(defaults.large_roi_min_pixels if large_roi_min_pixels is None else large_roi_min_pixels),
+                "large_min_pixels": int(
+                    resolved_large_roi_min_pixels
+                ),
                 "quality": selected_quality,
                 "mask_encoding": selected_mask_encoding,
             },
         }
     )
 
-    return DetectionRecord(
+    record = DetectionRecord(
         run_id=str(run_id),
         frame_id=str(frame_id),
         roi_index=int(roi_index or candidate.roi_index),
@@ -265,6 +296,11 @@ def build_candidate_detection_record(
         mask_shape=mask_shape,
         metadata=metadata,
     )
+    record_phase_duration(
+        "segmentation.record_finalization",
+        (time.perf_counter() - finalize_started) * 1000,
+    )
+    return record
 
 
 def choose_roi_encoding(
@@ -276,9 +312,16 @@ def choose_roi_encoding(
     large_roi_min_pixels: int | None = None,
 ) -> str:
     """Select a storage codec from the padded ROI's two-dimensional pixel count."""
-    defaults = default_processing_config().roi_recording
     if encoding is not None and str(encoding).lower() != "auto":
         return str(encoding).lower()
+    defaults = None
+    if (
+        not small_roi_encoding
+        or not large_roi_encoding
+        or large_roi_min_pixels is None
+    ):
+        with measure_phase("segmentation.recording_configuration_load"):
+            defaults = default_processing_config().roi_recording
     small = str(small_roi_encoding or defaults.small_roi_encoding).lower()
     large = str(large_roi_encoding or defaults.large_roi_encoding).lower()
     cutoff = defaults.large_roi_min_pixels if large_roi_min_pixels is None else int(large_roi_min_pixels)
@@ -368,16 +411,25 @@ def component_major_axis_orientation(mask: np.ndarray) -> MajorAxisOrientation:
     the midpoint, only the directed angle is null.
     """
     binary = as_binary_mask(mask)
-    rows, columns = np.nonzero(binary)
-    if columns.size == 0:
+    moments = cv2.moments(binary, binaryImage=True)
+    foreground_pixels = float(moments["m00"])
+    if foreground_pixels <= 0:
         raise ValueError("ROI orientation requires at least one foreground pixel.")
 
-    points = np.column_stack((columns, rows)).astype(np.float64, copy=False)
-    centroid = np.mean(points, axis=0)
-    if len(points) < 2:
+    centroid = np.array(
+        [moments["m10"] / foreground_pixels, moments["m01"] / foreground_pixels],
+        dtype=np.float64,
+    )
+    if foreground_pixels < 2:
         return MajorAxisOrientation(float(centroid[0]), float(centroid[1]), None, None, None, None)
 
-    covariance = np.cov(points, rowvar=False, bias=True)
+    covariance = np.array(
+        [
+            [moments["mu20"] / foreground_pixels, moments["mu11"] / foreground_pixels],
+            [moments["mu11"] / foreground_pixels, moments["mu02"] / foreground_pixels],
+        ],
+        dtype=np.float64,
+    )
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     major_variance = float(eigenvalues[-1])
     minor_variance = float(eigenvalues[0])
@@ -391,8 +443,23 @@ def component_major_axis_orientation(mask: np.ndarray) -> MajorAxisOrientation:
         vector *= -1
     orientation = float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0)
 
-    projections = points @ vector
-    axis_center = vector * ((float(np.min(projections)) + float(np.max(projections))) / 2.0)
+    # A linear projection's per-row extrema are the leftmost and rightmost
+    # foreground pixels. Selecting between those endpoints from the vector's x
+    # sign bounds temporary arrays by mask height instead of foreground-pixel
+    # count and remains cheap for fragmented masks with many contours.
+    left_columns = np.argmax(binary, axis=1)
+    populated_rows = np.flatnonzero(binary[np.arange(binary.shape[0]), left_columns])
+    right_columns = binary.shape[1] - 1 - np.argmax(binary[:, ::-1], axis=1)
+    min_columns, max_columns = (
+        (left_columns, right_columns) if vector[0] >= 0 else (right_columns, left_columns)
+    )
+    min_projection = float(
+        np.min(min_columns[populated_rows] * vector[0] + populated_rows * vector[1])
+    )
+    max_projection = float(
+        np.max(max_columns[populated_rows] * vector[0] + populated_rows * vector[1])
+    )
+    axis_center = vector * ((min_projection + max_projection) / 2.0)
     centroid_offset = float(np.dot(centroid - axis_center, vector))
     direction = (
         None

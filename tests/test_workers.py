@@ -39,6 +39,7 @@ class FakeRepository:
         self.successor_dispatches = []
         self.materialized_dispatches = []
         self.replaced_detections = []
+        self.replace_detection_options = []
         self.refined_detections = []
         self.background_calls = []
         self.touches = []
@@ -217,6 +218,7 @@ class FakeRepository:
 
     def replace_frame_detections(self, run_id, frame_ids, detections, **kwargs):
         self.project_calls.append(("replace_frame_detections", kwargs.get("project_id")))
+        self.replace_detection_options.append(kwargs)
         rows = [
             {"id": f"det-{index}", "frame_id": detection.frame_id}
             for index, detection in enumerate(detections, start=1)
@@ -1592,6 +1594,7 @@ def test_roi_detection_handler_segments_frames_and_stores_detections(monkeypatch
     assert result["frame_count"] == 1
     assert result["detection_count"] == 1
     assert result["detection_ids"] == ["det-1"]
+    assert repo.replace_detection_options == [{"project_id": None, "returning": "ids"}]
     assert result["timings"]["unit_count"] == 1
     assert result["timings"]["phase_counts"]["segmentation.database_update"] == 1
     assert retrieved == [("frame-1", context)]

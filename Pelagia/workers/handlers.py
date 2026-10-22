@@ -901,6 +901,7 @@ def roi_detection_handler(job: dict[str, Any], context: AppContext) -> dict[str,
                     run_frame_ids,
                     detections_by_run[resolved_frame_run_id],
                     project_id=project_id,
+                    returning="ids",
                 )
             )
     _mark_frame_stage_status(

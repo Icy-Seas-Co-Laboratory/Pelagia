@@ -53,6 +53,97 @@ class _MemoryBlobStore:
         return self.payloads[key]
 
 
+class _DetectionInsertCursor:
+    def __init__(self):
+        self.executions = []
+        self.fetchall_calls = 0
+        self._result_sets = []
+        self._rows = []
+        self._result_index = 0
+
+    def executemany(self, statement, parameters, *, returning=False):
+        parameters = list(parameters)
+        self.executions.append((statement, parameters))
+        self._result_sets = [
+            [{"id": f"det-{len(self.executions)}-{index}"}]
+            for index in range(len(parameters))
+        ] if returning else []
+        self._result_index = 0
+        self._rows = self._result_sets[0] if self._result_sets else []
+
+    def nextset(self):
+        self._result_index += 1
+        if self._result_index >= len(self._result_sets):
+            return None
+        self._rows = self._result_sets[self._result_index]
+        return True
+
+    def fetchall(self):
+        self.fetchall_calls += 1
+        return self._rows
+
+
+def _unit_detection(index: int, *, payload_bytes: int = 1) -> DetectionRecord:
+    return DetectionRecord(
+        run_id="run-1",
+        frame_id=f"frame-{index}",
+        roi_index=index,
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=1,
+        bbox_h=1,
+        area=1.0,
+        perimeter=4.0,
+        major_axis_length=1.0,
+        minor_axis_length=1.0,
+        min_gray_value=0,
+        mean_gray_value=0.0,
+        roi_payload=b"r" * payload_bytes,
+        mask_payload=b"m" * payload_bytes,
+        metadata={"index": index},
+    )
+
+
+def test_detection_insert_batches_by_row_count_and_returns_ids_only():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    cursor = _DetectionInsertCursor()
+
+    rows = repository._insert_detection_rows(
+        cursor,
+        "run-1",
+        [_unit_detection(index) for index in range(5)],
+        returning="ids",
+        batch_rows=2,
+        batch_bytes=1024 * 1024,
+    )
+
+    assert [len(parameters) for _, parameters in cursor.executions] == [2, 2, 1]
+    assert all("RETURNING id" in statement for statement, _ in cursor.executions)
+    assert all("RETURNING *" not in statement for statement, _ in cursor.executions)
+    assert len(rows) == 5
+
+
+def test_detection_insert_batches_by_payload_bytes_and_can_skip_returning():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    cursor = _DetectionInsertCursor()
+
+    rows = repository._insert_detection_rows(
+        cursor,
+        "run-1",
+        [_unit_detection(index, payload_bytes=4_000) for index in range(2)],
+        returning="none",
+        batch_rows=250,
+        batch_bytes=9_000,
+    )
+
+    assert [len(parameters) for _, parameters in cursor.executions] == [1, 1]
+    assert all("RETURNING" not in statement for statement, _ in cursor.executions)
+    assert cursor.fetchall_calls == 0
+    assert rows == []
+
+
 def test_render_schema_loads_sql_resource():
     rendered = postgres.render_schema("pelagia_unit")
 
@@ -1444,70 +1535,104 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert postgres_repo.get_frame_record(inserted_frames[0]["id"]).payload_ref == "kvstore-key-1"
     assert postgres_repo.list_frame_records(asset_id)[1].bbox_x == 7
 
-    inserted_detections = postgres_repo.replace_detections(
-        run_id,
-        asset_id,
-        [
-            DetectionRecord(
-                run_id=run_id,
-                frame_id=inserted_frames[0]["id"],
-                roi_index=1,
-                bbox_x=1,
-                bbox_y=2,
-                bbox_w=3,
-                bbox_h=4,
-                area=12.0,
-                perimeter=14.0,
-                major_axis_length=4.0,
-                minor_axis_length=3.0,
-                min_gray_value=5,
-                mean_gray_value=6.5,
-                roi_payload=b"roi-bytes",
-                mask_payload=b"mask-bytes",
-                crop_bbox_x=0,
-                crop_bbox_y=1,
-                crop_bbox_w=5,
-                crop_bbox_h=6,
-                roi_encoding="raw",
-                roi_format="raw_ndarray_c_order",
-                roi_dtype="uint8",
-                roi_shape=[4, 5],
-                mask_encoding="raw",
-                mask_format="raw_ndarray_c_order",
-                mask_dtype="uint8",
-                mask_shape=[4, 5],
-                metadata={"kind": "roi"},
-            ),
-            DetectionRecord(
-                run_id=run_id,
-                frame_id=inserted_frames[1]["id"],
-                roi_index=1,
-                bbox_x=10,
-                bbox_y=20,
-                bbox_w=30,
-                bbox_h=40,
-                area=1200.0,
-                perimeter=140.0,
-                major_axis_length=40.0,
-                minor_axis_length=30.0,
-                min_gray_value=8,
-                mean_gray_value=9.5,
-                roi_payload=b"other-roi",
-                mask_payload=b"other-mask",
-                roi_encoding="png",
-                roi_format="png",
-                mask_encoding="png",
-                mask_format="png",
-                metadata={"kind": "roi"},
-            )
-        ],
-    )
+    detection_records = [
+        DetectionRecord(
+            run_id=run_id,
+            frame_id=inserted_frames[0]["id"],
+            roi_index=1,
+            bbox_x=1,
+            bbox_y=2,
+            bbox_w=3,
+            bbox_h=4,
+            area=12.0,
+            perimeter=14.0,
+            major_axis_length=4.0,
+            minor_axis_length=3.0,
+            min_gray_value=5,
+            mean_gray_value=6.5,
+            roi_payload=b"roi-bytes",
+            mask_payload=b"mask-bytes",
+            crop_bbox_x=0,
+            crop_bbox_y=1,
+            crop_bbox_w=5,
+            crop_bbox_h=6,
+            roi_encoding="raw",
+            roi_format="raw_ndarray_c_order",
+            roi_dtype="uint8",
+            roi_shape=[4, 5],
+            mask_encoding="raw",
+            mask_format="raw_ndarray_c_order",
+            mask_dtype="uint8",
+            mask_shape=[4, 5],
+            metadata={"kind": "roi"},
+        ),
+        DetectionRecord(
+            run_id=run_id,
+            frame_id=inserted_frames[1]["id"],
+            roi_index=1,
+            bbox_x=10,
+            bbox_y=20,
+            bbox_w=30,
+            bbox_h=40,
+            area=1200.0,
+            perimeter=140.0,
+            major_axis_length=40.0,
+            minor_axis_length=30.0,
+            min_gray_value=8,
+            mean_gray_value=9.5,
+            roi_payload=b"other-roi",
+            mask_payload=b"other-mask",
+            roi_encoding="png",
+            roi_format="png",
+            mask_encoding="png",
+            mask_format="png",
+            metadata={"kind": "roi"},
+        ),
+    ]
+    inserted_detections = postgres_repo.replace_detections(run_id, asset_id, detection_records)
     assert len(inserted_detections) == 2
     assert inserted_detections[0]["roi_payload"] == b"roi-bytes"
     assert inserted_detections[0]["mask_payload"] == b"mask-bytes"
     assert inserted_detections[0]["crop_bbox_w"] == 5
     assert inserted_detections[0]["roi_encoding"] == "raw"
     assert inserted_detections[0]["mask_shape"] == [4, 5]
+
+    inserted_ids = postgres_repo.replace_frame_detections(
+        run_id,
+        [str(frame["id"]) for frame in inserted_frames],
+        detection_records,
+        returning="ids",
+    )
+    assert len(inserted_ids) == 2
+    assert all(set(row) == {"id"} for row in inserted_ids)
+    inserted_detections = postgres_repo.replace_detections(run_id, asset_id, detection_records)
+
+    rollback_records = [
+        DetectionRecord(
+            run_id=run_id,
+            frame_id=inserted_frames[index % 2]["id"],
+            roi_index=index + 10,
+            bbox_x=0,
+            bbox_y=0,
+            bbox_w=0 if index == 250 else 1,
+            bbox_h=1,
+            area=1.0,
+            perimeter=4.0,
+            major_axis_length=1.0,
+            minor_axis_length=1.0,
+            min_gray_value=0,
+            mean_gray_value=0.0,
+            roi_payload=None,
+        )
+        for index in range(251)
+    ]
+    with pytest.raises(postgres.psycopg.errors.CheckViolation):
+        postgres_repo.replace_frame_detections(
+            run_id,
+            [str(frame["id"]) for frame in inserted_frames],
+            rollback_records,
+            returning="ids",
+        )
 
     detections = postgres_repo.list_detections(asset_id)
     assert len(detections) == 2

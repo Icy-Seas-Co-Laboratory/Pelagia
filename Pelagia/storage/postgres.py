@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from ..config import CoreConfig
 from ..domain import AssetKind, ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
@@ -92,6 +92,14 @@ FRAME_PROCESSING_STATUS_VALUES = (
 FRAME_PROCESSING_STATUSES = set(FRAME_PROCESSING_STATUS_VALUES)
 PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+DETECTION_INSERT_BATCH_ROWS = 250
+DETECTION_INSERT_BATCH_BYTES = 8 * 1024 * 1024
+
+_DETECTION_INSERT_VALUE_SQL = """
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -3016,11 +3024,87 @@ class PostgresRepository:
         cursor,
         run_id: str,
         detections: Sequence[DetectionRecord],
+        *,
+        returning: Literal["full", "ids", "none"] = "full",
+        batch_rows: int = DETECTION_INSERT_BATCH_ROWS,
+        batch_bytes: int = DETECTION_INSERT_BATCH_BYTES,
     ) -> list[dict[str, Any]]:
+        """Insert candidates through bounded pipelined statement groups.
+
+        The byte limit is based on the encoded parameter values. A single row
+        larger than the limit is allowed as its own batch so that valid large
+        ROI payloads remain publishable.
+        """
+        if returning not in {"full", "ids", "none"}:
+            raise ValueError("returning must be one of: full, ids, none")
+        if batch_rows < 1:
+            raise ValueError("batch_rows must be at least 1")
+        if batch_bytes < 1:
+            raise ValueError("batch_bytes must be at least 1")
+
+        def parameters(detection: DetectionRecord) -> tuple[Any, ...]:
+            return (
+                run_id,
+                detection.frame_id,
+                detection.roi_index,
+                detection.bbox_x,
+                detection.bbox_y,
+                detection.bbox_w,
+                detection.bbox_h,
+                detection.crop_bbox_x,
+                detection.crop_bbox_y,
+                detection.crop_bbox_w,
+                detection.crop_bbox_h,
+                detection.area,
+                detection.perimeter,
+                detection.major_axis_length,
+                detection.minor_axis_length,
+                detection.centroid_x,
+                detection.centroid_y,
+                detection.major_axis_center_x,
+                detection.major_axis_center_y,
+                detection.major_axis_orientation_degrees,
+                detection.major_axis_direction_degrees,
+                detection.min_gray_value,
+                detection.mean_gray_value,
+                detection.roi_payload,
+                detection.mask_payload,
+                detection.roi_encoding,
+                detection.roi_format,
+                detection.roi_dtype,
+                json.dumps(json_ready(detection.roi_shape)),
+                detection.mask_encoding,
+                detection.mask_format,
+                detection.mask_dtype,
+                json.dumps(json_ready(detection.mask_shape)),
+                json.dumps(json_ready(detection.metadata)),
+            )
+
+        def parameter_bytes(values: Sequence[Any]) -> int:
+            total = 0
+            for value in values:
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    total += len(value)
+                elif isinstance(value, str):
+                    total += len(value.encode("utf-8"))
+                elif value is not None:
+                    total += len(str(value))
+            return total
+
+        pending: list[tuple[Any, ...]] = []
+        pending_bytes = 0
         inserted: list[dict[str, Any]] = []
-        for detection in detections:
-            cursor.execute(
-                f"""
+
+        def flush() -> None:
+            nonlocal pending, pending_bytes
+            if not pending:
+                return
+            returning_sql = {
+                "full": "RETURNING *",
+                "ids": "RETURNING id",
+                "none": "",
+            }[returning]
+            statement = f"""
                 INSERT INTO {self.schema}.detection_candidate
                 (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
                  crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
@@ -3030,49 +3114,30 @@ class PostgresRepository:
                  min_gray_value, mean_gray_value, roi_payload, mask_payload,
                  roi_encoding, roi_format, roi_dtype, roi_shape,
                  mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb)
-                RETURNING *;
-                """,
-                (
-                    run_id,
-                    detection.frame_id,
-                    detection.roi_index,
-                    detection.bbox_x,
-                    detection.bbox_y,
-                    detection.bbox_w,
-                    detection.bbox_h,
-                    detection.crop_bbox_x,
-                    detection.crop_bbox_y,
-                    detection.crop_bbox_w,
-                    detection.crop_bbox_h,
-                    detection.area,
-                    detection.perimeter,
-                    detection.major_axis_length,
-                    detection.minor_axis_length,
-                    detection.centroid_x,
-                    detection.centroid_y,
-                    detection.major_axis_center_x,
-                    detection.major_axis_center_y,
-                    detection.major_axis_orientation_degrees,
-                    detection.major_axis_direction_degrees,
-                    detection.min_gray_value,
-                    detection.mean_gray_value,
-                    detection.roi_payload,
-                    detection.mask_payload,
-                    detection.roi_encoding,
-                    detection.roi_format,
-                    detection.roi_dtype,
-                    json.dumps(json_ready(detection.roi_shape)),
-                    detection.mask_encoding,
-                    detection.mask_format,
-                    detection.mask_dtype,
-                    json.dumps(json_ready(detection.mask_shape)),
-                    json.dumps(json_ready(detection.metadata)),
-                ),
+                VALUES ({_DETECTION_INSERT_VALUE_SQL})
+                {returning_sql};
+                """
+            cursor.executemany(
+                statement,
+                pending,
+                returning=returning != "none",
             )
-            inserted.append(cursor.fetchone())
+            if returning != "none":
+                while True:
+                    inserted.extend(cursor.fetchall())
+                    if not cursor.nextset():
+                        break
+            pending = []
+            pending_bytes = 0
+
+        for detection in detections:
+            row = parameters(detection)
+            row_bytes = parameter_bytes(row)
+            if pending and (len(pending) >= batch_rows or pending_bytes + row_bytes > batch_bytes):
+                flush()
+            pending.append(row)
+            pending_bytes += row_bytes
+        flush()
         return inserted
 
     def upsert_refined_detections(
@@ -3181,6 +3246,7 @@ class PostgresRepository:
         detections: Sequence[DetectionRecord],
         *,
         project_id: str | None = None,
+        returning: Literal["full", "ids", "none"] = "full",
     ) -> list[dict[str, Any]]:
         resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
         if not resolved_frame_ids:
@@ -3200,7 +3266,7 @@ class PostgresRepository:
                     """,
                     (resolved_frame_ids,),
                 )
-                inserted = self._insert_detection_rows(cursor, run_id, detections)
+                inserted = self._insert_detection_rows(cursor, run_id, detections, returning=returning)
             connection.commit()
         return inserted
 

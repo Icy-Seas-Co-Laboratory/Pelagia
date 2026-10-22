@@ -1,0 +1,353 @@
+{
+  "baseline_commit": "9141ded752729d3f02dabf09f6be59fad34585e8",
+  "candidate_before": {
+    "environment": {
+      "python": "3.12.2",
+      "platform": "macOS-26.6.2-arm64-arm-64bit",
+      "numpy": "2.4.6",
+      "opencv": "4.13.0",
+      "opencv_threads": 1
+    },
+    "iterations": 100,
+    "scope": "in-memory segmentation with raw ROI/mask encoding; no decoding, augmentation, preprocessing, or database",
+    "scenarios": {
+      "many_rejected": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1647,
+        "detections": 7,
+        "median_ms": 24.989770999999998,
+        "mean_ms": 25.32603207,
+        "p95_ms": 26.9326024,
+        "frames_per_second": 39.485064112532335,
+        "config_loads_per_frame": 14.0,
+        "tracemalloc_peak_bytes": 9739084,
+        "geometry_payload_sha256": "d32fc44ae86d3205ef82b0381bbe6b1acf990b25d8094011dfa80c309bd7b7c1",
+        "single_sample_phases_ms": {
+          "segmentation.grayscale": 0.0012919772416353226,
+          "segmentation.thresholding": 0.275749946013093,
+          "segmentation.mask_augmentation": 0.0688331201672554,
+          "segmentation.roi_assembly": 10.952374897897243,
+          "segmentation.roi_filter": 0.5895420908927917,
+          "segmentation.roi_encode": 0.0077076256275177,
+          "segmentation.mask_encode": 0.005542067810893059
+        }
+      },
+      "few_components": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 7,
+        "detections": 7,
+        "median_ms": 14.993875,
+        "mean_ms": 15.05720083,
+        "p95_ms": 15.42827675,
+        "frames_per_second": 66.41340653487187,
+        "config_loads_per_frame": 14.0,
+        "tracemalloc_peak_bytes": 9440987,
+        "geometry_payload_sha256": "998b9084a2eadcaf277c231a1a79d5e7cfb28e6d28c28c0fbcc1123e7ee7aac6",
+        "single_sample_phases_ms": {
+          "segmentation.grayscale": 0.0009171199053525925,
+          "segmentation.thresholding": 0.23779179900884628,
+          "segmentation.mask_augmentation": 0.05879206582903862,
+          "segmentation.roi_assembly": 2.0510421600192785,
+          "segmentation.roi_filter": 0.004749977961182594,
+          "segmentation.roi_encode": 0.007168157026171684,
+          "segmentation.mask_encode": 0.005542067810893059
+        }
+      },
+      "large_object": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1,
+        "detections": 1,
+        "median_ms": 20.5395005,
+        "mean_ms": 20.68409045,
+        "p95_ms": 22.2052625,
+        "frames_per_second": 48.34633664058455,
+        "config_loads_per_frame": 2.0,
+        "tracemalloc_peak_bytes": 29088856,
+        "geometry_payload_sha256": "b5b93ac0c09ab3de31aa4007705809ce8b86536d4257dc9cda9a023e4ef2c337",
+        "single_sample_phases_ms": {
+          "segmentation.grayscale": 0.0020419247448444366,
+          "segmentation.thresholding": 0.2710828557610512,
+          "segmentation.mask_augmentation": 0.058999983593821526,
+          "segmentation.roi_assembly": 3.429500153288245,
+          "segmentation.roi_filter": 0.003084074705839157,
+          "segmentation.roi_encode": 0.01033395528793335,
+          "segmentation.mask_encode": 0.025290995836257935
+        }
+      },
+      "dense_mask": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1,
+        "detections": 1,
+        "median_ms": 33.864208500000004,
+        "mean_ms": 34.00631995,
+        "p95_ms": 35.361875,
+        "frames_per_second": 29.406298637144946,
+        "config_loads_per_frame": 2.0,
+        "tracemalloc_peak_bytes": 55793536,
+        "geometry_payload_sha256": "a3979d0030f6d515b2cdca8c2536b609dcc1d79a41de0ff26d3ba4c54790cdd8",
+        "single_sample_phases_ms": {
+          "segmentation.grayscale": 0.00200001522898674,
+          "segmentation.thresholding": 0.5758330225944519,
+          "segmentation.mask_augmentation": 0.055459095165133476,
+          "segmentation.roi_assembly": 5.554582923650742,
+          "segmentation.roi_filter": 0.003250082954764366,
+          "segmentation.roi_encode": 0.050459057092666626,
+          "segmentation.mask_encode": 0.08479203097522259
+        }
+      }
+    }
+  },
+  "candidate_after": {
+    "environment": {
+      "python": "3.12.2",
+      "platform": "macOS-26.6.2-arm64-arm-64bit",
+      "numpy": "2.4.6",
+      "opencv": "4.13.0",
+      "opencv_threads": 1
+    },
+    "iterations": 100,
+    "scope": "in-memory segmentation with raw ROI/mask encoding; no decoding, augmentation, preprocessing, or database",
+    "scenarios": {
+      "many_rejected": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1647,
+        "detections": 7,
+        "median_ms": 4.6423955,
+        "mean_ms": 4.66091876,
+        "p95_ms": 4.8221976,
+        "frames_per_second": 214.54997426301418,
+        "config_loads_per_frame": 0.0,
+        "tracemalloc_peak_bytes": 9500267,
+        "geometry_payload_sha256": "d32fc44ae86d3205ef82b0381bbe6b1acf990b25d8094011dfa80c309bd7b7c1",
+        "single_sample_phases_ms": {
+          "segmentation.configuration_load": 0.0007499475032091141,
+          "segmentation.grayscale": 0.0008749775588512421,
+          "segmentation.thresholding": 0.21087494678795338,
+          "segmentation.mask_augmentation": 0.05875015631318092,
+          "segmentation.connected_component_labeling": 1.9823748152703047,
+          "segmentation.connected_component_materialization": 1.6224589198827744,
+          "segmentation.roi_filter": 0.005500158295035362,
+          "segmentation.record_preparation": 0.07158378139138222,
+          "segmentation.roi_encode": 0.005666166543960571,
+          "segmentation.mask_encode": 0.004665926098823547,
+          "segmentation.component_measurements": 0.1475841272622347,
+          "segmentation.orientation": 0.36145863123238087,
+          "segmentation.record_finalization": 0.03358116373419762
+        }
+      },
+      "few_components": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 7,
+        "detections": 7,
+        "median_ms": 3.130354,
+        "mean_ms": 3.14976378,
+        "p95_ms": 3.3500981999999997,
+        "frames_per_second": 317.4841257460901,
+        "config_loads_per_frame": 0.0,
+        "tracemalloc_peak_bytes": 9441195,
+        "geometry_payload_sha256": "998b9084a2eadcaf277c231a1a79d5e7cfb28e6d28c28c0fbcc1123e7ee7aac6",
+        "single_sample_phases_ms": {
+          "segmentation.configuration_load": 0.0003748573362827301,
+          "segmentation.grayscale": 0.00062515027821064,
+          "segmentation.thresholding": 0.2027079463005066,
+          "segmentation.mask_augmentation": 0.05866703577339649,
+          "segmentation.connected_component_labeling": 1.7026248387992382,
+          "segmentation.connected_component_materialization": 0.07054186426103115,
+          "segmentation.roi_filter": 0.00500003807246685,
+          "segmentation.record_preparation": 0.07066712714731693,
+          "segmentation.roi_encode": 0.005957670509815216,
+          "segmentation.mask_encode": 0.0051246024668216705,
+          "segmentation.component_measurements": 0.1474160235375166,
+          "segmentation.orientation": 0.37266663275659084,
+          "segmentation.record_finalization": 0.03520771861076355
+        }
+      },
+      "large_object": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1,
+        "detections": 1,
+        "median_ms": 5.5721255,
+        "mean_ms": 5.62631541,
+        "p95_ms": 6.121291649999998,
+        "frames_per_second": 177.73621404563238,
+        "config_loads_per_frame": 0.0,
+        "tracemalloc_peak_bytes": 9620586,
+        "geometry_payload_sha256": "b5b93ac0c09ab3de31aa4007705809ce8b86536d4257dc9cda9a023e4ef2c337",
+        "single_sample_phases_ms": {
+          "segmentation.configuration_load": 0.00045797787606716156,
+          "segmentation.grayscale": 0.0006668269634246826,
+          "segmentation.thresholding": 0.27979095466434956,
+          "segmentation.mask_augmentation": 0.05874992348253727,
+          "segmentation.connected_component_labeling": 2.960499841719866,
+          "segmentation.connected_component_materialization": 0.2015838399529457,
+          "segmentation.roi_filter": 0.0027080532163381577,
+          "segmentation.record_preparation": 0.2009579911828041,
+          "segmentation.roi_encode": 0.008667120710015297,
+          "segmentation.mask_encode": 0.024041160941123962,
+          "segmentation.component_measurements": 0.49308291636407375,
+          "segmentation.orientation": 0.8563748560845852,
+          "segmentation.record_finalization": 0.00600004568696022
+        }
+      },
+      "dense_mask": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "components": 1,
+        "detections": 1,
+        "median_ms": 8.8008955,
+        "mean_ms": 8.79929209,
+        "p95_ms": 9.0627976,
+        "frames_per_second": 113.64550577158987,
+        "config_loads_per_frame": 0.0,
+        "tracemalloc_peak_bytes": 10489940,
+        "geometry_payload_sha256": "a3979d0030f6d515b2cdca8c2536b609dcc1d79a41de0ff26d3ba4c54790cdd8",
+        "single_sample_phases_ms": {
+          "segmentation.configuration_load": 0.00033294782042503357,
+          "segmentation.grayscale": 0.000666128471493721,
+          "segmentation.thresholding": 0.3242911770939827,
+          "segmentation.mask_augmentation": 0.09325006976723671,
+          "segmentation.connected_component_labeling": 4.5906249433755875,
+          "segmentation.connected_component_materialization": 0.7630409672856331,
+          "segmentation.roi_filter": 0.003416091203689575,
+          "segmentation.record_preparation": 0.2274580765515566,
+          "segmentation.roi_encode": 0.049042049795389175,
+          "segmentation.mask_encode": 0.049208989366889,
+          "segmentation.component_measurements": 1.0524580720812082,
+          "segmentation.orientation": 1.2908328790217638,
+          "segmentation.record_finalization": 0.005915993824601173
+        }
+      }
+    }
+  },
+  "orientation": {
+    "environment": {
+      "python": "3.12.2",
+      "numpy": "2.4.6",
+      "opencv": "4.13.0",
+      "opencv_threads": 1
+    },
+    "iterations": 500,
+    "scenarios": {
+      "small_candidate_bbox": {
+        "shape": [
+          32,
+          48
+        ],
+        "foreground_pixels": 217,
+        "coordinate_array_median_ms": 0.0553,
+        "moments_row_extrema_median_ms": 0.0424,
+        "speedup": 1.31,
+        "coordinate_array_peak_bytes": 17592,
+        "moments_row_extrema_peak_bytes": 8198
+      },
+      "large_filled": {
+        "shape": [
+          768,
+          1024
+        ],
+        "foreground_pixels": 249365,
+        "coordinate_array_median_ms": 8.1613,
+        "moments_row_extrema_median_ms": 0.9237,
+        "speedup": 8.84,
+        "coordinate_array_peak_bytes": 12823688,
+        "moments_row_extrema_peak_bytes": 1592554
+      },
+      "sparse_disconnected": {
+        "shape": [
+          768,
+          1024
+        ],
+        "foreground_pixels": 5220,
+        "coordinate_array_median_ms": 1.7868,
+        "moments_row_extrema_median_ms": 0.9545,
+        "speedup": 1.87,
+        "coordinate_array_peak_bytes": 1573153,
+        "moments_row_extrema_peak_bytes": 1591530
+      },
+      "noisy_6550_components": {
+        "shape": [
+          768,
+          1024
+        ],
+        "foreground_pixels": 6550,
+        "coordinate_array_median_ms": 1.8225,
+        "moments_row_extrema_median_ms": 0.943,
+        "speedup": 1.93,
+        "coordinate_array_peak_bytes": 1573153,
+        "moments_row_extrema_peak_bytes": 1589166
+      },
+      "ring_with_island": {
+        "shape": [
+          768,
+          1024
+        ],
+        "foreground_pixels": 17823,
+        "coordinate_array_median_ms": 2.1157,
+        "moments_row_extrema_median_ms": 0.9496,
+        "speedup": 2.23,
+        "coordinate_array_peak_bytes": 1709624,
+        "moments_row_extrema_peak_bytes": 1592646
+      }
+    }
+  },
+  "publication": {
+    "baseline": {
+      "detections": 27,
+      "frames": 4,
+      "iterations": 100,
+      "median_ms_per_frame": 1.4713697601109743,
+      "median_ms_per_publication": 5.885479040443897,
+      "p95_ms_per_publication": 7.292374968528748,
+      "payload_bytes_per_detection": 20480,
+      "payload_distribution": "seeded opaque random bytes",
+      "variant": "baseline_full"
+    },
+    "batched_full": {
+      "detections": 27,
+      "frames": 4,
+      "iterations": 100,
+      "median_ms_per_frame": 1.2308802688494325,
+      "median_ms_per_publication": 4.92352107539773,
+      "p95_ms_per_publication": 5.66533301025629,
+      "payload_bytes_per_detection": 20480,
+      "payload_distribution": "seeded opaque random bytes",
+      "variant": "batched_full"
+    },
+    "batched_ids": {
+      "detections": 27,
+      "frames": 4,
+      "iterations": 100,
+      "median_ms_per_frame": 0.8496717491652817,
+      "median_ms_per_publication": 3.3986869966611266,
+      "p95_ms_per_publication": 4.411166999489069,
+      "payload_bytes_per_detection": 20480,
+      "payload_distribution": "seeded opaque random bytes",
+      "variant": "batched_ids"
+    },
+    "benchmark": "detection_publication",
+    "worker_median_improvement_percent": 42.25300993672744
+  }
+}

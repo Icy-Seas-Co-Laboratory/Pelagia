@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+import time
 from typing import Any
 
 import cv2
 import numpy as np
 
 from .mask_augmentation import as_binary_mask
+from .roi_filter import component_statistics_pass_filters
+from .timing import measure_phase
 
 
 @dataclass(slots=True)
@@ -42,59 +46,115 @@ def assemble_candidate_rois(
     *,
     method: str = "connected_components",
     connectivity: int = 8,
+    filter_options: dict[str, int | float | None] | None = None,
+    assembly_stats: dict[str, int | float] | None = None,
 ) -> list[CandidateRoi]:
     """Assemble candidate ROI objects from a binary mask."""
     resolved_method = str(method).replace("-", "_").lower()
     binary = as_binary_mask(mask)
     if resolved_method in {"connected_components", "components", "connected_component"}:
-        return assemble_connected_components(binary, connectivity=connectivity)
+        return assemble_connected_components(
+            binary,
+            connectivity=connectivity,
+            filter_options=filter_options,
+            assembly_stats=assembly_stats,
+        )
     if resolved_method in {"contours", "find_contours"}:
-        return assemble_contours(binary)
+        with (
+            measure_phase("segmentation.contour_assembly")
+            if assembly_stats is not None
+            else nullcontext()
+        ):
+            candidates = assemble_contours(binary)
+        if assembly_stats is not None:
+            assembly_stats.update(
+                source_component_count=len(candidates),
+                materialized_candidate_count=len(candidates),
+                filtered_before_materialization_count=0,
+            )
+        return candidates
     raise ValueError(f"Unsupported ROI assembly method {method!r}.")
 
 
-def assemble_connected_components(mask: np.ndarray, *, connectivity: int = 8) -> list[CandidateRoi]:
+def assemble_connected_components(
+    mask: np.ndarray,
+    *,
+    connectivity: int = 8,
+    filter_options: dict[str, int | float | None] | None = None,
+    assembly_stats: dict[str, int | float] | None = None,
+) -> list[CandidateRoi]:
     """Assemble ROIs using OpenCV connected components."""
     binary = as_binary_mask(mask)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (binary > 0).astype(np.uint8),
-        connectivity=int(connectivity),
-    )
-    candidates: list[CandidateRoi] = []
-    for label in range(1, num):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        width = int(stats[label, cv2.CC_STAT_WIDTH])
-        height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        #area = float(stats[label, cv2.CC_STAT_AREA])
-        area = float(width * height) # area is bbox area.
-        # Candidate masks are bbox-local even though bbox coordinates are frame-relative.
-        component_mask = np.ascontiguousarray(
-            (labels[y:y + height, x:x + width] == label).astype(np.uint8) * 255
+    label_started = time.perf_counter()
+    with (
+        measure_phase("segmentation.connected_component_labeling")
+        if assembly_stats is not None
+        else nullcontext()
+    ):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (binary > 0).astype(np.uint8),
+            connectivity=int(connectivity),
         )
-        contour = _largest_contour(component_mask)
-        if contour is None:
-            continue
-        perimeter = float(cv2.arcLength(contour, True))
-        candidates.append(
-            CandidateRoi(
-                roi_index=len(candidates) + 1,
-                bbox_x=x,
-                bbox_y=y,
-                bbox_w=width,
-                bbox_h=height,
+    label_duration_ms = (time.perf_counter() - label_started) * 1000
+    source_component_count = int(num - 1)
+    options = filter_options or {}
+    candidates: list[CandidateRoi] = []
+    materialization_started = time.perf_counter()
+    with (
+        measure_phase("segmentation.connected_component_materialization")
+        if assembly_stats is not None
+        else nullcontext()
+    ):
+        for label in range(1, num):
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            width = int(stats[label, cv2.CC_STAT_WIDTH])
+            height = int(stats[label, cv2.CC_STAT_HEIGHT])
+            # Candidate area has historically been its bounding-box area, not
+            # its foreground-pixel count. Keep that public semantics here.
+            area = float(width * height)
+            if not component_statistics_pass_filters(
                 area=area,
-                perimeter=perimeter,
-                mask=np.ascontiguousarray(component_mask),
-                contour=contour,
-                mask_x=x,
-                mask_y=y,
-                metadata={
-                    "assembly_method": "connected_components",
-                    "component_label": int(label),
-                    "mask_coordinate_space": "bbox_local",
-                },
+                width=width,
+                height=height,
+                **options,
+            ):
+                continue
+            # Candidate masks are bbox-local even though bbox coordinates are frame-relative.
+            component_mask = np.ascontiguousarray(
+                (labels[y:y + height, x:x + width] == label).astype(np.uint8) * 255
             )
+            contour = _largest_contour(component_mask)
+            if contour is None:
+                continue
+            perimeter = float(cv2.arcLength(contour, True))
+            candidates.append(
+                CandidateRoi(
+                    roi_index=len(candidates) + 1,
+                    bbox_x=x,
+                    bbox_y=y,
+                    bbox_w=width,
+                    bbox_h=height,
+                    area=area,
+                    perimeter=perimeter,
+                    mask=np.ascontiguousarray(component_mask),
+                    contour=contour,
+                    mask_x=x,
+                    mask_y=y,
+                    metadata={
+                        "assembly_method": "connected_components",
+                        "component_label": int(label),
+                        "mask_coordinate_space": "bbox_local",
+                    },
+                )
+            )
+    if assembly_stats is not None:
+        assembly_stats.update(
+            source_component_count=source_component_count,
+            materialized_candidate_count=len(candidates),
+            filtered_before_materialization_count=source_component_count - len(candidates),
+            connected_component_labeling_ms=label_duration_ms,
+            connected_component_materialization_ms=(time.perf_counter() - materialization_started) * 1000,
         )
     return candidates
 
