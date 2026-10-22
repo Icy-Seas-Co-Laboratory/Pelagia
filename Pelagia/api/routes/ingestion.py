@@ -653,9 +653,7 @@ if APIRouter is not None:
                 checksum_status=checksum_status,
             )
             shard_payloads = [payload]
-            if asset.kind == AssetKind.INTERCHANGE.value and int(payload.get("n_tile", 1)) == 1 and not (
-                payload.get("generate_backgrounds") or payload.get("generate_flatfield_profiles")
-            ):
+            if asset.kind == AssetKind.INTERCHANGE.value:
                 from pelagia_interchange import Dataset
 
                 dataset = Dataset.open(Path(asset.path).expanduser().resolve())

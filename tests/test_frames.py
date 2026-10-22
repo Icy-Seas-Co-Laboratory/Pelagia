@@ -1446,7 +1446,7 @@ def test_interchange_shard_import_has_stable_indexes_after_missing_frame(tmp_pat
 def test_interchange_import_tiles_consecutive_frames_with_provenance(tmp_path):
     package = tmp_path / "tiled-interchange"
     images = [np.full((2, 3), value, dtype=np.uint8) for value in (10, 20, 30)]
-    with DatasetBuilder(package, maximum_frame_count=1) as builder:
+    with DatasetBuilder(package, maximum_frame_count=2) as builder:
         source = builder.register_source_file(original_filename="camera.avi", frame_count=3)
         for number, image in enumerate(images):
             ok, encoded = ingest_module.cv2.imencode(".png", image)
@@ -1477,6 +1477,45 @@ def test_interchange_import_tiles_consecutive_frames_with_provenance(tmp_path):
     assert [frame["frame_id"] for frame in first_metadata["interchange"]["tile_frames"]] == [0, 1]
     assert first_metadata.get("encoded_payload_passthrough") is not True
     assert second[4:6] == (3, 2)
+
+
+def test_interchange_tiling_stops_at_shard_boundaries_with_stable_indexes(tmp_path):
+    package = tmp_path / "tiled-shards"
+    images = [np.full((2, 3), value, dtype=np.uint8) for value in (10, 20, 30, 40)]
+    with DatasetBuilder(package, maximum_frame_count=2) as builder:
+        source = builder.register_source_file(original_filename="camera.avi", frame_count=4)
+        for number, image in enumerate(images):
+            ok, encoded = ingest_module.cv2.imencode(".png", image)
+            assert ok
+            builder.add_frame(
+                stream="camera", source_file=source, frame_id=number,
+                source_frame_number=number, encoded_bytes=encoded.tobytes(),
+                storage_format=StorageFormat("png"), width=3, height=2,
+            )
+    dataset = Dataset.open(package)
+    shard_ids = [shard["shard_uuid"] for shard in dataset.manifest.shards]
+    assert len(shard_ids) == 2
+
+    ctx = FakeContext()
+    stored_images = []
+    for shard_id in reversed(shard_ids):
+        ingest_interchange_dataset(
+            package, n_tile=3, context=ctx,
+            run_id="00000000-0000-0000-0000-000000000001",
+            asset_id="00000000-0000-0000-0000-000000000002",
+            shard_uuid=shard_id,
+            expected_dataset_uuid=dataset.manifest.dataset_uuid,
+            frame_stored_callback=lambda _row, image: stored_images.append(image.copy()),
+        )
+
+    assert [params[2] for params in ctx.repository.cursor_obj.params_history] == [3, 1]
+    np.testing.assert_array_equal(stored_images[0], np.vstack(images[2:]))
+    np.testing.assert_array_equal(stored_images[1], np.vstack(images[:2]))
+    tile_sources = [
+        [frame["frame_id"] for frame in json.loads(params[17])["interchange"]["tile_frames"]]
+        for params in ctx.repository.cursor_obj.params_history
+    ]
+    assert tile_sources == [[2, 3], [0, 1]]
 
 
 def test_interchange_tiling_does_not_join_distinct_source_files(tmp_path):

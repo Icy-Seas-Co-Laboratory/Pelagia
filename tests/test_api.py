@@ -5239,13 +5239,13 @@ def test_api_queues_one_interchange_job_per_shard_without_scanning(tmp_path, mon
         }]},
     )
     assert tiled.status_code == 200
-    assert len(tiled.json()["jobs"]) == 1
-    payload = repository.created_jobs[-1]["payload"]
-    assert payload["n_tile"] == 2
-    assert payload["generate_backgrounds"] is True
-    assert payload["background_window_width"] == 3
-    assert payload["background_window_stride"] == 1
-    assert "interchange_shard_uuid" not in payload
+    assert len(tiled.json()["jobs"]) == 2
+    tiled_payloads = [job["payload"] for job in repository.created_jobs[-2:]]
+    assert [payload["interchange_shard_uuid"] for payload in tiled_payloads] == shard_ids
+    assert all(payload["n_tile"] == 2 for payload in tiled_payloads)
+    assert all(payload["generate_backgrounds"] is True for payload in tiled_payloads)
+    assert all(payload["background_window_width"] == 3 for payload in tiled_payloads)
+    assert all(payload["background_window_stride"] == 1 for payload in tiled_payloads)
 
     line_scan = client.post(
         "/ingestion/assets", headers=headers,
@@ -5259,9 +5259,13 @@ def test_api_queues_one_interchange_job_per_shard_without_scanning(tmp_path, mon
         }]},
     )
     assert line_scan.status_code == 200
-    assert len(line_scan.json()["jobs"]) == 1
-    payload = repository.created_jobs[-1]["payload"]
-    assert (payload["flatfield_axis"], payload["flatfield_window_width"], payload["flatfield_window_stride"]) == (0, 4, 4)
+    assert len(line_scan.json()["jobs"]) == 2
+    line_scan_payloads = [job["payload"] for job in repository.created_jobs[-2:]]
+    assert [payload["interchange_shard_uuid"] for payload in line_scan_payloads] == shard_ids
+    assert all(
+        (payload["flatfield_axis"], payload["flatfield_window_width"], payload["flatfield_window_stride"]) == (0, 4, 4)
+        for payload in line_scan_payloads
+    )
 
 
 def test_api_analyze_rejects_paths_outside_import_roots(tmp_path):

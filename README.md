@@ -427,10 +427,11 @@ collection is supplied explicitly. Frame counts and a manifest-based package
 size estimate are available during assessment without scanning the image
 shards. The queued import creates one worker job per shard, so multiple extract
 workers can import shards concurrently. Each job reads only its assigned shard;
-the package remains one raw asset. If background or flatfield generation or
-multi-frame tiling is requested, import uses one job to preserve windows and
-tiles across shard boundaries. Tiling stacks consecutive compatible frames
-from the same source vertically; each tile records its member frame provenance.
+the package remains one raw asset. Background and flatfield windows and
+multi-frame tiles close at shard boundaries, even when the same source file
+continues in the next shard. Tiling stacks consecutive compatible frames
+from the same source vertically within a shard; each tile records its member
+frame provenance.
 Full frame reads begin in the queued import jobs. The assessment does
 not establish package integrity; run interchange validation when that
 assurance is needed. Dataset metadata, source-file identities, stream

@@ -582,8 +582,6 @@ def ingest_interchange_dataset(
 
     if n_tile < 1:
         raise ValueError("n_tile must be >= 1.")
-    if n_tile > 1 and shard_uuid is not None:
-        raise ValueError("Tiled interchange import must process the complete dataset in one job.")
     root = Path(dataset_path).expanduser().resolve()
     dataset = Dataset.open(root)
     if expected_dataset_uuid is not None and str(dataset.manifest.dataset_uuid) != expected_dataset_uuid:
@@ -667,14 +665,17 @@ def ingest_interchange_dataset(
     skipped = 0
     processed = 0
     tile_frames: list[tuple[np.ndarray, dict[str, Any], str, datetime | None, int, int, str]] = []
-    tile_number = 0
+    # Reserve each shard's manifest frame-index range for its derived tiles.
+    # This keeps indexes stable when shard jobs finish in any order while
+    # preserving consecutive tile indexes within a shard for field windows.
+    tile_number = shard_offsets[shard_uuid] - 1 if shard_uuid is not None else 0
 
     def store_tile() -> None:
         nonlocal tile_number
         if not tile_frames:
             return
-        tile_number += 1
         first, last = tile_frames[0], tile_frames[-1]
+        tile_number += 1
         image = np.ascontiguousarray(np.vstack([member[0] for member in tile_frames]))
         tile_metadata = dict(last[1])
         tile_metadata["frame_index"] = tile_number
@@ -841,6 +842,8 @@ def ingest_interchange_dataset(
             })
         if shard_frames_read != int(shard["frame_count"]):
             raise ValueError(f"Interchange shard {shard['shard_uuid']} frame count differs from its manifest.")
+        if tile_frames:
+            store_tile()
 
     if tile_frames:
         store_tile()
