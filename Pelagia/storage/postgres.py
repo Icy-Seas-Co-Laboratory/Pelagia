@@ -10287,7 +10287,9 @@ class PostgresRepository:
                     SELECT COUNT(*) AS count
                     FROM {self.schema}.worker_sessions
                     WHERE status = 'working'
-                    """
+                      AND last_heartbeat >= NOW() - (%s * INTERVAL '1 second')
+                    """,
+                    (self.config.queue.heartbeat_interval_seconds * 2,),
                 )
                 busy_workers = cursor.fetchone()["count"]
         return {
