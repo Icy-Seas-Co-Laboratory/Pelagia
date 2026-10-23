@@ -35,6 +35,11 @@ def log_processing_event(
             event_type=event_type,
             message=message,
             level=level,
+            # A live preview sandbox has no durable job, and its temporary
+            # frame ID cannot establish log ownership.  The request-scoped
+            # context is therefore the authoritative provenance for these
+            # events (and is also correct for worker-scoped processing).
+            project_id=getattr(context, "active_project_id", None),
             run_id=run_id,
             asset_id=asset_id,
             job_id=job_id,

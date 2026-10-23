@@ -22,6 +22,7 @@ from Pelagia.processing import frame_store
 from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
+from Pelagia.observability import DatabaseLogger
 from pelagia_interchange import Dataset, DatasetBuilder, StorageFormat
 
 
@@ -3112,6 +3113,41 @@ def test_api_live_threshold_and_detection_candidate_are_separate(monkeypatch):
 
     removed = client.get("/live/segmentation", params={"frame_id": "frame-1"})
     assert removed.status_code == 404
+
+
+def test_api_live_candidate_logging_uses_request_project(monkeypatch):
+    data = np.zeros((10, 10), dtype=np.uint8)
+    data[2:5, 3:7] = 50
+    frame = FrameData(
+        sourcePath="/tmp/",
+        filename="frame.png",
+        frameNumber=7,
+        data=data,
+        metadata={"run_id": "run-1", "asset_id": "asset-1", "frame_id": "frame-1"},
+    )
+    monkeypatch.setattr(frame_store, "retrieve_frame", lambda frame_id, context, payload_kind="original": frame)
+    client, repository, _ = make_client()
+    client.app.state.context.logger = DatabaseLogger(repository)
+
+    response = client.get(
+        "/live/detection-candidate",
+        params={
+            "frame_id": "frame-1",
+            "threshold": 1,
+            "apply_preprocessing": False,
+            "min_perimeter": 0,
+            "padding": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    events = {
+        row["event_type"]: row
+        for row in repository.logs
+        if row["event_type"].startswith("detection_candidate.live_")
+    }
+    assert events["detection_candidate.live_started"]["project_id"] == "project-1"
+    assert events["detection_candidate.live_completed"]["project_id"] == "project-1"
 
 
 def test_api_live_threshold_requires_preprocessed_payload_before_preprocessed_source():
