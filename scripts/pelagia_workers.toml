@@ -44,7 +44,7 @@ roi_refinement = "cpu"
 
 [[worker]]
 name = "fio-1"
-capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "storage-1"
@@ -56,23 +56,23 @@ capabilities = ["telemetry_import"]
 
 [[worker]]
 name = "fio-2"
-capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "registry_load", "registry_export", "registry_generate", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "fio-3"
-capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "fio-4"
-capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "fio-5"
-capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "fio-6"
-capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "export_bundle", "storage_reencode"]
 
 [[worker]]
 name = "cpu-1"
