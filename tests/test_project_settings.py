@@ -39,6 +39,15 @@ def test_project_storage_settings_override_global_defaults():
     assert resolved.small_roi_encoding_source == "project"
 
 
+def test_project_without_storage_overrides_uses_jpg_75_and_small_roi_zstd():
+    resolved = resolve_project_storage_settings(_context({"settings": {}}), "project-1")
+
+    assert (resolved.frame_encoding, resolved.frame_quality) == ("jpg", 75)
+    assert (resolved.small_roi_encoding, resolved.large_roi_encoding) == ("zstd", "jpg")
+    assert (resolved.large_roi_min_pixels, resolved.roi_quality) == (1_000, 75)
+    assert resolved.mask_encoding == "zstd"
+
+
 def test_explicit_storage_overrides_take_precedence_over_project_settings():
     project = {
         "settings": {

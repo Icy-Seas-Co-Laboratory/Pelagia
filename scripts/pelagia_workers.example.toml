@@ -82,6 +82,10 @@ name = "registry-1"
 capabilities = ["registry_load", "registry_export", "registry_generate", "export_bundle"]
 
 [[worker]]
+name = "storage-1"
+capabilities = ["storage_reencode"]
+
+[[worker]]
 name = "allrounder"
-capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify", "registry_load", "registry_export", "registry_generate", "export_bundle"]
+capabilities = ["ingest", "background", "preprocess", "segment", "roi_refinement", "classify", "registry_load", "registry_export", "registry_generate", "export_bundle", "storage_reencode"]
 enabled = false

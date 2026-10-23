@@ -8,6 +8,7 @@ from Pelagia.processing.heuristic_refinement import (
     HeuristicEdgeRefinementParameters,
     heuristic_edge_refine,
 )
+from Pelagia.processing.mask_augmentation import fill_mask_holes
 
 
 def test_heuristic_refiner_grows_a_similar_seed_on_a_uniform_crop():
@@ -85,8 +86,54 @@ def test_backend_reports_versioned_parameters_and_audit_metadata():
     assert backend.method_name == HEURISTIC_EDGE_METHOD_NAME
     assert prediction.metadata["inference_backend"] == "pelagia_builtin"
     assert prediction.metadata["refinement_algorithm"] == HEURISTIC_EDGE_METHOD_NAME
+    assert prediction.metadata["refinement_algorithm_version"] == 2
     assert prediction.metadata["refinement_parameters"]["max_growth_pixels"] == 2
     assert prediction.metadata["heuristic_edge_audit"]["seed_foreground_pixels"] == 1
+
+
+def test_hole_fill_uses_external_padding_when_top_left_pixel_is_foreground():
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[0, 0] = 255
+    mask[2:7, 2] = 255
+    mask[2:7, 6] = 255
+    mask[2, 2:7] = 255
+    mask[6, 2:7] = 255
+
+    filled = fill_mask_holes(mask)
+
+    assert filled[0, 0] == 255
+    assert filled[1, 1] == 0
+    assert np.all(filled[3:6, 3:6] == 255)
+
+
+def test_v1_zero_growth_fills_ring_but_preserves_nested_competing_candidate():
+    image = np.full((9, 9), 100, dtype=np.uint8)
+    ring = np.zeros_like(image)
+    ring[1:8, 1] = 255
+    ring[1:8, 7] = 255
+    ring[1, 1:8] = 255
+    ring[7, 1:8] = 255
+    competitor = np.zeros_like(image)
+    competitor[4, 4] = 255
+
+    ordinary, ordinary_audit = heuristic_edge_refine(
+        image,
+        ring,
+        parameters=HeuristicEdgeRefinementParameters(max_growth_pixels=0),
+    )
+    protected, protected_audit = heuristic_edge_refine(
+        image,
+        ring,
+        competing_seed_mask=competitor,
+        parameters=HeuristicEdgeRefinementParameters(max_growth_pixels=0),
+    )
+
+    assert np.all(ordinary[1:8, 1:8] == 255)
+    assert ordinary_audit["hole_pixels_filled"] == 25
+    assert protected[4, 4] == 0
+    assert not np.any(protected[2:7, 2:7])
+    assert protected_audit["protected_holes"] == 1
+    assert protected_audit["protected_hole_pixels"] == 25
 
 
 @pytest.mark.parametrize(

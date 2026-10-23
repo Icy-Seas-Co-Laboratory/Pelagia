@@ -4,6 +4,13 @@ Pelagia owns ROI inputs, project scope, processing jobs, human labels, and
 evidence storage. Oracle Builder owns sealed model artifacts, model execution,
 preprocessing, tiling, and thresholding. Pelagia never imports TensorFlow or
 Keras. The default ROI refiner is Pelagia's CPU-only `heuristic_edge_v1`.
+All three built-in heuristics finish with versioned, padded-border hole filling
+and validate the final binary mask before publication. Ordinary enclosed holes
+are filled. If an enclosed background component contains another candidate's
+seed, the component remains background and the audit records it as a protected
+hole so candidate identity is not destroyed. This behavior is algorithm
+version 2 for `heuristic_edge_v1`, version 3 for `heuristic_v2`, and version 4
+for `heuristic_v3`.
 Select `method="heuristic_v2"` to expand each original candidate seed through
 successively lower intensity thresholds. It scores boundary contrast and growth
 stability, retains every seed pixel, and excludes neighboring candidate seeds.
@@ -20,10 +27,21 @@ that exceed it fail explicitly so the search limit can be adjusted.
 
 Every refinement method runs a split/merge assessment before publication.
 Configured residual discovery and overlap reconciliation then apply, except
-that v2 and v3 retain separate candidate identities. After publication, Pelagia
-automatically reassesses cross-frame connections for assets declared as line
-scans; other assets are skipped. The assessment run is recorded with the
-refinement result.
+that all built-in heuristics retain separate candidate identities. After
+publication, Pelagia automatically reassesses cross-frame connections for
+assets declared as line scans; other assets are skipped. The assessment run is
+recorded with the refinement result. Ingestion declares this geometry with
+`metadata.line_scan_geometry={"scan_axis":"x"}` or `{"scan_axis":"y"}`;
+Pelagia validates and stores that canonical field on the asset and extracted
+frames. Queued refinement retries reuse each refined output by its parent
+candidate and ROI index, preserving distinct split/residual children, and reuse
+the continuity run already written by the same job, including when continuity
+fails after the refined rows commit. Direct refinement reports a
+continuity-specific error in `connection_assessment` while retaining its
+successfully stored ROI results. That error names the continuity-only retry
+endpoint; it does not ask clients to repeat refinement. A failure to refresh
+the processing-status projection is reported separately in
+`status_publication` for the same reason.
 
 ## Interactive V2 contract
 

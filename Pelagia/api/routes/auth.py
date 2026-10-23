@@ -21,9 +21,10 @@ if APIRouter is not None:
         storage_settings_payload,
         validate_allowed_storage_encodings,
     )
+    from ...processing.codec_registry import image_codec_available
     from ...storage.blob_store import named_kvstore_path
     from ...storage.postgres import PROJECT_ROLES
-    from ._common import as_response, get_context, get_repository
+    from ._common import as_response, get_context, get_repository, kvstore_status
 
     class ProjectKVStoreRequest(BaseModel):
         project_key: str
@@ -80,6 +81,9 @@ if APIRouter is not None:
 
     class ResetPasswordRequest(BaseModel):
         password: str = Field(min_length=1)
+
+    class UpdateProjectMembershipRequest(BaseModel):
+        role: str
 
     router = APIRouter(prefix="/auth", tags=["auth"])
     projects_router = APIRouter(prefix="/projects", tags=["projects"])
@@ -211,6 +215,18 @@ if APIRouter is not None:
         if normalized not in PROJECT_ROLES:
             raise HTTPException(status_code=422, detail=f"Project role must be one of: {', '.join(sorted(PROJECT_ROLES))}.")
         return normalized
+
+    def _require_membership_management(auth, repository, user: dict[str, Any], project: dict[str, Any], role: str | None = None) -> None:
+        """Authorize one project membership change without granting cross-project access."""
+        _require_project_management(auth, repository, str(project["id"]))
+        if auth.is_admin:
+            return
+        if str(project["id"]) != auth.project_id:
+            raise HTTPException(status_code=403, detail="Project manager permission is limited to the active project.")
+        if user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Only user admins can manage user admin accounts.")
+        if role is not None and role not in {"viewer", "editor"}:
+            raise HTTPException(status_code=403, detail="Project managers can assign viewer or editor roles only.")
 
     def _create_project_with_kvstore(
         request: Request,
@@ -403,6 +419,22 @@ if APIRouter is not None:
             }
         )
 
+    @projects_router.get("/{project_id}/storage-usage")
+    def get_project_storage_usage(request: Request, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        resolved_project_id = str(project["id"])
+        _require_project_management(auth, repository, resolved_project_id)
+        store = get_context(request).kvstore_for_project(resolved_project_id, initialize=False)
+        if store is None:
+            return {"project_id": resolved_project_id, "kvstore_file_bytes": None}
+        status = kvstore_status(store, deep=False)
+        return {"project_id": resolved_project_id,
+                "kvstore_file_bytes": status.get("total_file_bytes")}
+
     @projects_router.patch("/{project_id}/storage-settings")
     def update_project_storage_settings(
         request: Request,
@@ -457,6 +489,75 @@ if APIRouter is not None:
                 "effective": effective.storage.as_dict(),
             }
         )
+
+    @projects_router.get("/{project_id}/storage-reencode")
+    def get_project_storage_reencode(request: Request, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        _require_project_management(auth, repository, str(project["id"]))
+        available = repository.has_online_worker_capability("storage_reencode")
+        return as_response({
+            "project_id": project["id"],
+            "job": repository.latest_project_storage_reencode_job(str(project["id"])),
+            "worker_available": available,
+        })
+
+    @projects_router.post("/{project_id}/storage-reencode")
+    def enqueue_project_storage_reencode(request: Request, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        resolved_project_id = str(project["id"])
+        _require_project_management(auth, repository, resolved_project_id)
+        context = get_context(request)
+        invalidate_project_settings(context, resolved_project_id)
+        settings = resolve_project_storage_settings(context, resolved_project_id)
+        policy = {
+            "frame_encoding": settings.frame_encoding,
+            "frame_quality": settings.frame_quality,
+            "small_roi_encoding": settings.small_roi_encoding,
+            "large_roi_encoding": settings.large_roi_encoding,
+            "large_roi_min_pixels": settings.large_roi_min_pixels,
+            "roi_quality": settings.roi_quality,
+            "mask_encoding": settings.mask_encoding,
+        }
+        encodings = (settings.frame_encoding, settings.small_roi_encoding,
+                     settings.large_roi_encoding, settings.mask_encoding)
+        try:
+            validate_allowed_storage_encodings(context, *encodings)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        unavailable = sorted({encoding for encoding in encodings if not image_codec_available(encoding)})
+        if unavailable:
+            raise HTTPException(status_code=422, detail="Storage codec(s) unavailable: " + ", ".join(unavailable))
+        job, created = repository.enqueue_project_storage_reencode(
+            project_id=resolved_project_id, policy=policy,
+            submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+        )
+        return as_response({"project_id": resolved_project_id, "job": job, "created": created,
+                            "worker_available": repository.has_online_worker_capability("storage_reencode")})
+
+    @projects_router.post("/{project_id}/storage-reencode/cancel")
+    def cancel_project_storage_reencode(request: Request, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        resolved_project_id = str(project["id"])
+        _require_project_management(auth, repository, resolved_project_id)
+        job = repository.latest_project_storage_reencode_job(resolved_project_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No datastore update was found.")
+        repository.cancel_jobs(project_id=resolved_project_id, stages=["storage_reencode"],
+                               job_ids=[str(job["id"])], reason="Cancelled from project administration")
+        return as_response({"project_id": resolved_project_id,
+                            "job": repository.get_job(str(job["id"]), project_id=resolved_project_id)})
 
     @projects_router.delete("/{project_id}")
     def delete_project(request: Request, project_id: str) -> dict:
@@ -521,6 +622,65 @@ if APIRouter is not None:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return as_response({"user": _public_user(user), "membership": membership})
+
+    @users_router.get("/{user_id}/project-memberships")
+    def list_user_project_memberships(request: Request, user_id: str) -> dict:
+        auth = require_auth(request)
+        if not auth.is_admin:
+            raise HTTPException(status_code=403, detail="User admin permission is required to view project memberships.")
+        repository = get_repository(request)
+        user = _user_by_id_or_username(repository, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User {user_id!r} was not found.")
+        return as_response(
+            {
+                "user": _public_user(user),
+                "memberships": repository.list_user_project_memberships(str(user["id"])),
+            }
+        )
+
+    @users_router.put("/{user_id}/project-memberships/{project_id}")
+    def update_user_project_membership(
+        request: Request,
+        user_id: str,
+        project_id: str,
+        body: UpdateProjectMembershipRequest,
+    ) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        user = _user_by_id_or_username(repository, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User {user_id!r} was not found.")
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        if not project.get("is_active", True):
+            raise HTTPException(status_code=422, detail="Project is not active.")
+        role = _normalize_requested_role(body.role)
+        _require_membership_management(auth, repository, user, project, role)
+        membership = repository.add_project_member(
+            str(user["id"]),
+            str(project["id"]),
+            role=role,
+            metadata={"updated_by_user_id": auth.user_id},
+        )
+        return as_response({"membership": membership})
+
+    @users_router.delete("/{user_id}/project-memberships/{project_id}")
+    def remove_user_project_membership(request: Request, user_id: str, project_id: str) -> dict:
+        auth = require_auth(request)
+        repository = get_repository(request)
+        user = _user_by_id_or_username(repository, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User {user_id!r} was not found.")
+        project = _project_by_id_or_key(repository, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id!r} was not found.")
+        _require_membership_management(auth, repository, user, project)
+        membership = repository.remove_project_member(str(user["id"]), str(project["id"]))
+        if membership is None:
+            raise HTTPException(status_code=404, detail="User does not belong to this project.")
+        return as_response({"removed": True, "membership": membership})
 
     @users_router.post("/{user_id}/deactivate")
     def deactivate_user(request: Request, user_id: str) -> dict:

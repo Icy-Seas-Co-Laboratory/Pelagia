@@ -7,7 +7,7 @@ BEGIN
         CREATE TYPE {schema}.asset_kind AS ENUM ('video', 'image', 'image_sequence', 'interchange', 'telemetry');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'stage_name' AND n.nspname = '{schema}') THEN
-        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'roi_continuity', 'classify', 'publish', 'train_model', 'io_import', 'telemetry_import', 'io_export', 'io_upload', 'io_download', 'export_bundle');
+        CREATE TYPE {schema}.stage_name AS ENUM ('ingest_run', 'extract_frames', 'background_frames', 'preprocess_frames', 'segment', 'roi_refinement', 'roi_continuity', 'classify', 'publish', 'train_model', 'io_import', 'telemetry_import', 'io_export', 'io_upload', 'io_download', 'export_bundle', 'storage_reencode');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'job_status' AND n.nspname = '{schema}') THEN
         CREATE TYPE {schema}.job_status AS ENUM ('queued', 'leased', 'working', 'paused', 'succeeded', 'failed', 'cancelled', 'dead_lettered');
@@ -29,6 +29,7 @@ ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_upload';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'io_download';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'feature_space_analysis';
 ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'export_bundle';
+ALTER TYPE {schema}.stage_name ADD VALUE IF NOT EXISTS 'storage_reencode';
 
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'paused';
 ALTER TYPE {schema}.job_status ADD VALUE IF NOT EXISTS 'working';
@@ -837,6 +838,9 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_series_steps (
     step_index integer NOT NULL CHECK (step_index >= 0), stage {schema}.stage_name NOT NULL,
     filters jsonb NOT NULL DEFAULT '{}'::jsonb, options jsonb NOT NULL DEFAULT '{}'::jsonb,
     status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'planning', 'active', 'skipped', 'succeeded', 'failed', 'cancelled')),
+    planning_complete boolean NOT NULL DEFAULT false,
+    selection_boundary jsonb NOT NULL DEFAULT '{}'::jsonb,
+    planning_cursor jsonb NOT NULL DEFAULT '{}'::jsonb,
     matched_count bigint NOT NULL DEFAULT 0, job_count bigint NOT NULL DEFAULT 0,
     failure_policy text CHECK (failure_policy IN ('fail_fast', 'continue')),
     skip_reason text,
@@ -854,8 +858,12 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_submissions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE RESTRICT,
     request_id uuid NOT NULL, kind text NOT NULL CHECK (kind IN ('queue', 'series')),
     request jsonb NOT NULL, request_hash text NOT NULL,
-    status text NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted', 'planning', 'succeeded', 'failed', 'cancelled')),
+    status text NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted', 'planning', 'processing', 'succeeded', 'failed', 'cancelled')),
     claim_token uuid, claim_expires_at timestamptz, result jsonb, error text,
+    selection_boundary jsonb NOT NULL DEFAULT '{}'::jsonb,
+    planning_cursor jsonb NOT NULL DEFAULT '{}'::jsonb,
+    progress jsonb NOT NULL DEFAULT '{"phase":"finding_eligible","scheduled_count":0,"job_count":0,"queued_count":0,"running_count":0,"paused_count":0,"completed_count":0,"failed_count":0,"cancelled_count":0,"more_jobs_being_prepared":true}'::jsonb,
+    last_planned_at timestamptz, planning_finished_at timestamptz, next_plan_at timestamptz, cancellation_reason text,
     submitted_by_user_id text, submitted_by_username text,
     created_at timestamptz NOT NULL DEFAULT NOW(), updated_at timestamptz NOT NULL DEFAULT NOW(), finished_at timestamptz,
     UNIQUE (project_id, request_id)
@@ -863,6 +871,33 @@ CREATE TABLE IF NOT EXISTS {schema}.processing_submissions (
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_submissions_dispatch ON {schema}.processing_submissions (status, created_at) WHERE status IN ('accepted', 'planning');
 DROP TRIGGER IF EXISTS trg_processing_submissions_updated_at ON {schema}.processing_submissions;
 CREATE TRIGGER trg_processing_submissions_updated_at BEFORE UPDATE ON {schema}.processing_submissions FOR EACH ROW EXECUTE FUNCTION {schema}.set_updated_at();
+
+ALTER TABLE {schema}.processing_series ADD COLUMN IF NOT EXISTS submission_id uuid REFERENCES {schema}.processing_submissions(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{schema}_ps_series_unique ON {schema}.processing_series (submission_id) WHERE submission_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS {schema}.processing_submission_units (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    submission_id uuid NOT NULL REFERENCES {schema}.processing_submissions(id) ON DELETE CASCADE,
+    project_id uuid NOT NULL REFERENCES {schema}.projects(id) ON DELETE CASCADE,
+    stage text NOT NULL CHECK (stage IN ('preprocess_frames', 'segment', 'roi_refinement')),
+    step_id uuid REFERENCES {schema}.processing_series_steps(id) ON DELETE CASCADE,
+    unit_id uuid NOT NULL,
+    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT NOW(), released_at timestamptz,
+    UNIQUE (submission_id, stage, unit_id)
+);
+CREATE TABLE IF NOT EXISTS {schema}.processing_submission_jobs (
+    submission_id uuid NOT NULL REFERENCES {schema}.processing_submissions(id) ON DELETE CASCADE,
+    job_id uuid NOT NULL REFERENCES {schema}.processing_jobs(id) ON DELETE CASCADE,
+    step_id uuid REFERENCES {schema}.processing_series_steps(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT NOW(), PRIMARY KEY (submission_id, job_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{schema}_psu_active ON {schema}.processing_submission_units (project_id, stage, unit_id) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_{schema}_psu_submission ON {schema}.processing_submission_units (submission_id, job_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_psu_unreleased ON {schema}.processing_submission_units (created_at, id) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_{schema}_psj_submission ON {schema}.processing_submission_jobs (submission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_{schema}_frames_seek ON {schema}.frames (created_at, id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_dc_seek ON {schema}.detection_candidate (created_at, id);
 
 CREATE TABLE IF NOT EXISTS {schema}.project_processing_status_snapshots (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

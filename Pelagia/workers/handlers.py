@@ -1138,7 +1138,11 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     with measure_phase("refinement.record_construction"):
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
         all_candidate_seeds = None
-        if requested_method in {HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
+        if requested_method in {
+            HEURISTIC_EDGE_METHOD_NAME,
+            HEURISTIC_V2_METHOD_NAME,
+            HEURISTIC_V3_METHOD_NAME,
+        }:
             all_candidate_seeds = [
                 DetectionRecord.from_row(row)
                 for row in context.repository.get_frame_candidate_seed_records(

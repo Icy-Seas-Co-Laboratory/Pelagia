@@ -15,16 +15,16 @@ def test_thumbhash_processing_config_rejects_invalid_dimensions(max_dim):
         ThumbhashProcessingConfig(max_dim=max_dim)
 
 
-def test_image_data_storage_config_defaults_to_jpg_quality_90():
+def test_image_data_storage_config_defaults_to_jpg_quality_75():
     config = ImageDataStorageConfig()
     assert config.encoding == "jpg"
-    assert config.quality == 90
+    assert config.quality == 75
 
 
-def test_frame_storage_processing_config_defaults_to_jpg_quality_90():
+def test_frame_storage_processing_config_defaults_to_jpg_quality_75():
     config = FrameStorageProcessingConfig()
     assert config.image_encoding == "jpg"
-    assert config.image_quality == 90
+    assert config.image_quality == 75
 
 
 def test_image_data_storage_config_accepts_jpg():
@@ -149,7 +149,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.file_browser.root_path_import_dir.as_posix() == "data/import"
     assert config.file_browser.allowed_root_paths == []
     assert config.image_data_storage.encoding == "jpg"
-    assert config.image_data_storage.quality == 90
+    assert config.image_data_storage.quality == 75
     assert config.auth.enabled is True
     assert config.auth.session_ttl_seconds == 604800
     assert config.auth.dev_project_key is None
@@ -191,8 +191,8 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_recording.padding == 50
     assert config.processing.roi_recording.small_roi_encoding == "zstd"
     assert config.processing.roi_recording.large_roi_encoding == "jpg"
-    assert config.processing.roi_recording.large_roi_min_pixels == 50_000
-    assert config.processing.roi_recording.roi_quality == 90
+    assert config.processing.roi_recording.large_roi_min_pixels == 1_000
+    assert config.processing.roi_recording.roi_quality == 75
     assert config.processing.roi_recording.mask_encoding == "zstd"
     assert config.processing.roi_recording.always_store_mask is True
     assert config.processing.preprocessing.apply_mask is False
@@ -211,7 +211,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.preprocessing.crop_w is None
     assert config.processing.preprocessing.crop_h is None
     assert config.processing.frame_storage.image_encoding == "jpg"
-    assert config.processing.frame_storage.image_quality == 90
+    assert config.processing.frame_storage.image_quality == 75
     assert config.processing.thumbhash.max_dim == 100
     assert config.processing.roi_refinement.max_iterations == 5
     assert config.processing.roi_refinement.expansion_pixels == 256

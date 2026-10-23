@@ -54,7 +54,7 @@ allowed_root_paths = []
 # Default image payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
 encoding = "jpg"
 # Default lossy image quality for jpg and jxl payloads.
-quality = 90
+quality = 75
 # Deployment-level codec allowlist. Pelagia only advertises and accepts storage
 # codecs listed here; optional codecs must also be available in imagecodecs.
 allowed_encodings = ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
@@ -124,9 +124,9 @@ padding = 50
 # the classification. Crops at or above the cutoff use the large-ROI policy.
 small_roi_encoding = "zstd"
 large_roi_encoding = "jpg"
-large_roi_min_pixels = 50000
+large_roi_min_pixels = 1000
 # Lossy ROI quality for jpg and jxl payloads.
-roi_quality = 90
+roi_quality = 75
 # Masks are independent scientific payloads and remain lossless by default.
 mask_encoding = "zstd"
 # Store masks for every retained candidate, even when ROI image bytes are skipped.
@@ -250,7 +250,7 @@ crop_h = null
 # Stored frame payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
 image_encoding = "jpg"
 # Stored frame lossy image quality for jpg and jxl payloads.
-image_quality = 90
+image_quality = 75
 
 [processing.thumbhash]
 # Maximum image dimension before RGBA expansion and ThumbHash encoding (1-100).
@@ -351,13 +351,13 @@ level = "INFO"
 console = true
 max_bytes = 10485760
 backup_count = 10
-# PostgreSQL operational events; workers delete expired rows in bounded batches.
+# PostgreSQL operational events; workers drain expired rows in bounded batches at startup.
 high_frequency_retention_days = 7
 job_event_retention_days = 90
 routine_log_retention_days = 90
 important_log_retention_days = 365
 cleanup_interval_seconds = 300
-cleanup_batch_size = 2000
+cleanup_batch_size = 50000
 
 [artifacts]
 # Local runtime library for plugin manifests and future non-ML packs.

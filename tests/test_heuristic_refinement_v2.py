@@ -122,3 +122,25 @@ def test_v2_is_deterministic_for_same_image_and_inputs():
 
     np.testing.assert_array_equal(first_mask, second_mask)
     assert first_audit == second_audit
+
+
+def test_v2_zero_growth_fills_ordinary_hole_and_preserves_competing_hole():
+    image = np.full((9, 9), 100, dtype=np.uint8)
+    ring = np.zeros_like(image)
+    ring[1:8, 1] = ring[1:8, 7] = 255
+    ring[1, 1:8] = ring[7, 1:8] = 255
+    competitor = np.zeros_like(image)
+    competitor[4, 4] = 255
+    parameters = _parameters(max_growth_pixels=0)
+
+    ordinary, ordinary_audit = heuristic_v2_refine(image, ring, parameters=parameters)
+    protected, protected_audit = heuristic_v2_refine(
+        image, ring, competing_seed_mask=competitor, parameters=parameters
+    )
+
+    assert np.all(ordinary[1:8, 1:8] == 255)
+    assert ordinary_audit["hole_fill_method"] == "padded_border_flood_fill_v1"
+    assert ordinary_audit["final_mask_validation"] == "passed"
+    assert protected[4, 4] == 0
+    assert not np.any(protected[2:7, 2:7])
+    assert protected_audit["protected_holes"] == 1

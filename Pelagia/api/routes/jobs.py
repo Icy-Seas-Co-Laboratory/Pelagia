@@ -230,6 +230,11 @@ if APIRouter is not None:
     @router.post("", response_model=JobDetailResponse, response_model_exclude_none=True)
     def create_job(request: Request, body: CreateJobRequest) -> dict:
         auth = require_project_write(request)
+        if body.stage == PipelineStage.STORAGE_REENCODE:
+            raise HTTPException(
+                status_code=403,
+                detail="Storage re-encoding must be started from project administration.",
+            )
         try:
             job = PipelineService(get_context(request)).queue(
                 body.stage,

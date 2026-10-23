@@ -14,6 +14,7 @@ import numpy as np
 
 from .detection_refinement import RoiRefinementInput, RoiRefinementPrediction
 from .frame_preprocess import as_binary_mask, as_grayscale_array
+from .mask_augmentation import finalize_heuristic_mask
 
 
 HEURISTIC_V2_METHOD_NAME = "heuristic_v2"
@@ -97,7 +98,7 @@ class HeuristicV2RefinementBackend:
             metadata={
                 "inference_backend": "pelagia_builtin",
                 "refinement_algorithm": HEURISTIC_V2_METHOD_NAME,
-                "refinement_algorithm_version": 2,
+                "refinement_algorithm_version": 3,
                 "refinement_parameters": asdict(self.parameters),
                 "heuristic_v2_audit": audit,
                 "dominant_edge_angle_degrees": audit["dominant_edge_angle_degrees"],
@@ -147,7 +148,14 @@ def heuristic_v2_refine(
     seed_pixels = int(np.count_nonzero(seed))
     empty_audit = _empty_audit(seed_pixels=seed_pixels, overlap_pixels=overlap_pixels)
     if seed_pixels == 0:
-        return np.zeros(seed.shape, dtype=np.uint8), empty_audit
+        finalized, hole_audit = finalize_heuristic_mask(
+            np.zeros(seed.shape, dtype=np.uint8),
+            seed_mask=seed,
+            protected_mask=competing,
+        )
+        empty_audit.update(hole_audit)
+        empty_audit["competing_seed_pixels"] = int(np.count_nonzero(competing))
+        return finalized, empty_audit
 
     finite = np.isfinite(gray)
     if candidate_generation_threshold is None:
@@ -174,7 +182,19 @@ def heuristic_v2_refine(
                 "selected_threshold": starting_threshold,
             }
         )
-        return _mask_uint8(seed), audit
+        finalized, hole_audit = finalize_heuristic_mask(
+            _mask_uint8(seed), seed_mask=seed, protected_mask=competing
+        )
+        refined_pixels = int(np.count_nonzero(finalized))
+        audit.update(hole_audit)
+        audit.update(
+            {
+                "refined_foreground_pixels": refined_pixels,
+                "expanded_foreground_pixels": refined_pixels - seed_pixels,
+                "competing_seed_pixels": int(np.count_nonzero(competing)),
+            }
+        )
+        return finalized, audit
 
     seed_distance = cv2.distanceTransform((~seed).astype(np.uint8), cv2.DIST_C, 3)
     permitted = seed_distance <= float(int(resolved.max_growth_pixels))
@@ -323,8 +343,11 @@ def heuristic_v2_refine(
     selected |= seed
     selected &= ~competing
     selected |= seed
-    refined_pixels = int(np.count_nonzero(selected))
-    return _mask_uint8(selected), {
+    finalized, hole_audit = finalize_heuristic_mask(
+        _mask_uint8(selected), seed_mask=seed, protected_mask=competing
+    )
+    refined_pixels = int(np.count_nonzero(finalized))
+    return finalized, {
         "seed_foreground_pixels": seed_pixels,
         "refined_foreground_pixels": refined_pixels,
         "expanded_foreground_pixels": refined_pixels - seed_pixels,
@@ -349,6 +372,7 @@ def heuristic_v2_refine(
         "competing_seed_overlap_pixels": overlap_pixels,
         "competition_limited_pixels": competition_limited_pixels,
         "dominant_edge_angle_degrees": selected_metrics["dominant_angle"],
+        **hole_audit,
     }
 
 

@@ -329,8 +329,12 @@ class FakeOracle:
         ]
 
 
-def make_context(repository):
-    return AppContext(config=CoreConfig(), repository=repository, kvstore=None, oracle=FakeOracle())
+def make_context(repository, *, min_available_memory_fraction=0.0):
+    # Most worker tests exercise job behavior, independent of the host running
+    # pytest. Memory-admission tests opt into the production threshold below.
+    config = CoreConfig()
+    config.queue.min_available_memory_fraction = min_available_memory_fraction
+    return AppContext(config=config, repository=repository, kvstore=None, oracle=FakeOracle())
 
 
 def test_progress_checkpoint_acknowledges_requested_pause():
@@ -730,7 +734,11 @@ def test_embedding_handler_persists_embedding_product_without_cluster_evidence()
 
 def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     repo = FakeRepository()
-    repo.assets["asset-1"]["metadata"] = {"analysis": "generated", "source": "asset"}
+    repo.assets["asset-1"]["metadata"] = {
+        "analysis": "generated",
+        "source": "asset",
+        "line_scan_geometry": {"scan_axis": "y"},
+    }
     context = make_context(repo)
     calls = []
 
@@ -785,6 +793,7 @@ def test_extract_frames_handler_ingests_registered_asset(monkeypatch):
     assert kwargs["mask_path"] is None
     assert kwargs["metadata"]["source"] == "test"
     assert kwargs["metadata"]["analysis"] == "generated"
+    assert kwargs["metadata"]["line_scan_geometry"] == {"scan_axis": "y"}
     assert kwargs["metadata"]["collections"] == ["test"]
     assert kwargs["metadata"]["worker_job_id"] == "job-1"
 
@@ -897,8 +906,8 @@ def test_extract_frames_handler_records_durable_segment_dispatch(monkeypatch):
             "roi_encoding": "raw",
             "small_roi_encoding": "zstd",
             "large_roi_encoding": "jpg",
-            "large_roi_min_pixels": 50000,
-            "roi_quality": 90,
+            "large_roi_min_pixels": 1000,
+            "roi_quality": 75,
             "mask_encoding": "zstd",
             "collections": ["test"],
     }
@@ -1823,6 +1832,38 @@ def test_roi_refinement_handler_v3_uses_graph_cut_and_candidate_seed_query(monke
     assert repo.refined_detections[0][0][1].metadata["refinement_algorithm"] == "heuristic_v3"
 
 
+def test_queued_refinement_stores_rows_before_continuity_failure(monkeypatch):
+    repo = FakeRepository()
+    context = make_context(repo)
+    monkeypatch.setattr(
+        "Pelagia.workers.handlers.assess_refined_roi_connections",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("continuity unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="continuity unavailable"):
+        roi_refinement_handler(
+            {
+                "id": "job-retryable-refinement",
+                "project_id": "project-1",
+                "stage": PipelineStage.ROI_REFINEMENT.value,
+                "run_id": "run-1",
+                "asset_id": "asset-1",
+                "payload": {
+                    "detection_ids": ["det-1"],
+                    "method": "identity",
+                    "allow_frame_expansion": False,
+                    "encoding": "raw",
+                },
+            },
+            context,
+        )
+
+    # Retry reuse is covered at the PostgresRepository boundary; this verifies
+    # that the worker reaches that durable boundary before continuity runs.
+    assert len(repo.refined_detections) == 1
+    assert repo.refined_detections[0][0][0] == "det-1"
+
+
 def test_roi_refinement_handler_preserves_project_id():
     repo = FakeRepository()
     context = make_context(repo).for_project("project-1")
@@ -1919,6 +1960,7 @@ def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(mon
             "asset_id": "asset-1",
             "payload": {
                 "detection_ids": ["det-no-roi"],
+                "method": "oracle",
                 "model_ref": "test-refiner",
                 "encoding": "raw",
             },
@@ -2125,15 +2167,15 @@ def test_worker_defers_claims_under_memory_pressure_and_resumes(monkeypatch):
     repo = FakeRepository()
     claims = []
     repo.claim_jobs = lambda *args, **kwargs: claims.append(True) or []
-    memory = MemoryAvailability("host", 19, 100)
+    memory = MemoryAvailability("host", 49, 100)
     monkeypatch.setattr("Pelagia.workers.worker.available_memory", lambda: memory)
-    worker = Worker(context=make_context(repo), handlers=default_handler_registry(), worker_id="worker-1")
+    worker = Worker(context=make_context(repo, min_available_memory_fraction=0.50), handlers=default_handler_registry(), worker_id="worker-1")
 
     assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
     assert repo.touches[-1]["status"] == "idle"
     assert claims == []
 
-    memory = MemoryAvailability("host", 20, 100)
+    memory = MemoryAvailability("host", 50, 100)
     assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
     assert claims == [True]
     assert worker._memory_pressure_logged is False
@@ -2145,7 +2187,7 @@ def test_worker_defers_claims_when_memory_probe_fails(monkeypatch):
     def failed_probe():
         raise OSError("unavailable")
     monkeypatch.setattr("Pelagia.workers.worker.available_memory", failed_probe)
-    worker = Worker(context=make_context(repo), handlers=default_handler_registry(), worker_id="worker-1")
+    worker = Worker(context=make_context(repo, min_available_memory_fraction=0.50), handlers=default_handler_registry(), worker_id="worker-1")
 
     assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 0
     assert worker._memory_pressure_logged is True
@@ -2156,11 +2198,11 @@ def test_worker_defers_claim_if_memory_falls_after_claim(monkeypatch):
     repo.claimed_jobs = [{
         "id": "job-1", "lease_token": "lease-1", "stage": PipelineStage.SEGMENT.value,
     }]
-    readings = iter((MemoryAvailability("host", 21, 100), MemoryAvailability("host", 19, 100)))
+    readings = iter((MemoryAvailability("host", 51, 100), MemoryAvailability("host", 49, 100)))
     monkeypatch.setattr("Pelagia.workers.worker.available_memory", lambda: next(readings))
     registry = HandlerRegistry()
     registry.register(PipelineStage.SEGMENT, lambda job, context: pytest.fail("handler must not start"))
-    worker = Worker(context=make_context(repo), handlers=registry, worker_id="worker-1")
+    worker = Worker(context=make_context(repo, min_available_memory_fraction=0.50), handlers=registry, worker_id="worker-1")
 
     assert worker.run_once(stages=[PipelineStage.SEGMENT]) == 1
     assert repo.deferred_jobs == [

@@ -2,12 +2,12 @@
 
 Pelagia rotates local text logs with `logging.max_bytes` and
 `logging.backup_count`. PostgreSQL `logs` and `job_events` use age-based
-retention. Every long-running worker attempts cleanup on startup and every
-`logging.cleanup_interval_seconds` thereafter. A transaction advisory lock
-allows only one worker to clean a schema at a time. Each pass deletes at most
-`logging.cleanup_batch_size` rows from each category, so an old backlog may
-need several passes. PostgreSQL autovacuum reuses freed space; the database
-file may not shrink immediately.
+retention. Every long-running worker drains expired rows on startup, then runs
+one cleanup pass every `logging.cleanup_interval_seconds`. A transaction
+advisory lock allows only one worker to clean a schema at a time. Each pass
+deletes at most `logging.cleanup_batch_size` rows from each category; startup
+repeats passes until no expired rows remain. PostgreSQL autovacuum reuses freed
+space; the database file may not shrink immediately.
 
 | Category | Default age |
 | --- | ---: |
@@ -32,7 +32,7 @@ pelagia cleanup-logs --no-dry-run
 ```
 
 The manual command deletes one bounded batch. Set the retention periods and
-batch interval under `[logging]` in `config.toml`, or use
+batch size and interval under `[logging]` in `config.toml`, or use
 `PELAGIA_LOG_HIGH_FREQUENCY_RETENTION_DAYS`,
 `PELAGIA_LOG_JOB_EVENT_RETENTION_DAYS`,
 `PELAGIA_LOG_ROUTINE_RETENTION_DAYS`,

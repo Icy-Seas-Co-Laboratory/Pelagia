@@ -69,16 +69,148 @@ def close_binary_mask(
 
 
 def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill background holes enclosed by foreground regions."""
+    """Fill background holes enclosed by foreground regions.
+
+    The one-pixel background border makes the flood-fill seed independent of
+    the source mask's corner values.  In particular, a foreground pixel at
+    ``(0, 0)`` can no longer cause all exterior background to be mistaken for
+    an enclosed hole.
+    """
     binary = as_binary_mask(mask)
     if binary.size == 0:
         return binary
-    flood = binary.copy()
-    h, w = flood.shape[:2]
-    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    cv2.floodFill(flood, flood_mask, (0, 0), 255)
-    holes = cv2.bitwise_not(flood)
-    return np.ascontiguousarray(binary | holes)
+    holes = _enclosed_background(binary)
+    output = binary.copy()
+    output[holes] = 255
+    return np.ascontiguousarray(output)
+
+
+def fill_mask_holes_with_audit(
+    mask: np.ndarray,
+    *,
+    protected_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, int | str]]:
+    """Fill ordinary holes while retaining holes that contain protected seeds.
+
+    ``protected_mask`` represents pixels owned by other ROI candidates.  When
+    any protected pixel lies in an enclosed background component, that entire
+    component remains background so hole filling cannot merge the candidates.
+    """
+    binary = as_binary_mask(mask)
+    protected = (
+        np.zeros(binary.shape, dtype=bool)
+        if protected_mask is None
+        else as_binary_mask(protected_mask) > 0
+    )
+    if protected.shape != binary.shape:
+        raise ValueError("protected_mask and mask must have matching shapes.")
+    if np.any((binary > 0) & protected):
+        raise ValueError("protected_mask cannot overlap foreground mask pixels.")
+
+    audit: dict[str, int | str] = {
+        "hole_fill_method": "padded_border_flood_fill_v1",
+        "hole_fill_version": 1,
+        "background_connectivity": 4,
+        "holes_detected": 0,
+        "holes_filled": 0,
+        "hole_pixels_filled": 0,
+        "protected_holes": 0,
+        "protected_hole_pixels": 0,
+        "protected_seed_pixels": int(np.count_nonzero(protected)),
+        "remaining_unprotected_hole_pixels": 0,
+        "final_mask_validation": "passed",
+    }
+    if binary.size == 0:
+        return binary, audit
+
+    holes = _enclosed_background(binary)
+    component_count, labels = cv2.connectedComponents(
+        holes.astype(np.uint8), connectivity=4
+    )
+    protected_labels = set(int(value) for value in np.unique(labels[protected & holes]))
+    protected_labels.discard(0)
+    fill = holes.copy()
+    for label in protected_labels:
+        fill[labels == label] = False
+
+    hole_count = max(0, int(component_count) - 1)
+    protected_hole_pixels = int(np.count_nonzero(holes & ~fill))
+    filled_pixels = int(np.count_nonzero(fill))
+    output = binary.copy()
+    output[fill] = 255
+
+    remaining = _enclosed_background(output)
+    remaining_unprotected = remaining & ~protected
+    # Protected holes include background around the seed, so validate by
+    # component ownership rather than requiring every remaining pixel itself
+    # to be a protected pixel.
+    if np.any(remaining_unprotected):
+        remaining_count, remaining_labels = cv2.connectedComponents(
+            remaining.astype(np.uint8), connectivity=4
+        )
+        for label in range(1, remaining_count):
+            component = remaining_labels == label
+            if not np.any(component & protected):
+                raise RuntimeError("Heuristic hole filling left an unprotected enclosed hole.")
+    if np.any((output > 0) & protected):
+        raise RuntimeError("Heuristic hole filling absorbed a protected candidate seed.")
+
+    audit.update(
+        {
+            "holes_detected": hole_count,
+            "holes_filled": hole_count - len(protected_labels),
+            "hole_pixels_filled": filled_pixels,
+            "protected_holes": len(protected_labels),
+            "protected_hole_pixels": protected_hole_pixels,
+        }
+    )
+    return np.ascontiguousarray(output), audit
+
+
+def finalize_heuristic_mask(
+    mask: np.ndarray,
+    *,
+    seed_mask: np.ndarray,
+    protected_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, int | str]]:
+    """Apply mandatory hole filling and validate heuristic mask invariants."""
+    binary = as_binary_mask(mask)
+    seed = as_binary_mask(seed_mask) > 0
+    protected = (
+        np.zeros(binary.shape, dtype=bool)
+        if protected_mask is None
+        else as_binary_mask(protected_mask) > 0
+    )
+    if seed.shape != binary.shape or protected.shape != binary.shape:
+        raise ValueError("Heuristic mask, seed_mask, and protected_mask must have matching shapes.")
+    if np.any(seed & protected):
+        raise ValueError("seed_mask and protected_mask cannot overlap.")
+
+    normalized = binary > 0
+    normalized |= seed
+    normalized &= ~protected
+    normalized |= seed
+    filled, audit = fill_mask_holes_with_audit(
+        normalized.astype(np.uint8) * 255,
+        protected_mask=protected.astype(np.uint8) * 255,
+    )
+    if not np.all(filled[seed] == 255):
+        raise RuntimeError("Heuristic final mask validation lost immutable seed pixels.")
+    if np.any(filled[protected] > 0):
+        raise RuntimeError("Heuristic final mask validation absorbed a competing seed.")
+    audit["final_foreground_pixels"] = int(np.count_nonzero(filled))
+    return filled, audit
+
+
+def _enclosed_background(mask: np.ndarray) -> np.ndarray:
+    """Return four-connected background components that cannot reach outside."""
+    binary = as_binary_mask(mask)
+    height, width = binary.shape
+    padded = np.pad(binary, 1, mode="constant", constant_values=0)
+    flood = padded.copy()
+    flood_mask = np.zeros((height + 4, width + 4), dtype=np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 255, flags=4)
+    return flood[1:-1, 1:-1] == 0
 
 
 def remove_small_mask_components(mask: np.ndarray, *, min_area: int | float = 1) -> np.ndarray:

@@ -143,7 +143,8 @@ if APIRouter is not None:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError, ValidationError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"submission": as_response(submission)}
+        reused_active = bool(submission.pop("_reused_active_submission", False))
+        return {"submission": as_response(submission), "reused_active_submission": reused_active}
 
     @router.get("/submissions")
     def list_processing_submissions(request: Request, limit: int = 50) -> dict:
@@ -156,6 +157,20 @@ if APIRouter is not None:
     def get_processing_submission(request: Request, submission_id: str) -> dict:
         submission = get_context(request).repository.get_processing_submission(
             submission_id, project_id=scoped_project_id(request),
+        )
+        if submission is None:
+            raise HTTPException(status_code=404, detail=f"Processing submission {submission_id!r} was not found.")
+        return {"submission": as_response(submission)}
+
+    @router.post("/submissions/{submission_id}/cancel")
+    def cancel_processing_submission(
+        request: Request, submission_id: str, body: SeriesReasonRequest | None = None,
+    ) -> dict:
+        """Stop future planning pages and cooperatively cancel committed jobs."""
+        auth = require_project_write(request)
+        submission = get_context(request).repository.cancel_processing_submission(
+            submission_id, project_id=auth.project_id,
+            reason=None if body is None else body.reason,
         )
         if submission is None:
             raise HTTPException(status_code=404, detail=f"Processing submission {submission_id!r} was not found.")

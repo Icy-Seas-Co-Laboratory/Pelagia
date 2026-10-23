@@ -1129,6 +1129,34 @@ class FakeRepository:
             "project_name": None if project is None else project["project_name"],
         }
 
+    def list_user_project_memberships(self, user_id):
+        rows = []
+        for (member_user_id, project_id), role in self.memberships.items():
+            if member_user_id != user_id:
+                continue
+            project = self.get_project(project_id)
+            if project is None:
+                continue
+            rows.append({
+                "user_id": user_id,
+                "project_id": project_id,
+                "role": role,
+                "metadata": {},
+                "project_key": project["project_key"],
+                "project_name": project["project_name"],
+                "project_is_active": project.get("is_active", True),
+            })
+        return sorted(rows, key=lambda row: row["project_key"])
+
+    def remove_project_member(self, user_id, project_id):
+        role = self.memberships.pop((user_id, project_id), None)
+        if role is None:
+            return None
+        for session in self.sessions.values():
+            if session["user_id"] == user_id and session.get("project_id") == project_id:
+                session["revoked_at"] = "now"
+        return {"user_id": user_id, "project_id": project_id, "role": role, "metadata": {}}
+
     def deactivate_project(self, project_id, *, metadata=None):
         project = self.projects.get(project_id)
         if project is None:
@@ -1318,6 +1346,52 @@ def auth_headers(client, *, username="ada", project_key="default"):
     )
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
+def test_project_datastore_update_queues_saved_policy_with_management_scope():
+    client, repository, _ = make_client(auth_enabled=True)
+    queued = []
+    job = {"id": "storage-job-1", "project_id": "project-2", "stage": "storage_reencode", "status": "queued"}
+    repository.latest_project_storage_reencode_job = lambda project_id: job if project_id == "project-2" and queued else None
+
+    def enqueue(**kwargs):
+        queued.append(kwargs)
+        return job, True
+
+    repository.enqueue_project_storage_reencode = enqueue
+    repository.has_online_worker_capability = lambda capability: False
+    editor_headers = auth_headers(client)
+    assert client.post("/projects/other/storage-reencode", headers=editor_headers).status_code == 403
+
+    admin_headers = auth_headers(client, username="admin")
+    response = client.post("/projects/other/storage-reencode", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["job"]["stage"] == "storage_reencode"
+    assert response.json()["worker_available"] is False
+    assert queued[0]["project_id"] == "project-2"
+    assert queued[0]["policy"] == {
+        "frame_encoding": "jpg", "frame_quality": 75,
+        "small_roi_encoding": "zstd", "large_roi_encoding": "jpg",
+        "large_roi_min_pixels": 1000, "roi_quality": 75,
+        "mask_encoding": "zstd",
+    }
+    assert client.get("/projects/other/storage-reencode", headers=admin_headers).json()["job"]["id"] == "storage-job-1"
+    assert client.post("/jobs", headers=editor_headers, json={
+        "stage": "storage_reencode", "payload": {"policy": {}},
+    }).status_code == 403
+
+
+def test_project_storage_usage_is_project_scoped_and_reports_physical_store_size():
+    client, repository, _ = make_client(auth_enabled=True)
+    store = FakeKVStore(root_path="/tmp/other-store", total_sqlite_file_bytes=8192)
+    client.app.state.context._project_kvstores["project-2"] = store
+    editor_headers = auth_headers(client)
+    assert client.get("/projects/other/storage-usage", headers=editor_headers).status_code == 403
+
+    admin_headers = auth_headers(client, username="admin")
+    response = client.get("/projects/other/storage-usage", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json() == {"project_id": "project-2", "kvstore_file_bytes": 8192}
 
 
 def test_registry_open_queues_project_scoped_transfer_job(tmp_path):
@@ -2298,6 +2372,75 @@ def test_api_user_admin_can_request_global_user_list():
     assert all("project_role" not in user for user in global_response.json()["users"])
 
 
+def test_api_user_admin_can_manage_a_users_project_membership_matrix():
+    client, repo, _ = make_client()
+    repo.users["ben"] = {
+        "id": "user-ben",
+        "username": "ben",
+        "display_name": "Ben",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.memberships[("user-ben", "project-1")] = "viewer"
+    admin_headers = auth_headers(client, username="admin", project_key="default")
+    manager_headers = auth_headers(client, username="ada", project_key="default")
+
+    memberships = client.get("/users/ben/project-memberships", headers=admin_headers)
+    denied = client.get("/users/ben/project-memberships", headers=manager_headers)
+    updated = client.put(
+        "/users/ben/project-memberships/other",
+        headers=admin_headers,
+        json={"role": "manager"},
+    )
+    removed = client.delete("/users/ben/project-memberships/default", headers=admin_headers)
+
+    assert memberships.status_code == 200
+    assert memberships.json()["user"]["username"] == "ben"
+    assert [(row["project_key"], row["role"]) for row in memberships.json()["memberships"]] == [("default", "viewer")]
+    assert denied.status_code == 403
+    assert updated.status_code == 200
+    assert updated.json()["membership"]["project_id"] == "project-2"
+    assert repo.memberships[("user-ben", "project-2")] == "manager"
+    assert removed.status_code == 200
+    assert ("user-ben", "project-1") not in repo.memberships
+
+
+def test_api_project_manager_can_manage_only_their_active_project_memberships():
+    client, repo, _ = make_client()
+    repo.users["ben"] = {
+        "id": "user-ben",
+        "username": "ben",
+        "display_name": "Ben",
+        "is_admin": False,
+        "is_active": True,
+        "password": "secret",
+    }
+    repo.memberships[("user-1", "project-1")] = "manager"
+    headers = auth_headers(client, username="ada", project_key="default")
+
+    allowed = client.put(
+        "/users/ben/project-memberships/default",
+        headers=headers,
+        json={"role": "editor"},
+    )
+    forbidden_project = client.put(
+        "/users/ben/project-memberships/other",
+        headers=headers,
+        json={"role": "viewer"},
+    )
+    forbidden_role = client.put(
+        "/users/ben/project-memberships/default",
+        headers=headers,
+        json={"role": "manager"},
+    )
+
+    assert allowed.status_code == 200
+    assert repo.memberships[("user-ben", "project-1")] == "editor"
+    assert forbidden_project.status_code == 403
+    assert forbidden_role.status_code == 403
+
+
 def test_api_admin_can_create_user_and_reset_password():
     client, repo, _ = make_client()
     admin_headers = auth_headers(client, username="admin", project_key="default")
@@ -2623,6 +2766,73 @@ def test_api_identity_refinement_promotes_candidate_without_oracle():
     assert "oracle_model" not in refined["metadata"]
 
 
+def test_api_reports_continuity_failure_after_refinement_is_durably_stored(monkeypatch):
+    from Pelagia.api.routes import roi_refinement as roi_refinement_route
+
+    monkeypatch.setattr(
+        roi_refinement_route,
+        "assess_refined_roi_connections",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("continuity unavailable")),
+    )
+    client, repository, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "method": "identity",
+            "allow_frame_expansion": False,
+            "store": True,
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stored_count"] == 1
+    assert body["connection_assessment"] == {
+        "status": "failed",
+        "error": "continuity unavailable",
+        "retryable": True,
+        "retry_operation": "roi_continuity",
+        "retry_endpoint": "/roi-refinement/continuity/jobs",
+        "asset_ids": ["asset-1"],
+    }
+    assert body["status_publication"] == {"status": "succeeded"}
+    assert body["refined_detections"][0]["candidate_detection_id"] == "det-1"
+
+
+def test_api_reports_status_projection_failure_after_refinement_is_stored(monkeypatch):
+    from Pelagia.api.routes import roi_refinement as roi_refinement_route
+
+    monkeypatch.setattr(
+        roi_refinement_route,
+        "mark_frame_stage_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("status unavailable")),
+    )
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/roi-refinement",
+        json={
+            "detection_ids": ["det-1"],
+            "method": "identity",
+            "allow_frame_expansion": False,
+            "store": True,
+            "encoding": "raw",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stored_count"] == 1
+    assert body["status_publication"] == {
+        "status": "failed",
+        "error": "status unavailable",
+        "retry_operation": "processing_status_refresh",
+    }
+
+
 @pytest.mark.parametrize("method,growth_field", [
     ("heuristic_v2", "v2_max_growth_pixels"),
     ("heuristic_v3", "v3_max_growth_pixels"),
@@ -2717,6 +2927,7 @@ def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeyp
         "/roi-refinement",
         json={
             "detection_ids": ["det-no-roi"],
+            "method": "oracle",
             "model_ref": "test-refiner",
             "store": True,
             "encoding": "raw",
@@ -3204,7 +3415,7 @@ def test_api_segmentation_options_are_ui_ready():
     assert body["defaults"]["roi_filter"]["min_perimeter"] is None
     assert body["defaults"]["roi_recording"]["small_roi_encoding"] == "zstd"
     assert body["defaults"]["roi_recording"]["large_roi_encoding"] == "jpg"
-    assert body["defaults"]["roi_recording"]["large_roi_min_pixels"] == 50_000
+    assert body["defaults"]["roi_recording"]["large_roi_min_pixels"] == 1_000
     assert body["defaults"]["preprocessing"]["min_field_value"] is None
     assert body["defaults"]["preprocessing"]["max_field_value"] is None
     preprocessing_fields = {field["key"]: field for field in body["fields"]["preprocessing"]}
@@ -3417,6 +3628,77 @@ def test_api_processing_submission_requires_project_write_access():
         "request": {"stage": "segment", "filters": {"collection": ["tow-1"]}},
     })
     assert response.status_code == 403
+
+
+def test_api_processing_submission_cancel_requires_authentication(monkeypatch):
+    client, repository, _ = make_client(auth_enabled=True)
+    monkeypatch.setattr(
+        repository,
+        "cancel_processing_submission",
+        lambda *args, **kwargs: pytest.fail("Unauthenticated cancellation reached storage"),
+        raising=False,
+    )
+
+    response = client.post(
+        "/processing/submissions/42803b26-35a9-46a4-ad1f-5d28e5b4daa5/cancel",
+        json={"reason": "operator request"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_api_processing_submission_cancel_requires_project_write_access(monkeypatch):
+    client, repository, _ = make_client(auth_enabled=True)
+    repository.memberships[("user-1", "project-1")] = "viewer"
+    headers = auth_headers(client)
+    monkeypatch.setattr(
+        repository,
+        "cancel_processing_submission",
+        lambda *args, **kwargs: pytest.fail("Read-only cancellation reached storage"),
+        raising=False,
+    )
+
+    response = client.post(
+        "/processing/submissions/42803b26-35a9-46a4-ad1f-5d28e5b4daa5/cancel",
+        headers=headers,
+        json={"reason": "operator request"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_api_processing_submission_cancel_is_project_scoped(monkeypatch):
+    client, repository, _ = make_client(auth_enabled=True)
+    default_headers = auth_headers(client)
+    other_headers = auth_headers(client, username="admin", project_key="other")
+    calls = []
+
+    def cancel_submission(submission_id, *, project_id, reason=None):
+        calls.append((submission_id, project_id, reason))
+        if project_id != "project-1":
+            return None
+        return {
+            "id": submission_id,
+            "project_id": project_id,
+            "status": "cancelled",
+            "cancellation_reason": reason,
+        }
+
+    monkeypatch.setattr(
+        repository, "cancel_processing_submission", cancel_submission, raising=False,
+    )
+    path = "/processing/submissions/42803b26-35a9-46a4-ad1f-5d28e5b4daa5/cancel"
+
+    missing = client.post(path, headers=other_headers, json={"reason": "operator request"})
+    cancelled = client.post(path, headers=default_headers, json={"reason": "operator request"})
+
+    assert missing.status_code == 404
+    assert cancelled.status_code == 200
+    assert cancelled.json()["submission"]["status"] == "cancelled"
+    assert calls == [
+        ("42803b26-35a9-46a4-ad1f-5d28e5b4daa5", "project-2", "operator request"),
+        ("42803b26-35a9-46a4-ad1f-5d28e5b4daa5", "project-1", "operator request"),
+    ]
 
 
 def test_api_processing_submission_conflicting_retry_returns_409(monkeypatch):
@@ -5388,7 +5670,7 @@ def test_api_queues_video_ingestion(tmp_path, monkeypatch):
     assert repository.created_jobs[0]["payload"]["apply_mask"] is False
     assert repository.created_jobs[0]["payload"].get("mask_path") is None
     assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_encoding"] == "jpg"
-    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 90
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 75
     assert repository.created_jobs[0]["project_id"] == "project-1"
 
 
@@ -5702,7 +5984,52 @@ def test_api_queues_analyzed_assets_with_edited_metadata(tmp_path):
     assert repository.created_jobs[0]["payload"]["recursive"] is False
     assert repository.created_jobs[0]["payload"]["enqueue_segment"] is True
     assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_encoding"] == "jpg"
-    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 90
+    assert repository.created_jobs[0]["payload"]["metadata"]["kvstore_quality"] == 75
+
+
+def test_api_queues_line_scan_asset_with_canonical_continuity_geometry(tmp_path):
+    client, repository, _ = make_client()
+    sequence = tmp_path / "line-scan-sequence"
+    sequence.mkdir()
+    cv2.imwrite(str(sequence / "frame_001.png"), np.zeros((2, 5), dtype=np.uint8))
+    client.app.state.context.config.file_browser.root_path_import_dir = tmp_path
+
+    response = client.post(
+        "/ingestion/assets",
+        headers=auth_headers(client),
+        json={
+            "assets": [{
+                "path": str(sequence),
+                "kind": "image_sequence",
+                "metadata": {"line_scan_geometry": {"scan_axis": "Y"}},
+            }],
+        },
+    )
+
+    assert response.status_code == 200
+    expected = {"scan_axis": "y"}
+    asset = repository.registered_runs[0].manifest.assets[0]
+    assert asset.metadata["line_scan_geometry"] == expected
+    assert repository.created_jobs[0]["payload"]["metadata"]["line_scan_geometry"] == expected
+
+
+def test_api_rejects_invalid_line_scan_continuity_geometry():
+    client, _, _ = make_client()
+
+    response = client.post(
+        "/ingestion/assets",
+        headers=auth_headers(client),
+        json={
+            "assets": [{
+                "path": "/unused",
+                "kind": "image_sequence",
+                "metadata": {"line_scan_geometry": {"scan_axis": "diagonal"}},
+            }],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "line_scan_geometry.scan_axis" in response.text
 
 
 def test_live_preprocess_writes_to_sandbox_frame(monkeypatch):

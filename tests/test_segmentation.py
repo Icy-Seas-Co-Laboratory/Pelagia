@@ -87,6 +87,11 @@ def test_roi_storage_tier_uses_padded_image_pixel_count_not_bytes_or_channels():
     ) == "jpg"
 
 
+def test_default_roi_storage_tier_switches_at_1000_padded_pixels():
+    assert choose_roi_encoding(np.zeros((25, 39), dtype=np.uint8)) == "zstd"
+    assert choose_roi_encoding(np.zeros((25, 40), dtype=np.uint8)) == "jpg"
+
+
 class FakeDatabaseLogger:
     def __init__(self):
         self.events = []

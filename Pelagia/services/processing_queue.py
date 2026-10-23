@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+
+import numpy as np
 
 from ..services.context import AppContext
 from .job_commands import PreprocessFramesCommand, RoiRefinementCommand, SegmentFramesCommand, FrameSelection
@@ -13,12 +16,214 @@ from .job_commands import PreprocessFramesCommand, RoiRefinementCommand, Segment
 PREPROCESS_FRAMES_PER_JOB = 1_000
 SEGMENT_FRAMES_PER_JOB = 1_000
 ROI_REFINEMENT_DETECTIONS_PER_JOB = 10_000
+# These caps use decoded input array sizes.  They deliberately use decimal
+# units because they are operational job limits (1 GB / 100 MB), not storage
+# allocation limits expressed in GiB/MiB.
+PREPROCESS_INPUT_BYTES_PER_JOB = 1_000_000_000
+SEGMENT_INPUT_BYTES_PER_JOB = 1_000_000_000
+ROI_REFINEMENT_INPUT_BYTES_PER_JOB = 100_000_000
+INCREMENTAL_FRAME_PAGE_SIZE = 1_000
+INCREMENTAL_REFINEMENT_PAGE_SIZE = 10_000
 # A planning step has no durable director lease in the initial series schema.
 # Keep the recovery timeout deliberately conservative: a second director must
 # never reclaim work that a healthy planner is still materialising.
 PROCESSING_SERIES_PLANNING_TIMEOUT_SECONDS = 15 * 60
-PROCESSING_SUBMISSION_CLAIM_SECONDS = 60 * 60
+# A claim now owns only one bounded database page.  A short lease recovers an
+# API crash quickly; the row/advisory transaction fence protects a live page.
+PROCESSING_SUBMISSION_CLAIM_SECONDS = 2 * 60
 _TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "dead_lettered", "cancelled"})
+
+
+def decoded_array_input_bytes(shape: Any, dtype: Any) -> int | None:
+    """Return decoded array bytes, or ``None`` when its metadata is not usable.
+
+    Queue planning must not turn missing metadata into a zero-byte estimate:
+    callers use ``None`` to isolate that work into a one-unit job.
+    """
+    if not shape or dtype is None:
+        return None
+    try:
+        dimensions = tuple(int(dimension) for dimension in shape)
+        if not dimensions or any(dimension <= 0 for dimension in dimensions):
+            return None
+        itemsize = int(np.dtype(dtype).itemsize)
+        if itemsize <= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    total = itemsize
+    for dimension in dimensions:
+        total *= dimension
+    return total
+
+
+def batch_processing_units_by_limit(
+    units: list[dict[str, Any]],
+    max_units: int,
+    max_bytes: int,
+    extra_bytes_for_batch: Callable[[set[str], dict[str, Any]], int | None] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Batch ordered units without exceeding their count or decoded-byte cap.
+
+    A unit larger than the byte cap is still scheduled by itself.  The same
+    conservative treatment applies when the planner cannot establish its input
+    size from durable metadata.
+    """
+    if max_units < 1 or max_bytes < 1:
+        raise ValueError("Processing batch limits must be positive.")
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 0
+    current_frame_ids: set[str] = set()
+
+    def flush() -> None:
+        nonlocal current, current_bytes, current_frame_ids
+        if current:
+            batches.append(current)
+        current = []
+        current_bytes = 0
+        current_frame_ids = set()
+
+    for unit in units:
+        value = unit.get("input_bytes")
+        try:
+            input_bytes = int(value)
+            valid_size = not isinstance(value, bool) and input_bytes >= 0
+        except (TypeError, ValueError, OverflowError):
+            input_bytes = 0
+            valid_size = False
+        extra_bytes = 0 if extra_bytes_for_batch is None else extra_bytes_for_batch(current_frame_ids, unit)
+        if extra_bytes is not None:
+            try:
+                extra_bytes = int(extra_bytes)
+                valid_extra = extra_bytes >= 0
+            except (TypeError, ValueError, OverflowError):
+                valid_extra = False
+        else:
+            valid_extra = False
+        if not valid_size or not valid_extra:
+            flush()
+            batches.append([unit])
+            continue
+        required_bytes = input_bytes + extra_bytes
+        if required_bytes > max_bytes:
+            flush()
+            batches.append([unit])
+            continue
+        if current and (len(current) >= max_units or current_bytes + required_bytes > max_bytes):
+            flush()
+            extra_bytes = 0 if extra_bytes_for_batch is None else extra_bytes_for_batch(current_frame_ids, unit)
+            if extra_bytes is None:
+                batches.append([unit])
+                continue
+            try:
+                extra_bytes = int(extra_bytes)
+            except (TypeError, ValueError, OverflowError):
+                batches.append([unit])
+                continue
+            if extra_bytes < 0 or input_bytes + extra_bytes > max_bytes:
+                batches.append([unit])
+                continue
+        current.append(unit)
+        current_bytes += input_bytes + extra_bytes
+        if unit.get("frame_id"):
+            current_frame_ids.add(str(unit["frame_id"]))
+        if len(current) >= max_units:
+            flush()
+    flush()
+    return batches
+
+
+def _submission_page_batch(
+    rows: list[dict[str, Any]], *, stage: str, options: dict[str, Any], max_units: int,
+) -> list[dict[str, Any]]:
+    """Select one durable planning page under count and decoded-input limits.
+
+    ROI expansion retains a decoded source frame once per distinct frame in a
+    job.  The callback charges that shared array exactly once while the stored
+    ROI and mask arrays are charged for each detection.
+    """
+    if stage in {"preprocess_frames", "segment"}:
+        max_bytes = (
+            PREPROCESS_INPUT_BYTES_PER_JOB
+            if stage == "preprocess_frames"
+            else SEGMENT_INPUT_BYTES_PER_JOB
+        )
+        prepared = [{**row, "input_bytes": _frame_input_bytes(row)} for row in rows]
+        batches = batch_processing_units_by_limit(prepared, max_units, max_bytes)
+        return batches[0] if batches else []
+
+    if stage != "roi_refinement":
+        raise ValueError(f"Unsupported processing stage: {stage}.")
+
+    prepared = [{**row, "input_bytes": _roi_input_bytes(row)} for row in rows]
+    allow_expansion = bool(options.get("allow_frame_expansion", True))
+
+    batches = batch_processing_units_by_limit(
+        prepared, max_units, ROI_REFINEMENT_INPUT_BYTES_PER_JOB,
+        extra_bytes_for_batch=lambda current, candidate: _roi_expansion_frame_bytes(
+            current, candidate, allow_frame_expansion=allow_expansion,
+        ),
+    )
+    return batches[0] if batches else []
+
+
+def _frame_input_bytes(row: dict[str, Any]) -> int | None:
+    return decoded_array_input_bytes(row.get("payload_shape"), row.get("payload_dtype"))
+
+
+def _roi_input_bytes(row: dict[str, Any]) -> int | None:
+    """Decoded candidate crop/mask bytes, apart from an expansion frame."""
+    has_roi = row.get("has_roi_payload")
+    has_mask = row.get("has_mask_payload")
+    if not isinstance(has_roi, bool) or not isinstance(has_mask, bool):
+        return None
+    total = 0
+    if has_roi:
+        roi_bytes = decoded_array_input_bytes(row.get("roi_shape"), row.get("roi_dtype"))
+        if roi_bytes is None:
+            return None
+        total += roi_bytes
+    if has_mask:
+        mask_bytes = decoded_array_input_bytes(row.get("mask_shape"), row.get("mask_dtype"))
+        if mask_bytes is None:
+            return None
+        total += mask_bytes
+    else:
+        # Refinement always works with a binary mask.  When it is not persisted
+        # alongside the candidate, it is reconstructed from the crop geometry.
+        # Binary masks are uint8, one byte per crop pixel.
+        try:
+            mask_width = int(row.get("crop_bbox_w") or row.get("bbox_w"))
+            mask_height = int(row.get("crop_bbox_h") or row.get("bbox_h"))
+        except (TypeError, ValueError):
+            return None
+        if mask_width <= 0 or mask_height <= 0:
+            return None
+        total += mask_width * mask_height
+    return total
+
+
+def _roi_expansion_frame_bytes(
+    current_frame_ids: set[str],
+    candidate: dict[str, Any],
+    *,
+    allow_frame_expansion: bool,
+) -> int | None:
+    """Account once for a frame loaded by ROI refinement within one job."""
+    has_roi = candidate.get("has_roi_payload")
+    if not isinstance(has_roi, bool):
+        return None
+    if not allow_frame_expansion and has_roi:
+        return 0
+    frame_id = candidate.get("frame_id")
+    if not frame_id:
+        return None
+    if str(frame_id) in current_frame_ids:
+        return 0
+    return decoded_array_input_bytes(
+        candidate.get("frame_payload_shape"), candidate.get("frame_payload_dtype"),
+    )
 
 
 # Processing presets are a UI-facing flat document. Queue payloads are also
@@ -59,6 +264,24 @@ _PRESET_KEY_ALIASES = {
     "refinement_allow_frame_expansion": "allow_frame_expansion",
     "refinement_store": "store",
 }
+
+_UNORDERED_REQUEST_LIST_KEYS = frozenset({
+    "asset_ids", "frame_ids", "collection", "collections", "preprocessing_status",
+    "candidate_detection_status", "roi_refinement_status", "refinement_state",
+})
+
+
+def _canonical_submission_value(value: Any, *, key: str | None = None) -> Any:
+    """Normalize set-like selectors before active-request fingerprinting."""
+    if isinstance(value, dict):
+        return {str(item_key): _canonical_submission_value(item_value, key=str(item_key))
+                for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        normalized = [_canonical_submission_value(item) for item in value]
+        if key in _UNORDERED_REQUEST_LIST_KEYS:
+            return sorted({str(item) for item in normalized if item not in (None, "")})
+        return normalized
+    return value
 
 
 def _snake_case(value: str) -> str:
@@ -125,9 +348,9 @@ class ProcessingSubmissionService:
                 raise ValueError(f"Unsupported processing stage: {stage}.")
             filters = dict(persisted_request.get("filters") or {})
             if stage == "preprocess_frames":
-                filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
+                filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed", "cancelled"]
             elif stage == "segment":
-                filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed"]
+                filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed", "cancelled"]
             else:
                 filters["refinement_state"] = filters.get("refinement_state") or ["unrefined"]
             persisted_request["filters"] = filters
@@ -143,9 +366,9 @@ class ProcessingSubmissionService:
                 stage = str(step["stage"])
                 filters = dict(step.get("filters") or {})
                 if stage == "preprocess_frames":
-                    filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
+                    filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed", "cancelled"]
                 elif stage == "segment":
-                    filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed"]
+                    filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed", "cancelled"]
                 else:
                     filters["refinement_state"] = filters.get("refinement_state") or ["unrefined"]
                 normalized_steps.append(ProcessingQueueService._resolve_series_step_options(
@@ -156,6 +379,7 @@ class ProcessingSubmissionService:
             persisted_request["selection"] = selection
         else:
             raise ValueError("Processing submission kind must be 'queue' or 'series'.")
+        persisted_request = _canonical_submission_value(persisted_request)
         try:
             submission, _created = self.repository.create_processing_submission(
                 project_id=project_id, request_id=request_id, kind=kind, request=persisted_request,
@@ -170,6 +394,16 @@ class ProcessingSubmissionService:
 
     def dispatch(self, *, limit: int = 1) -> int:
         """Run a bounded number of claims; safe in every API process."""
+        reconcile = getattr(self.repository, "reconcile_processing_submissions", None)
+        if reconcile is not None:
+            reconcile(limit=100)
+        release = getattr(self.repository, "release_terminal_processing_submission_reservations", None)
+        if release is not None:
+            release(limit=50_000)
+        ready_series = getattr(self.repository, "list_ready_processing_submission_series", None)
+        if ready_series is not None:
+            for ready in ready_series(limit=25):
+                self.advance_series_for_job(str(ready["job_id"]))
         completed = 0
         for _ in range(min(max(1, int(limit)), 25)):
             submission = self.repository.claim_processing_submission(
@@ -185,78 +419,294 @@ class ProcessingSubmissionService:
         submission_id, claim_token = str(submission["id"]), str(submission["claim_token"])
         project_id = str(submission["project_id"])
         try:
-            # Criteria evaluation, job/series creation, work-unit attachment,
-            # and the fenced success transition share one transaction.  The
-            # repository also takes the per-project transaction advisory lock,
-            # so overlapping submissions observe the eligibility changes made
-            # by the preceding materialization without holding another pooled
-            # connection or exposing partially-created work after a crash.
-            with self.repository.processing_submission_transaction(
-                submission_id,
-                project_id=project_id,
-                claim_token=claim_token,
-            ) as connection:
-                # Another process may have reclaimed an expired lease between
-                # claim selection and transaction entry.  A stale claimant
-                # must never fall back to ordinary per-operation commits.
-                if connection is None:
-                    return
-                body = dict(submission.get("request") or {})
-                queue = ProcessingQueueService(self.context, _connection=connection)
-                if submission["kind"] == "queue":
-                    request = PreprocessQueueRequest(
-                        filters=dict(body.get("filters") or {}), options=dict(body.get("options") or {}),
-                        priority=body.get("priority"), dry_run=False,
-                        submitted_by_user_id=submission.get("submitted_by_user_id"),
-                        submitted_by_username=submission.get("submitted_by_username"),
-                    )
-                    stage = str(body["stage"])
-                    if stage == "preprocess_frames":
-                        result = queue.queue_preprocess(request, project_id=project_id)
-                    elif stage == "segment":
-                        result = queue.queue_segment(request, project_id=project_id)
-                    elif stage == "roi_refinement":
-                        result = queue.queue_roi_refinement(request, project_id=project_id)
-                    else:
-                        raise ValueError(f"Unsupported processing stage: {stage}.")
-                elif submission["kind"] == "series":
-                    steps = tuple(dict(step) for step in body.get("steps") or ())
-                    series = queue.create_series(
-                        ProcessingSeriesRequest(
-                            steps=steps, selection=dict(body.get("selection") or body.get("targets") or {}),
-                            preset_snapshot=dict(body.get("preset_snapshot") or {}),
-                            failure_policy=str(body.get("failure_policy") or "fail_fast"), priority=body.get("priority"),
-                            dry_run=False, submitted_by_user_id=submission.get("submitted_by_user_id"),
-                            submitted_by_username=submission.get("submitted_by_username"),
-                        ),
-                        project_id=project_id,
-                    )
-                    result = {"series": series, "dry_run": False}
-                else:  # protected by the database constraint, retained for old databases
-                    raise ValueError("Unsupported processing submission kind.")
-                # A submission response remains cheap even when one criteria
-                # set becomes thousands of queue jobs.  Queue/status owns the
-                # complete, paginated view.
-                job_ids = result.get("job_ids") if isinstance(result, dict) else None
-                if isinstance(job_ids, list) and len(job_ids) > 100:
-                    result = {**result, "job_ids": job_ids[:100], "job_ids_truncated": True}
-                batch_sizes = result.get("batch_sizes") if isinstance(result, dict) else None
-                if isinstance(batch_sizes, list) and len(batch_sizes) > 100:
-                    result = {
-                        **result,
-                        "batch_sizes": batch_sizes[:100],
-                        "batch_sizes_truncated": True,
-                    }
-                completed = self.repository.complete_processing_submission(
-                    submission_id,
-                    claim_token=claim_token,
-                    result=result,
-                    _connection=connection,
-                )
-                if completed is None:
-                    raise RuntimeError("Processing submission claim was lost during materialization.")
+            if submission["kind"] == "queue":
+                self._dispatch_queue_page(submission)
+                return
+            if submission["kind"] == "series":
+                self._dispatch_series_page(submission)
+                return
+            raise ValueError("Unsupported processing submission kind.")
         except Exception as exc:
             self.repository.fail_processing_submission(submission_id, claim_token=claim_token, error=str(exc))
+
+    def _dispatch_queue_page(self, submission: dict[str, Any]) -> None:
+        """Create and commit one worker-sized page, then yield to another request."""
+        submission_id, claim_token = str(submission["id"]), str(submission["claim_token"])
+        project_id = str(submission["project_id"])
+        body = dict(submission.get("request") or {})
+        stage = str(body["stage"])
+        request = PreprocessQueueRequest(
+            filters=dict(body.get("filters") or {}), options=dict(body.get("options") or {}),
+            priority=body.get("priority"), dry_run=False,
+            submitted_by_user_id=submission.get("submitted_by_user_id"),
+            submitted_by_username=submission.get("submitted_by_username"),
+        )
+        page_size = INCREMENTAL_REFINEMENT_PAGE_SIZE if stage == "roi_refinement" else INCREMENTAL_FRAME_PAGE_SIZE
+        with self.repository.processing_submission_transaction(
+            submission_id, project_id=project_id, claim_token=claim_token,
+        ) as connection:
+            if connection is None:
+                return
+            page = self.repository.plan_processing_submission_page(
+                submission_id=submission_id, project_id=project_id, stage=stage,
+                filters=request.filters,
+                payload_kind=str(
+                    request.options.get(
+                        "expansion_frame_payload_kind" if stage == "roi_refinement" else "frame_payload_kind",
+                        "preprocessed" if stage == "roi_refinement" else "original",
+                    )
+                ),
+                boundary=dict(submission.get("selection_boundary") or {}),
+                planning_cursor=dict(submission.get("planning_cursor") or {}),
+                limit=page_size, _connection=connection,
+            )
+            planned_rows = list(page["rows"])
+            rows = _submission_page_batch(
+                planned_rows, stage=stage, options=request.options, max_units=page_size,
+            )
+            if rows and len(rows) < len(planned_rows):
+                page["has_more"] = True
+                page["waiting_for_submission_id"] = None
+                page["cursor"] = {
+                    "created_at": rows[-1]["unit_created_at"],
+                    "detection_id" if stage == "roi_refinement" else "frame_id": str(
+                        rows[-1]["detection_id" if stage == "roi_refinement" else "frame_id"]
+                    ),
+                }
+            job = None
+            unit_ids: list[str] = []
+            if rows:
+                selected_ids = [str(row["detection_id"] if stage == "roi_refinement" else row["frame_id"]) for row in rows]
+                eligible_ids = set(self.repository.lock_processing_submission_page(
+                    project_id=project_id, stage=stage, unit_ids=selected_ids,
+                    filters=request.filters, _connection=connection,
+                ))
+                rows = [row for row in rows if str(
+                    row["detection_id"] if stage == "roi_refinement" else row["frame_id"]
+                ) in eligible_ids]
+            if rows:
+                if stage == "roi_refinement":
+                    unit_ids = [str(row["detection_id"]) for row in rows]
+                    payload = RoiRefinementCommand(
+                        detection_ids=tuple(unit_ids), options=dict(request.options),
+                    ).to_payload()
+                    summary = f"roi refinement queued for {len(unit_ids)} detections"
+                else:
+                    unit_ids = [str(row["frame_id"]) for row in rows]
+                    command = PreprocessFramesCommand if stage == "preprocess_frames" else SegmentFramesCommand
+                    payload = command(
+                        selection=FrameSelection(frame_ids=tuple(unit_ids)), options=dict(request.options),
+                    ).to_payload()
+                    summary = f"{stage} queued for {len(unit_ids)} frames"
+                assets = {str(row["asset_id"]) for row in rows}
+                runs = {str(row["run_id"]) for row in rows if row.get("run_id")}
+                cursor_hash = hashlib.sha256(
+                    repr(sorted(page["cursor"].items())).encode("utf-8")
+                ).hexdigest()[:24]
+                job = self.repository.create_job(
+                    stage, project_id=project_id,
+                    run_id=next(iter(runs)) if len(runs) == 1 else None,
+                    asset_id=next(iter(assets)) if len(assets) == 1 else None,
+                    priority=request.priority, payload=payload, summary=summary,
+                    submitted_by_user_id=request.submitted_by_user_id,
+                    submitted_by_username=request.submitted_by_username,
+                    idempotency_key=f"submission:{submission_id}:{stage}:{cursor_hash}",
+                    _connection=connection,
+                )
+            previous_scheduled = int((submission.get("progress") or {}).get("scheduled_count") or 0)
+            total_scheduled = previous_scheduled + len(unit_ids)
+            previous_jobs = int((submission.get("progress") or {}).get("job_count") or 0)
+            total_jobs = previous_jobs + (1 if job is not None else 0)
+            result = None if page["has_more"] else {
+                "stage": stage,
+                "unit": "detections" if stage == "roi_refinement" else "frames",
+                "matched_count": total_scheduled,
+                "job_count": total_jobs,
+                "max_units_per_job": page_size,
+                "max_input_bytes_per_job": (
+                    ROI_REFINEMENT_INPUT_BYTES_PER_JOB if stage == "roi_refinement"
+                    else PREPROCESS_INPUT_BYTES_PER_JOB if stage == "preprocess_frames"
+                    else SEGMENT_INPUT_BYTES_PER_JOB
+                ),
+            }
+            checkpointed = self.repository.checkpoint_processing_submission(
+                submission_id, claim_token=claim_token, project_id=project_id,
+                boundary=page["boundary"], cursor=page["cursor"],
+                scheduled_count=previous_scheduled, job_id=None if job is None else str(job["id"]),
+                stage=stage, unit_ids=unit_ids, has_more=bool(page["has_more"]),
+                result=result, waiting_for_submission_id=page.get("waiting_for_submission_id"),
+                _connection=connection,
+            )
+            if checkpointed is None:
+                raise RuntimeError("Processing submission claim was lost while checkpointing a page.")
+
+    def _dispatch_series_page(self, submission: dict[str, Any]) -> None:
+        """Plan one independently committed page of the currently eligible series step."""
+        submission_id, claim_token = str(submission["id"]), str(submission["claim_token"])
+        project_id = str(submission["project_id"])
+        body = dict(submission.get("request") or {})
+        with self.repository.processing_submission_transaction(
+            submission_id, project_id=project_id, claim_token=claim_token,
+        ) as connection:
+            if connection is None:
+                return
+            result_snapshot = dict(submission.get("result") or {})
+            series_ref = result_snapshot.get("series") if isinstance(result_snapshot.get("series"), dict) else {}
+            series_id = str(series_ref.get("id") or "")
+            if not series_id:
+                steps = tuple(dict(step) for step in body.get("steps") or ())
+                series = self.repository.create_processing_series(
+                    project_id=project_id, steps=steps,
+                    selection=dict(body.get("selection") or body.get("targets") or {}),
+                    preset_snapshot=dict(body.get("preset_snapshot") or {}),
+                    failure_policy=str(body.get("failure_policy") or "fail_fast"),
+                    priority=body.get("priority"),
+                    submitted_by_user_id=submission.get("submitted_by_user_id"),
+                    submitted_by_username=submission.get("submitted_by_username"),
+                    submission_id=submission_id, _connection=connection,
+                )
+                series_id = str(series["id"])
+            series = self.repository.get_processing_series(
+                series_id, project_id=project_id, _connection=connection,
+            )
+            if series is not None and str(series.get("status")) == "paused":
+                checkpointed = self.repository.checkpoint_processing_submission(
+                    submission_id, claim_token=claim_token, project_id=project_id,
+                    boundary=dict(submission.get("selection_boundary") or {}),
+                    cursor=dict(submission.get("planning_cursor") or {}),
+                    scheduled_count=int((submission.get("progress") or {}).get("scheduled_count") or 0),
+                    job_id=None, stage="segment", unit_ids=[], has_more=False,
+                    result={"series": {"id": series_id, "status": "paused"}},
+                    next_status_override="processing", _connection=connection,
+                )
+                if checkpointed is None:
+                    raise RuntimeError("Processing submission claim was lost while pausing its series.")
+                return
+            steps = self.repository.list_processing_series_steps(
+                series_id, project_id=project_id, _connection=connection,
+            )
+            step = next((item for item in steps if str(item.get("status")) == "planning"), None)
+            if step is None:
+                step = self.repository.claim_processing_series_step(
+                    series_id, project_id=project_id, _connection=connection,
+                )
+            if step is None:
+                series = self.repository.get_processing_series(series_id, project_id=project_id, _connection=connection)
+                terminal = str((series or {}).get("status")) in {"succeeded", "failed", "cancelled"}
+                checkpointed = self.repository.checkpoint_processing_submission(
+                    submission_id, claim_token=claim_token, project_id=project_id,
+                    boundary={}, cursor={}, scheduled_count=int((submission.get("progress") or {}).get("scheduled_count") or 0),
+                    job_id=None, stage="segment", unit_ids=[], has_more=not terminal,
+                    result={"series": series or {"id": series_id}},
+                    next_status_override=str((series or {}).get("status")) if terminal else "planning",
+                    _connection=connection,
+                )
+                if checkpointed is None:
+                    raise RuntimeError("Processing submission claim was lost while finalizing its series.")
+                return
+            stage = str(step["stage"])
+            filters = dict(step.get("filters") or {})
+            options = dict(step.get("options") or {})
+            page_size = INCREMENTAL_REFINEMENT_PAGE_SIZE if stage == "roi_refinement" else INCREMENTAL_FRAME_PAGE_SIZE
+            page = self.repository.plan_processing_submission_page(
+                submission_id=submission_id, project_id=project_id, stage=stage, filters=filters,
+                payload_kind=str(
+                    options.get(
+                        "expansion_frame_payload_kind" if stage == "roi_refinement" else "frame_payload_kind",
+                        "preprocessed" if stage == "roi_refinement" else "original",
+                    )
+                ),
+                boundary=dict(step.get("selection_boundary") or {}),
+                planning_cursor=dict(step.get("planning_cursor") or {}),
+                limit=page_size, _connection=connection,
+            )
+            planned_rows = list(page["rows"])
+            rows = _submission_page_batch(
+                planned_rows, stage=stage, options=options, max_units=page_size,
+            )
+            if rows and len(rows) < len(planned_rows):
+                page["has_more"] = True
+                page["waiting_for_submission_id"] = None
+                page["cursor"] = {
+                    "created_at": rows[-1]["unit_created_at"],
+                    "detection_id" if stage == "roi_refinement" else "frame_id": str(
+                        rows[-1]["detection_id" if stage == "roi_refinement" else "frame_id"]
+                    ),
+                }
+            job = None
+            unit_ids: list[str] = []
+            if rows:
+                selected_ids = [str(row["detection_id"] if stage == "roi_refinement" else row["frame_id"]) for row in rows]
+                eligible_ids = set(self.repository.lock_processing_submission_page(
+                    project_id=project_id, stage=stage, unit_ids=selected_ids,
+                    filters=filters, _connection=connection,
+                ))
+                rows = [row for row in rows if str(
+                    row["detection_id"] if stage == "roi_refinement" else row["frame_id"]
+                ) in eligible_ids]
+            if rows:
+                if stage == "roi_refinement":
+                    unit_ids = [str(row["detection_id"]) for row in rows]
+                    payload = RoiRefinementCommand(detection_ids=tuple(unit_ids), options=options).to_payload()
+                    summary = f"roi refinement queued for {len(unit_ids)} detections"
+                else:
+                    unit_ids = [str(row["frame_id"]) for row in rows]
+                    command = PreprocessFramesCommand if stage == "preprocess_frames" else SegmentFramesCommand
+                    payload = command(selection=FrameSelection(frame_ids=tuple(unit_ids)), options=options).to_payload()
+                    summary = f"{stage} queued for {len(unit_ids)} frames"
+                assets = {str(row["asset_id"]) for row in rows}
+                runs = {str(row["run_id"]) for row in rows if row.get("run_id")}
+                cursor_hash = hashlib.sha256(repr(sorted(page["cursor"].items())).encode("utf-8")).hexdigest()[:24]
+                job = self.repository.create_job(
+                    stage, project_id=project_id,
+                    run_id=next(iter(runs)) if len(runs) == 1 else None,
+                    asset_id=next(iter(assets)) if len(assets) == 1 else None,
+                    priority=step.get("series_priority"), payload=payload, summary=summary,
+                    submitted_by_user_id=step.get("submitted_by_user_id"),
+                    submitted_by_username=step.get("submitted_by_username"),
+                    idempotency_key=f"submission:{submission_id}:step:{step['id']}:{cursor_hash}",
+                    _connection=connection,
+                )
+            step_result = self.repository.checkpoint_processing_series_step(
+                series_id=series_id, step_id=str(step["id"]), boundary=page["boundary"],
+                planning_cursor=page["cursor"], job_id=None if job is None else str(job["id"]),
+                matched_count=len(unit_ids), has_more=bool(page["has_more"]), _connection=connection,
+            )
+            final_step_status = str(step_result["step"]["status"])
+            series_status = str(step_result["series"]["status"])
+            if page["has_more"]:
+                next_submission_status, more = "planning", True
+            elif final_step_status == "active":
+                next_submission_status, more = "processing", False
+            elif series_status in {"succeeded", "failed", "cancelled"}:
+                next_submission_status, more = series_status, False
+            else:
+                next_submission_status, more = "planning", True
+            previous_scheduled = int((submission.get("progress") or {}).get("scheduled_count") or 0)
+            checkpointed = self.repository.checkpoint_processing_submission(
+                submission_id, claim_token=claim_token, project_id=project_id,
+                boundary={"step_id": str(step["id"]), **dict(page["boundary"])},
+                cursor={"step_id": str(step["id"]), **dict(page["cursor"])},
+                scheduled_count=previous_scheduled, job_id=None if job is None else str(job["id"]),
+                stage=stage, step_id=str(step["id"]), unit_ids=unit_ids, has_more=more,
+                result={
+                    "series": {"id": series_id, "status": series_status},
+                    "batch_limits": {
+                        "stage": stage,
+                        "max_units_per_job": page_size,
+                        "max_input_bytes_per_job": (
+                            ROI_REFINEMENT_INPUT_BYTES_PER_JOB if stage == "roi_refinement"
+                            else PREPROCESS_INPUT_BYTES_PER_JOB if stage == "preprocess_frames"
+                            else SEGMENT_INPUT_BYTES_PER_JOB
+                        ),
+                    },
+                },
+                next_status_override=next_submission_status,
+                waiting_for_submission_id=page.get("waiting_for_submission_id"),
+                _connection=connection,
+            )
+            if checkpointed is None:
+                raise RuntimeError("Processing submission claim was lost while checkpointing a series page.")
 
 
 class ProcessingQueueService:
@@ -277,10 +727,13 @@ class ProcessingQueueService:
 
     def queue_preprocess(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
         filters = {**request.filters}
-        filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed"]
+        filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed", "cancelled"]
         frames = self._plan_by_assets("plan_preprocess_frames", project_id=project_id, filters=filters)
         frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
-        batches = self._batches(frames, PREPROCESS_FRAMES_PER_JOB)
+        self._set_frame_input_bytes(frames)
+        batches = batch_processing_units_by_limit(
+            frames, PREPROCESS_FRAMES_PER_JOB, PREPROCESS_INPUT_BYTES_PER_JOB,
+        )
         planned_jobs = [self._job_for_batch(batch, request.options) for batch in batches]
         result = {
             "stage": "preprocess_frames",
@@ -289,6 +742,7 @@ class ProcessingQueueService:
             "job_count": len(planned_jobs),
             "ordering": "kvstore_hash",
             "max_units_per_job": PREPROCESS_FRAMES_PER_JOB,
+            "max_input_bytes_per_job": PREPROCESS_INPUT_BYTES_PER_JOB,
             "batch_sizes": [len(batch) for batch in batches],
             "sample_frame_ids": [str(row["frame_id"]) for row in frames[:20]],
             "dry_run": request.dry_run,
@@ -309,7 +763,7 @@ class ProcessingQueueService:
     def queue_segment(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
         payload_kind = str(request.options.get("frame_payload_kind", "original"))
         filters = {**request.filters}
-        filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed"]
+        filters["candidate_detection_status"] = filters.get("candidate_detection_status") or ["unknown", "failed", "cancelled"]
         frames = self._plan_by_assets(
             "plan_segment_frames", project_id=project_id, filters=filters, payload_kind=payload_kind
         )
@@ -320,18 +774,22 @@ class ProcessingQueueService:
             project_id=project_id,
             command=SegmentFramesCommand,
             max_units=SEGMENT_FRAMES_PER_JOB,
+            max_input_bytes=SEGMENT_INPUT_BYTES_PER_JOB,
             ordering="kvstore_hash",
         )
 
     def queue_roi_refinement(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
+        payload_kind = str(request.options.get("expansion_frame_payload_kind", "preprocessed"))
         detections = self._plan_by_assets(
-            "plan_roi_refinement_detections", project_id=project_id, filters=request.filters
+            "plan_roi_refinement_detections", project_id=project_id, filters=request.filters,
+            frame_payload_kind=payload_kind,
         )
         return self._queue_detection_stage(
             detections,
             request,
             project_id=project_id,
             max_units=ROI_REFINEMENT_DETECTIONS_PER_JOB,
+            max_input_bytes=ROI_REFINEMENT_INPUT_BYTES_PER_JOB,
         )
 
     def create_series(self, request: ProcessingSeriesRequest, *, project_id: str) -> dict[str, Any]:
@@ -387,7 +845,15 @@ class ProcessingQueueService:
         if advanced is None or not advanced.get("ready"):
             return advanced
         series = self.repository.get_processing_series(str(advanced["series_id"]))
-        if series is None or series.get("status") in {"failed", "cancelled", "paused"}:
+        if series is None:
+            return advanced
+        linked_submission = getattr(self.repository, "get_processing_submission_for_series", lambda _id: None)(
+            str(advanced["series_id"])
+        )
+        if linked_submission is not None:
+            self.repository.wake_processing_submission_for_series(str(advanced["series_id"]))
+            return advanced
+        if series.get("status") in {"failed", "cancelled", "paused"}:
             return advanced
         self.advance_series(str(advanced["series_id"]), project_id=str(series["project_id"]))
         return advanced
@@ -411,6 +877,10 @@ class ProcessingQueueService:
         )
         if series is None:
             return None
+        linked_submission = getattr(self.repository, "get_processing_submission_for_series", lambda _id: None)(series_id)
+        if linked_submission is not None:
+            self.repository.wake_processing_submission_for_series(series_id)
+            return self.repository.get_processing_series(series_id, project_id=project_id)
         return self.advance_series(series_id, project_id=project_id)
 
     def reconcile_series(
@@ -585,10 +1055,12 @@ class ProcessingQueueService:
         project_id: str,
         command,
         max_units: int,
+        max_input_bytes: int,
         ordering: str,
     ) -> dict[str, Any]:
         frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
-        batches = self._batches(frames, max_units)
+        self._set_frame_input_bytes(frames)
+        batches = batch_processing_units_by_limit(frames, max_units, max_input_bytes)
         result = {
             "stage": stage,
             "unit": "frames",
@@ -596,6 +1068,7 @@ class ProcessingQueueService:
             "job_count": len(batches),
             "ordering": ordering,
             "max_units_per_job": max_units,
+            "max_input_bytes_per_job": max_input_bytes,
             "batch_sizes": [len(batch) for batch in batches],
             "dry_run": request.dry_run,
         }
@@ -629,9 +1102,20 @@ class ProcessingQueueService:
         *,
         project_id: str,
         max_units: int,
+        max_input_bytes: int,
     ) -> dict[str, Any]:
         detections.sort(key=lambda row: (str(row["frame_id"]), int(row.get("roi_index") or 0), str(row["detection_id"])))
-        batches = self._batches(detections, max_units)
+        for detection in detections:
+            detection["input_bytes"] = _roi_input_bytes(detection)
+        allow_frame_expansion = bool(request.options.get("allow_frame_expansion", True))
+        batches = batch_processing_units_by_limit(
+            detections,
+            max_units,
+            max_input_bytes,
+            extra_bytes_for_batch=lambda current, candidate: _roi_expansion_frame_bytes(
+                current, candidate, allow_frame_expansion=allow_frame_expansion,
+            ),
+        )
         result = {
             "stage": "roi_refinement",
             "unit": "detections",
@@ -639,6 +1123,7 @@ class ProcessingQueueService:
             "job_count": len(batches),
             "ordering": "frame_id",
             "max_units_per_job": max_units,
+            "max_input_bytes_per_job": max_input_bytes,
             "batch_sizes": [len(batch) for batch in batches],
             "dry_run": request.dry_run,
         }
@@ -683,8 +1168,9 @@ class ProcessingQueueService:
         return rows
 
     @staticmethod
-    def _batches(units: list[dict[str, Any]], max_units: int) -> list[list[dict[str, Any]]]:
-        return [units[index:index + max_units] for index in range(0, len(units), max_units)]
+    def _set_frame_input_bytes(frames: list[dict[str, Any]]) -> None:
+        for frame in frames:
+            frame["input_bytes"] = _frame_input_bytes(frame)
 
     @staticmethod
     def _job_for_batch(batch: list[dict[str, Any]], options: dict[str, Any]) -> dict[str, Any]:

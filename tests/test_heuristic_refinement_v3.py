@@ -97,6 +97,28 @@ def test_v3_backend_records_parameters_and_audit():
     ])[0]
 
     assert prediction.metadata["refinement_algorithm"] == "heuristic_v3"
-    assert prediction.metadata["refinement_algorithm_version"] == 3
+    assert prediction.metadata["refinement_algorithm_version"] == 4
     assert prediction.metadata["refinement_parameters"]["growth_penalty"] == 0.2
     assert prediction.metadata["heuristic_v3_audit"]["seed_foreground_pixels"] == 1
+
+
+def test_v3_zero_growth_fills_ordinary_hole_and_preserves_competing_hole():
+    image = np.full((9, 9), 100, dtype=np.uint8)
+    ring = np.zeros_like(image)
+    ring[1:8, 1] = ring[1:8, 7] = 255
+    ring[1, 1:8] = ring[7, 1:8] = 255
+    competitor = np.zeros_like(image)
+    competitor[4, 4] = 255
+    parameters = HeuristicV3RefinementParameters(max_growth_pixels=0)
+
+    ordinary, ordinary_audit = heuristic_v3_refine(image, ring, parameters=parameters)
+    protected, protected_audit = heuristic_v3_refine(
+        image, ring, competing_seed_mask=competitor, parameters=parameters
+    )
+
+    assert np.all(ordinary[1:8, 1:8] == 255)
+    assert ordinary_audit["hole_pixels_filled"] == 25
+    assert protected[4, 4] == 0
+    assert not np.any(protected[2:7, 2:7])
+    assert protected_audit["protected_holes"] == 1
+    assert protected_audit["final_mask_validation"] == "passed"

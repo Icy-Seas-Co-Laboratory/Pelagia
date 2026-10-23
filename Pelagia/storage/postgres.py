@@ -69,6 +69,8 @@ REQUIRED_SCHEMA_TABLES = (
     "processing_series_steps",
     "processing_work_units",
     "processing_submissions",
+    "processing_submission_units",
+    "processing_submission_jobs",
     "project_processing_status_snapshots",
     "frame_processing_status",
     "worker_sessions",
@@ -94,6 +96,26 @@ PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 DETECTION_INSERT_BATCH_ROWS = 250
 DETECTION_INSERT_BATCH_BYTES = 8 * 1024 * 1024
+
+_SUBMISSION_SET_KEYS = frozenset({
+    "asset_ids", "frame_ids", "collection", "collections", "preprocessing_status",
+    "candidate_detection_status", "roi_refinement_status", "refinement_state",
+})
+
+
+def _canonical_submission_request(value: Any, *, key: str | None = None) -> Any:
+    """Canonicalize persisted selectors, including rows created before 0032."""
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _canonical_submission_request(item_value, key=str(item_key))
+            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        normalized = [_canonical_submission_request(item) for item in value]
+        if key in _SUBMISSION_SET_KEYS:
+            return sorted({str(item) for item in normalized if item not in (None, "")})
+        return normalized
+    return value
 
 _DETECTION_INSERT_VALUE_SQL = """
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
@@ -968,6 +990,51 @@ class PostgresRepository:
                     (user_id, project_id),
                 )
                 return cursor.fetchone()
+
+    def list_user_project_memberships(self, user_id: str) -> list[dict[str, Any]]:
+        """Return every project role held by a user, including inactive projects."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        memberships.*,
+                        projects.project_key,
+                        projects.project_name,
+                        projects.is_active AS project_is_active
+                    FROM {self.schema}.project_memberships memberships
+                    JOIN {self.schema}.projects projects ON projects.id = memberships.project_id
+                    WHERE memberships.user_id = %s
+                    ORDER BY projects.project_key ASC
+                    """,
+                    (user_id,),
+                )
+                return cursor.fetchall()
+
+    def remove_project_member(self, user_id: str, project_id: str) -> dict[str, Any] | None:
+        """Remove a project membership and invalidate sessions scoped to that project."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.schema}.project_memberships
+                    WHERE user_id = %s AND project_id = %s
+                    RETURNING *;
+                    """,
+                    (user_id, project_id),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.schema}.user_sessions
+                        SET revoked_at = COALESCE(revoked_at, NOW())
+                        WHERE user_id = %s AND project_id = %s;
+                        """,
+                        (user_id, project_id),
+                    )
+            connection.commit()
+        return row
 
     def create_session(
         self,
@@ -3160,6 +3227,32 @@ class PostgresRepository:
                     frame_ids=[detection.frame_id for _, detection in refined_detections],
                 )
                 for candidate_detection_id, detection in refined_detections:
+                    if job_id is not None:
+                        # Residual/split results retain a distinct ROI index but are
+                        # stored against their real parent candidate.  The ROI index
+                        # is therefore part of the output identity: locking or
+                        # looking up only by candidate would collapse valid siblings.
+                        cursor.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));",
+                            (
+                                f"roi-refinement:{job_id}:{candidate_detection_id}:"
+                                f"{int(detection.roi_index)}",
+                            ),
+                        )
+                        cursor.execute(
+                            f"""
+                            SELECT * FROM {self.schema}.detections_refined
+                            WHERE job_id = %s AND candidate_detection_id = %s AND roi_index = %s
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT 1
+                            FOR UPDATE;
+                            """,
+                            (job_id, candidate_detection_id, int(detection.roi_index)),
+                        )
+                        existing = cursor.fetchone()
+                        if existing is not None:
+                            inserted.append(existing)
+                            continue
                     cursor.execute(
                         f"""
                         INSERT INTO {self.schema}.detections_refined
@@ -3800,6 +3893,20 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 self._ensure_project_scope(cursor, project_id, asset_id=asset_id)
+                if job_id is not None:
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));",
+                        (f"roi-continuity:{job_id}:{asset_id}:{method}",),
+                    )
+                    cursor.execute(
+                        f"""SELECT * FROM {self.schema}.roi_continuity_runs
+                            WHERE project_id = %s AND job_id = %s AND asset_id = %s AND method = %s
+                            ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+                        (project_id, job_id, asset_id, method),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is not None:
+                        return existing
                 cursor.execute(f"""INSERT INTO {self.schema}.roi_continuity_runs
                     (project_id, job_id, run_id, asset_id, method, parameters, metadata)
                     VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb) RETURNING *""", (
@@ -4468,11 +4575,37 @@ class PostgresRepository:
                 params.append(max(0, int(unrefined_candidate_count)))
         params.extend([resolved_project_id, [str(frame_id) for frame_id in frame_ids]])
         extra_sql = ", " + ", ".join(extra_assignments) if extra_assignments else ""
+        terminal_guard = ""
+        if job_id is not None and normalized_status in {
+            JobStatus.SUCCEEDED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value,
+            JobStatus.DEAD_LETTERED.value,
+        }:
+            terminal_guard = f"""
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {self.schema}.processing_jobs other_jobs
+                          WHERE other_jobs.project_id = %s
+                            AND other_jobs.stage = %s::{self.schema}.stage_name
+                            AND other_jobs.id <> %s::uuid
+                            AND other_jobs.status IN ('queued','leased','working','paused')
+                            AND (
+                                COALESCE(other_jobs.payload->'frame_ids', '[]'::jsonb) ? frame_status.frame_id::text
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM jsonb_array_elements_text(
+                                        COALESCE(other_jobs.payload->'detection_ids', '[]'::jsonb)
+                                    ) detection_id
+                                    JOIN {self.schema}.detection_candidate detection
+                                      ON detection.id = detection_id.value::uuid
+                                    WHERE detection.frame_id = frame_status.frame_id
+                                )
+                            )
+                      )"""
+            params.extend([resolved_project_id, stage_value, job_id])
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    UPDATE {self.schema}.frame_processing_status
+                    UPDATE {self.schema}.frame_processing_status AS frame_status
                     SET
                         {status_column} = %s,
                         {job_column} = %s,
@@ -4481,6 +4614,7 @@ class PostgresRepository:
                         {extra_sql}
                     WHERE project_id = %s
                       AND frame_id = ANY(%s::uuid[])
+                      {terminal_guard}
                     """,
                     tuple(params),
                 )
@@ -7742,6 +7876,205 @@ class PostgresRepository:
                     )
         return row
 
+    def enqueue_project_storage_reencode(
+        self,
+        *,
+        project_id: str,
+        policy: dict[str, Any],
+        submitted_by_user_id: str | None = None,
+        submitted_by_username: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Queue one policy snapshot per project; a project lock prevents races."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT id FROM {self.schema}.projects WHERE id = %s FOR UPDATE",
+                    (project_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("Project was not found.")
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.processing_jobs
+                    WHERE project_id = %s AND stage = 'storage_reencode'
+                      AND status IN ('queued', 'leased', 'working', 'paused')
+                    ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (project_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    return existing, False
+                cursor.execute("SELECT NOW() AS created_before")
+                created_before = cursor.fetchone()["created_before"]
+                job = self.create_job(
+                    PipelineStage.STORAGE_REENCODE,
+                    project_id=project_id,
+                    payload={"policy": policy, "created_before": created_before.isoformat()},
+                    summary="Updating project datastores",
+                    submitted_by_user_id=submitted_by_user_id,
+                    submitted_by_username=submitted_by_username,
+                    _connection=connection,
+                )
+            connection.commit()
+        return job, True
+
+    def latest_project_storage_reencode_job(self, project_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.processing_jobs
+                    WHERE project_id = %s AND stage = 'storage_reencode'
+                    ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (project_id,),
+                )
+                return cursor.fetchone()
+
+    def has_online_worker_capability(self, capability: str) -> bool:
+        """Report whether a recent, non-shutting-down worker can claim a stage."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT EXISTS (
+                        SELECT 1 FROM {self.schema}.worker_sessions
+                        WHERE capabilities ? %s AND NOT shutdown_requested
+                          AND status NOT IN ('stopped', 'failed')
+                          AND last_heartbeat >= NOW() - (%s * INTERVAL '1 second')
+                    ) AS available""",
+                    (capability, self.config.queue.heartbeat_interval_seconds * 2),
+                )
+                return bool(cursor.fetchone()["available"])
+
+    def list_storage_reencode_page(
+        self,
+        *,
+        project_id: str,
+        resource: str,
+        created_before: str,
+        after_created_at: str | None = None,
+        after_id: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        tables = {
+            "frames": "frames",
+            "detection_candidate": "detection_candidate",
+            "detections_refined": "detections_refined",
+        }
+        if resource not in tables:
+            raise ValueError("Unknown storage re-encode resource.")
+        table = tables[resource]
+        join = (
+            f"JOIN {self.schema}.raw_assets assets ON assets.id = item.asset_id"
+            if resource == "frames" else
+            f"JOIN {self.schema}.frames frames ON frames.id = item.frame_id "
+            f"JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id"
+        )
+        if resource == "detections_refined":
+            seek_clause = "item.id > %s::uuid"
+            seek_params: tuple[Any, ...] = (after_id or "00000000-0000-0000-0000-000000000000",)
+            order = "item.id"
+        else:
+            seek_clause = "(item.created_at, item.id) > (%s::timestamptz, %s::uuid)"
+            seek_params = (after_created_at or "-infinity",
+                           after_id or "00000000-0000-0000-0000-000000000000")
+            order = "item.created_at, item.id"
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT item.id, item.created_at
+                    FROM {self.schema}.{table} item {join}
+                    WHERE assets.project_id = %s AND item.created_at <= %s::timestamptz
+                      AND {seek_clause}
+                    ORDER BY {order} LIMIT %s""",
+                    (project_id, created_before, *seek_params, max(1, min(100, int(limit)))),
+                )
+                return cursor.fetchall()
+
+    def get_storage_reencode_row(
+        self, *, project_id: str, resource: str, resource_id: str,
+    ) -> dict[str, Any] | None:
+        if resource not in {"frames", "detection_candidate", "detections_refined"}:
+            raise ValueError("Unknown storage re-encode resource.")
+        join = (
+            f"JOIN {self.schema}.raw_assets assets ON assets.id = item.asset_id"
+            if resource == "frames" else
+            f"JOIN {self.schema}.frames frames ON frames.id = item.frame_id "
+            f"JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id"
+        )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT item.*, item.xmin::text AS row_version
+                    FROM {self.schema}.{resource} item {join}
+                    WHERE item.id = %s AND assets.project_id = %s""",
+                    (resource_id, project_id),
+                )
+                return cursor.fetchone()
+
+    def update_storage_reencode_frame(
+        self, *, project_id: str, frame_id: str, row_version: str,
+        variant: str, old_ref: str, new_ref: str, encoding: str, format: str,
+        dtype: str, shape: list[int], metadata: dict[str, Any],
+        preview_thumbhash: bytes | None = None,
+    ) -> bool:
+        columns = {
+            "original": ("kvstore_hash", "payload_ref", "payload_encoding", "payload_format", "payload_dtype", "payload_shape", "metadata", "preview_thumbhash"),
+            "preprocessed": ("preprocessed_kvstore_hash", "preprocessed_payload_ref", "preprocessed_payload_encoding", "preprocessed_payload_format", "preprocessed_payload_dtype", "preprocessed_payload_shape", "preprocessed_metadata", "preprocessed_preview_thumbhash"),
+            "background": ("background_kvstore_hash", "background_payload_ref", "background_payload_encoding", "background_payload_format", "background_payload_dtype", "background_payload_shape", "background_metadata", None),
+        }
+        if variant not in columns:
+            raise ValueError("Unknown frame payload variant.")
+        hash_col, ref_col, enc_col, fmt_col, dtype_col, shape_col, meta_col, preview_col = columns[variant]
+        preview_set = f", {preview_col} = %s" if preview_col and preview_thumbhash is not None else ""
+        values: list[Any] = [new_ref, new_ref, encoding, format, dtype,
+                             json.dumps(json_ready(shape)), json.dumps(json_ready(metadata))]
+        if preview_set:
+            values.append(preview_thumbhash)
+        values.extend([frame_id, project_id, row_version, old_ref])
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.frames item SET
+                    {hash_col} = %s, {ref_col} = %s, {enc_col} = %s, {fmt_col} = %s,
+                    {dtype_col} = %s, {shape_col} = %s::jsonb, {meta_col} = %s::jsonb
+                    {preview_set}
+                    FROM {self.schema}.raw_assets assets
+                    WHERE item.id = %s AND item.asset_id = assets.id
+                      AND assets.project_id = %s AND item.xmin::text = %s
+                      AND COALESCE(item.{ref_col}, item.{hash_col}) = %s
+                    RETURNING item.id""",
+                    tuple(values),
+                )
+                updated = cursor.fetchone() is not None
+            connection.commit()
+        return updated
+
+    def update_storage_reencode_detection(
+        self, *, project_id: str, resource: str, resource_id: str, row_version: str,
+        roi_payload: bytes | None, roi_encoding: str | None, roi_format: str | None,
+        mask_payload: bytes | None, mask_encoding: str | None, mask_format: str | None,
+        metadata: dict[str, Any],
+    ) -> bool:
+        if resource not in {"detection_candidate", "detections_refined"}:
+            raise ValueError("Unknown ROI resource.")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.{resource} item SET
+                    roi_payload = %s, roi_encoding = %s, roi_format = %s,
+                    mask_payload = %s, mask_encoding = %s, mask_format = %s,
+                    metadata = %s::jsonb
+                    FROM {self.schema}.frames frames
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE item.id = %s AND item.frame_id = frames.id
+                      AND assets.project_id = %s AND item.xmin::text = %s
+                    RETURNING item.id""",
+                    (roi_payload, roi_encoding, roi_format, mask_payload, mask_encoding,
+                     mask_format, json.dumps(json_ready(metadata)), resource_id, project_id,
+                     row_version),
+                )
+                updated = cursor.fetchone() is not None
+            connection.commit()
+        return updated
+
     def enqueue_feature_space_analysis(
         self,
         *,
@@ -7829,21 +8162,53 @@ class PostgresRepository:
         if kind not in {"queue", "series"}:
             raise ValueError("Processing submission kind must be 'queue' or 'series'.")
         resolved_project_id = self._required_project_id(project_id, "create_processing_submission")
-        canonical_request = json.dumps(json_ready(dict(request)), sort_keys=True, separators=(",", ":"))
+        canonical_value = _canonical_submission_request(json_ready(dict(request)))
+        canonical_request = json.dumps(canonical_value, sort_keys=True, separators=(",", ":"))
         request_hash = hashlib.sha256(f"{kind}:{canonical_request}".encode("utf-8")).hexdigest()
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                # Plain MVCC read deliberately avoids waiting on a dispatcher
-                # transaction that has locked this row while materializing it.
+                # request_id remains the strict idempotency boundary: callers
+                # must never be allowed to reuse one key for different input.
                 cursor.execute(
                     f"SELECT * FROM {self.schema}.processing_submissions WHERE project_id = %s AND request_id = %s",
                     (resolved_project_id, request_id),
                 )
                 existing = cursor.fetchone()
                 if existing is not None:
-                    if existing["kind"] != kind or existing["request_hash"] != request_hash:
+                    existing_request = json.dumps(
+                        _canonical_submission_request(existing["request"]),
+                        sort_keys=True, separators=(",", ":"),
+                    )
+                    existing_hash = hashlib.sha256(
+                        f"{existing['kind']}:{existing_request}".encode("utf-8")
+                    ).hexdigest()
+                    if existing["kind"] != kind or existing_hash != request_hash:
                         raise ValueError("request_id was already used with a different processing submission.")
                     return existing, False
+                # Serialize identical active requests without serializing all
+                # submissions for the project.  This makes two browser clicks
+                # with different request IDs converge on the same durable row.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{self.schema}:processing-request:{resolved_project_id}:{request_hash}",),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self.schema}.processing_submissions
+                    WHERE project_id = %s AND kind = %s
+                      AND status IN ('accepted', 'planning', 'processing')
+                    ORDER BY created_at, id""",
+                    (resolved_project_id, kind),
+                )
+                for active in cursor.fetchall():
+                    active_request = json.dumps(
+                        _canonical_submission_request(active["request"]),
+                        sort_keys=True, separators=(",", ":"),
+                    )
+                    active_hash = hashlib.sha256(
+                        f"{kind}:{active_request}".encode("utf-8")
+                    ).hexdigest()
+                    if active_hash == request_hash:
+                        return {**active, "_reused_active_submission": True}, False
                 cursor.execute(
                     f"""INSERT INTO {self.schema}.processing_submissions
                     (project_id, request_id, kind, request, request_hash, submitted_by_user_id, submitted_by_username)
@@ -7876,7 +8241,8 @@ class PostgresRepository:
                     f"SELECT * FROM {self.schema}.processing_submissions WHERE id = %s AND project_id = %s",
                     (submission_id, resolved_project_id),
                 )
-                return cursor.fetchone()
+                row = cursor.fetchone()
+        return self._processing_submission_projection(row) if row is not None else None
 
     def list_processing_submissions(self, *, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
         resolved_project_id = self._required_project_id(project_id, "list_processing_submissions")
@@ -7885,10 +8251,97 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""SELECT * FROM {self.schema}.processing_submissions WHERE project_id = %s
-                    ORDER BY (status IN ('accepted', 'planning')) DESC, created_at DESC, id DESC LIMIT %s""",
+                    ORDER BY (status IN ('accepted', 'planning', 'processing')) DESC, created_at DESC, id DESC LIMIT %s""",
                     (resolved_project_id, bounded_limit),
                 )
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+        return [self._processing_submission_projection(row) for row in rows]
+
+    def _processing_submission_projection(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        """Overlay current job counts on a persisted planning checkpoint."""
+        submission = dict(row)
+        submission_status = str(submission.get("status"))
+        progress = dict(submission.get("progress") or {})
+        persisted_waiting_for = progress.get("waiting_for_submission_id")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT
+                        COUNT(submission_jobs.job_id)::bigint AS job_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status = 'queued')::bigint AS queued_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status IN ('leased','working'))::bigint AS running_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status = 'paused')::bigint AS paused_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status = 'succeeded')::bigint AS completed_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status IN ('failed','dead_lettered'))::bigint AS failed_count,
+                        COUNT(submission_jobs.job_id) FILTER (WHERE jobs.status = 'cancelled')::bigint AS cancelled_count
+                    FROM {self.schema}.processing_submission_jobs submission_jobs
+                    JOIN {self.schema}.processing_jobs jobs ON jobs.id = submission_jobs.job_id
+                    WHERE submission_jobs.submission_id = %s""",
+                    (submission["id"],),
+                )
+                counts = cursor.fetchone() or {}
+                waiting_for = None
+                future_series_steps = False
+                if submission.get("kind") == "series" and str(submission.get("status")) == "processing":
+                    cursor.execute(
+                        f"""SELECT EXISTS (
+                            SELECT 1 FROM {self.schema}.processing_series series
+                            JOIN {self.schema}.processing_series_steps steps ON steps.series_id = series.id
+                            WHERE series.submission_id = %s
+                              AND series.status IN ('queued','active')
+                              AND steps.status IN ('queued','planning')
+                        ) AS value""",
+                        (submission["id"],),
+                    )
+                    future_series_steps = bool(cursor.fetchone()["value"])
+                if persisted_waiting_for is not None and submission_status in {"accepted", "planning"}:
+                    cursor.execute(
+                        f"""SELECT id FROM {self.schema}.processing_submissions
+                        WHERE id = %s AND project_id = %s
+                          AND status IN ('accepted','planning','processing')""",
+                        (persisted_waiting_for, submission["project_id"]),
+                    )
+                    blocker = cursor.fetchone()
+                    waiting_for = None if blocker is None else str(blocker["id"])
+                if waiting_for is None and submission_status == "accepted":
+                    cursor.execute(
+                        f"""SELECT id FROM {self.schema}.processing_submissions
+                        WHERE project_id = %s AND id <> %s AND status = 'planning'
+                          AND claim_token IS NOT NULL AND claim_expires_at >= NOW()
+                        ORDER BY COALESCE(last_planned_at, created_at), created_at, id LIMIT 1""",
+                        (submission["project_id"], submission["id"]),
+                    )
+                    blocker = cursor.fetchone()
+                    waiting_for = None if blocker is None else str(blocker["id"])
+        progress.update({key: int(counts.get(key) or 0) for key in (
+            "job_count", "queued_count", "running_count", "paused_count",
+            "completed_count", "failed_count", "cancelled_count",
+        )})
+        status = submission_status
+        progress["more_jobs_being_prepared"] = status in {"accepted", "planning"} or future_series_steps
+        if waiting_for is not None:
+            progress["phase"] = "waiting"
+            progress["waiting_for_submission_id"] = waiting_for
+        elif status == "accepted":
+            progress["phase"] = "finding_eligible"
+        elif status == "planning":
+            progress["phase"] = "planning_and_processing" if progress["job_count"] else "finding_eligible"
+        elif status == "processing":
+            progress["phase"] = "planning_and_processing" if future_series_steps else "processing"
+        elif status in {"succeeded", "failed", "cancelled"}:
+            progress["phase"] = "complete" if status == "succeeded" else status
+        if waiting_for is None:
+            progress["waiting_for_submission_id"] = None
+        if status == "cancelled":
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT EXISTS (SELECT 1 FROM {self.schema}.processing_submission_units WHERE submission_id = %s AND released_at IS NULL) AS value",
+                        (submission["id"],),
+                    )
+                    progress["cancellation_pending"] = bool(cursor.fetchone()["value"])
+        submission["progress"] = progress
+        return submission
 
     def claim_processing_submission(self, *, lease_seconds: float = 300.0) -> dict[str, Any] | None:
         """Claim one accepted or abandoned submission using a fenced durable lease."""
@@ -7899,8 +8352,10 @@ class PostgresRepository:
                     f"""WITH candidate AS (
                         SELECT id FROM {self.schema}.processing_submissions
                         WHERE status = 'accepted'
-                           OR (status = 'planning' AND claim_expires_at < NOW())
-                        ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1
+                           OR (status = 'planning' AND COALESCE(next_plan_at, NOW()) <= NOW()
+                               AND (claim_token IS NULL OR claim_expires_at < NOW()))
+                        ORDER BY COALESCE(last_planned_at, created_at), created_at, id
+                        FOR UPDATE SKIP LOCKED LIMIT 1
                     ) UPDATE {self.schema}.processing_submissions submission
                     SET status = 'planning', claim_token = gen_random_uuid(),
                         claim_expires_at = NOW() + (%s * INTERVAL '1 second'), error = NULL
@@ -7918,8 +8373,8 @@ class PostgresRepository:
 
         The xact advisory lock serializes overlapping criteria per project
         without holding a dedicated connection while workers expand a request.
-        All planner reads, job writes, and submission completion must share the
-        yielded connection so an interruption rolls back as one unit.
+        One page's planner reads, job writes, reservations, and checkpoint must
+        share the yielded connection so an interruption rolls back that page.
         """
         with self.connect() as connection:
             with connection.cursor() as cursor:
@@ -7954,18 +8409,414 @@ class PostgresRepository:
                 row = cursor.fetchone()
         return row
 
+    def checkpoint_processing_submission(
+        self, submission_id: str, *, claim_token: str, project_id: str,
+        boundary: Mapping[str, Any], cursor: Mapping[str, Any], scheduled_count: int,
+        job_id: str | None, stage: str, unit_ids: Sequence[str], has_more: bool,
+        result: Mapping[str, Any] | None = None, step_id: str | None = None,
+        next_status_override: str | None = None,
+        waiting_for_submission_id: str | None = None, _connection=None,
+    ) -> dict[str, Any] | None:
+        """Commit one seek page and its cursor under the current claim fence."""
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as db_cursor:
+                if job_id is not None and unit_ids:
+                    db_cursor.execute(
+                        f"""INSERT INTO {self.schema}.processing_submission_jobs (submission_id, job_id, step_id)
+                        VALUES (%s, %s, %s) ON CONFLICT (submission_id, job_id) DO NOTHING""",
+                        (submission_id, job_id, step_id),
+                    )
+                    db_cursor.executemany(
+                        f"""INSERT INTO {self.schema}.processing_submission_units
+                        (submission_id, project_id, stage, step_id, unit_id, job_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (submission_id, stage, unit_id) DO NOTHING""",
+                        [(submission_id, project_id, stage, step_id, unit_id, job_id) for unit_id in unit_ids],
+                    )
+                next_status = next_status_override or (
+                    "planning" if has_more else ("processing" if job_id is not None or scheduled_count else "succeeded")
+                )
+                next_phase = "planning_and_processing" if has_more and (job_id is not None or scheduled_count) else (
+                    "finding_eligible" if has_more else "processing" if next_status == "processing"
+                    else next_status if next_status in {"failed", "cancelled"} else "complete"
+                )
+                if waiting_for_submission_id is not None and job_id is None:
+                    next_phase = "waiting"
+                db_cursor.execute(
+                    f"""UPDATE {self.schema}.processing_submissions
+                    SET status = %s, selection_boundary = %s::jsonb, planning_cursor = %s::jsonb,
+                        progress = progress || jsonb_build_object(
+                            'phase', %s::text,
+                            'scheduled_count', COALESCE((progress->>'scheduled_count')::bigint, 0) + %s,
+                            'job_count', COALESCE((progress->>'job_count')::bigint, 0) + %s,
+                            'more_jobs_being_prepared', %s::boolean,
+                            'waiting_for_submission_id', %s::text
+                        ),
+                        result = COALESCE(%s::jsonb, result), error = NULL,
+                        last_planned_at = NOW(), planning_finished_at = CASE WHEN %s THEN NULL ELSE NOW() END,
+                        next_plan_at = CASE WHEN %s::text IS NOT NULL AND %s::uuid IS NULL
+                                           THEN NOW() + INTERVAL '2 seconds' ELSE NULL END,
+                        claim_token = NULL, claim_expires_at = NULL,
+                        finished_at = CASE WHEN %s IN ('succeeded','failed','cancelled') THEN NOW() ELSE NULL END
+                    WHERE id = %s AND project_id = %s AND status = 'planning' AND claim_token = %s
+                    RETURNING *""",
+                    (next_status, json.dumps(json_ready(dict(boundary))), json.dumps(json_ready(dict(cursor))),
+                     next_phase, len(unit_ids), 1 if job_id is not None else 0, has_more,
+                     waiting_for_submission_id,
+                     None if result is None else json.dumps(json_ready(dict(result))), has_more,
+                     waiting_for_submission_id, job_id,
+                     next_status, submission_id, project_id, claim_token),
+                )
+                return db_cursor.fetchone()
+
+    def checkpoint_processing_series_step(
+        self, *, series_id: str, step_id: str, boundary: Mapping[str, Any],
+        planning_cursor: Mapping[str, Any], job_id: str | None,
+        matched_count: int, has_more: bool, _connection=None,
+    ) -> dict[str, Any]:
+        """Attach one series job and durably advance that step's seek cursor."""
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as cursor:
+                if job_id is not None:
+                    cursor.execute(
+                        f"""INSERT INTO {self.schema}.processing_work_units (series_id, step_id, job_id)
+                        VALUES (%s, %s, %s) ON CONFLICT (job_id) DO NOTHING""",
+                        (series_id, step_id, job_id),
+                    )
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_series_steps
+                    SET selection_boundary = %s::jsonb, planning_cursor = %s::jsonb,
+                        matched_count = matched_count + %s, job_count = job_count + %s,
+                        planning_complete = NOT %s,
+                        status = CASE WHEN %s THEN 'planning'
+                                      WHEN job_count + %s > 0 THEN 'active' ELSE 'skipped' END,
+                        skip_reason = CASE WHEN NOT %s AND job_count + %s = 0 THEN 'no_eligible_units' ELSE NULL END,
+                        finished_at = CASE WHEN NOT %s AND job_count + %s = 0 THEN NOW() ELSE NULL END,
+                        updated_at = NOW()
+                    WHERE id = %s AND series_id = %s AND status = 'planning'
+                    RETURNING *""",
+                    (json.dumps(json_ready(dict(boundary))), json.dumps(json_ready(dict(planning_cursor))),
+                     matched_count, 1 if job_id is not None else 0, has_more, has_more,
+                     1 if job_id is not None else 0, has_more, 1 if job_id is not None else 0,
+                     has_more, 1 if job_id is not None else 0, step_id, series_id),
+                )
+                step = cursor.fetchone()
+                if step is None:
+                    raise RuntimeError("Processing series step was no longer owned by this planner.")
+                cursor.execute(
+                    f"UPDATE {self.schema}.processing_series SET status = 'active', updated_at = NOW() WHERE id = %s RETURNING *",
+                    (series_id,),
+                )
+                series = cursor.fetchone()
+                if not has_more and step["status"] == "active":
+                    cursor.execute(
+                        f"""SELECT
+                            COUNT(*) FILTER (WHERE jobs.status IN ('queued','leased','working','paused')) AS active,
+                            COUNT(*) FILTER (WHERE jobs.status IN ('failed','dead_lettered','cancelled')) AS failed
+                        FROM {self.schema}.processing_work_units units
+                        JOIN {self.schema}.processing_jobs jobs ON jobs.id = units.job_id
+                        WHERE units.step_id = %s""",
+                        (step_id,),
+                    )
+                    counts = cursor.fetchone()
+                    if int(counts.get("active") or 0) == 0:
+                        cursor.execute(
+                            f"SELECT failure_policy FROM {self.schema}.processing_series WHERE id = %s",
+                            (series_id,),
+                        )
+                        series_policy = str(cursor.fetchone()["failure_policy"])
+                        failed = int(counts.get("failed") or 0) > 0
+                        terminal_step = "failed" if failed and (step.get("failure_policy") or series_policy) == "fail_fast" else "succeeded"
+                        cursor.execute(
+                            f"UPDATE {self.schema}.processing_series_steps SET status = %s, finished_at = NOW(), updated_at = NOW() WHERE id = %s RETURNING *",
+                            (terminal_step, step_id),
+                        )
+                        step = cursor.fetchone()
+                        if terminal_step == "failed":
+                            cursor.execute(
+                                f"UPDATE {self.schema}.processing_series SET status = 'failed', finished_at = NOW(), updated_at = NOW() WHERE id = %s RETURNING *",
+                                (series_id,),
+                            )
+                            series = cursor.fetchone()
+                if not has_more and step["status"] == "skipped":
+                    cursor.execute(
+                        f"SELECT 1 FROM {self.schema}.processing_series_steps WHERE series_id = %s AND status = 'queued' LIMIT 1",
+                        (series_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            f"UPDATE {self.schema}.processing_series SET status = 'succeeded', finished_at = NOW(), updated_at = NOW() WHERE id = %s RETURNING *",
+                            (series_id,),
+                        )
+                        series = cursor.fetchone()
+                if not has_more and step["status"] == "succeeded":
+                    cursor.execute(
+                        f"SELECT 1 FROM {self.schema}.processing_series_steps WHERE series_id = %s AND status = 'queued' LIMIT 1",
+                        (series_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            f"UPDATE {self.schema}.processing_series SET status = 'succeeded', finished_at = NOW(), updated_at = NOW() WHERE id = %s RETURNING *",
+                            (series_id,),
+                        )
+                        series = cursor.fetchone()
+        return {"step": step, "series": series}
+
+    def get_processing_submission_for_series(self, series_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT submissions.* FROM {self.schema}.processing_series series
+                    JOIN {self.schema}.processing_submissions submissions ON submissions.id = series.submission_id
+                    WHERE series.id = %s""",
+                    (series_id,),
+                )
+                return cursor.fetchone()
+
+    def wake_processing_submission_for_series(self, series_id: str) -> dict[str, Any] | None:
+        """Return a durable series submission to the planner after one step finishes."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT series.status AS series_status, series.submission_id
+                    FROM {self.schema}.processing_series series WHERE series.id = %s FOR UPDATE""",
+                    (series_id,),
+                )
+                series = cursor.fetchone()
+                if series is None or series.get("submission_id") is None:
+                    return None
+                terminal = str(series["series_status"]) in {"succeeded", "failed", "cancelled"}
+                paused = str(series["series_status"]) == "paused"
+                next_status = str(series["series_status"]) if terminal else "processing" if paused else "planning"
+                # ``waiting`` is reserved for a named reservation blocker.
+                # Paused series remain in processing and expose paused_count.
+                next_phase = "processing" if paused else "complete" if next_status == "succeeded" else next_status
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_submissions
+                    SET status = %s, claim_token = NULL, claim_expires_at = NULL,
+                        progress = progress || jsonb_build_object(
+                            'phase', %s::text, 'more_jobs_being_prepared', %s::boolean,
+                            'waiting_for_submission_id', NULL
+                        ), finished_at = CASE WHEN %s THEN NOW() ELSE NULL END
+                    WHERE id = %s AND status IN ('planning','processing') RETURNING *""",
+                    (next_status, next_phase, not terminal and not paused, terminal, series["submission_id"]),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row
+
+    def reconcile_processing_submissions(self, *, limit: int = 100) -> int:
+        """Make combined submission status terminal after every linked job is terminal."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH oldest AS (
+                        SELECT id, planning_finished_at
+                        FROM {self.schema}.processing_submissions
+                        WHERE status = 'processing' AND kind = 'queue'
+                        ORDER BY planning_finished_at, id LIMIT %s
+                    ), candidates AS (
+                        SELECT oldest.id,
+                               COUNT(DISTINCT jobs.id) FILTER (WHERE jobs.status IN ('queued','leased','working','paused')) AS active,
+                               COUNT(DISTINCT jobs.id) FILTER (WHERE jobs.status IN ('failed','dead_lettered','cancelled')) AS failed
+                        FROM oldest
+                        JOIN {self.schema}.processing_submission_jobs submission_jobs ON submission_jobs.submission_id = oldest.id
+                        JOIN {self.schema}.processing_jobs jobs ON jobs.id = submission_jobs.job_id
+                        GROUP BY oldest.id
+                        HAVING COUNT(DISTINCT jobs.id) FILTER (WHERE jobs.status IN ('queued','leased','working','paused')) = 0
+                    )
+                    UPDATE {self.schema}.processing_submissions submissions
+                    SET status = CASE WHEN candidates.failed > 0 THEN 'failed' ELSE 'succeeded' END,
+                        error = CASE WHEN candidates.failed > 0 THEN 'One or more processing jobs failed or were cancelled.' ELSE NULL END,
+                        progress = progress || jsonb_build_object(
+                            'phase', CASE WHEN candidates.failed > 0 THEN 'failed' ELSE 'complete' END,
+                            'more_jobs_being_prepared', false,
+                            'waiting_for_submission_id', NULL
+                        ), finished_at = NOW()
+                    FROM candidates WHERE submissions.id = candidates.id
+                    RETURNING submissions.id""",
+                    (min(max(1, int(limit)), 1000),),
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        return len(rows)
+
+    def list_ready_processing_submission_series(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        """Find series steps whose completion callback raced the last planning page."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""SELECT DISTINCT ON (steps.id) units.job_id, steps.series_id
+                    FROM {self.schema}.processing_submissions submissions
+                    JOIN {self.schema}.processing_series series ON series.submission_id = submissions.id
+                    JOIN {self.schema}.processing_series_steps steps ON steps.series_id = series.id
+                    JOIN {self.schema}.processing_work_units units ON units.step_id = steps.id
+                    WHERE submissions.status = 'processing' AND steps.status = 'active'
+                      AND steps.planning_complete
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {self.schema}.processing_work_units active_units
+                          JOIN {self.schema}.processing_jobs active_jobs ON active_jobs.id = active_units.job_id
+                          WHERE active_units.step_id = steps.id
+                            AND active_jobs.status IN ('queued','leased','working','paused')
+                      )
+                    ORDER BY steps.id, units.created_at, units.id LIMIT %s""",
+                    (min(max(1, int(limit)), 100),),
+                )
+                return cursor.fetchall()
+
+    def release_terminal_processing_submission_reservations(self, *, limit: int = 50_000) -> int:
+        """Release terminal reservations in bounded cleanup passes."""
+        bounded_limit = min(max(1, int(limit)), 100_000)
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH releasable AS (
+                        SELECT units.ctid
+                        FROM {self.schema}.processing_submission_units units
+                        JOIN {self.schema}.processing_submissions submissions ON submissions.id = units.submission_id
+                        WHERE units.released_at IS NULL
+                          AND submissions.status IN ('succeeded','failed','cancelled')
+                        ORDER BY units.created_at, units.id LIMIT %s
+                        FOR UPDATE OF units SKIP LOCKED
+                    )
+                    UPDATE {self.schema}.processing_submission_units units
+                    SET released_at = NOW() FROM releasable
+                    WHERE units.ctid = releasable.ctid""",
+                    (bounded_limit,),
+                )
+                count = int(cursor.rowcount or 0)
+            connection.commit()
+        return count
+
+    def cancel_processing_submission(
+        self, submission_id: str, *, project_id: str, reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Stop future pages and cancel already committed jobs in one set-based transaction."""
+        resolved_project_id = self._required_project_id(project_id, "cancel_processing_submission")
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_submissions
+                    SET status = 'cancelled', cancellation_reason = %s, claim_token = NULL,
+                        claim_expires_at = NULL, finished_at = NOW(),
+                        progress = progress || '{{"phase":"cancelled","more_jobs_being_prepared":false,"cancellation_pending":true,"waiting_for_submission_id":null}}'::jsonb
+                    WHERE id = %s AND project_id = %s
+                      AND status IN ('accepted','planning','processing') RETURNING *""",
+                    (reason, submission_id, resolved_project_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        f"SELECT * FROM {self.schema}.processing_submissions WHERE id = %s AND project_id = %s",
+                        (submission_id, resolved_project_id),
+                    )
+                    return cursor.fetchone()
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_jobs jobs
+                    SET status = 'cancelled', control_reason = %s, finished_at = NOW(), updated_at = NOW(),
+                        lease_token = NULL, lease_expires_at = NULL
+                    FROM {self.schema}.processing_submission_jobs submission_jobs
+                    WHERE submission_jobs.submission_id = %s AND submission_jobs.job_id = jobs.id
+                      AND jobs.status IN ('queued','leased','working','paused')""",
+                    (reason or "processing_submission_cancelled", submission_id),
+                )
+                cursor.execute(
+                    f"""UPDATE {self.schema}.frame_processing_status status
+                    SET preprocessing_status = CASE WHEN preprocessing_job_id IN (
+                            SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                        ) THEN 'cancelled' ELSE preprocessing_status END,
+                        candidate_detection_status = CASE WHEN candidate_detection_job_id IN (
+                            SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                        ) THEN 'cancelled' ELSE candidate_detection_status END,
+                        roi_refinement_status = CASE WHEN roi_refinement_job_id IN (
+                            SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                        ) THEN 'cancelled' ELSE roi_refinement_status END,
+                        updated_at = NOW()
+                    WHERE project_id = %s AND (
+                        preprocessing_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                        OR candidate_detection_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                        OR roi_refinement_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                    )""",
+                    (submission_id, submission_id, submission_id, resolved_project_id,
+                     submission_id, submission_id, submission_id),
+                )
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_series SET status = 'cancelled',
+                        control_reason = %s, finished_at = NOW(), updated_at = NOW()
+                    WHERE submission_id = %s AND status IN ('queued','active','paused')""",
+                    (reason or "processing_submission_cancelled", submission_id),
+                )
+                cursor.execute(
+                    f"""UPDATE {self.schema}.processing_series_steps steps
+                    SET status = 'cancelled', finished_at = NOW(), updated_at = NOW()
+                    FROM {self.schema}.processing_series series
+                    WHERE series.submission_id = %s AND steps.series_id = series.id
+                      AND steps.status IN ('queued','planning','active')""",
+                    (submission_id,),
+                )
+            connection.commit()
+        self.release_terminal_processing_submission_reservations(limit=50_000)
+        return self.get_processing_submission(submission_id, project_id=resolved_project_id)
+
     def fail_processing_submission(self, submission_id: str, *, claim_token: str, error: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""UPDATE {self.schema}.processing_submissions
                     SET status = 'failed', error = %s, claim_token = NULL,
-                        claim_expires_at = NULL, finished_at = NOW()
+                        claim_expires_at = NULL, finished_at = NOW(),
+                        progress = progress || '{{"phase":"failed","more_jobs_being_prepared":false,"waiting_for_submission_id":null}}'::jsonb
                     WHERE id = %s AND status = 'planning' AND claim_token = %s RETURNING *""",
                     (error[:4000], submission_id, claim_token),
                 )
                 row = cursor.fetchone()
+                if row is not None:
+                    cursor.execute(
+                        f"""UPDATE {self.schema}.processing_jobs jobs
+                        SET status = 'cancelled', control_reason = 'submission_planning_failed',
+                            finished_at = NOW(), updated_at = NOW(), lease_token = NULL, lease_expires_at = NULL
+                        FROM {self.schema}.processing_submission_jobs submission_jobs
+                        WHERE submission_jobs.submission_id = %s AND submission_jobs.job_id = jobs.id
+                          AND jobs.status IN ('queued','leased','working','paused')""",
+                        (submission_id,),
+                    )
+                    cursor.execute(
+                        f"""UPDATE {self.schema}.frame_processing_status status
+                        SET preprocessing_status = CASE WHEN preprocessing_job_id IN (
+                                SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                            ) THEN 'cancelled' ELSE preprocessing_status END,
+                            candidate_detection_status = CASE WHEN candidate_detection_job_id IN (
+                                SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                            ) THEN 'cancelled' ELSE candidate_detection_status END,
+                            roi_refinement_status = CASE WHEN roi_refinement_job_id IN (
+                                SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s
+                            ) THEN 'cancelled' ELSE roi_refinement_status END,
+                            updated_at = NOW()
+                        WHERE project_id = %s AND (
+                            preprocessing_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                            OR candidate_detection_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                            OR roi_refinement_job_id IN (SELECT job_id FROM {self.schema}.processing_submission_jobs WHERE submission_id = %s)
+                        )""",
+                        (submission_id, submission_id, submission_id, row["project_id"],
+                         submission_id, submission_id, submission_id),
+                    )
+                    cursor.execute(
+                        f"""UPDATE {self.schema}.processing_series SET status = 'failed',
+                            control_reason = 'submission_planning_failed', finished_at = NOW(), updated_at = NOW()
+                        WHERE submission_id = %s AND status IN ('queued','active','paused')""",
+                        (submission_id,),
+                    )
+                    cursor.execute(
+                        f"""UPDATE {self.schema}.processing_series_steps steps
+                        SET status = 'cancelled', finished_at = NOW(), updated_at = NOW()
+                        FROM {self.schema}.processing_series series
+                        WHERE series.submission_id = %s AND steps.series_id = series.id
+                          AND steps.status IN ('queued','planning','active')""",
+                        (submission_id,),
+                    )
             connection.commit()
+        if row is not None:
+            self.release_terminal_processing_submission_reservations(limit=50_000)
         return row
 
     def create_processing_series(
@@ -7979,6 +8830,7 @@ class PostgresRepository:
         priority: int | None = None,
         submitted_by_user_id: str | None = None,
         submitted_by_username: str | None = None,
+        submission_id: str | None = None,
         _connection=None,
     ) -> dict[str, Any]:
         if failure_policy not in {"fail_fast", "continue"}:
@@ -7990,11 +8842,11 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""INSERT INTO {self.schema}.processing_series
-                    (project_id, failure_policy, priority, submitted_by_user_id, submitted_by_username, selection, preset_snapshot)
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb) RETURNING *""",
+                    (project_id, failure_policy, priority, submitted_by_user_id, submitted_by_username, selection, preset_snapshot, submission_id)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s) RETURNING *""",
                     (resolved_project_id, failure_policy, priority if priority is not None else self.config.queue.default_priority,
                      submitted_by_user_id, submitted_by_username,
-                     json.dumps(json_ready(selection or {})), json.dumps(json_ready(preset_snapshot or {}))),
+                     json.dumps(json_ready(selection or {})), json.dumps(json_ready(preset_snapshot or {})), submission_id),
                 )
                 series = cursor.fetchone()
                 for index, step in enumerate(steps):
@@ -8088,7 +8940,9 @@ class PostgresRepository:
         with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"""SELECT steps.* FROM {self.schema}.processing_series_steps steps
+                    f"""SELECT steps.*, series.priority AS series_priority,
+                               series.submitted_by_user_id, series.submitted_by_username
+                    FROM {self.schema}.processing_series_steps steps
                     JOIN {self.schema}.processing_series series ON series.id = steps.series_id
                     WHERE steps.series_id = %s AND (%s::uuid IS NULL OR series.project_id = %s::uuid)
                     ORDER BY steps.step_index""", (series_id, project_id, project_id))
@@ -8195,7 +9049,8 @@ class PostgresRepository:
                         [(series_id, step_id, job_id) for job_id in job_ids],
                     )
                 cursor.execute(
-                    f"""UPDATE {self.schema}.processing_series_steps SET status = %s, matched_count = %s, job_count = %s,
+                    f"""UPDATE {self.schema}.processing_series_steps SET status = %s, planning_complete = true,
+                        matched_count = %s, job_count = %s,
                         skip_reason = CASE WHEN %s = 'skipped' THEN 'no_eligible_units' ELSE NULL END,
                         finished_at = CASE WHEN %s = 'skipped' THEN NOW() ELSE NULL END WHERE id = %s""",
                     ('active' if job_ids else 'skipped', matched_count, len(job_ids),
@@ -8244,6 +9099,13 @@ class PostgresRepository:
                 unit = cursor.fetchone()
                 if unit is None:
                     return None
+                cursor.execute(
+                    f"SELECT status, planning_complete FROM {self.schema}.processing_series_steps WHERE id = %s",
+                    (unit["step_id"],),
+                )
+                step_state = cursor.fetchone()
+                if step_state is None or not bool(step_state.get("planning_complete")):
+                    return {**unit, "ready": False, "planning": True}
                 cursor.execute(f"""SELECT COUNT(*) FILTER (WHERE jobs.status IN ('queued','leased','working','paused')) AS active,
                     COUNT(*) FILTER (WHERE jobs.status IN ('failed','dead_lettered','cancelled')) AS failed
                     FROM {self.schema}.processing_work_units units JOIN {self.schema}.processing_jobs jobs ON jobs.id = units.job_id
@@ -8308,6 +9170,210 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    def plan_processing_submission_page(
+        self, *, submission_id: str, project_id: str, stage: str, filters: Mapping[str, Any],
+        payload_kind: str = "original", boundary: Mapping[str, Any] | None = None,
+        planning_cursor: Mapping[str, Any] | None = None, limit: int = 1000, _connection=None,
+    ) -> dict[str, Any]:
+        """Resolve one stable seek page without counting the complete selection."""
+        resolved_project_id = self._required_project_id(project_id, "plan_processing_submission_page")
+        bounded_limit = min(max(1, int(limit)), 10_000)
+        saved_boundary, saved_cursor = dict(boundary or {}), dict(planning_cursor or {})
+        if stage in {"preprocess_frames", "segment"}:
+            preprocess_statuses = filters.get("preprocessing_status")
+            candidate_statuses = filters.get("candidate_detection_status")
+            active_statuses = ["queued", "leased", "working"]
+            if stage == "preprocess_frames" and preprocess_statuses:
+                preprocess_statuses = list(dict.fromkeys([*preprocess_statuses, *active_statuses]))
+            if stage == "segment" and candidate_statuses:
+                candidate_statuses = list(dict.fromkeys([*candidate_statuses, *active_statuses]))
+            clauses, params = self._frame_status_filters(
+                project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
+                asset_ids=filters.get("asset_ids"), frame_ids=filters.get("frame_ids"), collection=None,
+                preprocessing_status=preprocess_statuses,
+                candidate_detection_status=candidate_statuses,
+                start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
+            )
+            collections = [str(value) for value in filters.get("collection") or [] if value]
+            if collections:
+                clauses.append("status.collections && %s::text[]")
+                params.append(collections)
+            base_where = " AND ".join(clauses)
+            with self._operation_connection(_connection) as connection:
+                with connection.cursor() as cursor:
+                    if not saved_boundary.get("created_before"):
+                        cursor.execute("SELECT NOW() AS value")
+                        saved_boundary = {"created_before": cursor.fetchone()["value"]}
+                    page_clauses = [base_where, "frames.created_at <= %s::timestamptz",
+                                    "(frames.created_at, status.frame_id) > (%s::timestamptz, %s::uuid)"]
+                    page_params = [*params, saved_boundary["created_before"],
+                                   saved_cursor.get("created_at") or "-infinity",
+                                   saved_cursor.get("frame_id") or "00000000-0000-0000-0000-000000000000"]
+                    page_params.append(bounded_limit + 1)
+                    payload_ref = (
+                        "COALESCE(frames.preprocessed_payload_ref, frames.preprocessed_kvstore_hash)"
+                        if stage == "segment" and payload_kind in {"preprocessed", "processed", "corrected"}
+                        else "COALESCE(frames.payload_ref, frames.kvstore_hash)"
+                    )
+                    payload_shape = (
+                        "frames.preprocessed_payload_shape"
+                        if stage == "segment" and payload_kind in {"preprocessed", "processed", "corrected"}
+                        else "frames.payload_shape"
+                    )
+                    payload_dtype = (
+                        "frames.preprocessed_payload_dtype"
+                        if stage == "segment" and payload_kind in {"preprocessed", "processed", "corrected"}
+                        else "frames.payload_dtype"
+                    )
+                    cursor.execute(
+                        f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index,
+                                   {payload_ref} AS payload_ref, {payload_shape} AS payload_shape,
+                                   {payload_dtype} AS payload_dtype, frames.created_at AS unit_created_at,
+                                   (SELECT reserved.submission_id
+                                    FROM {self.schema}.processing_submission_units reserved
+                                    WHERE reserved.project_id = status.project_id AND reserved.stage = '{stage}'
+                                      AND reserved.unit_id = status.frame_id AND reserved.released_at IS NULL
+                                    LIMIT 1) AS reserved_by_submission_id
+                        FROM {self.schema}.frame_processing_status status
+                        JOIN {self.schema}.frames frames ON frames.id = status.frame_id
+                        WHERE {' AND '.join(page_clauses)}
+                        ORDER BY frames.created_at, status.frame_id LIMIT %s""",
+                        tuple(page_params),
+                    )
+                    rows = cursor.fetchall()
+            blocking = next((str(row["reserved_by_submission_id"]) for row in rows
+                             if row.get("reserved_by_submission_id") is not None
+                             and str(row["reserved_by_submission_id"]) != submission_id), None)
+            if blocking is not None:
+                rows = rows[:next(index for index, row in enumerate(rows)
+                                  if str(row.get("reserved_by_submission_id") or "") == blocking)]
+                has_more = True
+            else:
+                has_more = len(rows) > bounded_limit
+                rows = rows[:bounded_limit]
+            next_cursor = saved_cursor if not rows else {
+                "created_at": rows[-1]["unit_created_at"], "frame_id": str(rows[-1]["frame_id"]),
+            }
+            return {"rows": rows, "boundary": saved_boundary, "cursor": next_cursor,
+                    "has_more": has_more, "waiting_for_submission_id": blocking}
+
+        if stage != "roi_refinement":
+            raise ValueError(f"Unsupported processing stage: {stage}.")
+        roi_statuses = filters.get("roi_refinement_status")
+        if roi_statuses:
+            roi_statuses = list(dict.fromkeys([*roi_statuses, "queued", "leased", "working"]))
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
+            asset_ids=filters.get("asset_ids"), frame_ids=filters.get("frame_ids"), collection=None,
+            roi_refinement_status=roi_statuses,
+            candidate_detection_status=filters.get("candidate_detection_status"),
+            preprocessing_status=filters.get("preprocessing_status"),
+            start_frame=filters.get("start_frame"), end_frame=filters.get("end_frame"),
+        )
+        collections = [str(value) for value in filters.get("collection") or [] if value]
+        if collections:
+            clauses.append("status.collections && %s::text[]")
+            params.append(collections)
+        refinement_clause = self._candidate_refinement_state_clause(
+            schema=self.schema, refinement_states=filters.get("refinement_state"),
+        )
+        if refinement_clause:
+            clauses.append(refinement_clause)
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as cursor:
+                if not saved_boundary.get("created_before"):
+                    cursor.execute("SELECT NOW() AS value")
+                    saved_boundary = {"created_before": cursor.fetchone()["value"]}
+                cursor.execute(
+                    f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id,
+                               status.run_id, detections.roi_index, detections.bbox_w, detections.bbox_h,
+                               detections.crop_bbox_w, detections.crop_bbox_h,
+                               detections.roi_payload IS NOT NULL AS has_roi_payload,
+                               detections.roi_shape, detections.roi_dtype,
+                               detections.mask_payload IS NOT NULL AS has_mask_payload,
+                               detections.mask_shape, detections.mask_dtype,
+                               {"frames.preprocessed_payload_shape" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_shape"} AS frame_payload_shape,
+                               {"frames.preprocessed_payload_dtype" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_dtype"} AS frame_payload_dtype,
+                               detections.created_at AS unit_created_at,
+                               (SELECT reserved.submission_id
+                                FROM {self.schema}.processing_submission_units reserved
+                                WHERE reserved.project_id = status.project_id AND reserved.stage = 'roi_refinement'
+                                  AND reserved.unit_id = detections.id AND reserved.released_at IS NULL
+                                LIMIT 1) AS reserved_by_submission_id
+                    FROM {self.schema}.detection_candidate detections
+                    JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
+                    JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                    WHERE {' AND '.join(clauses)}
+                      AND detections.created_at <= %s::timestamptz
+                      AND (detections.created_at, detections.id) > (%s::timestamptz, %s::uuid)
+                    ORDER BY detections.created_at, detections.id LIMIT %s""",
+                    tuple([*params, saved_boundary["created_before"],
+                           saved_cursor.get("created_at") or "-infinity",
+                           saved_cursor.get("detection_id") or "00000000-0000-0000-0000-000000000000",
+                           bounded_limit + 1]),
+                )
+                rows = cursor.fetchall()
+        blocking = next((str(row["reserved_by_submission_id"]) for row in rows
+                         if row.get("reserved_by_submission_id") is not None
+                         and str(row["reserved_by_submission_id"]) != submission_id), None)
+        if blocking is not None:
+            rows = rows[:next(index for index, row in enumerate(rows)
+                              if str(row.get("reserved_by_submission_id") or "") == blocking)]
+            has_more = True
+        else:
+            has_more = len(rows) > bounded_limit
+            rows = rows[:bounded_limit]
+        next_cursor = saved_cursor if not rows else {
+            "created_at": rows[-1]["unit_created_at"], "detection_id": str(rows[-1]["detection_id"]),
+        }
+        return {"rows": rows, "boundary": saved_boundary, "cursor": next_cursor,
+                "has_more": has_more, "waiting_for_submission_id": blocking}
+
+    def lock_processing_submission_page(
+        self, *, project_id: str, stage: str, unit_ids: Sequence[str],
+        filters: Mapping[str, Any], _connection=None,
+    ) -> list[str]:
+        """Revalidate a selected page under row locks immediately before job creation."""
+        if not unit_ids:
+            return []
+        resolved_project_id = self._required_project_id(project_id, "lock_processing_submission_page")
+        with self._operation_connection(_connection) as connection:
+            with connection.cursor() as cursor:
+                if stage == "roi_refinement":
+                    cursor.execute(
+                        f"""SELECT detections.id FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        WHERE assets.project_id = %s AND detections.id = ANY(%s::uuid[])
+                        FOR UPDATE OF detections""",
+                        (resolved_project_id, list(unit_ids)),
+                    )
+                    locked = {str(row["id"]) for row in cursor.fetchall()}
+                    refinement_states = {str(value) for value in filters.get("refinement_state") or ["unrefined"]}
+                    if refinement_states == {"unrefined"}:
+                        cursor.execute(
+                            f"""SELECT DISTINCT candidate_detection_id AS id FROM {self.schema}.detections_refined
+                            WHERE candidate_detection_id = ANY(%s::uuid[])""",
+                            (list(locked),),
+                        )
+                        locked.difference_update(str(row["id"]) for row in cursor.fetchall())
+                    return [unit_id for unit_id in unit_ids if unit_id in locked]
+                status_column = "preprocessing_status" if stage == "preprocess_frames" else "candidate_detection_status"
+                filter_key = "preprocessing_status" if stage == "preprocess_frames" else "candidate_detection_status"
+                eligible = [self._normalize_frame_processing_status(value) for value in filters.get(filter_key) or []]
+                cursor.execute(
+                    f"""SELECT frame_id, {status_column} AS stage_status
+                    FROM {self.schema}.frame_processing_status
+                    WHERE project_id = %s AND frame_id = ANY(%s::uuid[]) FOR UPDATE""",
+                    (resolved_project_id, list(unit_ids)),
+                )
+                rows = cursor.fetchall()
+                eligible_ids = {
+                    str(row["frame_id"]) for row in rows
+                    if not eligible or row["stage_status"] in eligible
+                }
+                return [unit_id for unit_id in unit_ids if unit_id in eligible_ids]
+
     def plan_preprocess_frames(
         self,
         *,
@@ -8337,7 +9403,8 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index,
-                           COALESCE(frames.payload_ref, frames.kvstore_hash) AS payload_ref
+                           COALESCE(frames.payload_ref, frames.kvstore_hash) AS payload_ref,
+                           frames.payload_shape, frames.payload_dtype
                     FROM {self.schema}.frame_processing_status status
                     JOIN {self.schema}.frames frames ON frames.id = status.frame_id
                     WHERE {' AND '.join(clauses)}
@@ -8361,14 +9428,20 @@ class PostgresRepository:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
         payload_ref = "COALESCE(frames.preprocessed_payload_ref, frames.preprocessed_kvstore_hash)" if payload_kind in {"preprocessed", "processed", "corrected"} else "COALESCE(frames.payload_ref, frames.kvstore_hash)"
+        payload_shape = "frames.preprocessed_payload_shape" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_shape"
+        payload_dtype = "frames.preprocessed_payload_dtype" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_dtype"
         with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index, {payload_ref} AS payload_ref
+                cursor.execute(f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index,
+                    {payload_ref} AS payload_ref, {payload_shape} AS payload_shape, {payload_dtype} AS payload_dtype
                     FROM {self.schema}.frame_processing_status status JOIN {self.schema}.frames frames ON frames.id = status.frame_id
                     WHERE {' AND '.join(clauses)} ORDER BY {payload_ref} ASC NULLS LAST, status.frame_id ASC""", tuple(params))
                 return cursor.fetchall()
 
-    def plan_roi_refinement_detections(self, *, project_id: str, filters: dict[str, Any], _connection=None) -> list[dict[str, Any]]:
+    def plan_roi_refinement_detections(
+        self, *, project_id: str, filters: dict[str, Any],
+        frame_payload_kind: str = "preprocessed", _connection=None,
+    ) -> list[dict[str, Any]]:
         resolved_project_id = self._required_project_id(project_id, "plan_roi_refinement_detections")
         clauses, params = self._frame_status_filters(
             project_id=resolved_project_id, run_id=filters.get("run_id"), asset_id=filters.get("asset_id"),
@@ -8390,9 +9463,28 @@ class PostgresRepository:
             clauses.append(refinement_clause)
         with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id, detections.roi_index
+                frame_payload_shape = (
+                    "frames.preprocessed_payload_shape"
+                    if frame_payload_kind in {"preprocessed", "processed", "corrected"}
+                    else "frames.payload_shape"
+                )
+                frame_payload_dtype = (
+                    "frames.preprocessed_payload_dtype"
+                    if frame_payload_kind in {"preprocessed", "processed", "corrected"}
+                    else "frames.payload_dtype"
+                )
+                cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id,
+                    detections.roi_index, detections.bbox_w, detections.bbox_h,
+                    detections.crop_bbox_w, detections.crop_bbox_h,
+                    detections.roi_payload IS NOT NULL AS has_roi_payload,
+                    detections.roi_shape, detections.roi_dtype,
+                    detections.mask_payload IS NOT NULL AS has_mask_payload,
+                    detections.mask_shape, detections.mask_dtype,
+                    {frame_payload_shape} AS frame_payload_shape,
+                    {frame_payload_dtype} AS frame_payload_dtype
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
+                    JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     WHERE {' AND '.join(clauses)} ORDER BY detections.frame_id ASC, detections.roi_index ASC, detections.id ASC""", tuple(params))
                 return cursor.fetchall()
 

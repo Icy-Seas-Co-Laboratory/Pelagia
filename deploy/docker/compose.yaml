@@ -13,7 +13,7 @@ x-backend: &backend
     PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE: /var/lib/pelagia/kvstores
     PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR: /var/lib/pelagia/import
     PELAGIA_ARTIFACTS_LOCAL_ROOT: /var/lib/pelagia/artifacts
-    PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION: ${PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION:-0.20}
+    PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION: ${PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION:-0.50}
     PELAGIA_ORACLE_BASE_URL: http://orchestrator:8110
     PELAGIA_ORACLE_API_TOKEN: ${PELAGIA_ORACLE_API_TOKEN:-}
   volumes:
@@ -53,6 +53,13 @@ services:
   worker:
     <<: *backend
     command: ["pelagia", "worker_run", "--stages", "extract_frames,preprocess_frames,background_frames,segment,roi_refinement,roi_continuity,classify,feature_space_analysis,telemetry_import,registry_load,registry_export,registry_generate,export_bundle"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  storage-worker:
+    <<: *backend
+    command: ["pelagia", "worker_run", "--stages", "storage_reencode"]
     depends_on:
       postgres:
         condition: service_healthy

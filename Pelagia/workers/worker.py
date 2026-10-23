@@ -432,7 +432,14 @@ class Worker:
                 cleanup_interval = self.context.config.logging.cleanup_interval_seconds
                 if callable(cleanup) and (last_cleanup_at is None or now - last_cleanup_at >= cleanup_interval):
                     try:
-                        cleanup()
+                        startup_cleanup = last_cleanup_at is None
+                        while True:
+                            result = cleanup()
+                            if not startup_cleanup or not isinstance(result, dict):
+                                break
+                            deleted = result.get("deleted", {})
+                            if not result.get("acquired", False) or not any(deleted.values()):
+                                break
                     except Exception:
                         get_core_logger("worker").exception("Operational log cleanup failed")
                     last_cleanup_at = now

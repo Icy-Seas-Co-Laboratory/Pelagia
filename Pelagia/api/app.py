@@ -41,7 +41,10 @@ def create_app(config: CoreConfig | None = None):
             service = ProcessingSubmissionService(context)
             while not stop_dispatcher.is_set():
                 try:
-                    dispatched = await asyncio.to_thread(service.dispatch, limit=1)
+                    # A small fair burst supplies several workers immediately.
+                    # Each claim still commits only one page and is reordered by
+                    # last_planned_at, so concurrent submissions round-robin.
+                    dispatched = await asyncio.to_thread(service.dispatch, limit=4)
                 except Exception:  # leave the durable row for the next pass
                     core_logger.exception("Processing submission dispatcher pass failed")
                     dispatched = 0

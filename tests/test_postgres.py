@@ -83,6 +83,85 @@ class _DetectionInsertCursor:
         return self._rows
 
 
+class _ExistingRowCursor:
+    def __init__(self, row):
+        self.row = row
+        self.executions = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, parameters=()):
+        self.executions.append((statement, parameters))
+
+    def fetchone(self):
+        return self.row
+
+
+class _ExistingRowConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.commits = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.commits += 1
+
+
+class _RefinedRetryCursor:
+    def __init__(self):
+        self.executions = []
+        self.rows = {}
+        self.insert_count = 0
+        self._current = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, parameters=()):
+        self.executions.append((statement, parameters))
+        normalized = " ".join(statement.split())
+        if normalized.startswith("SELECT pg_advisory_xact_lock"):
+            self._current = None
+            return
+        if normalized.startswith("SELECT * FROM"):
+            job_id, candidate_detection_id, roi_index = parameters
+            self._current = self.rows.get(
+                (str(job_id), str(candidate_detection_id), int(roi_index))
+            )
+            return
+        if normalized.startswith("INSERT INTO"):
+            candidate_detection_id, job_id, _, _, roi_index = parameters[:5]
+            key = (str(job_id), str(candidate_detection_id), int(roi_index))
+            self.insert_count += 1
+            self._current = {
+                "id": f"refined-{self.insert_count}",
+                "job_id": job_id,
+                "candidate_detection_id": candidate_detection_id,
+                "roi_index": roi_index,
+            }
+            self.rows[key] = self._current
+            return
+        raise AssertionError(f"Unexpected SQL in retry test: {normalized}")
+
+    def fetchone(self):
+        return self._current
+
+
 def _unit_detection(index: int, *, payload_bytes: int = 1) -> DetectionRecord:
     return DetectionRecord(
         run_id="run-1",
@@ -144,6 +223,101 @@ def test_detection_insert_batches_by_payload_bytes_and_can_skip_returning():
     assert rows == []
 
 
+def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    existing = {"id": "refined-existing", "candidate_detection_id": "candidate-1"}
+    cursor = _ExistingRowCursor(existing)
+    connection = _ExistingRowConnection(cursor)
+    repository.connect = lambda: connection
+
+    rows = repository.upsert_refined_detections(
+        [("candidate-1", _unit_detection(1))],
+        job_id="job-1",
+        project_id="project-1",
+    )
+
+    assert rows == [existing]
+    assert len(cursor.executions) == 2
+    assert "pg_advisory_xact_lock" in cursor.executions[0][0]
+    assert cursor.executions[0][1] == ("roi-refinement:job-1:candidate-1:1",)
+    assert (
+        "WHERE job_id = %s AND candidate_detection_id = %s AND roi_index = %s"
+        in cursor.executions[1][0]
+    )
+    assert cursor.executions[1][1] == ("job-1", "candidate-1", 1)
+    assert all("INSERT INTO" not in statement for statement, _ in cursor.executions)
+
+
+def test_refinement_retry_preserves_parent_and_residual_children():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    cursor = _RefinedRetryCursor()
+    connection = _ExistingRowConnection(cursor)
+    repository.connect = lambda: connection
+    parent = _unit_detection(7)
+    residual_one = _unit_detection(7101)
+    residual_two = _unit_detection(7102)
+    residual_one.frame_id = parent.frame_id
+    residual_two.frame_id = parent.frame_id
+    residual_one.metadata.update(
+        {"synthetic_candidate": True, "residual_component_index": 1}
+    )
+    residual_two.metadata.update(
+        {"synthetic_candidate": True, "residual_component_index": 2}
+    )
+    outputs = [
+        ("candidate-1", parent),
+        ("candidate-1", residual_one),
+        ("candidate-1", residual_two),
+    ]
+
+    first = repository.upsert_refined_detections(
+        outputs,
+        job_id="job-1",
+        project_id="project-1",
+    )
+    retried = repository.upsert_refined_detections(
+        outputs,
+        job_id="job-1",
+        project_id="project-1",
+    )
+
+    assert [row["roi_index"] for row in first] == [7, 7101, 7102]
+    assert [row["id"] for row in retried] == [row["id"] for row in first]
+    assert cursor.insert_count == 3
+    assert len(cursor.rows) == 3
+
+
+def test_continuity_retry_reuses_run_for_same_job_asset_and_method():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    existing = {"id": "continuity-existing"}
+    cursor = _ExistingRowCursor(existing)
+    connection = _ExistingRowConnection(cursor)
+    repository.connect = lambda: connection
+
+    stored = repository.record_roi_continuity(
+        project_id="project-1",
+        asset_id="asset-1",
+        run_id="run-1",
+        job_id="job-1",
+        method="line_scan_continuity_v1",
+        parameters={"scan_axis": "y"},
+        assemblies=[],
+        decisions=[],
+    )
+
+    assert stored == existing
+    assert len(cursor.executions) == 2
+    assert "pg_advisory_xact_lock" in cursor.executions[0][0]
+    assert "roi_continuity_runs" in cursor.executions[1][0]
+    assert all("INSERT INTO" not in statement for statement, _ in cursor.executions)
+
+
 def test_render_schema_loads_sql_resource():
     rendered = postgres.render_schema("pelagia_unit")
 
@@ -199,10 +373,14 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0029_operational_log_retention",
             "0030_registry_mask_revision_integrity",
             "0031_processing_submissions",
+            "0032_incremental_processing_submissions",
+            "0033_storage_reencode",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
     assert "{schema}" not in rendered
+
+
     projectless_sessions = postgres.render_migration(migrations[1], "pelagia_unit")
     assert "ALTER COLUMN project_id DROP NOT NULL" in projectless_sessions
     assert "{schema}" not in projectless_sessions
@@ -259,6 +437,133 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "oracle_artifact_fingerprint_sha256" in inference_v2_schema
     assert "classification_inference_batch_items" in inference_v2_schema
     assert "{schema}" not in inference_v2_schema
+    incremental_schema = postgres.render_migration(migrations[31], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.processing_submission_units" in incremental_schema
+    assert "idx_pelagia_unit_psu_active" in incremental_schema
+    assert "idx_pelagia_unit_ps_series_unique" in incremental_schema
+    assert "planning_complete" in incremental_schema
+    assert "{schema}" not in incremental_schema
+
+
+def test_project_storage_reencode_job_is_deduplicated_while_active(postgres_repo):
+    project = postgres_repo.create_project(f"storage-update-{uuid.uuid4().hex}")
+    policy = {
+        "frame_encoding": "jpg", "frame_quality": 75,
+        "small_roi_encoding": "zstd", "large_roi_encoding": "jpg",
+        "large_roi_min_pixels": 1000, "roi_quality": 75,
+        "mask_encoding": "zstd",
+    }
+
+    first, created = postgres_repo.enqueue_project_storage_reencode(
+        project_id=str(project["id"]), policy=policy,
+    )
+    second, second_created = postgres_repo.enqueue_project_storage_reencode(
+        project_id=str(project["id"]), policy=policy,
+    )
+
+    assert created is True
+    assert second_created is False
+    assert first["id"] == second["id"]
+    assert first["payload"]["policy"] == policy
+    assert postgres_repo.latest_project_storage_reencode_job(str(project["id"]))["id"] == first["id"]
+
+
+def test_storage_reencode_worker_availability_uses_capability_and_recent_heartbeat(postgres_repo):
+    assert postgres_repo.has_online_worker_capability("storage_reencode") is False
+    postgres_repo.touch_worker("storage-capable", "idle", capabilities=["storage_reencode"])
+    assert postgres_repo.has_online_worker_capability("storage_reencode") is True
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.worker_sessions "
+                "SET last_heartbeat = NOW() - INTERVAL '1 hour' "
+                "WHERE worker_id = 'storage-capable'"
+            )
+        connection.commit()
+    assert postgres_repo.has_online_worker_capability("storage_reencode") is False
+
+
+def test_project_storage_reencode_rows_are_scoped_and_compare_and_swap(postgres_repo):
+    project = postgres_repo.create_project(f"storage-rows-{uuid.uuid4().hex}")
+    project_id = str(project["id"])
+    other = postgres_repo.create_project(f"storage-other-{uuid.uuid4().hex}")
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.runs
+                (project_id, run_key, instrument, source_path, source_type)
+                VALUES (%s, %s, 'test', '/tmp/test', 'image') RETURNING id""",
+                (project_id, f"storage-run-{uuid.uuid4().hex}"),
+            )
+            run_id = str(cursor.fetchone()["id"])
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.raw_assets
+                (project_id, run_id, filename, path, kind, checksum, size_bytes)
+                VALUES (%s, %s, 'frame.png', '/tmp/frame.png', 'image', 'sha256:test', 4)
+                RETURNING id""",
+                (project_id, run_id),
+            )
+            asset_id = str(cursor.fetchone()["id"])
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.frames
+                (run_id, asset_id, frame_index, width, height, kvstore_hash,
+                 preview_thumbhash, payload_ref, payload_encoding, payload_format,
+                 payload_dtype, payload_shape)
+                VALUES (%s, %s, 1, 2, 2, 'old-ref', %s, 'old-ref', 'raw',
+                        'raw_ndarray_c_order', 'uint8', '[2,2]'::jsonb) RETURNING id""",
+                (run_id, asset_id, b"preview"),
+            )
+            frame_id = str(cursor.fetchone()["id"])
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.detection_candidate
+                (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                 roi_payload, mask_payload, roi_encoding, roi_format, roi_dtype,
+                 roi_shape, mask_encoding, mask_format, mask_dtype, mask_shape)
+                VALUES (%s, %s, 1, 0, 0, 2, 2, %s, %s, 'raw',
+                        'raw_ndarray_c_order', 'uint8', '[2,2]'::jsonb, 'raw',
+                        'raw_ndarray_c_order', 'uint8', '[2,2]'::jsonb) RETURNING id""",
+                (run_id, frame_id, b"roi!", b"mask"),
+            )
+            detection_id = str(cursor.fetchone()["id"])
+        connection.commit()
+
+    boundary = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+    page = postgres_repo.list_storage_reencode_page(
+        project_id=project_id, resource="frames", created_before=boundary,
+    )
+    assert [str(row["id"]) for row in page] == [frame_id]
+    assert postgres_repo.list_storage_reencode_page(
+        project_id=str(other["id"]), resource="frames", created_before=boundary,
+    ) == []
+    frame = postgres_repo.get_storage_reencode_row(
+        project_id=project_id, resource="frames", resource_id=frame_id,
+    )
+    assert postgres_repo.get_storage_reencode_row(
+        project_id=str(other["id"]), resource="frames", resource_id=frame_id,
+    ) is None
+    assert postgres_repo.update_storage_reencode_frame(
+        project_id=project_id, frame_id=frame_id, row_version=frame["row_version"],
+        variant="original", old_ref="old-ref", new_ref="new-ref", encoding="zstd",
+        format="zstd_ndarray_c_order", dtype="uint8", shape=[2, 2],
+        metadata={"kvstore_key": "new-ref"}, preview_thumbhash=b"new-preview",
+    ) is True
+    assert postgres_repo.update_storage_reencode_frame(
+        project_id=project_id, frame_id=frame_id, row_version=frame["row_version"],
+        variant="original", old_ref="old-ref", new_ref="bad-ref", encoding="zstd",
+        format="zstd_ndarray_c_order", dtype="uint8", shape=[2, 2], metadata={},
+    ) is False
+    detection = postgres_repo.get_storage_reencode_row(
+        project_id=project_id, resource="detection_candidate", resource_id=detection_id,
+    )
+    assert postgres_repo.update_storage_reencode_detection(
+        project_id=project_id, resource="detection_candidate", resource_id=detection_id,
+        row_version=detection["row_version"], roi_payload=b"new!", roi_encoding="zstd",
+        roi_format="zstd_ndarray_c_order", mask_payload=b"mask",
+        mask_encoding="raw", mask_format="raw_ndarray_c_order", metadata={"rewritten": True},
+    ) is True
+    assert postgres_repo.get_storage_reencode_row(
+        project_id=project_id, resource="detection_candidate", resource_id=detection_id,
+    )["metadata"]["rewritten"] is True
 
 
 def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
@@ -290,10 +595,40 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 31
-    assert status["migrations"]["applied_count"] == 31
+    assert status["migrations"]["available_count"] == 33
+    assert status["migrations"]["applied_count"] == 33
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_incremental_submission_indexes_remain_distinct_in_long_test_schema(postgres_repo):
+    configured_names = {
+        f"idx_{postgres_repo.schema}_psu_active",
+        f"idx_{postgres_repo.schema}_psu_submission",
+        f"idx_{postgres_repo.schema}_psu_unreleased",
+        f"idx_{postgres_repo.schema}_psj_submission",
+        f"idx_{postgres_repo.schema}_ps_fair",
+        f"idx_{postgres_repo.schema}_ps_series_unique",
+        f"idx_{postgres_repo.schema}_frames_seek",
+        f"idx_{postgres_repo.schema}_dc_seek",
+    }
+    # PostgreSQL's ``name`` type truncates identifiers to 63 bytes. The short
+    # suffixes must remain distinct even with the deliberately long test schema.
+    expected = {name[:63] for name in configured_names}
+    assert len(expected) == len(configured_names)
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT indexname, indexdef
+               FROM pg_indexes
+               WHERE schemaname = %s AND indexname = ANY(%s)""",
+            (postgres_repo.schema, sorted(expected)),
+        )
+        indexes = {row["indexname"]: row["indexdef"] for row in cursor.fetchall()}
+
+    assert set(indexes) == expected
+    active_name = f"idx_{postgres_repo.schema}_psu_active"[:63]
+    assert "CREATE UNIQUE INDEX" in indexes[active_name]
+    assert "WHERE (released_at IS NULL)" in indexes[active_name]
 
 
 def test_postgres_reuses_oracle_v2_inference_run_for_job(postgres_repo):
@@ -583,6 +918,40 @@ def test_initialize_schema_upgrades_database_missing_latest_job_columns(postgres
     assert {
         row["migration_id"] for row in status["applied"]
     } >= {"0022_job_lease_fencing", "0023_job_retry_dispatch"}
+
+
+def test_initialize_schema_adds_planner_columns_before_indexing_them(postgres_repo):
+    """Existing submissions must reach migration 0032 before its fair index."""
+
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"ALTER TABLE {postgres_repo.schema}.processing_submissions "
+                "DROP COLUMN last_planned_at CASCADE"
+            )
+            cursor.execute(
+                f"DELETE FROM {postgres_repo.schema}.schema_migrations "
+                "WHERE migration_id = '0032_incremental_processing_submissions'"
+            )
+        connection.commit()
+
+    postgres_repo.initialize_schema()
+
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'processing_submissions' "
+                "AND column_name = 'last_planned_at'",
+                (postgres_repo.schema,),
+            )
+            assert cursor.fetchone() is not None
+            cursor.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = %s AND indexname = %s",
+                (postgres_repo.schema, f"idx_{postgres_repo.schema}_ps_fair"),
+            )
+            assert cursor.fetchone() is not None
 
 
 def test_processing_series_is_project_scoped_and_advances_terminal_steps(postgres_repo):
@@ -2165,6 +2534,9 @@ def test_postgres_repository_manages_users_projects_memberships_and_sessions(pos
     assert membership["metadata"]["invited_by"] == "pytest"
     assert postgres_repo.get_project_membership(str(user["id"]), str(project["id"]))["role"] == "editor"
 
+    memberships = postgres_repo.list_user_project_memberships(str(user["id"]))
+    assert [(row["project_key"], row["role"] ) for row in memberships] == [("ocean lab", "editor")]
+
     user_projects = postgres_repo.list_user_projects(str(user["id"]))
     assert [row["project_key"] for row in user_projects] == ["ocean lab"]
     assert user_projects[0]["membership_role"] == "editor"
@@ -2197,6 +2569,12 @@ def test_postgres_repository_manages_users_projects_memberships_and_sessions(pos
     revoked = postgres_repo.revoke_session(token)
     assert revoked is not None
     assert postgres_repo.get_session(token) is None
+
+    removable_session = postgres_repo.create_session(str(user["id"]), str(project["id"]))
+    removed = postgres_repo.remove_project_member(str(user["id"]), str(project["id"]))
+    assert removed is not None
+    assert postgres_repo.get_project_membership(str(user["id"]), str(project["id"])) is None
+    assert postgres_repo.get_session(removable_session["token"]) is None
 
     other_project = postgres_repo.create_project("other-project")
     with pytest.raises(PermissionError):

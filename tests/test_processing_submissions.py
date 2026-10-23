@@ -11,7 +11,7 @@ import pytest
 from Pelagia.config import CoreConfig
 from Pelagia.domain import AssetKind, FrameRecord, PlannedRun, RawAssetManifest, RunManifest
 from Pelagia.services.context import AppContext
-from Pelagia.services.processing_queue import ProcessingSubmissionService
+from Pelagia.services.processing_queue import ProcessingQueueService, ProcessingSubmissionService
 from test_postgres import postgres_repo
 
 
@@ -125,22 +125,21 @@ def test_submission_crash_after_first_job_rolls_back_and_replays_once(
         request_id=str(uuid.uuid4()),
         project_id=project_id,
     )
-    assert submission["request"]["filters"]["candidate_detection_status"] == ["unknown", "failed"]
+    assert submission["request"]["filters"]["candidate_detection_status"] == ["cancelled", "failed", "unknown"]
     claimed = postgres_repo.claim_processing_submission(lease_seconds=60)
     assert claimed is not None and claimed["id"] == submission["id"]
 
-    monkeypatch.setattr(processing_queue, "SEGMENT_FRAMES_PER_JOB", 1)
+    monkeypatch.setattr(processing_queue, "INCREMENTAL_FRAME_PAGE_SIZE", 1)
     original_create_job = postgres_repo.create_job
     calls = 0
 
-    def crash_on_second_job(*args, **kwargs):
+    def crash_on_first_page(*args, **kwargs):
         nonlocal calls
         calls += 1
-        if calls == 2:
-            raise _SimulatedProcessCrash()
+        raise _SimulatedProcessCrash()
         return original_create_job(*args, **kwargs)
 
-    monkeypatch.setattr(postgres_repo, "create_job", crash_on_second_job)
+    monkeypatch.setattr(postgres_repo, "create_job", crash_on_first_page)
     with pytest.raises(_SimulatedProcessCrash):
         service._dispatch_claimed(claimed)
 
@@ -152,10 +151,26 @@ def test_submission_crash_after_first_job_rolls_back_and_replays_once(
     monkeypatch.setattr(postgres_repo, "create_job", original_create_job)
     _expire_claim(postgres_repo, str(submission["id"]))
     assert service.dispatch(limit=1) == 1
+    first_checkpoint = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert first_checkpoint["status"] == "planning"
+    assert first_checkpoint["progress"]["scheduled_count"] == 1
+    assert first_checkpoint["planning_cursor"]["frame_id"]
+    claimed_job = postgres_repo.claim_jobs("incremental-worker", stages=[], limit=1)
+    assert len(claimed_job) == 1
+
+    # A restarted planner resumes strictly after the committed cursor while
+    # the worker is already able to process the first page.
+    assert service.dispatch(limit=1) == 1
     assert _materialized_counts(postgres_repo, project_id) == (2, 0, 0)
     completed = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
-    assert completed["status"] == "succeeded"
+    assert completed["status"] == "processing"
     assert completed["result"]["job_count"] == 2
+    with postgres_repo.connect() as connection:
+        reservations = connection.execute(
+            f"SELECT unit_id FROM {postgres_repo.schema}.processing_submission_units WHERE submission_id = %s",
+            (submission["id"],),
+        ).fetchall()
+    assert len({str(row["unit_id"]) for row in reservations}) == 2
 
 
 def test_series_crash_after_attachment_rolls_back_and_replays_once(postgres_repo, monkeypatch):
@@ -175,28 +190,173 @@ def test_series_crash_after_attachment_rolls_back_and_replays_once(postgres_repo
         project_id=project_id,
     )
     assert submission["request"]["steps"][0]["filters"]["candidate_detection_status"] == [
-        "unknown", "failed",
+        "cancelled", "failed", "unknown",
     ]
     claimed = postgres_repo.claim_processing_submission(lease_seconds=60)
     assert claimed is not None and claimed["id"] == submission["id"]
 
-    original_complete = postgres_repo.complete_processing_submission
+    original_checkpoint = postgres_repo.checkpoint_processing_submission
 
-    def crash_before_submission_completion(*args, **kwargs):
+    def crash_before_submission_checkpoint(*args, **kwargs):
         raise _SimulatedProcessCrash()
 
-    monkeypatch.setattr(postgres_repo, "complete_processing_submission", crash_before_submission_completion)
+    monkeypatch.setattr(postgres_repo, "checkpoint_processing_submission", crash_before_submission_checkpoint)
     with pytest.raises(_SimulatedProcessCrash):
         service._dispatch_claimed(claimed)
     assert _materialized_counts(postgres_repo, project_id) == (0, 0, 0)
 
-    monkeypatch.setattr(postgres_repo, "complete_processing_submission", original_complete)
+    monkeypatch.setattr(postgres_repo, "checkpoint_processing_submission", original_checkpoint)
     _expire_claim(postgres_repo, str(submission["id"]))
     assert service.dispatch(limit=1) == 1
     assert _materialized_counts(postgres_repo, project_id) == (1, 1, 1)
-    assert postgres_repo.get_processing_submission(
-        str(submission["id"]), project_id=project_id,
-    )["status"] == "succeeded"
+    planned = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert planned["status"] == "processing"
+    assert planned["result"]["series"]["id"]
+
+
+def test_incremental_series_checkpoints_each_step_when_it_becomes_eligible(postgres_repo, monkeypatch):
+    import Pelagia.services.processing_queue as processing_queue
+
+    project_id, asset_id = _project_with_frames(postgres_repo, count=2)
+    service = _service(postgres_repo)
+    series_director = ProcessingQueueService(AppContext(config=CoreConfig(), repository=postgres_repo))
+    monkeypatch.setattr(processing_queue, "INCREMENTAL_FRAME_PAGE_SIZE", 1)
+    submission = service.submit(
+        kind="series",
+        request={
+            "steps": [
+                {"stage": "preprocess_frames", "filters": {"asset_ids": [asset_id]}, "options": {}},
+                {"stage": "segment", "filters": {"asset_ids": [asset_id]}, "options": {}},
+            ],
+            "selection": {"asset_ids": [asset_id]}, "preset_snapshot": {},
+            "failure_policy": "fail_fast", "priority": 7,
+        },
+        request_id=str(uuid.uuid4()), project_id=project_id,
+        submitted_by_user_id="scientist-1", submitted_by_username="Scientist",
+    )
+
+    assert service.dispatch(limit=1) == 1
+    first = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    first_step_id = first["planning_cursor"]["step_id"]
+    assert first["status"] == "planning"
+    assert service.dispatch(limit=1) == 1
+    planned_first = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert planned_first["status"] == "processing"
+    series_id = planned_first["result"]["series"]["id"]
+    first_units = postgres_repo.list_processing_work_units(series_id, project_id=project_id)
+    assert len(first_units) == 2
+    for unit in first_units:
+        job = postgres_repo.get_job(str(unit["job_id"]), project_id=project_id)
+        assert job["priority"] == 7
+        assert job["submitted_by_user_id"] == "scientist-1"
+        postgres_repo.complete_job(str(unit["job_id"]), result={})
+        series_director.advance_series_for_job(str(unit["job_id"]))
+
+    awakened = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert awakened["status"] == "planning"
+    assert service.dispatch(limit=1) == 1
+    second = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert second["planning_cursor"]["step_id"] != first_step_id
+    assert second["selection_boundary"]["step_id"] == second["planning_cursor"]["step_id"]
+
+
+def test_paused_incremental_series_does_not_report_reservation_waiting_or_future_planning(postgres_repo):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=1)
+    service = _service(postgres_repo)
+    submission = service.submit(
+        kind="series",
+        request={
+            "steps": [
+                {"stage": "preprocess_frames", "filters": {"asset_ids": [asset_id]}, "options": {}},
+                {"stage": "segment", "filters": {"asset_ids": [asset_id]}, "options": {}},
+            ],
+            "selection": {"asset_ids": [asset_id]}, "preset_snapshot": {},
+            "failure_policy": "fail_fast", "priority": None,
+        },
+        request_id=str(uuid.uuid4()), project_id=project_id,
+    )
+    assert service.dispatch(limit=1) == 1
+    active = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    series_id = str(active["result"]["series"]["id"])
+
+    assert postgres_repo.pause_processing_series(
+        series_id, project_id=project_id, reason="operator review",
+    )["status"] == "paused"
+    postgres_repo.wake_processing_submission_for_series(series_id)
+    paused = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+
+    assert paused["status"] == "processing"
+    assert paused["progress"]["phase"] == "processing"
+    assert paused["progress"]["more_jobs_being_prepared"] is False
+    assert paused["progress"]["waiting_for_submission_id"] is None
+    assert paused["progress"]["paused_count"] == 1
+
+
+def test_pausing_during_incremental_planning_stops_new_pages_until_resume(postgres_repo, monkeypatch):
+    import Pelagia.services.processing_queue as processing_queue
+
+    project_id, asset_id = _project_with_frames(postgres_repo, count=2)
+    monkeypatch.setattr(processing_queue, "INCREMENTAL_FRAME_PAGE_SIZE", 1)
+    service = _service(postgres_repo)
+    submission = service.submit(
+        kind="series",
+        request={
+            "steps": [{"stage": "preprocess_frames", "filters": {"asset_ids": [asset_id]}, "options": {}}],
+            "selection": {"asset_ids": [asset_id]}, "preset_snapshot": {},
+            "failure_policy": "fail_fast", "priority": None,
+        },
+        request_id=str(uuid.uuid4()), project_id=project_id,
+    )
+    assert service.dispatch(limit=1) == 1
+    first = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    series_id = str(first["result"]["series"]["id"])
+    assert first["status"] == "planning"
+    assert first["progress"]["job_count"] == 1
+
+    director = ProcessingQueueService(AppContext(config=CoreConfig(), repository=postgres_repo))
+    assert postgres_repo.pause_processing_series(series_id, project_id=project_id)["status"] == "paused"
+    assert service.dispatch(limit=1) == 1
+    paused = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert paused["status"] == "processing"
+    assert paused["progress"]["job_count"] == 1
+    assert paused["progress"]["more_jobs_being_prepared"] is False
+
+    assert director.resume_series(series_id, project_id=project_id)["status"] == "active"
+    assert service.dispatch(limit=1) == 1
+    resumed = postgres_repo.get_processing_submission(str(submission["id"]), project_id=project_id)
+    assert resumed["progress"]["job_count"] == 2
+
+
+def test_overlapping_submission_waits_on_named_reservation_without_hot_spin(postgres_repo):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=1)
+    service = _service(postgres_repo)
+    first = service.submit(
+        kind="queue",
+        request={"stage": "segment", "filters": {"asset_ids": [asset_id]}, "options": {"padding": 1}},
+        request_id=str(uuid.uuid4()), project_id=project_id,
+    )
+    assert service.dispatch(limit=1) == 1
+    assert postgres_repo.get_processing_submission(str(first["id"]), project_id=project_id)["status"] == "processing"
+
+    second = service.submit(
+        kind="queue",
+        request={"stage": "segment", "filters": {"asset_ids": [asset_id]}, "options": {"padding": 2}},
+        request_id=str(uuid.uuid4()), project_id=project_id,
+    )
+    assert service.dispatch(limit=1) == 1
+    waiting = postgres_repo.get_processing_submission(str(second["id"]), project_id=project_id)
+    assert waiting["status"] == "planning"
+    assert waiting["progress"]["phase"] == "waiting"
+    assert waiting["progress"]["waiting_for_submission_id"] == str(first["id"])
+    assert waiting["next_plan_at"] is not None
+    assert postgres_repo.claim_processing_submission(lease_seconds=60) is None
+
+    cancelled = postgres_repo.cancel_processing_submission(
+        str(second["id"]), project_id=project_id, reason="cancel blocked request",
+    )
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["progress"]["phase"] == "cancelled"
+    assert cancelled["progress"]["waiting_for_submission_id"] is None
 
 
 def test_expired_claim_is_fenced_and_locked_materialization_cannot_be_reclaimed(postgres_repo):
@@ -302,6 +462,7 @@ def test_submission_idempotency_is_concurrent_and_acceptance_does_not_wait_for_p
         future.result(timeout=5)
 
     assert repeated["id"] == submission["id"] and created is False
-    assert new_submission["id"] != submission["id"] and new_created is True
+    assert new_submission["id"] == submission["id"] and new_created is False
+    assert new_submission["_reused_active_submission"] is True
     assert retry_elapsed < 1.0
     assert new_elapsed < 1.0

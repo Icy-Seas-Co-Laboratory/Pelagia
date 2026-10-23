@@ -34,6 +34,21 @@ if APIRouter is not None:
     from ...processing.codec_registry import normalize_image_encoding
     from ._common import as_response, get_context, get_repository
 
+    def _canonical_ingestion_metadata(value: dict[str, Any] | None) -> dict[str, Any]:
+        metadata = dict(value or {})
+        geometry = metadata.get("line_scan_geometry")
+        if geometry is None:
+            return metadata
+        if not isinstance(geometry, dict):
+            raise ValueError("metadata.line_scan_geometry must be an object.")
+        axis = str(geometry.get("scan_axis", geometry.get("axis", ""))).strip().lower()
+        if axis not in {"x", "y"}:
+            raise ValueError(
+                "metadata.line_scan_geometry.scan_axis must be either 'x' or 'y'."
+            )
+        metadata["line_scan_geometry"] = {"scan_axis": axis}
+        return metadata
+
     class QueueVideoRequest(BaseModel):
         source_path: str
         n_tile: int | None = None
@@ -64,6 +79,11 @@ if APIRouter is not None:
         metadata: dict[str, Any] = Field(default_factory=dict)
         source_foreground_polarity: Literal["dark", "bright"] | None = None
 
+        @field_validator("metadata")
+        @classmethod
+        def _validate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+            return _canonical_ingestion_metadata(value)
+
     class AnalyzeIngestionRequest(BaseModel):
         source_path: str
         kind: str = "auto"
@@ -83,6 +103,11 @@ if APIRouter is not None:
         background_encoding: str | None = None
         background_quality: int | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
+
+        @field_validator("metadata")
+        @classmethod
+        def _validate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+            return _canonical_ingestion_metadata(value)
 
     class IngestionAssetRequest(BaseModel):
         asset_id: str | None = None
@@ -116,6 +141,11 @@ if APIRouter is not None:
         enqueue_segment: bool | None = None
         roi_padding: int | None = None
         roi_encoding: str | None = None
+
+        @field_validator("metadata")
+        @classmethod
+        def _validate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+            return _canonical_ingestion_metadata(value)
 
         @field_validator("kind")
         @classmethod
@@ -422,6 +452,7 @@ if APIRouter is not None:
             "collections": collections,
             "checksum_status": checksum_status,
             "metadata": {
+                **dict(asset.metadata or {}),
                 "kvstore_encoding": image_encoding,
                 "array_encoding": image_encoding,
                 "kvstore_quality": image_quality,
@@ -857,6 +888,7 @@ if APIRouter is not None:
                 "mask_path": mask_path,
                 "enqueue_segment": body.enqueue_segment,
                 "metadata": {
+                    **asset_metadata,
                     "kvstore_encoding": image_encoding,
                     "array_encoding": image_encoding,
                     "kvstore_quality": image_quality,

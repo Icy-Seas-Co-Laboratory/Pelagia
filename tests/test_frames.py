@@ -959,7 +959,7 @@ def test_store_frame_can_write_jpg_payload():
     metadata = json.loads(ctx.repository.cursor_obj.params[17])
     assert metadata["kvstore_encoding"] == "jpg"
     assert metadata["kvstore_format"] == "jpg"
-    assert metadata["kvstore_quality"] == 90
+    assert metadata["kvstore_quality"] == 75
     decoded = decode_array_payload(ctx.kvstore.payload, metadata)
     assert decoded.shape == data.shape
     assert decoded.dtype == np.uint8

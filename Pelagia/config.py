@@ -113,7 +113,7 @@ class ImageDataStorageConfig:
     """Frame image payload storage settings."""
 
     encoding: ImageDataStorageEncoding = "jpg"
-    quality: int = 90
+    quality: int = 75
     allowed_encodings: list[str] = field(
         default_factory=lambda: ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
     )
@@ -205,7 +205,7 @@ class LoggingConfig:
     routine_log_retention_days: int = 90
     important_log_retention_days: int = 365
     cleanup_interval_seconds: int = 300
-    cleanup_batch_size: int = 2000
+    cleanup_batch_size: int = 50000
 
     def __post_init__(self) -> None:
         for name in (
@@ -289,8 +289,8 @@ class RoiRecordingProcessingConfig:
     padding: int = 50
     small_roi_encoding: str = "zstd"
     large_roi_encoding: str = "jpg"
-    large_roi_min_pixels: int = 50_000
-    roi_quality: int = 90
+    large_roi_min_pixels: int = 1_000
+    roi_quality: int = 75
     mask_encoding: str = "zstd"
     always_store_mask: bool = True
     store_roi_payload_min_area: float | None = None
@@ -389,7 +389,7 @@ class FrameStorageProcessingConfig:
     """Default frame storage parameters."""
 
     image_encoding: ImageDataStorageEncoding = "jpg"
-    image_quality: int = 90
+    image_quality: int = 75
 
     def __post_init__(self) -> None:
         self.image_encoding = _normalize_image_data_storage_encoding(self.image_encoding)

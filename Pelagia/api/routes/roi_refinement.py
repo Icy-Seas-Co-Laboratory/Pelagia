@@ -390,7 +390,11 @@ if APIRouter is not None:
         method = "identity" if body.method == "identity" else backend.method_name
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
         all_candidate_seeds = None
-        if body.method in {HEURISTIC_V2_METHOD_NAME, HEURISTIC_V3_METHOD_NAME}:
+        if body.method in {
+            HEURISTIC_EDGE_METHOD_NAME,
+            HEURISTIC_V2_METHOD_NAME,
+            HEURISTIC_V3_METHOD_NAME,
+        }:
             frame_ids = sorted({record.frame_id for record in detection_records})
             all_candidate_seeds = [
                 DetectionRecord.from_row(row)
@@ -453,6 +457,7 @@ if APIRouter is not None:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         stored_rows = []
+        status_publication: dict[str, Any] | None = None
         if body.store:
             try:
                 stored_rows = repository.upsert_refined_detections(
@@ -462,9 +467,12 @@ if APIRouter is not None:
                     ],
                     project_id=project_id,
                 )
-                frame_ids = list(
-                    dict.fromkeys(str(row["frame_id"]) for row in stored_rows if row.get("frame_id"))
-                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to store refined detections: {exc}") from exc
+            frame_ids = list(
+                dict.fromkeys(str(row["frame_id"]) for row in stored_rows if row.get("frame_id"))
+            )
+            try:
                 connection_assessment = assess_refined_roi_connections(
                     repository=repository,
                     project_id=project_id,
@@ -476,6 +484,21 @@ if APIRouter is not None:
                         else None
                     ),
                 )
+            except Exception as exc:
+                # Refined rows are already durable at this boundary.  Report a
+                # continuity-specific failure without falsely claiming that the
+                # refinement itself failed or inviting an unsafe blind retry.
+                connection_assessment = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "retryable": True,
+                    "retry_operation": "roi_continuity",
+                    "retry_endpoint": "/roi-refinement/continuity/jobs",
+                    "asset_ids": sorted(
+                        {str(row["asset_id"]) for row in candidate_rows if row.get("asset_id")}
+                    ),
+                }
+            try:
                 mark_frame_stage_status(
                     repository,
                     project_id=project_id,
@@ -489,8 +512,13 @@ if APIRouter is not None:
                     frame_ids=frame_ids,
                 )
                 touch_processing_status_snapshot(repository, project_id=project_id)
+                status_publication = {"status": "succeeded"}
             except Exception as exc:
-                raise HTTPException(status_code=500, detail=f"Failed to store refined detections: {exc}") from exc
+                status_publication = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "retry_operation": "processing_status_refresh",
+                }
 
         return as_response(
             {
@@ -501,6 +529,7 @@ if APIRouter is not None:
                 "refined_count": len(refined_records),
                 "stored_count": len(stored_rows),
                 "connection_assessment": connection_assessment if body.store else None,
+                "status_publication": status_publication,
                 "synthetic_refined_count": sum(
                     1 for result in results if result.candidate_detection.metadata.get("synthetic_candidate")
                 ),

@@ -12,6 +12,7 @@ from scipy.sparse.csgraph import breadth_first_order, maximum_flow
 
 from .detection_refinement import RoiRefinementInput, RoiRefinementPrediction
 from .frame_preprocess import as_binary_mask, as_grayscale_array
+from .mask_augmentation import finalize_heuristic_mask
 
 
 HEURISTIC_V3_METHOD_NAME = "heuristic_v3"
@@ -68,7 +69,7 @@ class HeuristicV3RefinementBackend:
             metadata={
                 "inference_backend": "pelagia_builtin",
                 "refinement_algorithm": HEURISTIC_V3_METHOD_NAME,
-                "refinement_algorithm_version": 3,
+                "refinement_algorithm_version": 4,
                 "refinement_parameters": asdict(self.parameters),
                 "heuristic_v3_audit": audit,
             },
@@ -98,18 +99,33 @@ def heuristic_v3_refine(
         raise ValueError("candidate_mask and competing_seed_mask overlap; both seed constraints cannot hold.")
     seed_pixels = int(np.count_nonzero(seed))
     if not seed_pixels:
-        return np.zeros_like(seed, dtype=np.uint8), {
+        finalized, hole_audit = finalize_heuristic_mask(
+            np.zeros_like(seed, dtype=np.uint8),
+            seed_mask=seed,
+            protected_mask=competing,
+        )
+        return finalized, {
             "seed_foreground_pixels": 0, "refined_foreground_pixels": 0,
             "expanded_foreground_pixels": 0, "graph_pixels": 0,
+            "competing_seed_pixels": int(np.count_nonzero(competing)),
             "solver": "scipy_maximum_flow_dinic_v1",
+            **hole_audit,
         }
     if params.max_growth_pixels == 0:
-        return (seed.astype(np.uint8) * 255), {
+        finalized, hole_audit = finalize_heuristic_mask(
+            seed.astype(np.uint8) * 255,
+            seed_mask=seed,
+            protected_mask=competing,
+        )
+        refined_pixels = int(np.count_nonzero(finalized))
+        return finalized, {
             "seed_foreground_pixels": seed_pixels,
-            "refined_foreground_pixels": seed_pixels,
-            "expanded_foreground_pixels": 0,
+            "refined_foreground_pixels": refined_pixels,
+            "expanded_foreground_pixels": refined_pixels - seed_pixels,
+            "competing_seed_pixels": int(np.count_nonzero(competing)),
             "graph_pixels": seed_pixels,
             "solver": "scipy_maximum_flow_dinic_v1",
+            **hole_audit,
         }
 
     finite = np.isfinite(gray)
@@ -218,7 +234,13 @@ def heuristic_v3_refine(
     retained = np.isin(labels, seed_labels[seed_labels > 0]) if component_count > 1 else seed
     retained |= seed
     retained &= ~competing
-    refined_pixels = int(np.count_nonzero(retained))
+    retained |= seed
+    finalized, hole_audit = finalize_heuristic_mask(
+        retained.astype(np.uint8) * 255,
+        seed_mask=seed,
+        protected_mask=competing,
+    )
+    refined_pixels = int(np.count_nonzero(finalized))
     audit: dict[str, float | int | str] = {
         "seed_foreground_pixels": seed_pixels,
         "refined_foreground_pixels": refined_pixels,
@@ -231,5 +253,6 @@ def heuristic_v3_refine(
         "gradient_sigma": float(sigma),
         "cut_capacity": int(flow.flow_value),
         "solver": "scipy_maximum_flow_dinic_v1",
+        **hole_audit,
     }
-    return retained.astype(np.uint8) * 255, audit
+    return finalized, audit

@@ -83,10 +83,10 @@ Queue mutations trigger a refresh. Job logs, event history, artifact metadata,
 and frame coverage can still use their dedicated APIs; they are separate data
 from the queue status snapshot.
 
-[Durable processing submissions](processing-submissions.md) report acceptance
-and planning before jobs exist. Once planning completes, their created jobs
-appear in queue snapshots. A submission's successful planning status does not
-mean its jobs have finished processing.
+[Durable processing submissions](processing-submissions.md) report planning and
+worker execution together. Their live counters are sourced from the linked jobs
+in this queue-status model, and submission `succeeded` means both planning and
+execution completed successfully.
 
 `/jobs`, `/jobs/summary`, and `/jobs/stream` remain available for existing clients.
 The current status implementation uses polling. SSE can later invalidate these

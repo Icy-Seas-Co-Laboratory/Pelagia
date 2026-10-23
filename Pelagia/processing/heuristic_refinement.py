@@ -16,6 +16,7 @@ import numpy as np
 
 from .detection_refinement import RoiRefinementInput, RoiRefinementPrediction
 from .frame_preprocess import as_binary_mask, as_grayscale_array
+from .mask_augmentation import finalize_heuristic_mask
 
 
 HEURISTIC_EDGE_METHOD_NAME = "heuristic_edge_v1"
@@ -48,6 +49,7 @@ class HeuristicEdgeRefinementBackend:
     """CPU-only whole-crop refiner compatible with ``RoiRefinementBackend``."""
 
     method_name = HEURISTIC_EDGE_METHOD_NAME
+    protects_candidate_identity = True
 
     def __init__(self, parameters: HeuristicEdgeRefinementParameters | None = None) -> None:
         self.parameters = parameters or HeuristicEdgeRefinementParameters()
@@ -59,6 +61,7 @@ class HeuristicEdgeRefinementBackend:
         mask, audit = heuristic_edge_refine(
             item.image,
             item.candidate_mask,
+            competing_seed_mask=item.competing_seed_mask,
             parameters=self.parameters,
         )
         return RoiRefinementPrediction(
@@ -66,7 +69,7 @@ class HeuristicEdgeRefinementBackend:
             metadata={
                 "inference_backend": "pelagia_builtin",
                 "refinement_algorithm": HEURISTIC_EDGE_METHOD_NAME,
-                "refinement_algorithm_version": 1,
+                "refinement_algorithm_version": 2,
                 "refinement_parameters": asdict(self.parameters),
                 "heuristic_edge_audit": audit,
                 "dominant_edge_angle_degrees": audit["dominant_edge_angle_degrees"],
@@ -79,8 +82,9 @@ def heuristic_edge_refine(
     image: np.ndarray,
     candidate_mask: np.ndarray,
     *,
+    competing_seed_mask: np.ndarray | None = None,
     parameters: HeuristicEdgeRefinementParameters | None = None,
-) -> tuple[np.ndarray, dict[str, float | int | None]]:
+) -> tuple[np.ndarray, dict[str, float | int | str | None]]:
     """Return a binary mask grown from a candidate seed without crossing oblique edges.
 
     Axis-aligned image edges are *not* barriers.  This is intentional: they
@@ -93,14 +97,29 @@ def heuristic_edge_refine(
     seed = as_binary_mask(candidate_mask) > 0
     if gray.shape[:2] != seed.shape:
         raise ValueError("image and candidate_mask must have matching spatial shapes.")
+    competing = (
+        np.zeros(seed.shape, dtype=bool)
+        if competing_seed_mask is None
+        else as_binary_mask(competing_seed_mask) > 0
+    )
+    if competing.shape != seed.shape:
+        raise ValueError("competing_seed_mask and candidate_mask must have matching shapes.")
+    if np.any(seed & competing):
+        raise ValueError("candidate_mask and competing_seed_mask cannot overlap.")
     if not np.any(seed) or resolved.max_growth_pixels == 0:
-        return np.ascontiguousarray(seed.astype(np.uint8) * 255), {
+        finalized, hole_audit = finalize_heuristic_mask(
+            seed.astype(np.uint8) * 255,
+            seed_mask=seed,
+            protected_mask=competing,
+        )
+        return finalized, {
             "seed_foreground_pixels": int(np.count_nonzero(seed)),
-            "refined_foreground_pixels": int(np.count_nonzero(seed)),
+            "refined_foreground_pixels": int(np.count_nonzero(finalized)),
             "barrier_pixels": 0,
             "strong_gradient_threshold": 0.0,
             "dominant_edge_angle_degrees": None,
             "edge_strength": 0.0,
+            **hole_audit,
         }
 
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -129,17 +148,25 @@ def heuristic_edge_refine(
         seed.astype(np.uint8),
         np.ones((kernel_size, kernel_size), dtype=np.uint8),
     ).astype(bool)
-    traversable = permitted_extent & similar_intensity & ~barriers
+    traversable = permitted_extent & similar_intensity & ~barriers & ~competing
     traversable |= seed
     component_count, labels = cv2.connectedComponents(traversable.astype(np.uint8), connectivity=8)
     seed_labels = np.unique(labels[seed])
     keep_labels = seed_labels[seed_labels > 0]
     refined = np.isin(labels, keep_labels) if component_count > 1 else seed
     refined |= seed
+    refined &= ~competing
+    refined |= seed
+    finalized, hole_audit = finalize_heuristic_mask(
+        refined.astype(np.uint8) * 255,
+        seed_mask=seed,
+        protected_mask=competing,
+    )
     barrier_orientations = np.mod(np.degrees(np.arctan2(grad_y[barriers], grad_x[barriers])), 180.0)
-    return np.ascontiguousarray(refined.astype(np.uint8) * 255), {
+    return finalized, {
         "seed_foreground_pixels": int(np.count_nonzero(seed)),
-        "refined_foreground_pixels": int(np.count_nonzero(refined)),
+        "refined_foreground_pixels": int(np.count_nonzero(finalized)),
+        "competing_seed_pixels": int(np.count_nonzero(competing)),
         "barrier_pixels": int(np.count_nonzero(barriers)),
         "strong_gradient_threshold": strong_threshold,
         "seed_median_intensity": seed_median,
@@ -150,4 +177,5 @@ def heuristic_edge_refine(
         "edge_strength": (
             0.0 if not np.any(barriers) else float(np.mean(magnitude[barriers]))
         ),
+        **hole_audit,
     }

@@ -742,9 +742,23 @@ def _refine_detections_with_backend(
         _detection_identifier(state.detection): state.candidate_mask
         for state in states
     }
+    selected_ids_by_frame: dict[tuple[str, str], set[str]] = {}
+    for state in states:
+        selected_ids_by_frame.setdefault(
+            (state.detection.frame_id, state.detection.run_id), set()
+        ).add(_detection_identifier(state.detection))
     seeds_by_frame: dict[tuple[str, str], list[tuple[str, tuple[int, int, int, int], np.ndarray]]] = {}
     for record in seed_records:
         identifier = _detection_identifier(record)
+        frame_key = (record.frame_id, record.run_id)
+        # A selected seed only contributes to another selected ROI on the same
+        # frame.  Avoid decoding and validating it when it cannot be a
+        # competitor (the usual one-ROI job path).
+        if (
+            identifier in selected_masks
+            and selected_ids_by_frame.get(frame_key) == {identifier}
+        ):
+            continue
         mask = selected_masks.get(identifier)
         if mask is None:
             if record.mask_payload is None and record.roi_payload is None:
@@ -762,7 +776,7 @@ def _refine_detections_with_backend(
         bbox = _detection_crop_bbox(record, mask.shape)
         if mask.shape[:2] != (bbox[3], bbox[2]):
             raise ValueError(f"Candidate seed {identifier!r} does not match its crop bbox.")
-        seeds_by_frame.setdefault((record.frame_id, record.run_id), []).append((identifier, bbox, mask))
+        seeds_by_frame.setdefault(frame_key, []).append((identifier, bbox, mask))
 
     def competing_seeds(state: _BackendRefinementState) -> np.ndarray:
         result = np.zeros(state.roi.shape[:2], dtype=np.uint8)

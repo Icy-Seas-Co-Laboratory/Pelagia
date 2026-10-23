@@ -600,7 +600,7 @@ Frame metadata can be searched by range with
 `GET /assets/{asset_id}/frames?start_frame=1&end_frame=100`, and frame image data
 can be loaded with `GET /assets/{asset_id}/framedata/{frame_num}?format=png`.
 Supported frame data response formats are `png`, `jpg`/`jpeg`, `jxl`, `jxs`, `matrix`,
-and `preview`. Stored full-frame payloads default to `jpg` at quality `90`; set
+and `preview`. Stored full-frame payloads default to `jpg` at quality `75`; set
 `[processing.frame_storage].image_encoding = "jxl"` or `"jxs"` to store JPEG XL
 or JPEG XS payloads. Both codecs use in-memory `imagecodecs` bindings. JPEG XS
 requires an `imagecodecs` source build with `libjxs` enabled because binary wheels
@@ -682,14 +682,17 @@ allowed_encodings = ["zstd", "png", "jpg"]
 [processing.roi_recording]
 small_roi_encoding = "zstd"
 large_roi_encoding = "jpg"
-large_roi_min_pixels = 50000
-roi_quality = 90
+large_roi_min_pixels = 1000
+roi_quality = 75
 mask_encoding = "zstd"
 ```
 
 Every configured frame, ROI, and mask codec must be present in the deployment
 allowlist. The equivalent comma-separated allowlist environment variable is
 `PELAGIA_IMAGE_DATA_STORAGE_ALLOWED_ENCODINGS`.
+To re-encode existing project images after changing storage settings, use
+**Update datastores** in PelagiaView Administration; see
+[`docs/storage-reencode.md`](docs/storage-reencode.md) for scope and recovery behavior.
 
 Model and plugin artifacts are split between packaged assets under
 `Pelagia/assets/` and a local runtime library under `./.pelagia/`. See

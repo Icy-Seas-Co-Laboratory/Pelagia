@@ -68,6 +68,7 @@ class PipelineStage(str, Enum):
     REGISTRY_EXPORT = "registry_export"
     REGISTRY_GENERATE = "registry_generate"
     EXPORT_BUNDLE = "export_bundle"
+    STORAGE_REENCODE = "storage_reencode"
 
 
 class JobStatus(str, Enum):

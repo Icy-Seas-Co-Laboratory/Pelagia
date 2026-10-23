@@ -4,11 +4,15 @@ from Pelagia.config import CoreConfig
 from Pelagia.services.context import AppContext
 from Pelagia.services.processing_queue import (
     PREPROCESS_FRAMES_PER_JOB,
+    PREPROCESS_INPUT_BYTES_PER_JOB,
     ROI_REFINEMENT_DETECTIONS_PER_JOB,
+    ROI_REFINEMENT_INPUT_BYTES_PER_JOB,
     SEGMENT_FRAMES_PER_JOB,
+    SEGMENT_INPUT_BYTES_PER_JOB,
     PreprocessQueueRequest,
     ProcessingSeriesRequest,
     ProcessingQueueService,
+    batch_processing_units_by_limit,
 )
 from Pelagia.storage.postgres import PostgresRepository, _initial_job_progress
 
@@ -20,9 +24,9 @@ class QueueRepository:
     def plan_preprocess_frames(self, *, project_id, filters):
         assert project_id == "project-1"
         return [
-            {"frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "frame_index": 1, "payload_ref": "b-key"},
-            {"frame_id": "frame-a", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 1, "payload_ref": "a-key"},
-            {"frame_id": "frame-c", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 2, "payload_ref": "a-key"},
+            {"frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "frame_index": 1, "payload_ref": "b-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
+            {"frame_id": "frame-a", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 1, "payload_ref": "a-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
+            {"frame_id": "frame-c", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 2, "payload_ref": "a-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
         ]
 
     def create_preprocess_jobs(
@@ -35,17 +39,17 @@ class QueueRepository:
         submitted_by_user_id=None,
         submitted_by_username=None,
     ):
-        assert eligible_statuses == ["unknown", "failed"]
+        assert eligible_statuses == ["unknown", "failed", "cancelled"]
         self.created = jobs
         return [{"id": f"job-{index}"} for index, _ in enumerate(jobs, start=1)]
 
     def plan_segment_frames(self, *, project_id, filters, payload_kind):
         return self.plan_preprocess_frames(project_id=project_id, filters=filters)
 
-    def plan_roi_refinement_detections(self, *, project_id, filters):
+    def plan_roi_refinement_detections(self, *, project_id, filters, frame_payload_kind="preprocessed"):
         return [
-            {"detection_id": "det-2", "frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "roi_index": 0},
-            {"detection_id": "det-1", "frame_id": "frame-a", "asset_id": "asset-1", "run_id": "run-1", "roi_index": 1},
+            {"detection_id": "det-2", "frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "roi_index": 0, "bbox_w": 10, "bbox_h": 10, "has_roi_payload": True, "roi_shape": [10, 10], "roi_dtype": "uint8", "has_mask_payload": True, "mask_shape": [10, 10], "mask_dtype": "uint8", "frame_payload_shape": [20, 20], "frame_payload_dtype": "uint8"},
+            {"detection_id": "det-1", "frame_id": "frame-a", "asset_id": "asset-1", "run_id": "run-1", "roi_index": 1, "bbox_w": 10, "bbox_h": 10, "has_roi_payload": True, "roi_shape": [10, 10], "roi_dtype": "uint8", "has_mask_payload": True, "mask_shape": [10, 10], "mask_dtype": "uint8", "frame_payload_shape": [20, 20], "frame_payload_dtype": "uint8"},
         ]
 
     def create_job(self, stage, **kwargs):
@@ -183,6 +187,8 @@ def test_queue_stage_batch_limits_are_controlled_by_the_backend():
                     "run_id": "run-1",
                     "frame_index": index,
                     "payload_ref": "payload-1",
+                    "payload_shape": [10, 10],
+                    "payload_dtype": "uint8",
                 }
                 for index in range(PREPROCESS_FRAMES_PER_JOB + 1)
             ]
@@ -190,7 +196,7 @@ def test_queue_stage_batch_limits_are_controlled_by_the_backend():
         def plan_segment_frames(self, *, project_id, filters, payload_kind):
             return self.plan_preprocess_frames(project_id=project_id, filters=filters)
 
-        def plan_roi_refinement_detections(self, *, project_id, filters):
+        def plan_roi_refinement_detections(self, *, project_id, filters, frame_payload_kind="preprocessed"):
             return [
                 {
                     "detection_id": f"detection-{index}",
@@ -198,6 +204,16 @@ def test_queue_stage_batch_limits_are_controlled_by_the_backend():
                     "asset_id": "asset-1",
                     "run_id": "run-1",
                     "roi_index": 0,
+                    "bbox_w": 10,
+                    "bbox_h": 10,
+                    "has_roi_payload": True,
+                    "roi_shape": [10, 10],
+                    "roi_dtype": "uint8",
+                    "has_mask_payload": True,
+                    "mask_shape": [10, 10],
+                    "mask_dtype": "uint8",
+                    "frame_payload_shape": [20, 20],
+                    "frame_payload_dtype": "uint8",
                 }
                 for index in range(ROI_REFINEMENT_DETECTIONS_PER_JOB + 1)
             ]
@@ -212,6 +228,95 @@ def test_queue_stage_batch_limits_are_controlled_by_the_backend():
     assert preprocess["batch_sizes"] == [PREPROCESS_FRAMES_PER_JOB, 1]
     assert segment["batch_sizes"] == [SEGMENT_FRAMES_PER_JOB, 1]
     assert refinement["batch_sizes"] == [ROI_REFINEMENT_DETECTIONS_PER_JOB, 1]
+
+
+def test_byte_batch_limit_splits_frames_and_keeps_unknown_or_oversized_units_alone():
+    units = [
+        {"id": "first", "input_bytes": 600_000_000},
+        {"id": "second", "input_bytes": 600_000_000},
+        {"id": "unknown", "input_bytes": None},
+        {"id": "oversized", "input_bytes": 1_000_000_001},
+        {"id": "final", "input_bytes": 1},
+    ]
+
+    batches = batch_processing_units_by_limit(units, 1_000, PREPROCESS_INPUT_BYTES_PER_JOB)
+
+    assert [[unit["id"] for unit in batch] for batch in batches] == [
+        ["first"], ["second"], ["unknown"], ["oversized"], ["final"],
+    ]
+
+
+def test_frame_queue_reports_decoded_byte_limits():
+    repository = QueueRepository()
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
+
+    preprocess = service.queue_preprocess(
+        PreprocessQueueRequest(filters={}, options={}, dry_run=True), project_id="project-1",
+    )
+    segment = service.queue_segment(
+        PreprocessQueueRequest(filters={}, options={}, dry_run=True), project_id="project-1",
+    )
+
+    assert preprocess["max_input_bytes_per_job"] == PREPROCESS_INPUT_BYTES_PER_JOB
+    assert segment["max_input_bytes_per_job"] == SEGMENT_INPUT_BYTES_PER_JOB
+
+
+def test_roi_refinement_byte_budget_counts_expansion_frame_once_per_job(monkeypatch):
+    import Pelagia.services.processing_queue as processing_queue
+
+    class RoiRepository(QueueRepository):
+        def plan_roi_refinement_detections(self, *, project_id, filters, frame_payload_kind="preprocessed"):
+            return [
+                {
+                    "detection_id": f"detection-{index}", "frame_id": frame_id,
+                    "asset_id": "asset-1", "run_id": "run-1", "roi_index": index, "bbox_w": 10, "bbox_h": 1,
+                    "has_roi_payload": True, "roi_shape": [10], "roi_dtype": "uint8",
+                    "has_mask_payload": False, "frame_payload_shape": [80], "frame_payload_dtype": "uint8",
+                }
+                for index, frame_id in enumerate(("frame-a", "frame-a", "frame-b"))
+            ]
+
+    monkeypatch.setattr(processing_queue, "ROI_REFINEMENT_INPUT_BYTES_PER_JOB", 120)
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=RoiRepository()))
+
+    result = service.queue_roi_refinement(
+        PreprocessQueueRequest(filters={}, options={}, dry_run=True), project_id="project-1",
+    )
+
+    # Each crop and its derived mask cost 20 bytes. The first two share one 80-byte expansion frame,
+    # while the third needs a second frame and starts another job.
+    assert result["batch_sizes"] == [2, 1]
+    assert result["max_input_bytes_per_job"] == 120
+    assert ROI_REFINEMENT_INPUT_BYTES_PER_JOB == 100_000_000
+
+
+def test_roi_refinement_without_a_stored_crop_charges_the_source_frame(monkeypatch):
+    import Pelagia.services.processing_queue as processing_queue
+
+    class MissingCropRepository(QueueRepository):
+        def plan_roi_refinement_detections(self, *, project_id, filters, frame_payload_kind="preprocessed"):
+            return [
+                {
+                    "detection_id": f"detection-{index}", "frame_id": "frame-a",
+                    "asset_id": "asset-1", "run_id": "run-1", "roi_index": index,
+                    "bbox_w": 10, "bbox_h": 1,
+                    "has_roi_payload": False, "has_mask_payload": False,
+                    "frame_payload_shape": [80], "frame_payload_dtype": "uint8",
+                }
+                for index in range(2)
+            ]
+
+    monkeypatch.setattr(processing_queue, "ROI_REFINEMENT_INPUT_BYTES_PER_JOB", 100)
+    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=MissingCropRepository()))
+
+    result = service.queue_roi_refinement(
+        PreprocessQueueRequest(filters={}, options={"allow_frame_expansion": False}, dry_run=True),
+        project_id="project-1",
+    )
+
+    # Each reconstructed mask costs 10 bytes; the 80-byte source frame is
+    # loaded once because there is no stored ROI crop, even with expansion off.
+    assert result["batch_sizes"] == [2]
 
 
 def test_initial_job_progress_counts_queued_frame_and_roi_units():
