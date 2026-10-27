@@ -28,7 +28,7 @@ from Pelagia.storage import postgres
 from Pelagia.storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository, hash_session_token
 from Pelagia.services.taxonomy import default_taxonomy_dictionary
 from Pelagia.services.registry_transfer import export_sqlite_workspace, load_sqlite_workspace
-from Pelagia.services.registry_workspace import RegistryWorkspaceService
+from Pelagia.services.registry_workspace import RegistryWorkspaceService, migrate_registry_assets_to_hot_storage
 from Pelagia.services.telemetry import TelemetryColumn, TelemetryCsvSpec, TelemetryIngestionService, TelemetryResolver
 from oracle_data_contracts.datasets import initialize_database, validate_database
 
@@ -186,6 +186,7 @@ def _unit_detection(index: int, *, payload_bytes: int = 1) -> DetectionRecord:
 def test_detection_insert_batches_by_row_count_and_returns_ids_only():
     repository = object.__new__(PostgresRepository)
     repository.schema = "pelagia_unit"
+    repository.hot_store = _MemoryBlobStore()
     cursor = _DetectionInsertCursor()
 
     rows = repository._insert_detection_rows(
@@ -203,9 +204,28 @@ def test_detection_insert_batches_by_row_count_and_returns_ids_only():
     assert len(rows) == 5
 
 
+def test_detection_payloads_are_externalized_and_hydrated_from_hot_store():
+    repository = object.__new__(PostgresRepository)
+    repository.hot_store = _MemoryBlobStore()
+    stored = repository._store_detection_payloads(_unit_detection(1, payload_bytes=3))
+
+    assert stored.roi_payload is None
+    assert stored.mask_payload is None
+    assert stored.roi_payload_ref in repository.hot_store.payloads
+    assert stored.mask_payload_ref in repository.hot_store.payloads
+    row = repository._hydrate_detection_row({
+        "roi_payload": None, "mask_payload": None,
+        "roi_payload_ref": stored.roi_payload_ref,
+        "mask_payload_ref": stored.mask_payload_ref,
+    })
+    assert row["roi_payload"] == b"r" * 3
+    assert row["mask_payload"] == b"m" * 3
+
+
 def test_detection_insert_batches_by_payload_bytes_and_can_skip_returning():
     repository = object.__new__(PostgresRepository)
     repository.schema = "pelagia_unit"
+    repository.hot_store = _MemoryBlobStore()
     cursor = _DetectionInsertCursor()
 
     rows = repository._insert_detection_rows(
@@ -226,6 +246,7 @@ def test_detection_insert_batches_by_payload_bytes_and_can_skip_returning():
 def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
     repository = object.__new__(PostgresRepository)
     repository.schema = "pelagia_unit"
+    repository.hot_store = _MemoryBlobStore()
     repository._ensure_project_scope = lambda *_args, **_kwargs: None
     existing = {"id": "refined-existing", "candidate_detection_id": "candidate-1"}
     cursor = _ExistingRowCursor(existing)
@@ -253,6 +274,7 @@ def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
 def test_refinement_retry_preserves_parent_and_residual_children():
     repository = object.__new__(PostgresRepository)
     repository.schema = "pelagia_unit"
+    repository.hot_store = _MemoryBlobStore()
     repository._ensure_project_scope = lambda *_args, **_kwargs: None
     cursor = _RefinedRetryCursor()
     connection = _ExistingRowConnection(cursor)
@@ -375,6 +397,8 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0031_processing_submissions",
             "0032_incremental_processing_submissions",
             "0033_storage_reencode",
+            "0034_external_roi_payloads",
+            "0035_registry_assets_hot_storage",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
@@ -443,6 +467,9 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "idx_pelagia_unit_ps_series_unique" in incremental_schema
     assert "planning_complete" in incremental_schema
     assert "{schema}" not in incremental_schema
+    external_roi_schema = postgres.render_migration(migrations[33], "pelagia_unit")
+    assert "roi_payload_ref text" in external_roi_schema
+    assert "{schema}" not in external_roi_schema
 
 
 def test_project_storage_reencode_job_is_deduplicated_while_active(postgres_repo):
@@ -466,6 +493,61 @@ def test_project_storage_reencode_job_is_deduplicated_while_active(postgres_repo
     assert first["id"] == second["id"]
     assert first["payload"]["policy"] == policy
     assert postgres_repo.latest_project_storage_reencode_job(str(project["id"]))["id"] == first["id"]
+
+
+def test_roi_hot_storage_migration_is_project_scoped_and_verifies_payloads(postgres_repo):
+    project = postgres_repo.create_project(f"roi-hot-{uuid.uuid4().hex}")
+    other = postgres_repo.create_project(f"roi-hot-other-{uuid.uuid4().hex}")
+
+    def legacy_detection(project_id: str) -> str:
+        with postgres_repo.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"INSERT INTO {postgres_repo.schema}.runs (project_id, run_key, instrument, source_path, source_type) "
+                    "VALUES (%s, %s, 'test', '/tmp/source', 'image') RETURNING id",
+                    (project_id, f"roi-hot-run-{uuid.uuid4().hex}"),
+                )
+                run_id = cursor.fetchone()["id"]
+                cursor.execute(
+                    f"INSERT INTO {postgres_repo.schema}.raw_assets "
+                    "(project_id, run_id, filename, path, kind, checksum, size_bytes) "
+                    "VALUES (%s, %s, 'source.png', '/tmp/source.png', 'image', 'sha256:test', 1) RETURNING id",
+                    (project_id, run_id),
+                )
+                asset_id = cursor.fetchone()["id"]
+                cursor.execute(
+                    f"INSERT INTO {postgres_repo.schema}.frames "
+                    "(run_id, asset_id, frame_index, width, height, kvstore_hash, preview_thumbhash) "
+                    "VALUES (%s, %s, 1, 1, 1, 'frame', %s) RETURNING id",
+                    (run_id, asset_id, b"thumb"),
+                )
+                frame_id = cursor.fetchone()["id"]
+                cursor.execute(
+                    f"INSERT INTO {postgres_repo.schema}.detection_candidate "
+                    "(run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h, roi_payload, mask_payload) "
+                    "VALUES (%s, %s, 1, 0, 0, 1, 1, %s, %s) RETURNING id",
+                    (run_id, frame_id, b"roi-hot", b"mask-hot"),
+                )
+                detection_id = str(cursor.fetchone()["id"])
+            connection.commit()
+        return detection_id
+
+    detection_id = legacy_detection(str(project["id"]))
+    other_id = legacy_detection(str(other["id"]))
+    migrated = postgres_repo.migrate_roi_payloads_to_hot_storage(project_id=str(project["id"]))
+    assert migrated == {"candidate_rows": 1, "refined_rows": 0, "objects": 2}
+    migrated_row = postgres_repo.get_detection(detection_id, project_id=str(project["id"]))
+    assert migrated_row["roi_payload"] == b"roi-hot"
+    assert migrated_row["mask_payload"] == b"mask-hot"
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT roi_payload, roi_payload_ref FROM {postgres_repo.schema}.detection_candidate WHERE id=%s",
+                (other_id,),
+            )
+            other_row = cursor.fetchone()
+    assert other_row["roi_payload"] == b"roi-hot"
+    assert other_row["roi_payload_ref"] is None
 
 
 def test_storage_reencode_worker_availability_uses_capability_and_recent_heartbeat(postgres_repo):
@@ -595,8 +677,8 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 33
-    assert status["migrations"]["applied_count"] == 33
+    assert status["migrations"]["available_count"] == 35
+    assert status["migrations"]["applied_count"] == 35
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
 
@@ -1386,6 +1468,7 @@ def postgres_repo():
     config.database.schema_name = schema
 
     repo = PostgresRepository(config)
+    repo.hot_store = _MemoryBlobStore()
     try:
         with repo.connect() as connection:
             with connection.cursor() as cursor:
@@ -1490,6 +1573,28 @@ def test_registry_workspace_round_trip_purge_and_reload(postgres_repo, tmp_path,
 
     loaded = load_sqlite_workspace(postgres_repo, source, **scope)
     workspace = RegistryWorkspaceService(postgres_repo, scope["project_id"], scope["owner_username"])
+    # New loads externalize portable ROI assets immediately. Exercise the
+    # one-way migration separately with an older inline asset row.
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"""INSERT INTO {postgres_repo.schema}.registry_assets
+              (workspace_id,asset_id,content_sha256,payload,encoding,media_type,metadata,created_at)
+              VALUES (%s,%s,%s,%s,'raw','application/octet-stream','{{}}','2026-08-19T00:00:00Z')""",
+            (loaded["workspace_id"], "legacy-inline-asset", hashlib.sha256(b"legacy-registry-payload").hexdigest(), b"legacy-registry-payload"),
+        )
+        connection.commit()
+    migrated = workspace.migrate_asset_payloads_to_hot_storage()
+    assert migrated == {"assets": 1, "objects": 1}
+    assert workspace.migrate_asset_payloads_to_hot_storage() == {"assets": 0, "objects": 0}
+    assert migrate_registry_assets_to_hot_storage(postgres_repo, project_id=scope["project_id"]) == {
+        "projects": 1, "assets": 0, "objects": 0,
+    }
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT payload,payload_ref,payload_bytes FROM {postgres_repo.schema}.registry_assets WHERE workspace_id=%s AND asset_id='legacy-inline-asset'", (loaded["workspace_id"],))
+        legacy = cursor.fetchone()
+    assert legacy["payload"] is None
+    assert legacy["payload_bytes"] == len(b"legacy-registry-payload")
+    assert postgres_repo.hot_store.get_store(legacy["payload_ref"]) == b"legacy-registry-payload"
     registry_item = workspace.list_items(limit=10, offset=0)["items"][0]
     assert registry_item["bbox"] == {"x": 102, "y": 203, "w": 5, "h": 6}
     assert registry_item["crop_bbox"] == {"x": 100, "y": 200, "w": 16, "h": 12}

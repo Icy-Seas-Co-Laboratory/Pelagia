@@ -13,10 +13,8 @@ from ..config import CoreConfig
 from ..domain import AssetKind, JobStatus, PipelineStage, PlannedRun, RawAssetManifest, RunManifest, normalize_collections
 from ..observability import configure_core_logging
 from ..services.context import AppContext
-from ..services.projects import initialize_project_kvstore
 from ..services.job_commands import ExtractFramesCommand, PreprocessFramesCommand, SegmentFramesCommand
 from ..services.pipeline import PipelineService
-from ..storage.blob_store import create_kvstore, create_named_kvstore, initialize_kvstore, named_kvstore_path, reset_kvstore
 from ..utils.serialization import json_ready
 from ..version import build_info
 
@@ -90,8 +88,6 @@ if typer is not None:
         config = _config_from_options(kvstore_root, database_dsn, schema)
         configure_core_logging(config)
         context = AppContext.from_config(config)
-        if context.kvstore is not None and not context.kvstore.initialized:
-            initialize_kvstore(context.kvstore, config.kvstore)
         if initialize_schema and context.repository is not None:
             context.repository.initialize_schema()
         return context
@@ -527,11 +523,9 @@ if typer is not None:
 
     @app.command("init-kvstore")
     def init_kvstore(directory: Path, store_name: str) -> None:
-        config = CoreConfig.load()
-        store = create_named_kvstore(directory, store_name, config.kvstore)
-        if not store.initialized:
-            initialize_kvstore(store, config.kvstore)
-        typer.echo(f"KVStore ready at {store.root_path}")
+        del directory, store_name
+        typer.echo("Local KVStore initialization was removed; configure and start SkerryKV instead.")
+        raise typer.Exit(code=2)
 
     @app.command("init-system")
     def init_system(
@@ -578,6 +572,77 @@ if typer is not None:
             }
         )
 
+    @app.command("migrate-roi-storage")
+    def migrate_roi_storage(
+        project_id: Optional[str] = typer.Option(None, help="Limit migration to one project UUID."),
+        batch_size: int = typer.Option(100, min=1),
+    ) -> None:
+        """Move legacy PostgreSQL ROI and mask payloads into hot SkerryKV storage."""
+        context = AppContext.from_config(CoreConfig.load())
+        if context.repository is None:
+            raise RuntimeError("A PostgresRepository is required for ROI migration.")
+        _echo_json(context.repository.migrate_roi_payloads_to_hot_storage(
+            project_id=project_id, batch_size=batch_size,
+        ))
+
+    @app.command("migrate-registry-assets")
+    def migrate_registry_assets(
+        project_id: Optional[str] = typer.Option(None, help="Limit migration to one project UUID."),
+        batch_size: int = typer.Option(128, min=1),
+    ) -> None:
+        """Move Registry workspace images and masks into hot SkerryKV storage."""
+        from ..services.registry_workspace import migrate_registry_assets_to_hot_storage
+
+        context = AppContext.from_config(CoreConfig.load())
+        try:
+            if context.repository is None:
+                raise RuntimeError("A PostgresRepository is required for Registry migration.")
+            _echo_json(migrate_registry_assets_to_hot_storage(
+                context.repository, project_id=project_id, batch_size=batch_size,
+            ))
+        finally:
+            context.close()
+
+    @app.command("migrate-cold-storage")
+    def migrate_cold_storage(
+        project_id: str = typer.Option(..., help="Project UUID whose legacy objects will be copied."),
+        legacy_root: Path = typer.Option(..., exists=True, file_okay=False, help="Legacy project KVStore root."),
+        legacy_backend: str = typer.Option("kvstore2", help="Legacy backend: kvstore or kvstore2."),
+        database_dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Copy one project's legacy frame objects to configured cold SkerryKV storage."""
+        if legacy_backend not in {"kvstore", "kvstore2"}:
+            raise typer.BadParameter("legacy_backend must be kvstore or kvstore2.")
+        config = _config_from_options(None, database_dsn, schema)
+        import psycopg
+
+        from ..services.migrate_cold_storage import migrate_project
+        from ..storage.kvstore import KVStore
+        from ..storage.kvstore2 import KVStore2
+        from ..storage.skerrykv import SkerryKVStore
+
+        source = (KVStore2 if legacy_backend == "kvstore2" else KVStore)(legacy_root)
+        if not source.initialized:
+            raise RuntimeError(f"Legacy {legacy_backend} is not initialized: {legacy_root}")
+        destination = SkerryKVStore(
+            config.cold_storage.endpoint,
+            token=config.cold_storage.token,
+            timeout_seconds=config.cold_storage.timeout_seconds,
+        )
+        try:
+            with psycopg.connect(config.database.dsn) as connection:
+                result = migrate_project(
+                    connection, config.database.schema_name, project_id, source, destination,
+                    config.cold_storage.endpoint,
+                )
+            _echo_json(result)
+        finally:
+            close_source = getattr(source, "close", None)
+            if close_source is not None:
+                close_source()
+            destination.close()
+
     @app.command("create-user")
     def create_user(
         username: str,
@@ -606,8 +671,6 @@ if typer is not None:
         project_key: str,
         project_name: Optional[str] = None,
         description: Optional[str] = None,
-        kvstore_directory: Optional[Path] = None,
-        kvstore_name: Optional[str] = None,
         inactive: bool = False,
         kvstore_root: Optional[Path] = None,
         database_dsn: Optional[str] = None,
@@ -616,18 +679,13 @@ if typer is not None:
         context = _context_from_options(kvstore_root, database_dsn, schema, initialize_schema=True)
         if context.repository is None:
             raise RuntimeError("A PostgresRepository is required to create projects.")
-        directory = kvstore_directory or context.config.kvstore.directory
-        store_name = kvstore_name or project_key
         project = context.repository.create_project(
             project_key,
             project_name=project_name,
             description=description,
-            kvstore_root_path=str(named_kvstore_path(directory, store_name)),
             is_active=not inactive,
-            metadata={"kvstore": {"directory": str(directory), "store_name": store_name}},
         )
-        kvstore = initialize_project_kvstore(context, project)
-        _echo_json({"project": project, "kvstore": kvstore})
+        _echo_json({"project": project, "storage": {"cold": "skerrykv", "hot": "skerrykv"}})
 
     @app.command("add-project-user")
     def add_project_user(
@@ -709,7 +767,7 @@ if typer is not None:
                     "password_applied": user_created,
                     "project_creation_required": True,
                     "project": None,
-                    "kvstore": None,
+                    "storage": {"cold": "skerrykv", "hot": "skerrykv"},
                     "membership": None,
                     "token": None,
                     "session": None,
@@ -717,23 +775,11 @@ if typer is not None:
             )
             return
         project = context.repository.get_project_by_key(resolved_project_key)
-        project_kvstore = None
         if project is None:
-            store_name = resolved_project_key
             project = context.repository.create_project(
                 resolved_project_key,
                 project_name=project_name or resolved_project_key.title(),
-                kvstore_root_path=str(
-                    named_kvstore_path(context.config.kvstore.directory, store_name)
-                ),
-                metadata={
-                    "kvstore": {
-                        "directory": str(context.config.kvstore.directory),
-                        "store_name": store_name,
-                    }
-                },
             )
-            project_kvstore = initialize_project_kvstore(context, project)
         membership = context.repository.add_project_member(str(user["id"]), str(project["id"]), role=role)
         session = context.repository.create_session(
             str(user["id"]),
@@ -747,7 +793,7 @@ if typer is not None:
                 "password": resolved_password if user_created else None,
                 "password_applied": user_created,
                 "project": project,
-                "kvstore": project_kvstore,
+                "storage": {"cold": "skerrykv", "hot": "skerrykv"},
                 "membership": membership,
                 "token": session["token"],
                 "session": session,
@@ -774,22 +820,25 @@ if typer is not None:
                 {
                     "project_id": project["id"],
                     "project_key": project.get("project_key"),
-                    "root_path": project.get("kvstore_root_path"),
                     "initialized": bool(store is not None and store.initialized),
                 }
             )
-        kvstore_status = {
+        cold_status = {
             "required": bool(projects),
             "initialized": all(store["initialized"] for store in project_stores),
             "project_count": len(projects),
             "stores": project_stores,
         }
-        ready = bool(database_status.get("ready")) and bool(kvstore_status.get("initialized"))
+        hot_status = {
+            "configured": context.hot_storage is not None,
+            "initialized": bool(context.hot_storage is not None and context.hot_storage.initialized),
+        }
+        ready = bool(database_status.get("ready")) and bool(cold_status.get("initialized")) and bool(hot_status["initialized"])
         result = {
             "build": build_info(),
             "ready": ready,
             "database": database_status,
-            "kvstore": kvstore_status,
+            "storage": {"cold": cold_status, "hot": hot_status},
         }
         typer.echo(json.dumps(json_ready(result), indent=2, sort_keys=True))
         if not ready:
@@ -1577,75 +1626,6 @@ if typer is not None:
         context = _context_from_options(kvstore_root, database_dsn, schema)
         if context.repository is None:
             raise RuntimeError("Reset requires a PostgresRepository.")
-        config = context.config
-        schema_status = context.repository.schema_status()
-        existing_tables = schema_status.get("existing_tables")
-        projects_table_exists = existing_tables is None or "projects" in existing_tables
-        projects = (
-            _list_all_projects(context.repository, active_only=False)
-            if projects_table_exists
-            else []
-        )
-
-        kvstore_results = []
-        seen_roots: set[str] = set()
-        for project in projects:
-            root_path = project.get("kvstore_root_path")
-            if not root_path:
-                kvstore_results.append(
-                    {
-                        "project_id": project.get("id"),
-                        "project_key": project.get("project_key"),
-                        "root_path": None,
-                        "status": "not_configured",
-                    }
-                )
-                continue
-            resolved_root = str(Path(root_path).expanduser().resolve(strict=False))
-            if resolved_root in seen_roots:
-                kvstore_results.append(
-                    {
-                        "project_id": project.get("id"),
-                        "project_key": project.get("project_key"),
-                        "root_path": resolved_root,
-                        "status": "shared_store_already_reset",
-                    }
-                )
-                continue
-            seen_roots.add(resolved_root)
-            store = create_kvstore(resolved_root, config.kvstore)
-            if not store.initialized:
-                kvstore_results.append(
-                    {
-                        "project_id": project.get("id"),
-                        "project_key": project.get("project_key"),
-                        "root_path": resolved_root,
-                        "status": "missing",
-                    }
-                )
-                continue
-            try:
-                reset_result = reset_kvstore(store, config.kvstore)
-            except Exception as exc:
-                kvstore_results.append(
-                    {
-                        "project_id": project.get("id"),
-                        "project_key": project.get("project_key"),
-                        "root_path": resolved_root,
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                )
-            else:
-                kvstore_results.append(
-                    {
-                        "project_id": project.get("id"),
-                        "project_key": project.get("project_key"),
-                        "root_path": resolved_root,
-                        "status": "reset",
-                        "result": reset_result,
-                    }
-                )
         database_result = context.repository.purge_all(
             exact_counts=False,
             preserve_migrations=False,
@@ -1658,10 +1638,9 @@ if typer is not None:
                     {
                         "deleted": True,
                         "database": database_result,
-                        "kvstores": {
-                            "project_count": len(projects),
-                            "reset_count": sum(result["status"] == "reset" for result in kvstore_results),
-                            "results": kvstore_results,
+                        "storage": {
+                            "cold": "SkerryKV objects are immutable and were not deleted.",
+                            "hot": "SkerryKV objects are immutable and were not deleted.",
                         },
                     }
                 ),

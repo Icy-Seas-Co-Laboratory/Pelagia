@@ -27,7 +27,8 @@ class SystemUsageService:
 
     def snapshot(self) -> dict[str, Any]:
         storage = {
-            "kvstore_directory": _filesystem_usage(self.context.config.kvstore.directory),
+            "cold_storage": _object_storage_usage(self.context.config.cold_storage.endpoint),
+            "hot_storage": _object_storage_usage(self.context.config.hot_storage.endpoint),
             "raw_assets_default": _filesystem_usage(
                 self.context.config.file_browser.root_path_import_dir
             ),
@@ -90,6 +91,19 @@ class SystemUsageService:
             ),
         }
         return result
+
+
+def _object_storage_usage(endpoint: str) -> dict[str, Any]:
+    """Report the endpoint without pretending an HTTP object store is local disk."""
+    return {
+        "available": True,
+        "backend": "skerrykv",
+        "endpoint": endpoint,
+        "filesystem": {
+            "available": False,
+            "reason": "SkerryKV storage capacity is managed by the object-store service.",
+        },
+    }
 
 
 def _filesystem_usage(path: Path) -> dict[str, Any]:

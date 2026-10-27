@@ -42,6 +42,18 @@ max_rows = 1000000
 # kvstore2 blob-shard size limit.
 max_blob_bytes = 68_719_476_736
 
+[cold_storage]
+# SkerryKV stores immutable source and derived frame payloads.
+endpoint = "http://127.0.0.1:7788"
+token = ""
+timeout_seconds = 30.0
+
+[hot_storage]
+# SkerryKV stores ROI and mask payloads. It may initially share cold_storage.
+endpoint = "http://127.0.0.1:7788"
+token = ""
+timeout_seconds = 30.0
+
 [file_browser]
 # Server-side roots exposed through /live/files for local file/folder selection.
 # The file API cannot browse outside root_path_kvstore, root_path_import_dir,

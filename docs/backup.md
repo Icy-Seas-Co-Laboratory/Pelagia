@@ -1,16 +1,17 @@
 # Backup And Restore
 
-Pelagia backups should capture PostgreSQL and KVStore from the same maintenance
-window. PostgreSQL contains the metadata and content keys. KVStore contains the
-large payload bytes those keys refer to.
+Pelagia backups should capture PostgreSQL and SkerryKV from the same maintenance
+window. PostgreSQL contains project ownership, metadata, and object references.
+Cold SkerryKV holds frame payloads; hot SkerryKV holds ROI and mask bytes. The
+two roles may use one shared SkerryKV instance.
 
 ## What To Back Up
 
 Back up all of the following:
 
 - PostgreSQL database or the Pelagia schema inside that database.
-- Configured top-level KVStore root, usually `./data/kvstore`.
-- Explicit project KVStore roots from `projects.kvstore_root_path`, if any.
+- The configured cold SkerryKV root or volume, usually `./data/skerry-cold`.
+- The configured hot SkerryKV root or volume when it is separate.
 - `config.toml`.
 - `.pelagia/` if it contains local plugin artifacts.
 - Worker stack TOML files or service files.
@@ -28,14 +29,15 @@ logs/pelagia.log
 For active systems:
 
 - PostgreSQL: nightly `pg_dump` plus retention.
-- KVStore: nightly file-level sync or filesystem snapshot.
+- SkerryKV: nightly offline copy or filesystem/volume snapshot. Verify copied
+  roots with `skerry verify --path <root>`.
 - Config and `.pelagia/`: back up whenever changed, plus nightly with the rest
   of the system.
 - Before upgrades or resets: take an immediate manual backup.
 
-For large installations, prefer filesystem or volume snapshots for KVStore.
-KVStore contains many SQLite shard files, so incremental snapshot tools are
-usually faster and safer than repeatedly making compressed archives.
+For large installations, prefer filesystem or volume snapshots for SkerryKV.
+Do not copy a live store directory without a snapshot mechanism; its index and
+segments must be captured together.
 
 ## Consistent Backup Procedure
 
@@ -68,18 +70,18 @@ If you use a URL DSN:
 pg_dump --format=custom --file "$BACKUP_DIR/pelagia.dump" "$PELAGIA_DATABASE_DSN"
 ```
 
-4. Copy KVStore.
+4. Copy and verify SkerryKV after the stack has stopped.
 
 ```bash
-rsync -a --delete ./data/kvstore/ "$BACKUP_DIR/kvstore/"
+rsync -a ./data/skerry-cold/ "$BACKUP_DIR/skerry-cold/"
+skerry verify --path "$BACKUP_DIR/skerry-cold"
 ```
 
-If you have explicit project KVStore roots outside `./data/kvstore`, copy each
-one too:
+When hot storage is separate, copy and verify it too:
 
 ```bash
-mkdir -p "$BACKUP_DIR/project-kvstores"
-rsync -a /path/to/project-kvstore/ "$BACKUP_DIR/project-kvstores/field-survey/"
+rsync -a ./data/skerry-hot/ "$BACKUP_DIR/skerry-hot/"
+skerry verify --path "$BACKUP_DIR/skerry-hot"
 ```
 
 5. Copy configuration and local artifacts.

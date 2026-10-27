@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
 
 import pytest
@@ -121,16 +120,13 @@ class _FakeKVStore:
 def _install_fake_context(monkeypatch):
     config = CoreConfig()
     repo = _FakeRepository()
-    context = AppContext(config=config, repository=repo, kvstore=_FakeKVStore())
-    monkeypatch.setattr(cli_module, "_context_from_options", lambda *args, **kwargs: context)
-    monkeypatch.setattr(
-        cli_module,
-        "initialize_project_kvstore",
-        lambda context, project: {
-            "initialized": True,
-            "root_path": f"/tmp/pelagia-kv/projects/{project['id']}",
-        },
+    context = AppContext(
+        config=config,
+        repository=repo,
+        kvstore=_FakeKVStore(),
+        hot_storage=_FakeKVStore(),
     )
+    monkeypatch.setattr(cli_module, "_context_from_options", lambda *args, **kwargs: context)
     return repo
 
 
@@ -159,8 +155,7 @@ def test_cli_create_dev_login_bootstraps_user_project_and_session(monkeypatch):
     assert body["password"] == "secret"
     assert body["password_applied"] is True
     assert body["project"]["project_key"] == "reef"
-    assert body["kvstore"]["initialized"] is True
-    assert body["kvstore"]["root_path"] == "/tmp/pelagia-kv/projects/project-1"
+    assert body["storage"] == {"cold": "skerrykv", "hot": "skerrykv"}
     assert body["token"] == "token-1"
     assert repo.memberships[("user-1", "project-1")]["role"] == "admin"
     assert repo.sessions["token-1"]["ttl_seconds"] == 120
@@ -188,7 +183,7 @@ def test_cli_create_dev_login_bootstraps_projectless_admin(monkeypatch):
     assert body["password_applied"] is True
     assert body["project_creation_required"] is True
     assert body["project"] is None
-    assert body["kvstore"] is None
+    assert body["storage"] == {"cold": "skerrykv", "hot": "skerrykv"}
     assert body["membership"] is None
     assert body["token"] is None
     assert body["session"] is None
@@ -231,7 +226,7 @@ def test_cli_create_project_user_membership_and_list(monkeypatch):
     create_project = runner.invoke(cli_module.app, ["create-project", "survey", "--project-name", "Survey"])
     assert create_project.exit_code == 0
     created_project = json.loads(create_project.output)
-    assert created_project["kvstore"]["initialized"] is True
+    assert created_project["storage"] == {"cold": "skerrykv", "hot": "skerrykv"}
     assert runner.invoke(cli_module.app, ["add-project-user", "ben", "survey", "--role", "viewer"]).exit_code == 0
     result = runner.invoke(cli_module.app, ["list-projects", "--username", "ben"])
 
@@ -242,7 +237,7 @@ def test_cli_create_project_user_membership_and_list(monkeypatch):
             "description": None,
             "id": "project-1",
             "is_active": True,
-            "kvstore_root_path": str((Path("data/kvstores") / "survey").resolve()),
+            "kvstore_root_path": None,
             "project_key": "survey",
             "project_name": "Survey",
             "role": "viewer",
@@ -263,10 +258,9 @@ def test_cli_reset_allows_projectless_system_without_kvstore(monkeypatch):
     assert body["database"]["exact_counts_collected"] is False
     assert body["database"]["schema_initialized"] is True
     assert body["database"]["preserved_tables"] == []
-    assert body["kvstores"] == {
-        "project_count": 0,
-        "reset_count": 0,
-        "results": [],
+    assert body["storage"] == {
+        "cold": "SkerryKV objects are immutable and were not deleted.",
+        "hot": "SkerryKV objects are immutable and were not deleted.",
     }
     assert repo.initialized is True
     assert repo.initialize_statement_timeout_ms == 0
@@ -282,39 +276,24 @@ def test_cli_check_system_treats_projectless_storage_as_ready(monkeypatch):
     assert result.exit_code == 0, result.output
     body = json.loads(result.output)
     assert body["ready"] is True
-    assert body["kvstore"] == {
-        "required": False,
-        "initialized": True,
-        "project_count": 0,
-        "stores": [],
+    assert body["storage"] == {
+        "cold": {"required": False, "initialized": True, "project_count": 0, "stores": []},
+        "hot": {"configured": True, "initialized": True},
     }
 
 
-def test_cli_reset_resets_configured_project_kvstores(monkeypatch, tmp_path):
+def test_cli_reset_preserves_immutable_skerry_objects(monkeypatch, tmp_path):
     repo = _install_fake_context(monkeypatch)
     root_path = tmp_path / "stores" / "reef"
     repo.create_project("reef", kvstore_root_path=str(root_path))
-    reset_calls = []
-
-    class _ProjectStore:
-        initialized = True
-
-    monkeypatch.setattr(cli_module, "create_kvstore", lambda root, config: _ProjectStore())
-    monkeypatch.setattr(
-        cli_module,
-        "reset_kvstore",
-        lambda store, config: reset_calls.append(store) or {"root_path": str(root_path)},
-    )
     runner = CliRunner()
 
     result = runner.invoke(cli_module.app, ["reset", "--delete"])
 
     assert result.exit_code == 0, result.output
     body = json.loads(result.output)
-    assert body["kvstores"]["project_count"] == 1
-    assert body["kvstores"]["reset_count"] == 1
-    assert body["kvstores"]["results"][0]["status"] == "reset"
-    assert len(reset_calls) == 1
+    assert body["storage"]["cold"] == "SkerryKV objects are immutable and were not deleted."
+    assert body["storage"]["hot"] == "SkerryKV objects are immutable and were not deleted."
     assert repo.purged is True
 
 

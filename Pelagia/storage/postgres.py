@@ -6,7 +6,7 @@ import json
 import math
 import secrets
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from urllib.parse import urlparse
@@ -16,6 +16,7 @@ from ..config import CoreConfig
 from ..domain import AssetKind, ClassificationResultRecord, DetectionRecord, FrameRecord, JobStatus, ModelRecord, PipelineStage, PlannedRun, normalize_collections
 from ..utils.serialization import json_ready
 from ..utils.validation import validate_schema_name
+from .blob_store import create_skerrykv_store
 
 try:
     import psycopg
@@ -120,7 +121,7 @@ def _canonical_submission_request(value: Any, *, key: str | None = None) -> Any:
 _DETECTION_INSERT_VALUE_SQL = """
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
+    %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
 """
 
 
@@ -331,6 +332,41 @@ class PostgresRepository:
         self.frames = FrameRepository(self)
         self.jobs = JobRepository(self)
         self.telemetry = TelemetryRepository(self)
+        # Configured by AppContext.  Keeping this injectable lets repository
+        # tests use a small in-memory object-store double.
+        self.hot_store: Any | None = create_skerrykv_store(config.hot_storage)
+
+    def _store_detection_payloads(self, detection: DetectionRecord) -> DetectionRecord:
+        """Publish ROI and mask bytes to hot storage before their DB reference."""
+        roi_payload = detection.roi_payload
+        mask_payload = detection.mask_payload
+        if roi_payload is None and mask_payload is None:
+            return detection
+        if getattr(self, "hot_store", None) is None:
+            raise RuntimeError("Hot object storage is not configured for ROI payloads.")
+        roi_ref = detection.roi_payload_ref
+        mask_ref = detection.mask_payload_ref
+        if roi_payload is not None:
+            roi_ref = self.hot_store.put_store(bytes(roi_payload))
+        if mask_payload is not None:
+            mask_ref = self.hot_store.put_store(bytes(mask_payload))
+        return replace(
+            detection,
+            roi_payload=None,
+            mask_payload=None,
+            roi_payload_ref=roi_ref,
+            mask_payload_ref=mask_ref,
+        )
+
+    def _hydrate_detection_row(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        if getattr(self, "hot_store", None) is None:
+            return row
+        for payload, ref in (("roi_payload", "roi_payload_ref"), ("mask_payload", "mask_payload_ref")):
+            if row.get(payload) is None and row.get(ref):
+                row[payload] = self.hot_store.get_store(str(row[ref]))
+        return row
 
     def connect(self):
         """Borrow a bounded, reusable connection for one repository operation."""
@@ -2506,7 +2542,7 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchall()
+                return [self._hydrate_detection_row(row) for row in cursor.fetchall()]
 
     def get_frame(self, frame_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -3110,6 +3146,9 @@ class PostgresRepository:
             raise ValueError("batch_bytes must be at least 1")
 
         def parameters(detection: DetectionRecord) -> tuple[Any, ...]:
+            roi_size = None if detection.roi_payload is None else len(detection.roi_payload)
+            mask_size = None if detection.mask_payload is None else len(detection.mask_payload)
+            stored = self._store_detection_payloads(detection)
             return (
                 run_id,
                 detection.frame_id,
@@ -3134,17 +3173,19 @@ class PostgresRepository:
                 detection.major_axis_direction_degrees,
                 detection.min_gray_value,
                 detection.mean_gray_value,
-                detection.roi_payload,
-                detection.mask_payload,
-                detection.roi_encoding,
-                detection.roi_format,
-                detection.roi_dtype,
-                json.dumps(json_ready(detection.roi_shape)),
-                detection.mask_encoding,
-                detection.mask_format,
-                detection.mask_dtype,
-                json.dumps(json_ready(detection.mask_shape)),
-                json.dumps(json_ready(detection.metadata)),
+                stored.roi_payload_ref,
+                stored.mask_payload_ref,
+                roi_size,
+                mask_size,
+                stored.roi_encoding,
+                stored.roi_format,
+                stored.roi_dtype,
+                json.dumps(json_ready(stored.roi_shape)),
+                stored.mask_encoding,
+                stored.mask_format,
+                stored.mask_dtype,
+                json.dumps(json_ready(stored.mask_shape)),
+                json.dumps(json_ready(stored.metadata)),
             )
 
         def parameter_bytes(values: Sequence[Any]) -> int:
@@ -3178,7 +3219,8 @@ class PostgresRepository:
                  area, perimeter, major_axis_length, minor_axis_length,
                  centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
                  major_axis_orientation_degrees, major_axis_direction_degrees,
-                 min_gray_value, mean_gray_value, roi_payload, mask_payload,
+                 min_gray_value, mean_gray_value, roi_payload_ref, mask_payload_ref,
+                 roi_payload_bytes, mask_payload_bytes,
                  roi_encoding, roi_format, roi_dtype, roi_shape,
                  mask_encoding, mask_format, mask_dtype, mask_shape, metadata)
                 VALUES ({_DETECTION_INSERT_VALUE_SQL})
@@ -3199,13 +3241,14 @@ class PostgresRepository:
 
         for detection in detections:
             row = parameters(detection)
-            row_bytes = parameter_bytes(row)
+            # Bound work by source bytes as well as the smaller external refs.
+            row_bytes = parameter_bytes(row) + len(detection.roi_payload or b"") + len(detection.mask_payload or b"")
             if pending and (len(pending) >= batch_rows or pending_bytes + row_bytes > batch_bytes):
                 flush()
             pending.append(row)
             pending_bytes += row_bytes
         flush()
-        return inserted
+        return [self._hydrate_detection_row(row) for row in inserted]
 
     def upsert_refined_detections(
         self,
@@ -3227,6 +3270,9 @@ class PostgresRepository:
                     frame_ids=[detection.frame_id for _, detection in refined_detections],
                 )
                 for candidate_detection_id, detection in refined_detections:
+                    roi_size = None if detection.roi_payload is None else len(detection.roi_payload)
+                    mask_size = None if detection.mask_payload is None else len(detection.mask_payload)
+                    stored_detection = self._store_detection_payloads(detection)
                     if job_id is not None:
                         # Residual/split results retain a distinct ROI index but are
                         # stored against their real parent candidate.  The ROI index
@@ -3261,12 +3307,13 @@ class PostgresRepository:
                          area, perimeter, major_axis_length, minor_axis_length,
                          centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
                          major_axis_orientation_degrees, major_axis_direction_degrees,
-                         min_gray_value, mean_gray_value, roi_payload, mask_payload,
+                         min_gray_value, mean_gray_value, roi_payload_ref, mask_payload_ref,
+                         roi_payload_bytes, mask_payload_bytes,
                          roi_encoding, roi_format, roi_dtype, roi_shape,
                          mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
-                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
                                 %s, %s, %s, %s::jsonb,
@@ -3300,23 +3347,25 @@ class PostgresRepository:
                             detection.major_axis_direction_degrees,
                             detection.min_gray_value,
                             detection.mean_gray_value,
-                            detection.roi_payload,
-                            detection.mask_payload,
-                            detection.roi_encoding,
-                            detection.roi_format,
-                            detection.roi_dtype,
-                            json.dumps(json_ready(detection.roi_shape)),
-                            detection.mask_encoding,
-                            detection.mask_format,
-                            detection.mask_dtype,
-                            json.dumps(json_ready(detection.mask_shape)),
-                            detection.metadata.get("refinement_method", "identity"),
-                            json.dumps(json_ready(detection.metadata)),
+                            stored_detection.roi_payload_ref,
+                            stored_detection.mask_payload_ref,
+                            roi_size,
+                            mask_size,
+                            stored_detection.roi_encoding,
+                            stored_detection.roi_format,
+                            stored_detection.roi_dtype,
+                            json.dumps(json_ready(stored_detection.roi_shape)),
+                            stored_detection.mask_encoding,
+                            stored_detection.mask_format,
+                            stored_detection.mask_dtype,
+                            json.dumps(json_ready(stored_detection.mask_shape)),
+                            stored_detection.metadata.get("refinement_method", "identity"),
+                            json.dumps(json_ready(stored_detection.metadata)),
                         ),
                     )
                     inserted.append(cursor.fetchone())
             connection.commit()
-        return inserted
+        return [self._hydrate_detection_row(row) for row in inserted]
 
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -3465,9 +3514,9 @@ class PostgresRepository:
                 params.append(value)
 
         if has_roi_payload is True:
-            clauses.append("detections.roi_payload IS NOT NULL AND octet_length(detections.roi_payload) > 0")
+            clauses.append("detections.roi_payload_ref IS NOT NULL AND detections.roi_payload_bytes > 0")
         elif has_roi_payload is False:
-            clauses.append("(detections.roi_payload IS NULL OR octet_length(detections.roi_payload) = 0)")
+            clauses.append("(detections.roi_payload_ref IS NULL OR detections.roi_payload_bytes = 0)")
 
         normalized_refinement_state = str(refinement_state or "").replace("_", "-").lower()
         if normalized_refinement_state in {"refined", "has-refinement", "has-refined"}:
@@ -3504,7 +3553,7 @@ class PostgresRepository:
         sort_key = str(sort_by or "asset_frame").lower()
         order_by_options = {
             "area": f"(detections.bbox_w::double precision * detections.bbox_h) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
-            "byte_size": f"octet_length(detections.roi_payload) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
+            "byte_size": f"detections.roi_payload_bytes {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
             "id": f"detections.id {direction}",
             "asset_frame": f"assets.filename {direction} NULLS LAST, frames.frame_index {direction}, detections.roi_index {direction}",
             "random": "random()",
@@ -3542,7 +3591,8 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+        return [self._hydrate_detection_row(row) for row in rows]
 
     def _telemetry_filter_clauses(
         self,
@@ -3706,7 +3756,7 @@ class PostgresRepository:
                     tuple(params),
                 )
                 rows_by_id = {str(row["id"]): row for row in cursor.fetchall()}
-        return [rows_by_id[detection_id] for detection_id in resolved_ids if detection_id in rows_by_id]
+        return [self._hydrate_detection_row(rows_by_id[detection_id]) for detection_id in resolved_ids if detection_id in rows_by_id]
 
     def get_frame_candidate_seed_records(
         self,
@@ -3736,11 +3786,10 @@ class PostgresRepository:
                            detections.bbox_w, detections.bbox_h,
                            detections.crop_bbox_x, detections.crop_bbox_y,
                            detections.crop_bbox_w, detections.crop_bbox_h,
-                           detections.mask_payload, detections.mask_encoding,
+                           detections.mask_payload_ref, detections.mask_encoding,
                            detections.mask_format, detections.mask_dtype,
                            detections.mask_shape,
-                           CASE WHEN detections.mask_payload IS NULL
-                                THEN detections.roi_payload ELSE NULL END AS roi_payload,
+                           detections.roi_payload_ref,
                            detections.roi_encoding, detections.roi_format,
                            detections.roi_dtype, detections.roi_shape
                     FROM {self.schema}.detection_candidate detections
@@ -3751,7 +3800,12 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+        for row in rows:
+            self._hydrate_detection_row(row)
+            if row.get("mask_payload") is not None:
+                row["roi_payload"] = None
+        return rows
 
     def get_detection(self, detection_id: str, *, project_id: str | None = None) -> dict[str, Any] | None:
         rows = self.get_detections([detection_id], project_id=project_id)
@@ -3788,7 +3842,7 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchone()
+                return self._hydrate_detection_row(cursor.fetchone())
 
     def get_refined_detection(
         self,
@@ -3819,7 +3873,7 @@ class PostgresRepository:
                     """,
                     tuple(params),
                 )
-                return cursor.fetchone()
+                return self._hydrate_detection_row(cursor.fetchone())
 
     def list_refined_detections(
         self, frame_id: str, *, project_id: str | None = None,
@@ -3842,11 +3896,11 @@ class PostgresRepository:
                            refined.area, refined.perimeter, refined.metadata,
                            refined.roi_encoding, refined.roi_format, refined.roi_shape, refined.roi_dtype,
                            refined.mask_encoding, refined.mask_format, refined.mask_shape, refined.mask_dtype,
-                           octet_length(refined.roi_payload) AS roi_payload_bytes,
-                           octet_length(refined.mask_payload) AS mask_payload_bytes,
+                           refined.roi_payload_ref, refined.mask_payload_ref,
+                           refined.roi_payload_bytes, refined.mask_payload_bytes,
                            CASE WHEN refined.metadata->'roi_measurements'->>'version' = '1'
                                      AND refined.metadata->'roi_measurements'->>'area_method' = 'opencv_external_contours'
-                                THEN NULL ELSE refined.mask_payload END AS mask_payload,
+                                THEN NULL ELSE refined.mask_payload_ref END AS mask_payload_ref,
                            frames.asset_id, frames.frame_index,
                            frames.captured_at, assets.filename AS asset_filename
                     FROM {self.schema}.detections_refined refined
@@ -3856,7 +3910,13 @@ class PostgresRepository:
                     ORDER BY refined.roi_index ASC, refined.id ASC
                     LIMIT %s OFFSET %s
                 """, tuple(params))
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+        if getattr(self, "hot_store", None) is not None:
+            for row in rows:
+                row["mask_payload"] = None
+                if row.get("mask_payload_ref"):
+                    row["mask_payload"] = self.hot_store.get_store(str(row["mask_payload_ref"]))
+        return rows
 
     def list_detection_records(self, asset_id: str) -> list[DetectionRecord]:
         return [DetectionRecord.from_row(row) for row in self.list_detections(asset_id)]
@@ -3883,7 +3943,7 @@ class PostgresRepository:
                     WHERE {' AND '.join(clauses)}
                     ORDER BY frames.frame_index ASC, refined.roi_index ASC, refined.id ASC
                 """, tuple(params))
-                return cursor.fetchall()
+                return [self._hydrate_detection_row(row) for row in cursor.fetchall()]
 
     def record_roi_continuity(
         self, *, project_id: str, asset_id: str, run_id: str | None, job_id: str | None,
@@ -5353,7 +5413,7 @@ class PostgresRepository:
                     """,
                     (project_id, include_deprecated),
                 )
-                return list(cursor.fetchall())
+                return [self._hydrate_detection_row(row) for row in cursor.fetchall()]
 
     def create_curation_label(
         self,
@@ -6446,7 +6506,7 @@ class PostgresRepository:
         }[evidence_kind]
 
         filters = dict(selection or {})
-        clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
+        clauses = ["assets.project_id = %s", "refined.roi_payload_ref IS NOT NULL"]
         where_params: list[Any] = [project_id]
         if roi_ids:
             clauses.append("refined.id = ANY(%s::uuid[])")
@@ -6596,7 +6656,7 @@ class PostgresRepository:
                     """,
                     (*params, limit, offset),
                 )
-                return list(cursor.fetchall())
+                return [self._hydrate_detection_row(row) for row in cursor.fetchall()]
 
     def count_classification_targets(
         self,
@@ -8007,7 +8067,8 @@ class PostgresRepository:
                     WHERE item.id = %s AND assets.project_id = %s""",
                     (resource_id, project_id),
                 )
-                return cursor.fetchone()
+                row = cursor.fetchone()
+        return self._hydrate_detection_row(row) if resource != "frames" else row
 
     def update_storage_reencode_frame(
         self, *, project_id: str, frame_id: str, row_version: str,
@@ -8055,25 +8116,114 @@ class PostgresRepository:
     ) -> bool:
         if resource not in {"detection_candidate", "detections_refined"}:
             raise ValueError("Unknown ROI resource.")
+        if getattr(self, "hot_store", None) is None:
+            raise RuntimeError("Hot object storage is not configured for ROI payloads.")
+        roi_ref = None if roi_payload is None else self.hot_store.put_store(roi_payload)
+        mask_ref = None if mask_payload is None else self.hot_store.put_store(mask_payload)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""UPDATE {self.schema}.{resource} item SET
-                    roi_payload = %s, roi_encoding = %s, roi_format = %s,
-                    mask_payload = %s, mask_encoding = %s, mask_format = %s,
+                    roi_payload_ref = %s, roi_payload_bytes = %s, roi_encoding = %s, roi_format = %s,
+                    mask_payload_ref = %s, mask_payload_bytes = %s, mask_encoding = %s, mask_format = %s,
                     metadata = %s::jsonb
                     FROM {self.schema}.frames frames
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE item.id = %s AND item.frame_id = frames.id
                       AND assets.project_id = %s AND item.xmin::text = %s
                     RETURNING item.id""",
-                    (roi_payload, roi_encoding, roi_format, mask_payload, mask_encoding,
+                    (roi_ref, None if roi_payload is None else len(roi_payload), roi_encoding, roi_format,
+                     mask_ref, None if mask_payload is None else len(mask_payload), mask_encoding,
                      mask_format, json.dumps(json_ready(metadata)), resource_id, project_id,
                      row_version),
                 )
                 updated = cursor.fetchone() is not None
             connection.commit()
         return updated
+
+    def migrate_roi_payloads_to_hot_storage(
+        self, *, project_id: str | None = None, batch_size: int = 100,
+    ) -> dict[str, int]:
+        """Move legacy PostgreSQL ROI and mask bytea values into hot storage.
+
+        This one-way development migration is restartable: an object upload may
+        be repeated safely because SkerryKV addresses objects by their bytes.
+        """
+        if self.hot_store is None:
+            raise RuntimeError("Hot object storage is not configured.")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        result = {"candidate_rows": 0, "refined_rows": 0, "objects": 0}
+        for table, counter in (("detection_candidate", "candidate_rows"), ("detections_refined", "refined_rows")):
+            # Restrict repeated batch scans to rows which still need copying.
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"""CREATE INDEX IF NOT EXISTS {table}_skerry_pending_idx
+                        ON {self.schema}.{table} (id)
+                        WHERE (roi_payload IS NOT NULL AND roi_payload_ref IS NULL)
+                           OR (mask_payload IS NOT NULL AND mask_payload_ref IS NULL)""")
+                connection.commit()
+            while True:
+                with self.connect() as connection:
+                    with connection.cursor() as cursor:
+                        clauses = ["((item.roi_payload IS NOT NULL AND item.roi_payload_ref IS NULL) "
+                                   "OR (item.mask_payload IS NOT NULL AND item.mask_payload_ref IS NULL))"]
+                        params: list[Any] = []
+                        join = (f"JOIN {self.schema}.frames frames ON frames.id = item.frame_id "
+                                f"JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id")
+                        if project_id is not None:
+                            clauses.append("assets.project_id = %s")
+                            params.append(project_id)
+                        params.append(batch_size)
+                        cursor.execute(
+                            f"""SELECT item.id, item.roi_payload, item.mask_payload
+                            FROM {self.schema}.{table} item {join}
+                            WHERE {' AND '.join(clauses)}
+                            ORDER BY item.id LIMIT %s FOR UPDATE SKIP LOCKED""", tuple(params),
+                        )
+                        rows = cursor.fetchall()
+                        from concurrent.futures import ThreadPoolExecutor
+
+                        def copy_row(row):
+                            refs = []
+                            for field in ("roi_payload", "mask_payload"):
+                                value = row.get(field)
+                                if value is None:
+                                    refs.append(None)
+                                    continue
+                                payload = bytes(value)
+                                ref = self.hot_store.put_store(payload)
+                                if self.hot_store.get_store(ref) != payload:
+                                    raise RuntimeError(f"Hot storage verification failed for {field} on {row['id']}.")
+                                refs.append(ref)
+                            return refs
+
+                        with ThreadPoolExecutor(max_workers=16) as executor:
+                            references = list(executor.map(copy_row, rows))
+                        for row, (roi_ref, mask_ref) in zip(rows, references):
+                            roi = row.get("roi_payload")
+                            mask = row.get("mask_payload")
+                            cursor.execute(
+                                f"""UPDATE {self.schema}.{table}
+                                SET roi_payload_ref = COALESCE(roi_payload_ref, %s),
+                                    roi_payload_bytes = COALESCE(roi_payload_bytes, %s),
+                                    mask_payload_ref = COALESCE(mask_payload_ref, %s),
+                                    mask_payload_bytes = COALESCE(mask_payload_bytes, %s),
+                                    roi_payload = NULL, mask_payload = NULL
+                                WHERE id = %s""",
+                                (roi_ref, None if roi is None else len(roi), mask_ref,
+                                 None if mask is None else len(mask), row["id"]),
+                            )
+                            result[counter] += 1
+                            result["objects"] += int(roi is not None) + int(mask is not None)
+                    connection.commit()
+                if len(rows) < batch_size:
+                    break
+            with self.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"DROP INDEX IF EXISTS {self.schema}.{table}_skerry_pending_idx")
+                connection.commit()
+        return result
 
     def enqueue_feature_space_analysis(
         self,
@@ -9288,9 +9438,9 @@ class PostgresRepository:
                     f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id,
                                status.run_id, detections.roi_index, detections.bbox_w, detections.bbox_h,
                                detections.crop_bbox_w, detections.crop_bbox_h,
-                               detections.roi_payload IS NOT NULL AS has_roi_payload,
+                               detections.roi_payload_ref IS NOT NULL AS has_roi_payload,
                                detections.roi_shape, detections.roi_dtype,
-                               detections.mask_payload IS NOT NULL AS has_mask_payload,
+                               detections.mask_payload_ref IS NOT NULL AS has_mask_payload,
                                detections.mask_shape, detections.mask_dtype,
                                {"frames.preprocessed_payload_shape" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_shape"} AS frame_payload_shape,
                                {"frames.preprocessed_payload_dtype" if payload_kind in {"preprocessed", "processed", "corrected"} else "frames.payload_dtype"} AS frame_payload_dtype,
@@ -9476,9 +9626,9 @@ class PostgresRepository:
                 cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id,
                     detections.roi_index, detections.bbox_w, detections.bbox_h,
                     detections.crop_bbox_w, detections.crop_bbox_h,
-                    detections.roi_payload IS NOT NULL AS has_roi_payload,
+                    detections.roi_payload_ref IS NOT NULL AS has_roi_payload,
                     detections.roi_shape, detections.roi_dtype,
-                    detections.mask_payload IS NOT NULL AS has_mask_payload,
+                    detections.mask_payload_ref IS NOT NULL AS has_mask_payload,
                     detections.mask_shape, detections.mask_dtype,
                     {frame_payload_shape} AS frame_payload_shape,
                     {frame_payload_dtype} AS frame_payload_dtype

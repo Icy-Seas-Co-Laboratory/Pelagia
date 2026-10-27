@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
 import os
 import sqlite3
+import threading
+import weakref
 
 import pytest
 
@@ -14,10 +17,276 @@ from Pelagia.storage.kvstore2 import (
     KVStore2ConfigError,
     KVStore2IntegrityError,
     KVStore2LockError,
+    KVStore2Error,
+    MAX_CACHED_CONNECTIONS_PER_THREAD,
     RECORD_HEADER_PREFIX,
     RECORD_HEADER_VERSION,
     RECORD_MAGIC,
 )
+
+
+def test_connections_reuse_and_roll_back_on_error(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    path = store.root_path / "index.sqlite"
+    with store._connect(path) as first:
+        first.execute("CREATE TABLE example (value INTEGER)")
+    with pytest.raises(ValueError), store._connect(path) as second:
+        assert second is first
+        second.execute("INSERT INTO example VALUES (1)")
+        raise ValueError("rollback")
+    with store._connect(path) as connection:
+        assert connection is first
+        assert connection.execute("SELECT COUNT(*) FROM example").fetchone()[0] == 0
+    store.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        first.execute("SELECT 1")
+    with pytest.raises(KVStore2Error, match="closed"):
+        with store._connect(path):
+            pass
+
+
+def test_connection_cache_evicts_least_recently_used(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    paths = [store.root_path / f"{index}.sqlite" for index in range(MAX_CACHED_CONNECTIONS_PER_THREAD + 1)]
+    with store._connect(paths[0]) as oldest:
+        pass
+    for path in paths[1:]:
+        with store._connect(path):
+            pass
+    with pytest.raises(sqlite3.ProgrammingError):
+        oldest.execute("SELECT 1")
+    store.close()
+
+
+def test_connections_are_thread_isolated_and_closed_by_store(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    path = store.root_path / "index.sqlite"
+    handles = []
+    ready = threading.Barrier(3)
+
+    def worker():
+        with store._connect(path) as connection:
+            handles.append(connection)
+            ready.wait()
+        ready.wait()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    ready.wait()
+    assert handles[0] is not handles[1]
+    ready.wait()
+    for thread in threads:
+        thread.join()
+    store.close()
+    for connection in handles:
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+
+@pytest.mark.parametrize("cleanup", ["close", "next_acquisition"])
+def test_finished_thread_cache_is_explicitly_closed(tmp_path, cleanup):
+    store = KVStore2(tmp_path / "store")
+    handles = []
+
+    def worker():
+        with store._connect(store.root_path / "worker.sqlite") as connection:
+            handles.append(connection)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    thread_ref = weakref.ref(thread)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del thread
+        # The store retains the thread's cache until it can close its connections.
+        assert thread_ref() is not None
+        if cleanup == "close":
+            store.close()
+        else:
+            with store._connect(store.root_path / "main.sqlite"):
+                pass
+        with pytest.raises(sqlite3.ProgrammingError):
+            handles[0].execute("SELECT 1")
+        assert thread_ref() is None
+    finally:
+        store.close()
+        if gc_was_enabled:
+            gc.enable()
+
+
+def test_nested_connections_are_distinct_and_reset_reopens_indexes(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    store.initialize(prefix_length=1)
+    path = store.root_path / "0" / "0-index.sqlite"
+    with store._connect(path) as outer:
+        with store._connect(path) as inner:
+            assert inner is not outer
+    key = store.put_store(b"before reset")
+    store.reset(prefix_length=1)
+    assert not store.key_exists(key)
+    assert store.get_store(store.put_store(b"after reset")) == b"after reset"
+    store.close()
+
+
+def test_replaced_index_is_reopened(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    store.initialize(prefix_length=1)
+    key = store.put_store(b"original")
+    assert store.key_exists(key)
+    other = KVStore2(store.root_path)
+    other.reset(prefix_length=1)
+    assert not store.key_exists(key)
+    store.close()
+    other.close()
+
+
+def test_close_waits_for_active_connection(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    acquired = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    def worker():
+        with store._connect(store.root_path / "index.sqlite") as connection:
+            acquired.set()
+            assert release.wait(5)
+            connection.execute("SELECT 1")
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert acquired.wait(5)
+    closer = threading.Thread(target=lambda: (store.close(), closed.set()))
+    closer.start()
+    assert not closed.wait(0.05)
+    release.set()
+    thread.join(5)
+    closer.join(5)
+    assert closed.is_set()
+
+
+@pytest.mark.parametrize("blocked_phase", ["open", "eviction_close"])
+def test_blocked_sqlite_work_does_not_block_other_prefix_and_close_waits(
+    tmp_path, monkeypatch, blocked_phase
+):
+    from Pelagia.storage import kvstore2
+
+    store = KVStore2(tmp_path / "store")
+    blocked_path = store.root_path / "blocked.sqlite"
+    entered = threading.Event()
+    release = threading.Event()
+    other_done = threading.Event()
+    closed = threading.Event()
+    errors = []
+    original_connect = sqlite3.connect
+
+    class BlockingConnection(sqlite3.Connection):
+        def close(self):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("blocked close was not released")
+            super().close()
+
+    def connect(path, **kwargs):
+        if path == blocked_path:
+            if blocked_phase == "open":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("blocked open was not released")
+            else:
+                kwargs["factory"] = BlockingConnection
+        return original_connect(path, **kwargs)
+
+    monkeypatch.setattr(kvstore2.sqlite3, "connect", connect)
+    monkeypatch.setattr(kvstore2, "MAX_CACHED_CONNECTIONS_PER_THREAD", 1)
+
+    def blocked_worker():
+        try:
+            with store._connect(blocked_path):
+                pass
+            if blocked_phase == "eviction_close":
+                with store._connect(store.root_path / "evict.sqlite"):
+                    pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    def other_worker():
+        try:
+            with store._connect(store.root_path / "other.sqlite"):
+                pass
+            other_done.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_store():
+        try:
+            store.close()
+            closed.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    blocked = threading.Thread(target=blocked_worker)
+    other = threading.Thread(target=other_worker)
+    closer = threading.Thread(target=close_store)
+    blocked.start()
+    try:
+        assert entered.wait(5)
+        other.start()
+        assert other_done.wait(2), "unrelated connection was blocked"
+        closer.start()
+        assert not closed.wait(0.05), "close returned before detached work finished"
+    finally:
+        release.set()
+        blocked.join(5)
+        if other.ident is not None:
+            other.join(5)
+        if closer.ident is not None:
+            closer.join(5)
+        else:
+            store.close()
+    assert not blocked.is_alive()
+    assert not other.is_alive()
+    assert not closer.is_alive()
+    assert closed.is_set()
+    assert not errors
+
+
+def test_context_close_closes_project_store_connections(tmp_path):
+    from Pelagia.config import CoreConfig
+    from Pelagia.services.context import AppContext
+
+    store = KVStore2(tmp_path / "store")
+    with store._connect(store.root_path / "index.sqlite") as connection:
+        pass
+    context = AppContext(config=CoreConfig(), kvstore=store, _project_kvstores={"p": store})
+    context.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_forked_child_does_not_reuse_parent_connection(tmp_path):
+    store = KVStore2(tmp_path / "store")
+    path = store.root_path / "index.sqlite"
+    with store._connect(path) as parent_connection:
+        parent_connection.execute("CREATE TABLE example (value INTEGER)")
+    child = os.fork()
+    if child == 0:
+        try:
+            with store._connect(path) as connection:
+                assert connection is not parent_connection
+                connection.execute("INSERT INTO example VALUES (1)")
+            store.close()
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    with store._connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM example").fetchone()[0] == 1
+    store.close()
 
 
 def sha256_key(payload: bytes) -> str:

@@ -1,10 +1,35 @@
 # Migrating Pelagia
 
-This page covers three common migration tasks:
+This page covers common migration tasks:
 
 - upgrading an existing Pelagia checkout;
 - moving Pelagia to a new machine;
-- moving the KVStore root or project-specific KVStore roots.
+- moving a legacy KVStore root or project-specific KVStore roots.
+
+## SkerryKV Cutover
+
+New Pelagia installations use SkerryKV rather than local KVStore directories.
+Configure `[cold_storage]` for frames and `[hot_storage]` for ROI and mask
+payloads; both may initially reference one instance. Start and verify the
+services before initializing Pelagia:
+
+```bash
+skerry init --path ./data/skerry-cold
+SKERRY_LISTEN=127.0.0.1:7788 skerry serve --config ./data/skerry-cold/config.toml
+curl http://127.0.0.1:7788/v1/health
+```
+
+Use `.venv/bin/python -m Pelagia.services.migrate_cold_storage` to copy legacy
+frame objects, then `pelagia migrate-roi-storage` after database migrations to
+copy PostgreSQL ROI payloads. See [SkerryKV migration](skerry-migration.md) for
+the exact sequence. The commands target development data: they are restartable
+because SkerryKV deduplicates immutable objects, but they do not maintain a
+production rollback mirror. Stop API writers and workers, run both migrations,
+then validate frames, candidate ROIs, and refined ROIs using the API. Preserve
+legacy files and a PostgreSQL backup until validation passes.
+
+The remainder of this page describes legacy filesystem-KVStore relocation and
+is only needed before this cutover.
 
 Pelagia uses a lightweight SQL migration ledger in PostgreSQL. The packaged base
 schema remains idempotent, and migration files under

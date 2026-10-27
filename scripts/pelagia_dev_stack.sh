@@ -9,7 +9,15 @@ LOG_DIR="$RUN_DIR/logs"
 
 PELAGIA_DATABASE_DSN="${PELAGIA_DATABASE_DSN:-postgresql://postgres:postgres@127.0.0.1:5432/pelagia}"
 PELAGIA_DATABASE_SCHEMA="${PELAGIA_DATABASE_SCHEMA:-pelagia}"
-PELAGIA_KVSTORE_ROOT="${PELAGIA_KVSTORE_ROOT:-$ROOT_DIR/data/kvstore}"
+PELAGIA_COLD_STORAGE_ENDPOINT="${PELAGIA_COLD_STORAGE_ENDPOINT:-http://127.0.0.1:7788}"
+PELAGIA_HOT_STORAGE_ENDPOINT="${PELAGIA_HOT_STORAGE_ENDPOINT:-$PELAGIA_COLD_STORAGE_ENDPOINT}"
+PELAGIA_COLD_STORAGE_TOKEN="${PELAGIA_COLD_STORAGE_TOKEN:-${SKERRY_TOKEN:-}}"
+PELAGIA_HOT_STORAGE_TOKEN="${PELAGIA_HOT_STORAGE_TOKEN:-$PELAGIA_COLD_STORAGE_TOKEN}"
+PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS="${PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS:-30}"
+PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS="${PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS:-$PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS}"
+SKERRY_BIN="${SKERRY_BIN:-skerry}"
+SKERRY_COLD_ROOT="${SKERRY_COLD_ROOT:-$ROOT_DIR/data/skerry-cold}"
+SKERRY_HOT_ROOT="${SKERRY_HOT_ROOT:-$ROOT_DIR/data/skerry-hot}"
 PELAGIA_API_HOST="${PELAGIA_API_HOST:-127.0.0.1}"
 PELAGIA_API_PORT="${PELAGIA_API_PORT:-8000}"
 PELAGIA_WORKER_STAGES="${PELAGIA_WORKER_STAGES:-extract_frames,telemetry_import,background_frames,preprocess_frames,segment}"
@@ -155,8 +163,51 @@ storage_is_ready() {
     "$CPU_PYTHON" -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
-        --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
         >"$LOG_DIR/storage-check.log" 2>&1
+}
+
+skerry_endpoint_listen_address() {
+    local endpoint="$1"
+    endpoint="${endpoint#http://}"
+    endpoint="${endpoint#https://}"
+    endpoint="${endpoint%%/*}"
+    printf '%s\n' "$endpoint"
+}
+
+start_skerry_store() {
+    local name="$1" endpoint="$2" root="$3" token="$4"
+    local listen
+    listen="$(skerry_endpoint_listen_address "$endpoint")"
+    if [[ "$endpoint" != http://127.0.0.1:* && "$endpoint" != http://localhost:* ]]; then
+        echo "not launching $name because its endpoint is externally managed: $endpoint"
+        return
+    fi
+    if ! command -v "$SKERRY_BIN" >/dev/null 2>&1; then
+        echo "SkerryKV executable not found: $SKERRY_BIN (set SKERRY_BIN or install skerry)" >&2
+        return 2
+    fi
+    if [[ ! -f "$root/config.toml" ]]; then
+        mkdir -p "$root"
+        "$SKERRY_BIN" init --path "$root" >"$LOG_DIR/$name.init.log" 2>&1
+    fi
+    start_process "$name" env "SKERRY_LISTEN=$listen" "SKERRY_ROOT=$root/data" "SKERRY_TOKEN=$token" \
+        "$SKERRY_BIN" serve --config "$root/config.toml"
+    for _ in {1..240}; do
+        if SKERRY_TOKEN="$token" "$SKERRY_BIN" status --connect "$endpoint" >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.5
+    done
+    echo "$name did not become ready at $endpoint" >&2
+    return 1
+}
+
+start_skerry_stores() {
+    start_skerry_store skerry-cold "$PELAGIA_COLD_STORAGE_ENDPOINT" "$SKERRY_COLD_ROOT" "$PELAGIA_COLD_STORAGE_TOKEN"
+    if [[ "$PELAGIA_HOT_STORAGE_ENDPOINT" == "$PELAGIA_COLD_STORAGE_ENDPOINT" ]]; then
+        return
+    fi
+    start_skerry_store skerry-hot "$PELAGIA_HOT_STORAGE_ENDPOINT" "$SKERRY_HOT_ROOT" "$PELAGIA_HOT_STORAGE_TOKEN"
 }
 
 initialize_system() {
@@ -183,8 +234,7 @@ initialize_system() {
     echo "initializing storage..."
     if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" "$CPU_PYTHON" -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
-        --schema "$PELAGIA_DATABASE_SCHEMA" \
-        --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then
+        --schema "$PELAGIA_DATABASE_SCHEMA" >"$log_file" 2>&1; then
         echo "failed to initialize storage; log follows:"
         tail -120 "$log_file" || true
         return 1
@@ -197,11 +247,13 @@ start_stack() {
     if ! is_running "$PID_DIR/api.pid"; then
         pelagia_require_available_tcp_port "$PELAGIA_API_HOST" "$PELAGIA_API_PORT" "Pelagia API" "$CPU_PYTHON"
     fi
+    start_skerry_stores
     initialize_system
 
     export PELAGIA_DATABASE_DSN
     export PELAGIA_DATABASE_SCHEMA
-    export PELAGIA_KVSTORE_ROOT
+    export PELAGIA_COLD_STORAGE_ENDPOINT PELAGIA_COLD_STORAGE_TOKEN PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS
+    export PELAGIA_HOT_STORAGE_ENDPOINT PELAGIA_HOT_STORAGE_TOKEN PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS
 
     start_process api \
         "$CPU_PYTHON" -m uvicorn Pelagia.api.app:create_app \
@@ -229,7 +281,6 @@ start_stack() {
                     "$worker_python" -m Pelagia.cli.app worker_run \
                     --database-dsn "$PELAGIA_DATABASE_DSN" \
                     --schema "$PELAGIA_DATABASE_SCHEMA" \
-                    --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
                     --worker-id "$worker_id" \
                     --stages "$stage" \
                     --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
@@ -240,7 +291,6 @@ start_stack() {
                     "$worker_python" -m Pelagia.cli.app worker_run \
                     --database-dsn "$PELAGIA_DATABASE_DSN" \
                     --schema "$PELAGIA_DATABASE_SCHEMA" \
-                    --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
                     --worker-id "$worker_id" \
                     --stages "$stage" \
                     --idle-sleep-seconds "$PELAGIA_IDLE_SLEEP_SECONDS" \
@@ -272,6 +322,8 @@ stop_stack() {
         done
     done
     stop_pid_file api
+    stop_pid_file skerry-hot
+    stop_pid_file skerry-cold
 }
 
 status_stack() {

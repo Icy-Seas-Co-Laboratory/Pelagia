@@ -14,10 +14,9 @@ if APIRouter is not None:
     from ..schemas import OptionsResponse, SystemCapabilitiesResponse
     from ...config import CoreConfig
     from ...processing.capabilities import preprocessing_capabilities, system_capabilities
-    from ...storage.blob_store import initialize_kvstore
     from ...services.system_usage import SystemUsageService
     from ...version import __version__, build_info
-    from ._common import as_response, get_context, get_kvstore, get_repository, kvstore_status, postgres_ping
+    from ._common import as_response, get_context, get_repository, kvstore_status, postgres_ping
 
     router = APIRouter(prefix="/system", tags=["system"])
     preprocessing_router = APIRouter(prefix="/preprocessing", tags=["preprocessing"])
@@ -44,14 +43,17 @@ if APIRouter is not None:
                     "lease_seconds": config.queue.lease_seconds,
                     "heartbeat_interval_seconds": config.queue.heartbeat_interval_seconds,
                 },
-                "kvstore": {
-                    "backend": config.kvstore.backend,
-                    "directory": config.kvstore.directory,
-                    "hash_algorithm": config.kvstore.hash_algorithm,
-                    "prefix_length": config.kvstore.prefix_length,
-                    "max_db_bytes": config.kvstore.max_db_bytes,
-                    "max_rows": config.kvstore.max_rows,
-                    "max_blob_bytes": config.kvstore.max_blob_bytes,
+                "storage": {
+                    "cold": {
+                        "backend": "skerrykv",
+                        "endpoint": config.cold_storage.endpoint,
+                        "timeout_seconds": config.cold_storage.timeout_seconds,
+                    },
+                    "hot": {
+                        "backend": "skerrykv",
+                        "endpoint": config.hot_storage.endpoint,
+                        "timeout_seconds": config.hot_storage.timeout_seconds,
+                    },
                 },
                 "image_data_storage": {
                     "encoding": config.image_data_storage.encoding,
@@ -89,7 +91,9 @@ if APIRouter is not None:
     @router.get("/status")
     def get_system_status(request: Request, deep_kvstore: bool = False) -> dict:
         repository = get_repository(request)
-        kvstore = get_context(request).kvstore
+        context = get_context(request)
+        cold_storage = context.kvstore
+        hot_storage = context.hot_storage
         postgres = {"healthy": False}
         try:
             postgres = postgres_ping(repository)
@@ -102,11 +106,18 @@ if APIRouter is not None:
                 "build": build_info(),
                 "postgres": postgres,
                 "database": database_status,
-                "kvstore": (
-                    kvstore_status(kvstore, deep=deep_kvstore)
-                    if kvstore is not None
-                    else {"configured": False, "initialized": False}
-                ),
+                "storage": {
+                    "cold": (
+                        kvstore_status(cold_storage, deep=deep_kvstore)
+                        if cold_storage is not None
+                        else {"configured": False, "initialized": False}
+                    ),
+                    "hot": (
+                        kvstore_status(hot_storage, deep=deep_kvstore)
+                        if hot_storage is not None
+                        else {"configured": False, "initialized": False}
+                    ),
+                },
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
             }
@@ -142,9 +153,10 @@ if APIRouter is not None:
         if not auth.is_admin and repository.get_project_membership(auth.user_id, project_id) is None:
             raise HTTPException(status_code=403, detail="Project read permission is required.")
 
-        kvstore = context.kvstore_for_project(project_id, initialize=False)
-        if kvstore is None:
-            raise HTTPException(status_code=503, detail="KVStore is not configured.")
+        cold_storage = context.kvstore_for_project(project_id, initialize=False)
+        hot_storage = context.hot_storage or cold_storage
+        if cold_storage is None:
+            raise HTTPException(status_code=503, detail="SkerryKV storage is not configured.")
         postgres = {"healthy": False}
         try:
             postgres = postgres_ping(repository)
@@ -158,7 +170,10 @@ if APIRouter is not None:
                 "project": project,
                 "postgres": postgres,
                 "database": database_status,
-                "kvstore": kvstore_status(kvstore, deep=deep_kvstore),
+                "storage": {
+                    "cold": kvstore_status(cold_storage, deep=deep_kvstore),
+                    "hot": kvstore_status(hot_storage, deep=deep_kvstore),
+                },
                 "queue": queue.get("queue", {}),
                 "workers": queue.get("workers", {}),
             }
@@ -171,7 +186,7 @@ if APIRouter is not None:
                 "run synchronous thresholding and candidate detection for stored frames",
                 "inspect and control queued jobs",
                 "monitor worker sessions and request worker shutdown",
-                "inspect KVStore and PostgreSQL health",
+                "inspect SkerryKV and PostgreSQL health",
                 "browse runs, assets, frames, detections, and registered models",
             ],
             "common_flows": {
@@ -211,10 +226,12 @@ if APIRouter is not None:
     @router.post("/initialize")
     def initialize_system(request: Request) -> dict:
         context = get_context(request)
-        initialized: dict[str, bool] = {"postgres": False, "kvstore": False}
+        initialized: dict[str, bool] = {"postgres": False, "cold_storage": False, "hot_storage": False}
         if context.repository is not None:
             context.repository.initialize_schema()
             initialized["postgres"] = True
+        initialized["cold_storage"] = context.kvstore is not None
+        initialized["hot_storage"] = context.hot_storage is not None
         if context.repository is None:
             raise HTTPException(status_code=503, detail="No system stores are configured.")
         if context.logger is not None and initialized["postgres"]:

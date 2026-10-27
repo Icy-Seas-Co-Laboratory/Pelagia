@@ -4,6 +4,7 @@ import subprocess
 import sys
 import os
 import socket
+import tomllib
 from pathlib import Path
 
 
@@ -23,6 +24,14 @@ def _write_stack_config(tmp_path: Path, contents: str) -> Path:
     config_path = tmp_path / "workers.toml"
     config_path.write_text(contents, encoding="utf-8")
     return config_path
+
+
+def test_worker_stack_examples_use_migrated_skerry_store():
+    for filename in ("pelagia_workers.example.toml", "pelagia_workers.toml"):
+        with (ROOT_DIR / "scripts" / filename).open("rb") as config_file:
+            config = tomllib.load(config_file)
+        assert config["skerry"]["root"] == "./data/skerry-cold"
+        assert config["hot_storage"]["endpoint"] == config["cold_storage"]["endpoint"]
 
 
 def test_stack_validate_selects_venv_by_worker_capability(tmp_path):

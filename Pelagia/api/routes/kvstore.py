@@ -24,9 +24,12 @@ if APIRouter is not None:
 
     def _store_health(kvstore, status: dict | None, *, deep: bool = False) -> dict:
         if kvstore is None:
-            return {"healthy": False, "errors": ["KVStore is not configured."]}
+            return {"healthy": False, "errors": ["Cold SkerryKV storage is not configured."]}
         if not hasattr(kvstore, "check_health"):
-            return {"healthy": False, "errors": ["KVStore health check is not available."]}
+            return {
+                "healthy": bool(status is not None and status.get("initialized", False)),
+                "errors": [] if status is not None and status.get("initialized", False) else ["SkerryKV status is unavailable."],
+            }
         if status is not None and not status.get("initialized", False):
             return {"healthy": False, "errors": ["KVStore is not initialized."]}
         if not deep:
@@ -52,10 +55,9 @@ if APIRouter is not None:
         status = _store_status(context.kvstore, deep=deep_status)
         return as_response(
             {
-                "directory": context.config.kvstore.directory,
-                "root_path": None if context.kvstore is None else context.kvstore.root_path,
-                "configured_hash_algorithm": context.config.kvstore.hash_algorithm,
-                "configured_prefix_length": context.config.kvstore.prefix_length,
+                "backend": "skerrykv",
+                "endpoint": context.config.cold_storage.endpoint,
+                "timeout_seconds": context.config.cold_storage.timeout_seconds,
                 "status": status,
                 "health": _store_health(context.kvstore, status, deep=include_health),
             }
@@ -74,13 +76,14 @@ if APIRouter is not None:
         auth = require_project_read(request)
         kvstore = get_context(request).kvstore_for_project(auth.project_id, initialize=False)
         if kvstore is None:
-            return {"healthy": False, "errors": ["Project KVStore is not configured."]}
+            return {"healthy": False, "errors": ["Project cold SkerryKV storage is not configured."]}
         if not kvstore.initialized:
             return {
                 "healthy": False,
-                "errors": ["KVStore is not initialized."],
+                "errors": ["SkerryKV storage is not initialized."],
                 "status": kvstore_status(kvstore),
             }
-        return as_response(kvstore.check_health())
+        status = kvstore_status(kvstore, deep=True)
+        return as_response({"healthy": bool(status.get("initialized", False)), "status": status})
 else:
     router = None

@@ -239,6 +239,7 @@ class DetectionRecord:
     min_gray_value: int
     mean_gray_value: float
     roi_payload: bytes | None
+    roi_payload_ref: str | None = None
     centroid_x: float | None = None
     centroid_y: float | None = None
     major_axis_center_x: float | None = None
@@ -246,6 +247,7 @@ class DetectionRecord:
     major_axis_orientation_degrees: float | None = None
     major_axis_direction_degrees: float | None = None
     mask_payload: bytes | None = None
+    mask_payload_ref: str | None = None
     crop_bbox_x: int | None = None
     crop_bbox_y: int | None = None
     crop_bbox_w: int | None = None
@@ -285,6 +287,7 @@ class DetectionRecord:
             min_gray_value=int(data.get("min_gray_value") or 0),
             mean_gray_value=float(data.get("mean_gray_value") or 0),
             roi_payload=data.get("roi_payload"),
+            roi_payload_ref=data.get("roi_payload_ref"),
             centroid_x=_optional_float(data.get("centroid_x")),
             centroid_y=_optional_float(data.get("centroid_y")),
             major_axis_center_x=_optional_float(data.get("major_axis_center_x")),
@@ -292,6 +295,7 @@ class DetectionRecord:
             major_axis_orientation_degrees=_optional_float(data.get("major_axis_orientation_degrees")),
             major_axis_direction_degrees=_optional_float(data.get("major_axis_direction_degrees")),
             mask_payload=data.get("mask_payload"),
+            mask_payload_ref=data.get("mask_payload_ref"),
             roi_encoding=data.get("roi_encoding"),
             roi_format=data.get("roi_format"),
             roi_dtype=data.get("roi_dtype"),

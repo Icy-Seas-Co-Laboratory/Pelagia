@@ -9,8 +9,12 @@ x-backend: &backend
   image: pelagia/backend:local
   environment:
     PELAGIA_DATABASE_DSN: postgresql://pelagia:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/pelagia
-    PELAGIA_KVSTORE_DIRECTORY: /var/lib/pelagia/kvstores
-    PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE: /var/lib/pelagia/kvstores
+    # Both roles share one service by default. Set either URL to a distinct
+    # SkerryKV service when hot ROI storage and cold frame storage are split.
+    PELAGIA_COLD_STORAGE_ENDPOINT: ${PELAGIA_COLD_STORAGE_ENDPOINT:-http://skerry:7788}
+    PELAGIA_HOT_STORAGE_ENDPOINT: ${PELAGIA_HOT_STORAGE_ENDPOINT:-http://skerry:7788}
+    PELAGIA_COLD_STORAGE_TOKEN: ${PELAGIA_COLD_STORAGE_TOKEN:-${SKERRY_TOKEN:?Set SKERRY_TOKEN in .env}}
+    PELAGIA_HOT_STORAGE_TOKEN: ${PELAGIA_HOT_STORAGE_TOKEN:-${SKERRY_TOKEN:?Set SKERRY_TOKEN in .env}}
     PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR: /var/lib/pelagia/import
     PELAGIA_ARTIFACTS_LOCAL_ROOT: /var/lib/pelagia/artifacts
     PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION: ${PELAGIA_QUEUE_MIN_AVAILABLE_MEMORY_FRACTION:-0.50}
@@ -38,10 +42,29 @@ services:
       retries: 20
     restart: unless-stopped
 
+  skerry:
+    build:
+      context: ../../../skerrykv
+    image: skerrykv:local
+    environment:
+      SKERRY_TOKEN: ${SKERRY_TOKEN:?Set SKERRY_TOKEN in .env}
+      SKERRY_MCP_ENABLED: "false"
+    volumes:
+      - skerry_data:/var/lib/skerry
+    networks: [pelagia]
+    healthcheck:
+      test: ["CMD", "skerry", "status", "--connect", "http://127.0.0.1:7788"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   api:
     <<: *backend
     depends_on:
       postgres:
+        condition: service_healthy
+      skerry:
         condition: service_healthy
     expose: ["8000"]
     healthcheck:
@@ -56,12 +79,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      skerry:
+        condition: service_healthy
 
   storage-worker:
     <<: *backend
     command: ["pelagia", "worker_run", "--stages", "storage_reencode"]
     depends_on:
       postgres:
+        condition: service_healthy
+      skerry:
         condition: service_healthy
 
   view:
@@ -102,3 +129,4 @@ networks:
 volumes:
   postgres_data:
   pelagia_data:
+  skerry_data:

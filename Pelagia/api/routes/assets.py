@@ -24,6 +24,9 @@ if APIRouter is not None:
         collections: list[str] | str | None = Field(default=None)
 
     def _delete_unreferenced_payload(context, key: str) -> dict:
+        # SkerryKV has immutable objects and does not support deletion.
+        if not hasattr(context.kvstore, "key_delete"):
+            return {"key": key, "deleted": False, "missing": False, "retained": True}
         try:
             context.kvstore.key_delete(key)
             return {"key": key, "deleted": True, "missing": False}

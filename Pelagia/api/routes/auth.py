@@ -12,7 +12,6 @@ except ImportError:  # pragma: no cover
 
 if APIRouter is not None:
     from ..auth import MANAGE_ROLES, bearer_token, require_auth
-    from ...services.projects import initialize_project_kvstore
     from ...services.project_settings import (
         merge_project_settings,
         invalidate_project_settings,
@@ -22,7 +21,6 @@ if APIRouter is not None:
         validate_allowed_storage_encodings,
     )
     from ...processing.codec_registry import image_codec_available
-    from ...storage.blob_store import named_kvstore_path
     from ...storage.postgres import PROJECT_ROLES
     from ._common import as_response, get_context, get_repository, kvstore_status
 
@@ -30,8 +28,6 @@ if APIRouter is not None:
         project_key: str
         project_name: str | None = None
         description: str | None = None
-        kvstore_directory: str
-        kvstore_name: str
         is_active: bool = True
         metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -228,7 +224,7 @@ if APIRouter is not None:
         if role is not None and role not in {"viewer", "editor"}:
             raise HTTPException(status_code=403, detail="Project managers can assign viewer or editor roles only.")
 
-    def _create_project_with_kvstore(
+    def _create_project_with_storage(
         request: Request,
         body: ProjectKVStoreRequest,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -236,25 +232,16 @@ if APIRouter is not None:
         if repository.get_project_by_key(body.project_key) is not None:
             raise HTTPException(status_code=409, detail=f"Project {body.project_key!r} already exists.")
         try:
-            kvstore_root_path = named_kvstore_path(body.kvstore_directory, body.kvstore_name)
             project = repository.create_project(
                 body.project_key,
                 project_name=body.project_name,
                 description=body.description,
-                kvstore_root_path=str(kvstore_root_path),
                 is_active=body.is_active,
-                metadata={
-                    **body.metadata,
-                    "kvstore": {
-                        "directory": str(body.kvstore_directory),
-                        "store_name": body.kvstore_name,
-                    },
-                },
+                metadata=body.metadata,
             )
-            kvstore = initialize_project_kvstore(get_context(request), project)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return project, kvstore
+        return project, {"cold": "skerrykv", "hot": "skerrykv"}
 
     @router.post("/login")
     def login(request: Request, body: LoginRequest) -> dict:
@@ -272,7 +259,7 @@ if APIRouter is not None:
                     status_code=409,
                     detail="A project already exists; create additional projects through POST /projects.",
                 )
-            project, project_kvstore = _create_project_with_kvstore(request, body.create_project)
+            project, project_kvstore = _create_project_with_storage(request, body.create_project)
             repository.add_project_member(str(user["id"]), str(project["id"]), role="admin")
             project_created = True
         else:
@@ -305,7 +292,7 @@ if APIRouter is not None:
             response["project_creation_required"] = True
         if project_created:
             response["project_created"] = True
-            response["kvstore"] = project_kvstore
+            response["storage"] = project_kvstore
         return as_response(response)
 
     @router.get("/me")
@@ -372,12 +359,12 @@ if APIRouter is not None:
         if not auth.is_admin:
             raise HTTPException(status_code=403, detail="User admin permission is required to create projects.")
         repository = get_repository(request)
-        project, kvstore = _create_project_with_kvstore(request, body)
+        project, kvstore = _create_project_with_storage(request, body)
         user = repository.get_user(auth.user_id)
         membership = None
         if user is not None:
             membership = repository.add_project_member(auth.user_id, str(project["id"]), role="admin")
-        return as_response({"project": project, "membership": membership, "kvstore": kvstore})
+        return as_response({"project": project, "membership": membership, "storage": kvstore})
 
     @projects_router.patch("/{project_id}")
     def update_project(request: Request, project_id: str, body: UpdateProjectRequest) -> dict:

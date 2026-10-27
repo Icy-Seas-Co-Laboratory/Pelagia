@@ -17,6 +17,29 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def migrate_registry_assets_to_hot_storage(repository, *, project_id: str | None = None,
+                                           batch_size: int = 128) -> dict[str, int]:
+    """Migrate inline Registry asset bytes for one project or every project.
+
+    The migration itself scopes through ``registry_workspaces.project_id`` and
+    does not depend on an active workspace or a particular workspace owner.
+    """
+    schema = repository.schema
+    with repository.connect() as connection, connection.cursor() as cursor:
+        if project_id is None:
+            cursor.execute(f"SELECT DISTINCT project_id FROM {schema}.registry_workspaces ORDER BY project_id")
+            projects = [str(row["project_id"]) for row in cursor.fetchall()]
+        else:
+            projects = [str(project_id)]
+    total = {"projects": 0, "assets": 0, "objects": 0}
+    for resolved_project_id in projects:
+        result = RegistryWorkspaceService(repository, resolved_project_id, "__registry_migration__").migrate_asset_payloads_to_hot_storage(batch_size=batch_size)
+        total["projects"] += 1
+        total["assets"] += result["assets"]
+        total["objects"] += result["objects"]
+    return total
+
+
 def _performance_metrics(value: Any) -> dict[str, str | int | float]:
     """Collect explicitly named model metrics without interpreting arbitrary numbers."""
     metric_groups = {
@@ -59,6 +82,17 @@ class RegistryWorkspaceService:
         self.project_id = project_id
         self.owner_username = owner_username
 
+    def _asset_payload(self, row: dict[str, Any]) -> bytes:
+        """Resolve an asset after its project/user scoped SQL lookup."""
+        payload = row.get("payload")
+        if payload is not None:
+            return bytes(payload)
+        ref = row.get("payload_ref")
+        hot_store = getattr(self.repository, "hot_store", None)
+        if ref and hot_store is not None:
+            return hot_store.get_store(str(ref))
+        raise KeyError("Registry asset payload is unavailable")
+
     def _workspace(self, cursor, *, required: bool = True, for_update: bool = False) -> dict[str, Any] | None:
         cursor.execute(
             f"""SELECT * FROM {self.schema}.registry_workspaces
@@ -74,6 +108,53 @@ class RegistryWorkspaceService:
     def active_workspace(self) -> dict[str, Any] | None:
         with self.repository.connect() as connection, connection.cursor() as cursor:
             return self._workspace(cursor, required=False)
+
+    def migrate_asset_payloads_to_hot_storage(self, *, batch_size: int = 128) -> dict[str, int]:
+        """Externalize this project's legacy Registry image and mask bytes.
+
+        An upload is verified before the corresponding PostgreSQL row is cleared.
+        The method is safe to retry after interruption because SkerryKV writes are
+        content addressed and the SQL predicate selects only unmigrated rows.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        hot_store = getattr(self.repository, "hot_store", None)
+        if hot_store is None:
+            raise RegistryTransferError("Hot object storage is not configured for Registry assets")
+        from concurrent.futures import ThreadPoolExecutor
+
+        result = {"assets": 0, "objects": 0}
+        while True:
+            with self.repository.connect() as connection, connection.cursor() as cursor:
+                cursor.execute(f"""SELECT a.workspace_id,a.asset_id,a.content_sha256,a.payload
+                    FROM {self.schema}.registry_assets a
+                    JOIN {self.schema}.registry_workspaces w ON w.id=a.workspace_id
+                    WHERE w.project_id=%s AND a.payload IS NOT NULL AND a.payload_ref IS NULL
+                    ORDER BY a.workspace_id,a.asset_id LIMIT %s FOR UPDATE SKIP LOCKED""", (self.project_id, batch_size))
+                rows = cursor.fetchall()
+
+                def publish(row: dict[str, Any]) -> tuple[str, int]:
+                    payload = bytes(row["payload"])
+                    if hashlib.sha256(payload).hexdigest() != row["content_sha256"]:
+                        raise RegistryTransferError(f"Registry asset {row['asset_id']} fails its recorded SHA-256")
+                    ref = hot_store.put_store(payload)
+                    verified = hot_store.get_store(ref)
+                    if verified != payload or hashlib.sha256(verified).hexdigest() != row["content_sha256"]:
+                        raise RegistryTransferError(f"Hot storage verification failed for Registry asset {row['asset_id']}")
+                    return ref, len(payload)
+
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    published = list(executor.map(publish, rows))
+                for row, (ref, payload_bytes) in zip(rows, published):
+                    cursor.execute(f"""UPDATE {self.schema}.registry_assets
+                        SET payload_ref=%s,payload_bytes=%s,payload=NULL
+                        WHERE workspace_id=%s AND asset_id=%s AND payload_ref IS NULL""",
+                        (ref, payload_bytes, row["workspace_id"], row["asset_id"]))
+                connection.commit()
+            result["assets"] += len(rows)
+            result["objects"] += len(rows)
+            if len(rows) < batch_size:
+                return result
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         """Return the non-purged workspaces visible to the current project user."""
@@ -497,12 +578,14 @@ class RegistryWorkspaceService:
     def image(self, item_id: str, size: int | None = None) -> tuple[bytes, str]:
         with self.repository.connect() as connection, connection.cursor() as cursor:
             workspace = self._workspace(cursor)
-            cursor.execute(f"""SELECT a.payload,a.media_type,a.encoding FROM {self.schema}.registry_items i
+            cursor.execute(f"""SELECT a.payload,a.payload_ref,a.media_type,a.encoding FROM {self.schema}.registry_items i
               JOIN {self.schema}.registry_assets a ON a.workspace_id=i.workspace_id AND a.asset_id=i.image_asset_id
               WHERE i.workspace_id=%s AND i.item_id=%s""", (workspace["id"], item_id))
             row = cursor.fetchone()
-        if not row or row["payload"] is None: raise KeyError(item_id)
-        payload = bytes(row["payload"]); media = row["media_type"] or "application/octet-stream"
+        if not row: raise KeyError(item_id)
+        try: payload = self._asset_payload(row)
+        except KeyError as exc: raise KeyError(item_id) from exc
+        media = row["media_type"] or "application/octet-stream"
         if size is None: return payload, media
         image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
         if image is None: return payload, media
@@ -653,7 +736,7 @@ class RegistryWorkspaceService:
             workspace = self._workspace(cursor)
             if layer == "candidate":
                 cursor.execute(
-                    f"""SELECT asset.payload,asset.media_type,asset.encoding,asset.shape,asset.dtype,
+                    f"""SELECT asset.payload,asset.payload_ref,asset.media_type,asset.encoding,asset.shape,asset.dtype,
                         image.shape image_shape FROM {self.schema}.registry_items i
                       JOIN {self.schema}.registry_assets image ON image.workspace_id=i.workspace_id
                         AND image.asset_id=i.image_asset_id
@@ -664,7 +747,7 @@ class RegistryWorkspaceService:
                 )
             else:
                 cursor.execute(
-                    f"""SELECT asset.payload,asset.media_type,asset.encoding,asset.shape,asset.dtype,
+                    f"""SELECT asset.payload,asset.payload_ref,asset.media_type,asset.encoding,asset.shape,asset.dtype,
                         image.shape image_shape FROM {self.schema}.registry_mask_annotations annotation
                       JOIN {self.schema}.registry_items item ON item.workspace_id=annotation.workspace_id
                         AND item.item_id=annotation.item_id
@@ -676,10 +759,10 @@ class RegistryWorkspaceService:
                     (workspace["id"], item_id),
                 )
             row = cursor.fetchone()
-        if not row or row["payload"] is None:
+        if not row:
             raise KeyError(item_id)
         try:
-            mask = decode_array_payload(bytes(row["payload"]), {
+            mask = decode_array_payload(self._asset_payload(row), {
                 "kvstore_encoding": row["encoding"], "dtype": row["dtype"], "shape": row["shape"],
             })
         except (ValueError, RuntimeError) as exc:
@@ -752,9 +835,9 @@ class RegistryWorkspaceService:
                                                  "parent_annotation_id": actual, "source": "registry_roi_editor"}}
                 cursor.execute(
                     f"""INSERT INTO {self.schema}.registry_assets
-                      (workspace_id,asset_id,content_sha256,payload,encoding,media_type,shape,dtype,metadata,created_at)
-                      VALUES (%s,%s,%s,%s,'png','image/png',%s,'uint8',%s,%s)""",
-                    (workspace["id"], asset_id, digest, normalized, _jsonb([height, width]), _jsonb(asset_metadata), created_at),
+                      (workspace_id,asset_id,content_sha256,payload,payload_ref,payload_bytes,encoding,media_type,shape,dtype,metadata,created_at)
+                      VALUES (%s,%s,%s,NULL,%s,%s,'png','image/png',%s,'uint8',%s,%s)""",
+                    (workspace["id"], asset_id, digest, self.repository.hot_store.put_store(normalized), len(normalized), _jsonb([height, width]), _jsonb(asset_metadata), created_at),
                 )
             if previous:
                 cursor.execute(

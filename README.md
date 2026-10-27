@@ -65,7 +65,7 @@ Run at least one worker with `registry_load,registry_export,registry_generate` c
 
 - [uv](https://docs.astral.sh/uv/) for Python and dependency management.
 - PostgreSQL reachable from the Pelagia machine.
-- A writable runtime directory for logs, pid files, and cold frame storage.
+- A SkerryKV service for object storage and a writable runtime directory for logs and pid files.
 - Node.js 18+ and npm if you will run PelagiaView.
 
 On Debian/Ubuntu systems, these packages are commonly useful before creating the
@@ -133,14 +133,13 @@ Create a local `config.toml` for machine-specific backend settings:
 dsn = "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"
 schema_name = "pelagia"
 
-[kvstore]
-backend = "kvstore" # Options: kvstore, kvstore2
-root_path = "./data/kvstore"
-hash_algorithm = "blake3"
-prefix_length = 2
-max_db_bytes = 42_949_672_960   # Used by kvstore.
-max_rows = 1_000_000           # Used by kvstore.
-max_blob_bytes = 67_108_864    # Used by kvstore2.
+[cold_storage]
+endpoint = "http://127.0.0.1:7788"
+timeout_seconds = 30
+
+[hot_storage]
+endpoint = "http://127.0.0.1:7788"
+timeout_seconds = 30
 
 [api]
 host = "0.0.0.0"
@@ -155,8 +154,9 @@ dev_project_key = "default"
 ```
 
 `config.toml` is ignored by git. You can also use environment variables such as
-`PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_BACKEND`,
-`PELAGIA_KVSTORE_ROOT`,
+`PELAGIA_DATABASE_DSN`, `PELAGIA_DATABASE_SCHEMA`,
+`PELAGIA_COLD_STORAGE_ENDPOINT`, `PELAGIA_HOT_STORAGE_ENDPOINT`,
+`PELAGIA_COLD_STORAGE_TOKEN`, `PELAGIA_HOT_STORAGE_TOKEN`,
 `PELAGIA_API_HOST`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`, `PELAGIA_AUTH_ENABLED`,
 `PELAGIA_AUTH_SESSION_TTL_SECONDS`, and `PELAGIA_AUTH_DEV_PROJECT_KEY`.
 
@@ -438,7 +438,7 @@ assurance is needed. Dataset metadata, source-file identities, stream
 identities, frame timestamps, timestamp provenance, and original frame
 numbers are retained. Compatible JPEG, PNG, JPEG XL, JPEG XS, raw array, and
 Zstandard array frame payloads are copied
-directly into KVStore without re-encoding, even when the project has a different
+directly into cold SkerryKV storage without re-encoding, even when the project has a different
 default frame encoding. Unsupported but decodable image codecs fall back to the
 project's configured frame encoding. Each frame is
 decoded once for geometry validation and its browser thumbhash.
@@ -517,7 +517,7 @@ the API, and starts workers for currently runnable stages:
 ```
 
 Override defaults with environment variables such as `PELAGIA_DATABASE_DSN`,
-`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_KVSTORE_ROOT`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`,
+`PELAGIA_DATABASE_SCHEMA`, `PELAGIA_COLD_STORAGE_ENDPOINT`, `PELAGIA_HOT_STORAGE_ENDPOINT`, `PELAGIA_API_PORT`, `PELAGIA_API_ROOT_PATH`,
 `PELAGIA_RUN_DIR`, and `PELAGIA_WORKER_STAGES`. Use `PELAGIA_WORKER_COUNT=3` to
 start three workers for every configured stage, or
 `PELAGIA_WORKER_COUNTS=extract_frames=2,segment=4` for per-stage counts.
@@ -727,9 +727,18 @@ Pelagia treats storage as a replaceable adapter layer.
 
 - Postgres stores durable metadata, jobs, worker sessions, events, frame records, ROI records, model records, and classification results.
 - Large full-frame payloads are stored by a cold payload store adapter because they are expensive and usually read infrequently.
-- ROI crops and masks are small enough to store directly with ROI records, making downstream analysis and export simpler.
+- ROI crops and masks are stored in hot SkerryKV, with their references and metadata in Postgres.
 
-`KVStore` is currently the cold payload store used by Pelagia during development. It is intentionally separable and is expected to become an external dependency rather than a core Pelagia subsystem.
+Cold and hot storage can use the same SkerryKV service or separate instances. See [SkerryKV operations](docs/skerrykv.md) and [migration instructions](docs/skerry-migration.md). Legacy KVStore implementations remain available for copying existing stores.
+
+`KVStore2` reuses up to 16 idle SQLite index connections per thread, evicting the
+least recently used connection when the cache is full. A later connection
+acquisition closes caches belonging to finished threads. Call `KVStore2.close()`
+when a standalone store handle is no longer needed; it waits for active
+operations, closes cached connections, and makes the handle unusable. Application
+context shutdown closes its stores automatically. The internal `_connect` method
+is a context manager that commits or rolls back transactions; connections retain
+the existing WAL journal mode and `synchronous=NORMAL` setting.
 
 ## Development Direction
 

@@ -39,12 +39,14 @@ class UsageRepository:
 
 def test_system_usage_includes_postgres_storage_location_and_size(tmp_path):
     config = CoreConfig()
-    config.kvstore.root_path = tmp_path / "kvstore"
+    config.cold_storage.endpoint = "http://cold.example.test:7788"
+    config.hot_storage.endpoint = "http://hot.example.test:7788"
     config.file_browser.root_path_import_dir = tmp_path / "import"
 
     usage = SystemUsageService(AppContext(config=config, repository=UsageRepository())).snapshot()
 
-    assert usage["storage"]["kvstore_directory"]["resolved_path"] == str(tmp_path / "kvstore")
+    assert usage["storage"]["cold_storage"]["endpoint"] == "http://cold.example.test:7788"
+    assert usage["storage"]["hot_storage"]["endpoint"] == "http://hot.example.test:7788"
     assert usage["storage"]["raw_assets_default"]["resolved_path"] == str(tmp_path / "import")
     database_storage = usage["storage"]["database"]["storage"]
     assert database_storage["available"] is True

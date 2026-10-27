@@ -100,6 +100,24 @@ class KVStoreConfig:
 
 
 @dataclass(slots=True)
+class SkerryKVConfig:
+    """Connection settings for one SkerryKV object service."""
+
+    endpoint: str = "http://127.0.0.1:7788"
+    token: str | None = None
+    timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        self.endpoint = str(self.endpoint).strip().rstrip("/")
+        if not self.endpoint.startswith(("http://", "https://")):
+            raise ValueError("SkerryKV endpoint must be an http(s) URL.")
+        self.token = None if self.token in {None, ""} else str(self.token)
+        self.timeout_seconds = float(self.timeout_seconds)
+        if self.timeout_seconds <= 0:
+            raise ValueError("SkerryKV timeout_seconds must be positive.")
+
+
+@dataclass(slots=True)
 class FileBrowserConfig:
     """Server-side roots exposed to the file selection API."""
 
@@ -489,6 +507,8 @@ class CoreConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     kvstore: KVStoreConfig = field(default_factory=KVStoreConfig)
+    cold_storage: SkerryKVConfig = field(default_factory=SkerryKVConfig)
+    hot_storage: SkerryKVConfig = field(default_factory=SkerryKVConfig)
     file_browser: FileBrowserConfig = field(default_factory=FileBrowserConfig)
     image_data_storage: ImageDataStorageConfig = field(default_factory=ImageDataStorageConfig)
     api: APIConfig = field(default_factory=APIConfig)
@@ -638,6 +658,13 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "kvstore", "max_db_bytes", "PELAGIA_KVSTORE_MAX_DB_BYTES", int)
     _set_from_env(settings, "kvstore", "max_rows", "PELAGIA_KVSTORE_MAX_ROWS", int)
     _set_from_env(settings, "kvstore", "max_blob_bytes", "PELAGIA_KVSTORE_MAX_BLOB_BYTES", int)
+
+    _set_from_env(settings, "cold_storage", "endpoint", "PELAGIA_COLD_STORAGE_ENDPOINT")
+    _set_from_env(settings, "cold_storage", "token", "PELAGIA_COLD_STORAGE_TOKEN")
+    _set_from_env(settings, "cold_storage", "timeout_seconds", "PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS", float)
+    _set_from_env(settings, "hot_storage", "endpoint", "PELAGIA_HOT_STORAGE_ENDPOINT")
+    _set_from_env(settings, "hot_storage", "token", "PELAGIA_HOT_STORAGE_TOKEN")
+    _set_from_env(settings, "hot_storage", "timeout_seconds", "PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS", float)
 
     _set_from_env(settings, "file_browser", "root_path_kvstore", "PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", Path)
     _set_from_env(settings, "file_browser", "root_path_import_dir", "PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR", Path)
@@ -857,6 +884,8 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     database = _section(settings, "database")
     queue = _section(settings, "queue")
     kvstore = _section(settings, "kvstore")
+    cold_storage = _section(settings, "cold_storage")
+    hot_storage = _section(settings, "hot_storage")
     file_browser = _section(settings, "file_browser")
     image_data_storage = _section(settings, "image_data_storage")
     api = _section(settings, "api")
@@ -881,6 +910,7 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
     assembly_defaults = RoiAssemblyProcessingConfig()
     filter_defaults = RoiFilterProcessingConfig()
     recording_defaults = RoiRecordingProcessingConfig()
+    skerry_defaults = SkerryKVConfig()
 
     return CoreConfig(
         database=DatabaseConfig(
@@ -921,6 +951,16 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             max_db_bytes=int(kvstore.get("max_db_bytes", KVStoreConfig.max_db_bytes)),
             max_rows=int(kvstore.get("max_rows", KVStoreConfig.max_rows)),
             max_blob_bytes=int(kvstore.get("max_blob_bytes", KVStoreConfig.max_blob_bytes)),
+        ),
+        cold_storage=SkerryKVConfig(
+            endpoint=str(cold_storage.get("endpoint", skerry_defaults.endpoint)),
+            token=cold_storage.get("token", skerry_defaults.token),
+            timeout_seconds=float(cold_storage.get("timeout_seconds", skerry_defaults.timeout_seconds)),
+        ),
+        hot_storage=SkerryKVConfig(
+            endpoint=str(hot_storage.get("endpoint", skerry_defaults.endpoint)),
+            token=hot_storage.get("token", skerry_defaults.token),
+            timeout_seconds=float(hot_storage.get("timeout_seconds", skerry_defaults.timeout_seconds)),
         ),
         file_browser=FileBrowserConfig(
             root_path_kvstore=Path(

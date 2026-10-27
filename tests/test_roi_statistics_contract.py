@@ -83,8 +83,8 @@ def test_refined_frame_listing_scopes_and_paginates_all_identities(monkeypatch):
     assert "ORDER BY refined.roi_index ASC, refined.id ASC" in cursor.sql
     assert "DISTINCT" not in cursor.sql
     assert "SELECT refined.*" not in cursor.sql
-    assert "THEN NULL ELSE refined.mask_payload" in cursor.sql
-    assert "octet_length(refined.roi_payload) AS roi_payload_bytes" in cursor.sql
+    assert "THEN NULL ELSE refined.mask_payload_ref" in cursor.sql
+    assert "refined.roi_payload_bytes" in cursor.sql
 
 
 @pytest.mark.parametrize("version", [None, 0, 2])

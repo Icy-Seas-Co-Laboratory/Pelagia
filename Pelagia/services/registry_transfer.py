@@ -158,7 +158,7 @@ def load_sqlite_workspace(
                     ),
                 )
                 workspace_id = cursor.fetchone()["id"]
-                _load_assets(cursor, schema, workspace_id, source_connection)
+                _load_assets(repository, cursor, schema, workspace_id, source_connection)
                 if progress_callback: progress_callback(1, "Loaded assets")
                 _load_items(cursor, schema, workspace_id, source_connection, info["dataset_type"])
                 if progress_callback: progress_callback(2, "Loaded dataset items")
@@ -187,15 +187,22 @@ def load_sqlite_workspace(
         temporary_path.unlink(missing_ok=True)
 
 
-def _load_assets(cursor, schema: str, workspace_id: Any, source: sqlite3.Connection) -> None:
+def _load_assets(repository, cursor, schema: str, workspace_id: Any, source: sqlite3.Connection) -> None:
+    hot_store = getattr(repository, "hot_store", None)
+    if hot_store is None:
+        raise RegistryTransferError("Hot object storage is not configured for Registry assets")
     for row in _rows(source, "assets"):
+        payload = None if row["payload"] is None else bytes(row["payload"])
+        payload_ref = None if payload is None else hot_store.put_store(payload)
+        if payload is not None and hot_store.get_store(payload_ref) != payload:
+            raise RegistryTransferError(f"Hot storage verification failed for Registry asset {row['asset_id']}")
         cursor.execute(
             f"""INSERT INTO {schema}.registry_assets (
-              workspace_id,asset_id,content_sha256,payload,external_uri,encoding,media_type,
+              workspace_id,asset_id,content_sha256,payload,payload_ref,payload_bytes,external_uri,encoding,media_type,
               shape,dtype,original_filename,metadata,created_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            ) VALUES (%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
-                workspace_id,row["asset_id"],row["content_sha256"],row["payload"],row["external_uri"],
+                workspace_id,row["asset_id"],row["content_sha256"],payload_ref,None if payload is None else len(payload),row["external_uri"],
                 row["encoding"],row["media_type"],_jsonb(row["shape_json"]),row["dtype"],
                 row["original_filename"],_jsonb(row["metadata_json"]),row["created_at"],
             ),
@@ -443,7 +450,7 @@ def export_sqlite_workspace(
                         name=workspace["name"], title=workspace["title"], description=workspace["description"],
                         version=workspace["dataset_version"], metadata=workspace["metadata"],
                     )
-                    _write_workspace(cursor, schema, workspace_id, output, workspace, progress_callback=progress_callback)
+                    _write_workspace(repository, cursor, schema, workspace_id, output, workspace, progress_callback=progress_callback)
                     output.commit()
                     report = validate_database(output)
                     if not report["valid"]:
@@ -477,16 +484,22 @@ def export_sqlite_workspace(
                 raise
 
 
-def _write_workspace(cursor, schema: str, workspace_id: str, output: sqlite3.Connection, workspace: dict[str, Any],
+def _write_workspace(repository, cursor, schema: str, workspace_id: str, output: sqlite3.Connection, workspace: dict[str, Any],
                      *, progress_callback: Callable[[int, str], None] | None = None) -> None:
     def pg_rows(table: str, order: str) -> list[dict[str, Any]]:
         cursor.execute(f"SELECT * FROM {schema}.{table} WHERE workspace_id=%s ORDER BY {order}", (workspace_id,))
         return list(cursor.fetchall())
 
+    hot_store = getattr(repository, "hot_store", None)
+    if hot_store is None:
+        raise RegistryTransferError("Hot object storage is not configured for Registry assets")
     for row in pg_rows("registry_assets", "asset_id"):
+        payload = row["payload"]
+        if payload is None and row.get("payload_ref"):
+            payload = hot_store.get_store(str(row["payload_ref"]))
         output.execute("""INSERT INTO assets(asset_id,dataset_id,content_sha256,payload,external_uri,encoding,
           media_type,shape_json,dtype,original_filename,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-          (row["asset_id"],workspace["dataset_id"],row["content_sha256"],bytes(row["payload"]) if row["payload"] is not None else None,
+          (row["asset_id"],workspace["dataset_id"],row["content_sha256"],bytes(payload) if payload is not None else None,
            row["external_uri"],row["encoding"],row["media_type"],json.dumps(row["shape"]),row["dtype"],
            row["original_filename"],json.dumps(row["metadata"],sort_keys=True),row["created_at"]))
     if progress_callback: progress_callback(1, "Exported assets")

@@ -165,6 +165,9 @@ if APIRouter is not None:
         if repository is not None and hasattr(repository, "count_frame_payload_references"):
             if repository.count_frame_payload_references(key, exclude_frame_id=exclude_frame_id) > 0:
                 return {"key": key, "deleted": False, "referenced": True, "missing": False}
+        # SkerryKV has immutable objects and does not support deletion.
+        if not hasattr(context.kvstore, "key_delete"):
+            return {"key": key, "deleted": False, "missing": False, "retained": True}
         try:
             context.kvstore.key_delete(str(key))
             return {"key": key, "deleted": True, "referenced": False, "missing": False}

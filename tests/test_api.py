@@ -1943,11 +1943,11 @@ def test_api_lists_system_status_without_live_database():
     assert body["database"]["migrations"]["pending_count"] == 0
     assert body["queue"] == {"queued": 2}
     assert body["workers"]["online"] == 1
-    assert body["kvstore"]["initialized"] is True
-    assert body["kvstore"]["total_sqlite_file_bytes"] == 4096
-    assert body["kvstore"]["total_file_bytes"] == 4096
-    assert body["kvstore"]["total_physical_file_bytes"] == 4096
-    assert body["kvstore"]["total_storage_file_bytes"] == 4096
+    assert body["storage"]["cold"]["initialized"] is True
+    assert body["storage"]["cold"]["total_sqlite_file_bytes"] == 4096
+    assert body["storage"]["cold"]["total_file_bytes"] == 4096
+    assert body["storage"]["cold"]["total_physical_file_bytes"] == 4096
+    assert body["storage"]["cold"]["total_storage_file_bytes"] == 4096
 
 
 def test_api_reports_system_usage_and_preserves_system_use_discovery():
@@ -1961,14 +1961,14 @@ def test_api_reports_system_usage_and_preserves_system_use_discovery():
     assert usage["host"]["hostname"]
     assert usage["cpu"]["logical_cpus"] is not None
     assert usage["memory"]["total_bytes"] is not None
-    assert usage["storage"]["kvstore_directory"]["available"] is True
+    assert usage["storage"]["cold_storage"]["backend"] == "skerrykv"
     assert usage["storage"]["raw_assets_default"]["available"] is True
     assert "status" in usage["stress"]
 
     assert use_response.status_code == 200
     use = use_response.json()
     assert use["storage"].keys() == usage["storage"].keys()
-    assert use["storage"]["kvstore_directory"]["configured_path"] == usage["storage"]["kvstore_directory"]["configured_path"]
+    assert use["storage"]["cold_storage"]["endpoint"] == usage["storage"]["cold_storage"]["endpoint"]
     assert use["common_flows"]["system_usage"] == "GET /system/usage"
 
 
@@ -1991,7 +1991,7 @@ def test_api_normalizes_kvstore2_system_status_size_fields():
     response = client.get("/system/status")
 
     assert response.status_code == 200
-    kvstore = response.json()["kvstore"]
+    kvstore = response.json()["storage"]["cold"]
     assert kvstore["layout"] == "sqlite-index-blob-shard"
     assert kvstore["total_index_file_bytes"] == 128
     assert kvstore["total_blob_file_bytes"] == 2048
@@ -2017,9 +2017,9 @@ def test_api_lists_project_system_status_with_project_kvstore():
     assert response.status_code == 200
     body = response.json()
     assert body["project"]["project_key"] == "other"
-    assert body["kvstore"]["root_path"] == "/tmp/pelagia-kv/projects/project-2"
-    assert body["kvstore"]["total_stored_blobs"] == 8
-    assert body["kvstore"]["total_file_bytes"] == 4096
+    assert body["storage"]["cold"]["root_path"] == "/tmp/pelagia-kv/projects/project-2"
+    assert body["storage"]["cold"]["total_stored_blobs"] == 8
+    assert body["storage"]["cold"]["total_file_bytes"] == 4096
     assert body["queue"] == {"queued": 5}
     assert body["workers"]["online"] == 1
 
@@ -2054,8 +2054,8 @@ def test_api_project_system_status_does_not_initialize_missing_project_kvstore()
     assert response.status_code == 200
     body = response.json()
     assert body["project"]["project_key"] == "other"
-    assert body["kvstore"]["root_path"] == "/storage/cruise-1"
-    assert body["kvstore"]["initialized"] is False
+    assert body["storage"]["cold"]["root_path"] == "/storage/cruise-1"
+    assert body["storage"]["cold"]["initialized"] is False
     assert body["queue"] == {"queued": 5}
 
 
@@ -2202,11 +2202,10 @@ def test_api_admin_can_create_project_and_non_admin_cannot(tmp_path):
     body = created.json()
     assert body["project"]["project_key"] == "survey"
     assert body["project"]["project_name"] == "Survey"
-    assert body["project"]["kvstore_root_path"] == str(project_kvstore_root)
+    assert body["project"]["kvstore_root_path"] is None
     assert body["membership"]["role"] == "admin"
-    assert body["kvstore"]["initialized"] is True
-    assert body["kvstore"]["root_path"] == str(project_kvstore_root.resolve(strict=False))
-    assert (project_kvstore_root / "config.json").exists()
+    assert body["storage"] == {"cold": "skerrykv", "hot": "skerrykv"}
+    assert not project_kvstore_root.exists()
     assert repo.memberships[("user-admin", body["project"]["id"])] == "admin"
     assert duplicate.status_code == 409
 
@@ -2241,9 +2240,8 @@ def test_api_projectless_admin_login_can_create_and_switch_to_first_project(tmp_
     assert created.status_code == 200
     body = created.json()
     assert body["project"]["project_key"] == "first-project"
-    assert body["kvstore"]["initialized"] is True
-    assert body["kvstore"]["root_path"] == str((tmp_path / "stores" / "first-store").resolve())
-    assert repository.projects[body["project"]["id"]]["kvstore_root_path"] == body["kvstore"]["root_path"]
+    assert body["storage"] == {"cold": "skerrykv", "hot": "skerrykv"}
+    assert repository.projects[body["project"]["id"]]["kvstore_root_path"] is None
 
     switched = client.post(
         "/auth/switch-project",

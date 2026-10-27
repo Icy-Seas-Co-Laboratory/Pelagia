@@ -1,8 +1,9 @@
 """Storage adapters for metadata, queues, and large blob payloads."""
 
-from .blob_store import BlobStore, create_kvstore, initialize_kvstore, reset_kvstore
+from .blob_store import BlobStore, create_kvstore, create_skerrykv_store, initialize_kvstore, reset_kvstore
 from .kvstore import KVStore, KVStoreLockError
 from .kvstore2 import KVStore2, KVStore2LockError
+from .skerrykv import SkerryKVError, SkerryKVStore
 from .postgres import PostgresRepository
 from .scoped import CatalogRepository, FrameRepository, IdentityRepository, JobRepository
 
@@ -18,6 +19,9 @@ __all__ = [
     "KVStoreLockError",
     "PostgresRepository",
     "create_kvstore",
+    "create_skerrykv_store",
     "initialize_kvstore",
     "reset_kvstore",
+    "SkerryKVError",
+    "SkerryKVStore",
 ]

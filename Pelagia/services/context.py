@@ -6,7 +6,8 @@ from typing import Any
 
 from ..config import CoreConfig
 from ..observability import DatabaseLogger
-from ..storage.blob_store import BlobStore, create_kvstore, initialize_kvstore
+from ..storage.blob_store import BlobStore, create_kvstore, create_skerrykv_store, initialize_kvstore
+from ..storage.skerrykv import SkerryKVStore
 from ..storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository
 
 
@@ -17,6 +18,7 @@ class AppContext:
     config: CoreConfig
     repository: PostgresRepository | None = None
     kvstore: BlobStore | None = None
+    hot_storage: BlobStore | None = None
     logger: DatabaseLogger | None = None
     oracle: Any | None = None
     active_project_id: str | None = None
@@ -29,7 +31,17 @@ class AppContext:
         resolved = config or CoreConfig.load()
         repository = PostgresRepository(resolved)
         logger = DatabaseLogger(repository)
-        return cls(config=resolved, repository=repository, kvstore=None, logger=logger)
+        hot_storage = create_skerrykv_store(resolved.hot_storage)
+        # Repository methods resolve persisted ROI/mask references through this
+        # service without making HTTP concerns part of SQL code.
+        repository.hot_store = hot_storage
+        return cls(
+            config=resolved,
+            repository=repository,
+            kvstore=create_skerrykv_store(resolved.cold_storage),
+            hot_storage=hot_storage,
+            logger=logger,
+        )
 
     def kvstore_for_project(self, project_id: str | None, *, initialize: bool = True) -> BlobStore | None:
         """Return the physical KVStore for a project."""
@@ -44,18 +56,23 @@ class AppContext:
         project = self.repository.get_project(resolved_project_id)
         if project is None:
             return None
-        root_path = project.get("kvstore_root_path")
-        if not root_path:
-            if resolved_project_id == DEFAULT_PROJECT_ID and self.kvstore is not None:
-                return self.kvstore
-            if resolved_project_id == DEFAULT_PROJECT_ID:
-                return None
-            root_path = Path(self.config.kvstore.directory) / "projects" / resolved_project_id
+        if resolved_project_id == DEFAULT_PROJECT_ID and self.kvstore is not None:
+            return self.kvstore
         if self.active_project_id == resolved_project_id and self.kvstore is not None:
             return self.kvstore
-        store = create_kvstore(root_path, self.config.kvstore)
-        if initialize and not store.initialized:
-            initialize_kvstore(store, self.config.kvstore)
+        # Test and one-off callers may explicitly inject a legacy store. Keep
+        # that isolated path available while normal contexts use SkerryKV.
+        if self.kvstore is not None and not isinstance(self.kvstore, SkerryKVStore):
+            root_path = project.get("kvstore_root_path") or (
+                Path(self.config.kvstore.directory) / "projects" / resolved_project_id
+            )
+            store = create_kvstore(root_path, self.config.kvstore)
+            if initialize and not store.initialized:
+                initialize_kvstore(store, self.config.kvstore)
+            self._project_kvstores[resolved_project_id] = store
+            return store
+        del initialize
+        store = create_skerrykv_store(self.config.cold_storage)
         self._project_kvstores[resolved_project_id] = store
         return store
 
@@ -71,5 +88,17 @@ class AppContext:
     def close(self) -> None:
         """Release process-owned service resources."""
 
+        stores = list(self._project_kvstores.values())
+        if self.kvstore is not None:
+            stores.append(self.kvstore)
+        if self.hot_storage is not None:
+            stores.append(self.hot_storage)
+        seen: set[int] = set()
+        for store in stores:
+            if id(store) not in seen:
+                seen.add(id(store))
+                close = getattr(store, "close", None)
+                if close is not None:
+                    close()
         if self.repository is not None:
             self.repository.close()

@@ -9,7 +9,9 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any, BinaryIO, Iterable, Iterator
 
 
 DEFAULT_MAX_BLOB_BYTES = 64 * 1024 * 1024
+MAX_CACHED_CONNECTIONS_PER_THREAD = 16
 CONFIG_FILENAME = "config.json"
 LOCK_FILENAME = ".kvstore.lock"
 MANIFEST_FILENAME = "manifest.json"
@@ -204,6 +207,12 @@ class KVStore2:
         self.lock_timeout_s = lock_timeout_s
         self.lock_poll_interval_s = lock_poll_interval_s
         self.stale_lock_seconds = stale_lock_seconds
+        self._connection_condition = threading.Condition()
+        self._connection_pid = os.getpid()
+        self._connection_caches: dict[threading.Thread, OrderedDict] = {}
+        self._active_connections = 0
+        self._closing_connections = False
+        self._closed = False
 
         if self.config_path.exists():
             self.config = self._load_config()
@@ -233,6 +242,7 @@ class KVStore2:
                     raise KVStore2AlreadyInitializedError(
                         f"Store path is not empty: {self.root_path}"
                     )
+                self._clear_connections()
                 for path in content_paths:
                     if path.is_dir():
                         shutil.rmtree(path)
@@ -1308,13 +1318,100 @@ class KVStore2:
             return MANIFEST_FILENAME
         return str(self.config.get("manifest_filename", MANIFEST_FILENAME))
 
-    def _connect(self, db_path: Path) -> sqlite3.Connection:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(db_path)
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+    def close(self) -> None:
+        """Close cached connections after outstanding operations finish."""
+        self._clear_connections(permanent=True)
+
+    def _check_connection_process(self) -> None:
+        # A forked child must not reuse the parent's SQLite connections or locks.
+        if self._connection_pid != os.getpid():
+            self._connection_condition = threading.Condition()
+            self._connection_caches = {}
+            self._active_connections = 0
+            self._closing_connections = False
+            self._connection_pid = os.getpid()
+
+    def _clear_connections(self, *, permanent: bool = False) -> None:
+        self._check_connection_process()
+        with self._connection_condition:
+            while self._closing_connections:
+                self._connection_condition.wait()
+            self._closing_connections = True
+            while self._active_connections:
+                self._connection_condition.wait()
+            detached = [connection for cache in self._connection_caches.values()
+                        for connection, _identity in cache.values()]
+            self._connection_caches.clear()
+        try:
+            for connection in detached:
+                connection.close()
+        finally:
+            with self._connection_condition:
+                self._closed = self._closed or permanent
+                self._closing_connections = False
+                self._connection_condition.notify_all()
+
+    @contextmanager
+    def _connect(self, db_path: Path) -> Iterator[sqlite3.Connection]:
+        self._check_connection_process()
+        with self._connection_condition:
+            while self._closing_connections:
+                self._connection_condition.wait()
+            if self._closed:
+                raise KVStore2Error("Store is closed.")
+            detached = []
+            for thread in list(self._connection_caches):
+                if not thread.is_alive():
+                    detached.extend(connection for connection, _identity in
+                                    self._connection_caches.pop(thread).values())
+            cache = self._connection_caches.setdefault(threading.current_thread(), OrderedDict())
+            entry = cache.pop(db_path, None)
+            self._active_connections += 1
+
+        connection = entry[0] if entry is not None else None
+        ready = False
+        try:
+            for stale in detached:
+                stale.close()
+            if entry is not None:
+                identity = entry[1]
+                try:
+                    stat = db_path.stat()
+                    current_identity = (stat.st_dev, stat.st_ino)
+                except FileNotFoundError:
+                    current_identity = None
+                if identity != current_identity:
+                    connection.close()
+                    connection = None
+            if connection is None:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(db_path, check_same_thread=False)
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA foreign_keys=ON")
+                stat = db_path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+            ready = True
+            with connection:
+                yield connection
+        finally:
+            try:
+                if ready:
+                    with self._connection_condition:
+                        # Nested operations may have cached a second connection.
+                        previous = cache.pop(db_path, None)
+                        cache[db_path] = (connection, identity)
+                        evicted = cache.popitem(last=False)[1] if len(cache) > MAX_CACHED_CONNECTIONS_PER_THREAD else None
+                    if previous is not None:
+                        previous[0].close()
+                    if evicted is not None:
+                        evicted[0].close()
+                elif connection is not None:
+                    connection.close()
+            finally:
+                with self._connection_condition:
+                    self._active_connections -= 1
+                    self._connection_condition.notify_all()
 
     def _db_file_size(self, path: Path) -> int:
         return path.stat().st_size if path.exists() else 0

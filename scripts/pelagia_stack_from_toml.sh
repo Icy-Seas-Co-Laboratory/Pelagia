@@ -22,9 +22,15 @@ PID_DIR=""
 LOG_DIR=""
 PELAGIA_DATABASE_DSN=""
 PELAGIA_DATABASE_SCHEMA=""
-PELAGIA_KVSTORE_BACKEND=""
-PELAGIA_KVSTORE_ROOT=""
-PELAGIA_KVSTORE_MAX_BLOB_BYTES=""
+PELAGIA_COLD_STORAGE_ENDPOINT=""
+PELAGIA_COLD_STORAGE_TOKEN=""
+PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS=""
+PELAGIA_HOT_STORAGE_ENDPOINT=""
+PELAGIA_HOT_STORAGE_TOKEN=""
+PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS=""
+SKERRY_MANAGED=""
+SKERRY_BINARY=""
+SKERRY_ROOT=""
 PELAGIA_API_ENABLED=true
 PELAGIA_API_HOST="0.0.0.0"
 PELAGIA_API_PORT="8000"
@@ -150,7 +156,9 @@ stage_aliases = {
 
 stack = section("stack")
 database = section("database")
-kvstore = section("kvstore")
+cold_storage = section("cold_storage")
+hot_storage = section("hot_storage")
+skerry = section("skerry")
 file_browser = section("file_browser")
 api = section("api")
 worker_defaults = section("worker_defaults")
@@ -166,11 +174,6 @@ run_dir = path_value(
     stack.get("run_dir", os.environ.get("PELAGIA_RUN_DIR")),
     root_dir / ".pelagia" / "run" / stack_name,
 )
-kvstore_root = path_value(
-    kvstore.get("root_path", kvstore.get("root")),
-    Path(os.environ.get("PELAGIA_KVSTORE_ROOT", root_dir / "data" / "kvstore")),
-)
-
 
 def venv_path(value: object, *, label: str) -> tuple[str, str]:
     if value is None or not str(value).strip():
@@ -259,15 +262,18 @@ config_rows = {
         os.environ.get("PELAGIA_DATABASE_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/pelagia"),
     ),
     "database_schema": scalar(database.get("schema"), os.environ.get("PELAGIA_DATABASE_SCHEMA", "pelagia")),
-    "kvstore_backend": scalar(kvstore.get("backend"), os.environ.get("PELAGIA_KVSTORE_BACKEND", "kvstore")),
-    "kvstore_root": kvstore_root,
-    "kvstore_max_blob_bytes": scalar(
-        kvstore.get("max_blob_bytes"),
-        os.environ.get("PELAGIA_KVSTORE_MAX_BLOB_BYTES", "67108864"),
-    ),
+    "cold_storage_endpoint": scalar(cold_storage.get("endpoint"), os.environ.get("PELAGIA_COLD_STORAGE_ENDPOINT", "http://127.0.0.1:7788")),
+    "cold_storage_token": scalar(cold_storage.get("token"), os.environ.get("PELAGIA_COLD_STORAGE_TOKEN", "")),
+    "cold_storage_timeout_seconds": scalar(cold_storage.get("timeout_seconds"), os.environ.get("PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS", "30")),
+    "hot_storage_endpoint": scalar(hot_storage.get("endpoint"), os.environ.get("PELAGIA_HOT_STORAGE_ENDPOINT", cold_storage.get("endpoint", "http://127.0.0.1:7788"))),
+    "hot_storage_token": scalar(hot_storage.get("token"), os.environ.get("PELAGIA_HOT_STORAGE_TOKEN", cold_storage.get("token", ""))),
+    "hot_storage_timeout_seconds": scalar(hot_storage.get("timeout_seconds"), os.environ.get("PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS", cold_storage.get("timeout_seconds", "30"))),
+    "skerry_managed": bool_text(skerry.get("managed", False)),
+    "skerry_binary": scalar(skerry.get("binary"), os.environ.get("SKERRY_BIN", "skerry")),
+    "skerry_root": path_value(skerry.get("root"), Path(os.environ.get("SKERRY_ROOT", root_dir / "data" / "skerry-cold"))),
     "file_browser_root_path_kvstore": path_value(
         file_browser.get("root_path_kvstore"),
-        Path(os.environ.get("PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", kvstore_root)),
+        Path(os.environ.get("PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE", root_dir / "data")),
     ),
     "file_browser_root_path_import_dir": path_value(
         file_browser.get("root_path_import_dir"),
@@ -396,9 +402,15 @@ PY
                     run_dir) RUN_DIR="$value" ;;
                     database_dsn) PELAGIA_DATABASE_DSN="$value" ;;
                     database_schema) PELAGIA_DATABASE_SCHEMA="$value" ;;
-                    kvstore_backend) PELAGIA_KVSTORE_BACKEND="$value" ;;
-                    kvstore_root) PELAGIA_KVSTORE_ROOT="$value" ;;
-                    kvstore_max_blob_bytes) PELAGIA_KVSTORE_MAX_BLOB_BYTES="$value" ;;
+                    cold_storage_endpoint) PELAGIA_COLD_STORAGE_ENDPOINT="$value" ;;
+                    cold_storage_token) PELAGIA_COLD_STORAGE_TOKEN="$value" ;;
+                    cold_storage_timeout_seconds) PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS="$value" ;;
+                    hot_storage_endpoint) PELAGIA_HOT_STORAGE_ENDPOINT="$value" ;;
+                    hot_storage_token) PELAGIA_HOT_STORAGE_TOKEN="$value" ;;
+                    hot_storage_timeout_seconds) PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS="$value" ;;
+                    skerry_managed) SKERRY_MANAGED="$value" ;;
+                    skerry_binary) SKERRY_BINARY="$value" ;;
+                    skerry_root) SKERRY_ROOT="$value" ;;
                     file_browser_root_path_kvstore) PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE="$value" ;;
                     file_browser_root_path_import_dir) PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR="$value" ;;
                     file_browser_allowed_root_paths) PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS="$value" ;;
@@ -513,13 +525,44 @@ cleanup_stale_pid_files() {
 }
 
 storage_is_ready() {
-    PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
-    PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
     "$PELAGIA_CONTROL_PYTHON" -m Pelagia.cli.app check-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
         --schema "$PELAGIA_DATABASE_SCHEMA" \
-        --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
         >"$LOG_DIR/storage-check.log" 2>&1
+}
+
+start_skerry() {
+    [[ "$SKERRY_MANAGED" == "true" ]] && return
+    if ! command -v "$SKERRY_BINARY" >/dev/null 2>&1; then
+        echo "SkerryKV executable not found: $SKERRY_BINARY" >&2
+        return 2
+    fi
+    if [[ "$PELAGIA_COLD_STORAGE_ENDPOINT" != http://127.0.0.1:* && "$PELAGIA_COLD_STORAGE_ENDPOINT" != http://localhost:* ]]; then
+        echo "[skerry] is local but cold endpoint is not loopback: $PELAGIA_COLD_STORAGE_ENDPOINT" >&2
+        return 2
+    fi
+    if [[ "$PELAGIA_HOT_STORAGE_ENDPOINT" != "$PELAGIA_COLD_STORAGE_ENDPOINT" ]]; then
+        echo "Separate hot and cold local SkerryKV instances are not supported by this TOML stack; use managed = true." >&2
+        return 2
+    fi
+    if [[ ! -f "$SKERRY_ROOT/config.toml" ]]; then
+        mkdir -p "$SKERRY_ROOT"
+        "$SKERRY_BINARY" init --path "$SKERRY_ROOT" >"$LOG_DIR/skerry.init.log" 2>&1
+    fi
+    local endpoint listen
+    endpoint="${PELAGIA_COLD_STORAGE_ENDPOINT#http://}"
+    endpoint="${endpoint#https://}"
+    listen="${endpoint%%/*}"
+    start_process skerry env "SKERRY_LISTEN=$listen" "SKERRY_ROOT=$SKERRY_ROOT/data" "SKERRY_TOKEN=$PELAGIA_COLD_STORAGE_TOKEN" \
+        "$SKERRY_BINARY" serve --config "$SKERRY_ROOT/config.toml"
+    for _ in {1..240}; do
+        if SKERRY_TOKEN="$PELAGIA_COLD_STORAGE_TOKEN" "$SKERRY_BINARY" status --connect "$PELAGIA_COLD_STORAGE_ENDPOINT" >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.5
+    done
+    echo "SkerryKV did not become ready at $PELAGIA_COLD_STORAGE_ENDPOINT" >&2
+    return 1
 }
 
 initialize_system() {
@@ -545,12 +588,9 @@ initialize_system() {
 
     echo "initializing storage..."
     if ! PELAGIA_DB_STATEMENT_TIMEOUT_MS="$PELAGIA_INIT_STATEMENT_TIMEOUT_MS" \
-        PELAGIA_KVSTORE_BACKEND="$PELAGIA_KVSTORE_BACKEND" \
-        PELAGIA_KVSTORE_MAX_BLOB_BYTES="$PELAGIA_KVSTORE_MAX_BLOB_BYTES" \
         "$PELAGIA_CONTROL_PYTHON" -m Pelagia.cli.app init-system \
         --database-dsn "$PELAGIA_DATABASE_DSN" \
-        --schema "$PELAGIA_DATABASE_SCHEMA" \
-        --kvstore-root "$PELAGIA_KVSTORE_ROOT" >"$log_file" 2>&1; then
+        --schema "$PELAGIA_DATABASE_SCHEMA" >"$log_file" 2>&1; then
         echo "failed to initialize storage; log follows:"
         tail -120 "$log_file" || true
         return 1
@@ -563,13 +603,13 @@ start_stack() {
     if [[ "$PELAGIA_API_ENABLED" == "true" ]] && ! is_running "$PID_DIR/api.pid"; then
         pelagia_require_available_tcp_port "$PELAGIA_API_HOST" "$PELAGIA_API_PORT" "Pelagia API" "$PELAGIA_CONTROL_PYTHON"
     fi
+    start_skerry
     initialize_system
 
     export PELAGIA_DATABASE_DSN
     export PELAGIA_DATABASE_SCHEMA
-    export PELAGIA_KVSTORE_BACKEND
-    export PELAGIA_KVSTORE_ROOT
-    export PELAGIA_KVSTORE_MAX_BLOB_BYTES
+    export PELAGIA_COLD_STORAGE_ENDPOINT PELAGIA_COLD_STORAGE_TOKEN PELAGIA_COLD_STORAGE_TIMEOUT_SECONDS
+    export PELAGIA_HOT_STORAGE_ENDPOINT PELAGIA_HOT_STORAGE_TOKEN PELAGIA_HOT_STORAGE_TIMEOUT_SECONDS
     export PELAGIA_FILE_BROWSER_ROOT_PATH_KVSTORE
     export PELAGIA_FILE_BROWSER_ROOT_PATH_IMPORT_DIR
     export PELAGIA_FILE_BROWSER_ALLOWED_ROOT_PATHS
@@ -603,7 +643,6 @@ start_stack() {
                 "$worker_python" -m Pelagia.cli.app worker_run \
                 --database-dsn "$PELAGIA_DATABASE_DSN" \
                 --schema "$PELAGIA_DATABASE_SCHEMA" \
-                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
                 --worker-id "$worker_id" \
                 --stages "$stages" \
                 --idle-sleep-seconds "$idle" \
@@ -614,7 +653,6 @@ start_stack() {
                 "$worker_python" -m Pelagia.cli.app worker_run \
                 --database-dsn "$PELAGIA_DATABASE_DSN" \
                 --schema "$PELAGIA_DATABASE_SCHEMA" \
-                --kvstore-root "$PELAGIA_KVSTORE_ROOT" \
                 --worker-id "$worker_id" \
                 --stages "$stages" \
                 --idle-sleep-seconds "$idle" \
@@ -642,6 +680,7 @@ stop_stack() {
         stop_pid_file "$process_name"
     done
     stop_pid_file api
+    stop_pid_file skerry
 }
 
 status_stack() {

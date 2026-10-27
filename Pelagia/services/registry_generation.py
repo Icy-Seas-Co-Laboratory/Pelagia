@@ -65,7 +65,7 @@ def _portable_image(row: Mapping[str, Any]) -> tuple[bytes, str, str, list[Any],
 
 def _selection_sql(repository, project_id: str, selection: Mapping[str, Any]) -> tuple[str, list[Any]]:
     schema = repository.schema
-    clauses = ["assets.project_id = %s", "refined.roi_payload IS NOT NULL"]
+    clauses = ["assets.project_id = %s", "refined.roi_payload_ref IS NOT NULL"]
     params: list[Any] = [project_id]
 
     asset_ids = [str(value) for value in selection.get("asset_ids") or () if value]
@@ -170,7 +170,7 @@ def preview_registry_dataset(
             cursor.execute(
                 f"""
                 WITH matched AS (
-                    SELECT octet_length(refined.roi_payload) AS payload_bytes,
+                    SELECT refined.roi_payload_bytes AS payload_bytes,
                            row_number() OVER (
                                ORDER BY assets.id, frames.frame_index, refined.roi_index, refined.id
                            ) AS selection_ordinal
@@ -253,7 +253,8 @@ def _selected_rows(repository, project_id: str, selection: Mapping[str, Any], ra
                 (*params, ratio),
             )
             while batch := cursor.fetchmany(128):
-                yield from batch
+                for row in batch:
+                    yield repository._hydrate_detection_row(row)
 
 
 def _labels(repository, project_id: str) -> list[dict[str, Any]]:

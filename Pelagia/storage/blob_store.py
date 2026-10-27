@@ -3,11 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..config import KVStoreConfig
+from ..config import KVStoreConfig, SkerryKVConfig
 from .kvstore import KVStore
 from .kvstore2 import KVStore2
+from .skerrykv import SkerryKVStore
 
-BlobStore = KVStore | KVStore2
+BlobStore = KVStore | KVStore2 | SkerryKVStore
+
+
+def create_skerrykv_store(config: SkerryKVConfig) -> SkerryKVStore:
+    """Create a handle to a configured SkerryKV service."""
+    return SkerryKVStore(
+        config.endpoint,
+        token=config.token,
+        timeout_seconds=config.timeout_seconds,
+    )
 
 
 def create_kvstore(root_path: str | Path, config: KVStoreConfig) -> BlobStore:
@@ -37,6 +47,8 @@ def create_named_kvstore(
 
 def initialize_kvstore(store: BlobStore, config: KVStoreConfig, *, overwrite: bool = False) -> None:
     """Initialize a configured blob store, hiding backend-specific options."""
+    if isinstance(store, SkerryKVStore):
+        return
     if isinstance(store, KVStore2):
         store.initialize(
             hash_algorithm=config.hash_algorithm,
@@ -56,6 +68,8 @@ def initialize_kvstore(store: BlobStore, config: KVStoreConfig, *, overwrite: bo
 
 def reset_kvstore(store: BlobStore, config: KVStoreConfig) -> dict[str, Any]:
     """Reset a configured blob store, hiding backend-specific options."""
+    if isinstance(store, SkerryKVStore):
+        raise RuntimeError("SkerryKV objects are immutable and cannot be reset by Pelagia.")
     if isinstance(store, KVStore2):
         return store.reset(
             hash_algorithm=config.hash_algorithm,
