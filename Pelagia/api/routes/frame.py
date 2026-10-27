@@ -367,6 +367,7 @@ if APIRouter is not None:
                 frame_id=frame_id,
                 limit=detection_limit,
                 offset=detection_offset,
+                include_payload=False,
             )
         detection_summaries = [detection_summary(detection) for detection in detections]
         image_urls = {

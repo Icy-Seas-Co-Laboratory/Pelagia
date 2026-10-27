@@ -719,6 +719,10 @@ class FakeRepository:
             },
         }
 
+    def get_refinement_queue_counts(self, **kwargs):
+        self.frame_status_filter_calls.append(kwargs)
+        return {"candidates": 5, "refined": 2, "unrefined": 3}
+
     def get_frame_status_facets(self, **kwargs):
         summary = self.get_frame_status_summary(**kwargs)
         return {
@@ -2901,10 +2905,10 @@ def test_api_roi_refinement_rejects_missing_roi_payload():
     )
 
     assert response.status_code == 422
-    assert "do not include ROI payload data" in response.json()["detail"]
+    assert "without stored ROI crops" in response.json()["detail"]
 
 
-def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeypatch):
+def test_api_roi_refinement_rejects_missing_crop_even_with_expansion(monkeypatch):
     from Pelagia.api.routes import roi_refinement as roi_refinement_route
 
     loaded = []
@@ -2932,11 +2936,9 @@ def test_api_roi_refinement_loads_frame_crop_when_roi_payload_is_missing(monkeyp
         },
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["refined_count"] == 1
-    assert loaded == [("frame-1", "preprocessed")]
-    assert body["refined_detections"][0]["metadata"]["refinement_initial_roi_source"] == "frame"
+    assert response.status_code == 422
+    assert "without stored ROI crops" in response.json()["detail"]
+    assert loaded == []
 
 
 def test_api_roi_refinement_uses_project_size_policy_without_override():
@@ -5363,6 +5365,16 @@ def test_api_processing_status_snapshot_is_project_scoped():
     assert len(repo.frame_status_filter_calls) == 1
 
 
+def test_api_refinement_queue_counts_are_project_scoped():
+    client, repo, _ = make_client()
+    response = client.get("/processing/status/refinement-counts?asset_id=asset-1&collection=test")
+    assert response.status_code == 200
+    assert response.json() == {"candidates": 5, "refined": 2, "unrefined": 3}
+    assert repo.frame_status_filter_calls[-1]["project_id"]
+    assert repo.frame_status_filter_calls[-1]["asset_ids"] == ["asset-1"]
+    assert repo.frame_status_filter_calls[-1]["collections"] == ["test"]
+
+
 def test_api_processing_status_facets_group_counts_in_one_request():
     client, repo, _ = make_client()
 
@@ -6218,20 +6230,81 @@ def test_api_refined_frame_listing_keeps_split_records_and_project_scope(monkeyp
 
     def listing(frame_id, **kwargs):
         calls.append((frame_id, kwargs))
-        return [repository._detection_row(
+        rows = [repository._detection_row(
             id=f"refined-split-{index}", candidate_detection_id="det-1",
             area=12, bbox_w=4, bbox_h=3,
             mask_payload=np.full((3, 4), 255, dtype=np.uint8).tobytes(),
             mask_shape=[3, 4],
         ) for index in range(2)]
+        if not kwargs.get("include_payload", True):
+            for row in rows:
+                row.pop("mask_payload", None)
+                row.pop("roi_payload", None)
+        return rows
 
     monkeypatch.setattr(repository, "list_refined_detections", listing, raising=False)
     response = client.get("/refined-detections?frame_id=frame-1&limit=2&offset=2")
     assert response.status_code == 200
     result = response.json()
-    assert calls == [("frame-1", {"project_id": "project-1", "limit": 2, "offset": 2})]
+    assert calls == [("frame-1", {"project_id": "project-1", "limit": 2, "offset": 2, "include_payload": False})]
     assert [row["id"] for row in result["detections"]] == ["refined-split-0", "refined-split-1"]
-    assert all(row["contour_area"] == 6 and row["bbox_area"] == 12 for row in result["detections"])
+    assert all(row["contour_area"] is None and row["bbox_area"] == 12 for row in result["detections"])
     assert all("mask_payload" not in row for row in result["detections"])
     assert result["page"]["next_offset"] == 4
     assert client.get("/refined-detections?frame_id=frame-1&limit=0").status_code == 422
+
+
+@pytest.mark.parametrize("url", [
+    "/detections?frame_id=frame-1",
+    "/assets/asset-1/detections?frame_id=frame-1",
+    "/frames/frame-1/context?include_detections=true",
+])
+def test_detection_summary_endpoints_request_metadata_only(monkeypatch, url):
+    client, repository, _ = make_client()
+    original = repository.list_detections
+    calls = []
+
+    def listing(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "list_detections", listing)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["include_payload"] is False
+
+
+def test_api_queues_interchange_creation_and_rejects_existing_output(tmp_path):
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+    client.app.state.context.config.file_browser.root_path_import_dir = tmp_path
+    source = tmp_path / 'videos'
+    source.mkdir()
+    output = tmp_path / 'archive'
+    response = client.post('/ingestion/interchange', headers=headers, json={
+        'source_path': str(source), 'output_path': str(output), 'jpeg_quality': 85,
+    })
+    assert response.status_code == 200
+    job = repository.created_jobs[-1]
+    assert job['payload']['jpeg_quality'] == 85
+    assert job['payload']['source_path'] == str(source)
+    output.mkdir()
+    response = client.post('/ingestion/interchange', headers=headers, json={
+        'source_path': str(source), 'output_path': str(output),
+    })
+    assert response.status_code == 400
+    assert len(repository.created_jobs) == 1
+
+
+def test_api_rejects_interchange_paths_outside_import_roots(tmp_path):
+    client, repository, _ = make_client()
+    headers = auth_headers(client)
+    allowed = tmp_path / 'allowed'
+    allowed.mkdir()
+    client.app.state.context.config.file_browser.root_path_import_dir = allowed
+    response = client.post('/ingestion/interchange', headers=headers, json={
+        'source_path': str(tmp_path), 'output_path': str(allowed / 'archive'),
+    })
+    assert response.status_code == 403
+    assert not repository.created_jobs

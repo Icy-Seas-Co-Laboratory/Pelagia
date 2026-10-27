@@ -61,6 +61,10 @@ The BLOB is canonical raw image data for the package. Add an explicit status row
 
 ### Create automatically from a directory of videos
 
+PelagiaView can also queue this operation from **Ingestion → Create interchange**. Choose a server-side video directory and a new, separate output directory within the configured file-browser import roots; the worker writes the dataset there. When the job succeeds, select that directory in the raw asset browser and queue its import. The worker needs access to both paths, FFmpeg, FFprobe, and libjpeg-turbo. Configure at least one worker with the `interchange_create` capability; the example worker configuration includes it alongside ingestion. The API endpoint is `POST /ingestion/interchange` and requires project write access.
+
+Creation uses one automatic attempt and never overwrites an existing destination. An interrupted job may leave an incomplete dataset and scratch files; inspect and recover them using the `pii` resume and partial-shard tools described below. The modal currently supports video directories, not arbitrary image sequences.
+
 For the common case, point `pii create` at a directory of acquisition videos:
 
 ```bash

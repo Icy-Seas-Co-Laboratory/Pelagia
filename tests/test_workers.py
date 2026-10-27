@@ -1,3 +1,4 @@
+import hashlib
 import numpy as np
 import pytest
 from oracle_data_contracts.inference_v2 import InferenceItem as V2InferenceItem
@@ -715,6 +716,7 @@ def test_embedding_handler_persists_embedding_product_without_cluster_evidence()
     class EmbeddingKVStore:
         def put_store(self, payload):
             assert payload
+            self.payload = payload
             return "embedding-key"
 
     kvstore = EmbeddingKVStore()
@@ -729,6 +731,9 @@ def test_embedding_handler_persists_embedding_product_without_cluster_evidence()
     assert result["evidence_kind"] == "embedding"
     assert result["detection_count"] == 1
     assert stored[0]["records"][0]["embedding_payload_ref"] == "embedding-key"
+    digest = hashlib.sha256(kvstore.payload).hexdigest()
+    assert stored[0]["records"][0]["embedding_sha256"] == digest
+    assert stored[0]["records"][0]["oracle_result"]["output_packet"]["embedding"]["sha256"] == digest
     assert stored[0]["records"][0]["embedding_normalized"] is True
 
 
@@ -1722,6 +1727,20 @@ def test_roi_refinement_handler_refines_and_stores_candidate_rois():
     assert repo.refined_detections[0][0][1].metadata["detection_stage"] == "refined"
 
 
+def test_roi_refinement_handler_skips_missing_crops_in_mixed_job():
+    repo = FakeRepository()
+    result = roi_refinement_handler(
+        {"id": "mixed-refine", "stage": PipelineStage.ROI_REFINEMENT.value,
+         "payload": {"detection_ids": ["det-1", "det-no-roi"], "method": "identity",
+                     "allow_frame_expansion": False}},
+        make_context(repo),
+    )
+    assert result["detection_count"] == 1
+    assert result["skipped_count"] == 1
+    assert result["refined_count"] == 1
+    assert repo.refined_detections[0][0][0] == "det-1"
+
+
 def test_roi_refinement_handler_identity_promotes_without_oracle():
     repo = FakeRepository()
 
@@ -1935,7 +1954,7 @@ def test_roi_refinement_handler_uses_project_size_policy():
     assert repo.refined_detections[0][0][1].roi_encoding == "zstd"
 
 
-def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(monkeypatch):
+def test_roi_refinement_handler_skips_candidate_without_roi_crop(monkeypatch):
     repo = FakeRepository()
     context = make_context(repo)
     loaded = []
@@ -1968,9 +1987,10 @@ def test_roi_refinement_handler_loads_frame_crop_when_roi_payload_is_missing(mon
         context,
     )
 
-    assert result["refined_count"] == 1
-    assert loaded == [("frame-1", "preprocessed")]
-    assert repo.refined_detections[0][0][1].metadata["refinement_initial_roi_source"] == "frame"
+    assert result["refined_count"] == 0
+    assert result["skipped_count"] == 1
+    assert loaded == []
+    assert repo.refined_detections == []
 
 
 def test_default_registry_includes_roi_detection_handler(monkeypatch):

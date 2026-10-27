@@ -95,19 +95,35 @@ capabilities = ["segment"]
 
 [[worker]]
 name = "cpu-4"
-capabilities = ["segment"]
+capabilities = ["segment", "roi_refinement"]
 
 [[worker]]
 name = "cpu-5"
-capabilities = ["segment"]
+capabilities = ["segment", "roi_refinement"]
 
 [[worker]]
 name = "cpu-6"
-capabilities = ["segment"]
+capabilities = ["segment", "roi_refinement"]
 
 [[worker]]
 name = "refine-1"
 capabilities = ["roi_refinement", "classify"]
+
+[[worker]]
+name = "refine-2"
+capabilities = ["roi_refinement"]
+
+[[worker]]
+name = "refine-3"
+capabilities = ["roi_refinement"]
+
+[[worker]]
+name = "refine-4"
+capabilities = ["roi_refinement"]
+
+[[worker]]
+name = "refine-5"
+capabilities = ["roi_refinement"]
 
 [[worker]]
 name = "registry-1"

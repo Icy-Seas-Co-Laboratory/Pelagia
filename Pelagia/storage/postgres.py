@@ -3446,6 +3446,7 @@ class PostgresRepository:
         sort_dir: str = "desc",
         limit: int | None = 100,
         offset: int = 0,
+        include_payload: bool = True,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -3568,12 +3569,25 @@ class PostgresRepository:
         if offset:
             params.append(max(0, int(offset)))
 
+        detection_columns = "detections.*" if include_payload else """
+            detections.id, detections.run_id, detections.frame_id, detections.roi_index,
+            detections.bbox_x, detections.bbox_y, detections.bbox_w, detections.bbox_h,
+            detections.crop_bbox_x, detections.crop_bbox_y, detections.crop_bbox_w, detections.crop_bbox_h,
+            detections.area, detections.perimeter, detections.major_axis_length, detections.minor_axis_length,
+            detections.centroid_x, detections.centroid_y, detections.major_axis_center_x, detections.major_axis_center_y,
+            detections.major_axis_orientation_degrees, detections.major_axis_direction_degrees,
+            detections.min_gray_value, detections.mean_gray_value,
+            detections.roi_payload_ref, detections.mask_payload_ref, detections.roi_payload_bytes, detections.mask_payload_bytes,
+            detections.roi_encoding, detections.roi_format, detections.roi_dtype, detections.roi_shape,
+            detections.mask_encoding, detections.mask_format, detections.mask_dtype, detections.mask_shape,
+            detections.metadata, detections.created_at
+        """
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     SELECT
-                        detections.*,
+                        {detection_columns},
                         frames.asset_id,
                         frames.frame_index,
                         frames.captured_at AS captured_at,
@@ -3592,7 +3606,7 @@ class PostgresRepository:
                     tuple(params),
                 )
                 rows = cursor.fetchall()
-        return [self._hydrate_detection_row(row) for row in rows]
+        return [self._hydrate_detection_row(row) for row in rows] if include_payload else rows
 
     def _telemetry_filter_clauses(
         self,
@@ -3771,7 +3785,7 @@ class PostgresRepository:
             return []
         with self.connect() as connection:
             with connection.cursor() as cursor:
-                clauses = ["detections.frame_id = ANY(%s)"]
+                clauses = ["detections.frame_id = ANY(%s)", "detections.roi_payload_ref IS NOT NULL"]
                 params: list[Any] = [resolved_ids]
                 if project_id is not None:
                     clauses.append("assets.project_id = %s")
@@ -3877,7 +3891,7 @@ class PostgresRepository:
 
     def list_refined_detections(
         self, frame_id: str, *, project_id: str | None = None,
-        limit: int = 500, offset: int = 0,
+        limit: int = 500, offset: int = 0, include_payload: bool = True,
     ) -> list[dict[str, Any]]:
         """List persisted refined identities, including every split child."""
         clauses = ["refined.frame_id = %s"]
@@ -3911,7 +3925,7 @@ class PostgresRepository:
                     LIMIT %s OFFSET %s
                 """, tuple(params))
                 rows = cursor.fetchall()
-        if getattr(self, "hot_store", None) is not None:
+        if include_payload and getattr(self, "hot_store", None) is not None:
             for row in rows:
                 row["mask_payload"] = None
                 if row.get("mask_payload_ref"):
@@ -5052,6 +5066,34 @@ class PostgresRepository:
                 )
                 row = cursor.fetchone()
         return self._frame_status_summary_from_row(row)
+
+    def get_refinement_queue_counts(
+        self, *, project_id: str, asset_ids: Sequence[str] | None = None,
+        collections: Sequence[str] | None = None,
+    ) -> dict[str, int]:
+        """Count eligible candidates by candidate-level refinement state."""
+        resolved_project_id = self._required_project_id(project_id, "get_refinement_queue_counts")
+        clauses, params = self._frame_status_filters(
+            project_id=resolved_project_id, asset_ids=asset_ids, collections=collections,
+        )
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""WITH eligible AS (
+                        SELECT detections.id,
+                            EXISTS (SELECT 1 FROM {self.schema}.detections_refined refined
+                                    WHERE refined.candidate_detection_id = detections.id) AS refined
+                        FROM {self.schema}.frame_processing_status status
+                        JOIN {self.schema}.detection_candidate detections ON detections.frame_id = status.frame_id
+                        WHERE {' AND '.join(clauses)} AND detections.roi_payload_ref IS NOT NULL
+                    )
+                    SELECT COUNT(*)::bigint AS candidates,
+                           COUNT(*) FILTER (WHERE refined)::bigint AS refined,
+                           COUNT(*) FILTER (WHERE NOT refined)::bigint AS unrefined
+                    FROM eligible""", tuple(params),
+                )
+                row = cursor.fetchone() or {}
+        return {key: int(row.get(key) or 0) for key in ("candidates", "refined", "unrefined")}
 
     def get_frame_status_facets(
         self,
@@ -8154,20 +8196,29 @@ class PostgresRepository:
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
         result = {"candidate_rows": 0, "refined_rows": 0, "objects": 0}
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""SELECT count(*) AS count FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name IN ('detection_candidate', 'detections_refined')
+                      AND column_name IN ('roi_payload', 'mask_payload')""", (self.schema,))
+                count = cursor.fetchone()["count"]
+        if count == 0:
+            return result
+        if count != 4:
+            raise RuntimeError("Inline detection payload columns are in an incomplete migration state.")
         for table, counter in (("detection_candidate", "candidate_rows"), ("detections_refined", "refined_rows")):
             # Restrict repeated batch scans to rows which still need copying.
             with self.connect() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(f"""CREATE INDEX IF NOT EXISTS {table}_skerry_pending_idx
                         ON {self.schema}.{table} (id)
-                        WHERE (roi_payload IS NOT NULL AND roi_payload_ref IS NULL)
-                           OR (mask_payload IS NOT NULL AND mask_payload_ref IS NULL)""")
+                        WHERE roi_payload IS NOT NULL OR mask_payload IS NOT NULL""")
                 connection.commit()
             while True:
                 with self.connect() as connection:
                     with connection.cursor() as cursor:
-                        clauses = ["((item.roi_payload IS NOT NULL AND item.roi_payload_ref IS NULL) "
-                                   "OR (item.mask_payload IS NOT NULL AND item.mask_payload_ref IS NULL))"]
+                        clauses = ["(item.roi_payload IS NOT NULL OR item.mask_payload IS NOT NULL)"]
                         params: list[Any] = []
                         join = (f"JOIN {self.schema}.frames frames ON frames.id = item.frame_id "
                                 f"JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id")
@@ -8205,10 +8256,10 @@ class PostgresRepository:
                             mask = row.get("mask_payload")
                             cursor.execute(
                                 f"""UPDATE {self.schema}.{table}
-                                SET roi_payload_ref = COALESCE(roi_payload_ref, %s),
-                                    roi_payload_bytes = COALESCE(roi_payload_bytes, %s),
-                                    mask_payload_ref = COALESCE(mask_payload_ref, %s),
-                                    mask_payload_bytes = COALESCE(mask_payload_bytes, %s),
+                                SET roi_payload_ref = COALESCE(%s, roi_payload_ref),
+                                    roi_payload_bytes = COALESCE(%s, roi_payload_bytes),
+                                    mask_payload_ref = COALESCE(%s, mask_payload_ref),
+                                    mask_payload_bytes = COALESCE(%s, mask_payload_bytes),
                                     roi_payload = NULL, mask_payload = NULL
                                 WHERE id = %s""",
                                 (roi_ref, None if roi is None else len(roi), mask_ref,
@@ -9354,11 +9405,18 @@ class PostgresRepository:
                     if not saved_boundary.get("created_before"):
                         cursor.execute("SELECT NOW() AS value")
                         saved_boundary = {"created_before": cursor.fetchone()["value"]}
-                    page_clauses = [base_where, "frames.created_at <= %s::timestamptz",
-                                    "(frames.created_at, status.frame_id) > (%s::timestamptz, %s::uuid)"]
-                    page_params = [*params, saved_boundary["created_before"],
-                                   saved_cursor.get("created_at") or "-infinity",
-                                   saved_cursor.get("frame_id") or "00000000-0000-0000-0000-000000000000"]
+                        saved_boundary["frame_order"] = "asset_frame_v1"
+                    asset_frame_order = saved_boundary.get("frame_order") == "asset_frame_v1"
+                    if asset_frame_order:
+                        seek_clause = "(status.asset_id, status.frame_index, status.frame_id) > (%s::uuid, %s::integer, %s::uuid)"
+                        order_clause = "status.asset_id, status.frame_index, status.frame_id"
+                        seek_params = [saved_cursor.get("asset_id") or "00000000-0000-0000-0000-000000000000", saved_cursor.get("frame_index", -1), saved_cursor.get("frame_id") or "00000000-0000-0000-0000-000000000000"]
+                    else:
+                        seek_clause = "(frames.created_at, status.frame_id) > (%s::timestamptz, %s::uuid)"
+                        order_clause = "frames.created_at, status.frame_id"
+                        seek_params = [saved_cursor.get("created_at") or "-infinity", saved_cursor.get("frame_id") or "00000000-0000-0000-0000-000000000000"]
+                    page_clauses = [base_where, "frames.created_at <= %s::timestamptz", seek_clause]
+                    page_params = [*params, saved_boundary["created_before"], *seek_params]
                     page_params.append(bounded_limit + 1)
                     payload_ref = (
                         "COALESCE(frames.preprocessed_payload_ref, frames.preprocessed_kvstore_hash)"
@@ -9387,7 +9445,7 @@ class PostgresRepository:
                         FROM {self.schema}.frame_processing_status status
                         JOIN {self.schema}.frames frames ON frames.id = status.frame_id
                         WHERE {' AND '.join(page_clauses)}
-                        ORDER BY frames.created_at, status.frame_id LIMIT %s""",
+                        ORDER BY {order_clause} LIMIT %s""",
                         tuple(page_params),
                     )
                     rows = cursor.fetchall()
@@ -9404,6 +9462,8 @@ class PostgresRepository:
             next_cursor = saved_cursor if not rows else {
                 "created_at": rows[-1]["unit_created_at"], "frame_id": str(rows[-1]["frame_id"]),
             }
+            if rows and saved_boundary.get("frame_order") == "asset_frame_v1":
+                next_cursor.update({"asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"]})
             return {"rows": rows, "boundary": saved_boundary, "cursor": next_cursor,
                     "has_more": has_more, "waiting_for_submission_id": blocking}
 
@@ -9424,6 +9484,7 @@ class PostgresRepository:
         if collections:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
+        clauses.append("detections.roi_payload_ref IS NOT NULL")
         refinement_clause = self._candidate_refinement_state_clause(
             schema=self.schema, refinement_states=filters.get("refinement_state"),
         )
@@ -9433,10 +9494,19 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 if not saved_boundary.get("created_before"):
                     cursor.execute("SELECT NOW() AS value")
-                    saved_boundary = {"created_before": cursor.fetchone()["value"]}
+                    saved_boundary = {"created_before": cursor.fetchone()["value"], "roi_order": "generation_v1"}
+                generation_order = saved_boundary.get("roi_order") == "generation_v1"
+                if generation_order:
+                    seek_clause = "(detections.created_at, status.asset_id, status.frame_index, detections.frame_id, detections.roi_index, detections.id) > (%s::timestamptz, %s::uuid, %s::integer, %s::uuid, %s::integer, %s::uuid)"
+                    order_clause = "detections.created_at, status.asset_id, status.frame_index, detections.frame_id, detections.roi_index, detections.id"
+                    seek_params = [saved_cursor.get("created_at") or "-infinity", saved_cursor.get("asset_id") or "00000000-0000-0000-0000-000000000000", saved_cursor.get("frame_index", -1), saved_cursor.get("frame_id") or "00000000-0000-0000-0000-000000000000", saved_cursor.get("roi_index", -1), saved_cursor.get("detection_id") or "00000000-0000-0000-0000-000000000000"]
+                else:
+                    seek_clause = "(detections.created_at, detections.id) > (%s::timestamptz, %s::uuid)"
+                    order_clause = "detections.created_at, detections.id"
+                    seek_params = [saved_cursor.get("created_at") or "-infinity", saved_cursor.get("detection_id") or "00000000-0000-0000-0000-000000000000"]
                 cursor.execute(
                     f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id,
-                               status.run_id, detections.roi_index, detections.bbox_w, detections.bbox_h,
+                               status.run_id, status.frame_index, detections.roi_index, detections.bbox_w, detections.bbox_h,
                                detections.crop_bbox_w, detections.crop_bbox_h,
                                detections.roi_payload_ref IS NOT NULL AS has_roi_payload,
                                detections.roi_shape, detections.roi_dtype,
@@ -9455,12 +9525,9 @@ class PostgresRepository:
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                     WHERE {' AND '.join(clauses)}
                       AND detections.created_at <= %s::timestamptz
-                      AND (detections.created_at, detections.id) > (%s::timestamptz, %s::uuid)
-                    ORDER BY detections.created_at, detections.id LIMIT %s""",
-                    tuple([*params, saved_boundary["created_before"],
-                           saved_cursor.get("created_at") or "-infinity",
-                           saved_cursor.get("detection_id") or "00000000-0000-0000-0000-000000000000",
-                           bounded_limit + 1]),
+                      AND {seek_clause}
+                    ORDER BY {order_clause} LIMIT %s""",
+                    tuple([*params, saved_boundary["created_before"], *seek_params, bounded_limit + 1]),
                 )
                 rows = cursor.fetchall()
         blocking = next((str(row["reserved_by_submission_id"]) for row in rows
@@ -9476,6 +9543,9 @@ class PostgresRepository:
         next_cursor = saved_cursor if not rows else {
             "created_at": rows[-1]["unit_created_at"], "detection_id": str(rows[-1]["detection_id"]),
         }
+        if rows and saved_boundary.get("roi_order") == "generation_v1":
+            next_cursor.update({"asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"],
+                                "frame_id": str(rows[-1]["frame_id"]), "roi_index": rows[-1]["roi_index"]})
         return {"rows": rows, "boundary": saved_boundary, "cursor": next_cursor,
                 "has_more": has_more, "waiting_for_submission_id": blocking}
 
@@ -9495,6 +9565,7 @@ class PostgresRepository:
                         JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                         JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                         WHERE assets.project_id = %s AND detections.id = ANY(%s::uuid[])
+                          AND detections.roi_payload_ref IS NOT NULL
                         FOR UPDATE OF detections""",
                         (resolved_project_id, list(unit_ids)),
                     )
@@ -9558,8 +9629,7 @@ class PostgresRepository:
                     FROM {self.schema}.frame_processing_status status
                     JOIN {self.schema}.frames frames ON frames.id = status.frame_id
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY COALESCE(frames.payload_ref, frames.kvstore_hash) ASC NULLS LAST,
-                             status.frame_id ASC
+                    ORDER BY status.asset_id, status.frame_index, status.frame_id
                     """,
                     tuple(params),
                 )
@@ -9585,7 +9655,7 @@ class PostgresRepository:
                 cursor.execute(f"""SELECT status.frame_id, status.asset_id, status.run_id, status.frame_index,
                     {payload_ref} AS payload_ref, {payload_shape} AS payload_shape, {payload_dtype} AS payload_dtype
                     FROM {self.schema}.frame_processing_status status JOIN {self.schema}.frames frames ON frames.id = status.frame_id
-                    WHERE {' AND '.join(clauses)} ORDER BY {payload_ref} ASC NULLS LAST, status.frame_id ASC""", tuple(params))
+                    WHERE {' AND '.join(clauses)} ORDER BY status.asset_id, status.frame_index, status.frame_id""", tuple(params))
                 return cursor.fetchall()
 
     def plan_roi_refinement_detections(
@@ -9605,6 +9675,7 @@ class PostgresRepository:
         if collections:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
+        clauses.append("detections.roi_payload_ref IS NOT NULL")
         refinement_clause = self._candidate_refinement_state_clause(
             schema=self.schema,
             refinement_states=filters.get("refinement_state"),
@@ -9624,7 +9695,7 @@ class PostgresRepository:
                     else "frames.payload_dtype"
                 )
                 cursor.execute(f"""SELECT detections.id AS detection_id, detections.frame_id, status.asset_id, status.run_id,
-                    detections.roi_index, detections.bbox_w, detections.bbox_h,
+                    detections.roi_index, detections.created_at AS unit_created_at, status.frame_index, detections.bbox_w, detections.bbox_h,
                     detections.crop_bbox_w, detections.crop_bbox_h,
                     detections.roi_payload_ref IS NOT NULL AS has_roi_payload,
                     detections.roi_shape, detections.roi_dtype,
@@ -9635,7 +9706,7 @@ class PostgresRepository:
                     FROM {self.schema}.detection_candidate detections
                     JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
                     JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
-                    WHERE {' AND '.join(clauses)} ORDER BY detections.frame_id ASC, detections.roi_index ASC, detections.id ASC""", tuple(params))
+                    WHERE {' AND '.join(clauses)} ORDER BY detections.created_at, status.asset_id, status.frame_index, detections.frame_id, detections.roi_index, detections.id""", tuple(params))
                 return cursor.fetchall()
 
     @staticmethod

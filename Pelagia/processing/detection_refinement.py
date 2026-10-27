@@ -270,6 +270,7 @@ class _BackendRefinementState:
     refined_mask: np.ndarray
     crop_bbox: tuple[int, int, int, int]
     full_frame: np.ndarray | None = None
+    frame_shape: tuple[int, int] | None = None
     frame_loaded: bool = False
     roi_source: str = "payload"
     expansion_count: int = 0
@@ -347,7 +348,7 @@ def _crop_detection_roi_from_frame(detection: DetectionRecord, frame: np.ndarray
         raise ValueError(
             f"Detection crop bbox {(crop_x, crop_y, crop_w, crop_h)} exceeds frame bounds {(frame_w, frame_h)}."
         )
-    return np.ascontiguousarray(frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w])
+    return np.array(frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w], copy=True, order="C")
 
 
 def build_roi_tiles(
@@ -722,7 +723,8 @@ def _refine_detections_with_backend(
                 candidate_mask=candidate_mask,
                 refined_mask=candidate_mask,
                 crop_bbox=_detection_crop_bbox(detection, roi.shape),
-                full_frame=full_frame,
+                full_frame=None,
+                frame_shape=None if full_frame is None else full_frame.shape[:2],
                 frame_loaded=frame_loaded,
                 roi_source=roi_source,
             )
@@ -861,7 +863,7 @@ def _refine_detections_with_backend(
             touched = mask_touches_uncovered_edge(
                 state.refined_mask,
                 crop_bbox=state.crop_bbox,
-                frame_shape=None if state.full_frame is None else state.full_frame.shape[:2],
+                frame_shape=state.frame_shape,
                 margin=options.edge_touch_margin,
             )
             if not any(touched.values()):
@@ -873,6 +875,7 @@ def _refine_detections_with_backend(
                 with measure_phase("refinement.frame_prepare"):
                     state.full_frame = as_grayscale_array(frame_loader(state.detection.frame_id))
                 state.frame_loaded = True
+            state.frame_shape = state.full_frame.shape[:2]
             new_crop_bbox = _expanded_crop_bbox(
                 state.crop_bbox,
                 touched,
@@ -880,6 +883,7 @@ def _refine_detections_with_backend(
                 expansion_pixels=options.resolved_expansion_pixels,
             )
             if new_crop_bbox == state.crop_bbox:
+                state.full_frame = None
                 continue
             with measure_phase("refinement.roi_expansion"):
                 state.roi, state.refined_mask = _expand_roi_and_mask_from_frame(
@@ -889,6 +893,7 @@ def _refine_detections_with_backend(
                     current_crop_bbox=state.crop_bbox,
                     new_crop_bbox=new_crop_bbox,
                 )
+            state.full_frame = None
             state.crop_bbox = new_crop_bbox
             state.expansion_count += 1
             next_active.append(index)
@@ -1586,7 +1591,7 @@ def _expand_roi_and_mask_from_frame(
     new_crop_bbox: tuple[int, int, int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
     x, y, width, height = new_crop_bbox
-    new_roi = np.ascontiguousarray(frame[y:y + height, x:x + width])
+    new_roi = np.array(frame[y:y + height, x:x + width], copy=True, order="C")
     new_mask = np.zeros((height, width), dtype=np.uint8)
     old_x, old_y, old_width, old_height = current_crop_bbox
     dest_x = old_x - x

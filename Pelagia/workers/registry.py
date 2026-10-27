@@ -29,9 +29,10 @@ class HandlerRegistry:
 
 def default_stage_handlers() -> tuple[tuple[PipelineStage, JobHandler], ...]:
     """Return the built-in stages in one inspectable registration table."""
-    from .stages import analysis, background, classification, continuity, export, extract, preprocess, refinement, registry_transfer, segmentation, storage_reencode, telemetry
+    from .stages import analysis, background, classification, continuity, export, extract, interchange, preprocess, refinement, registry_transfer, segmentation, storage_reencode, telemetry
 
     return (
+        (PipelineStage.INTERCHANGE_CREATE, interchange.handle),
         (PipelineStage.EXTRACT_FRAMES, extract.handle),
         (PipelineStage.PREPROCESS_FRAMES, preprocess.handle),
         (PipelineStage.BACKGROUND_FRAMES, background.handle),

@@ -672,8 +672,12 @@ The equivalent environment variables are
 OpenCV's FFmpeg backend and the FFmpeg CLI fallback.
 
 ROI storage uses an explicit small/large image policy. Size is the padded crop
-width multiplied by height; masks have an independent lossless codec. An
-installation can restrict the codecs advertised and accepted by the API:
+width multiplied by height; masks have an independent lossless codec. Candidate
+masks are stored only when the ROI image meets the payload storage thresholds
+and `always_store_mask` is enabled. Candidates without a stored ROI crop are
+excluded from refinement and from neighboring seeds. For eligible candidates
+without a stored mask, refinement can derive a seed from the ROI crop.
+An installation can restrict the codecs advertised and accepted by the API:
 
 ```toml
 [image_data_storage]

@@ -104,7 +104,7 @@ def build_candidate_detection_record(
             crop_x1=crop_x1,
             crop_y1=crop_y1,
         )
-        if always_store_mask
+        if store_roi_payload and always_store_mask
         else None
     )
 
@@ -168,7 +168,7 @@ def build_candidate_detection_record(
         roi_dtype = None
         roi_shape = []
 
-    if always_store_mask:
+    if store_roi_payload and always_store_mask:
         if mask_crop is None:
             raise RuntimeError("Mask payload was requested but no mask crop was prepared.")
         with measure_phase("segmentation.mask_encode"):

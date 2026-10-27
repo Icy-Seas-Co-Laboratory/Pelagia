@@ -24,7 +24,7 @@ class QueueRepository:
     def plan_preprocess_frames(self, *, project_id, filters):
         assert project_id == "project-1"
         return [
-            {"frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "frame_index": 1, "payload_ref": "b-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
+            {"frame_id": "frame-b", "asset_id": "asset-2", "run_id": "run-2", "frame_index": 1, "payload_ref": "z-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
             {"frame_id": "frame-a", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 1, "payload_ref": "a-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
             {"frame_id": "frame-c", "asset_id": "asset-1", "run_id": "run-1", "frame_index": 2, "payload_ref": "a-key", "payload_shape": [10, 10], "payload_dtype": "uint8"},
         ]
@@ -101,7 +101,7 @@ def test_processing_queue_refinement_state_filters_match_frontend_contract():
     assert default == unrefined
 
 
-def test_preprocess_queue_orders_frames_by_payload_ref_with_backend_batch_limit():
+def test_preprocess_queue_orders_frames_by_asset_and_frame_with_backend_batch_limit():
     repository = QueueRepository()
     service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
 
@@ -110,7 +110,7 @@ def test_preprocess_queue_orders_frames_by_payload_ref_with_backend_batch_limit(
         project_id="project-1",
     )
 
-    assert result["ordering"] == "kvstore_hash"
+    assert result["ordering"] == "asset_frame"
     assert result["max_units_per_job"] == PREPROCESS_FRAMES_PER_JOB
     assert result["batch_sizes"] == [3]
     assert result["job_ids"] == ["job-1"]
@@ -168,9 +168,11 @@ def test_segment_and_refinement_queue_apply_stage_specific_ordering():
         project_id="project-1",
     )
 
-    assert segment["ordering"] == "kvstore_hash"
+    assert segment["ordering"] == "asset_frame"
     assert segment["max_units_per_job"] == SEGMENT_FRAMES_PER_JOB
-    assert refinement["ordering"] == "frame_id"
+    segment_job = next(job for job in repository.created if job["stage"] == "segment")
+    assert segment_job["payload"]["frame_ids"] == ["frame-a", "frame-c", "frame-b"]
+    assert refinement["ordering"] == "candidate_generation"
     assert refinement["max_units_per_job"] == ROI_REFINEMENT_DETECTIONS_PER_JOB
     assert refinement["job_count"] == 1
     refinement_payloads = [job["payload"] for job in repository.created if job["stage"] == "roi_refinement"]
@@ -261,7 +263,7 @@ def test_frame_queue_reports_decoded_byte_limits():
     assert segment["max_input_bytes_per_job"] == SEGMENT_INPUT_BYTES_PER_JOB
 
 
-def test_roi_refinement_byte_budget_counts_expansion_frame_once_per_job(monkeypatch):
+def test_roi_refinement_byte_budget_excludes_expansion_frames(monkeypatch):
     import Pelagia.services.processing_queue as processing_queue
 
     class RoiRepository(QueueRepository):
@@ -283,40 +285,10 @@ def test_roi_refinement_byte_budget_counts_expansion_frame_once_per_job(monkeypa
         PreprocessQueueRequest(filters={}, options={}, dry_run=True), project_id="project-1",
     )
 
-    # Each crop and its derived mask cost 20 bytes. The first two share one 80-byte expansion frame,
-    # while the third needs a second frame and starts another job.
-    assert result["batch_sizes"] == [2, 1]
+    # Each crop and reconstructed mask costs 20 bytes; expansion frames are excluded.
+    assert result["batch_sizes"] == [3]
     assert result["max_input_bytes_per_job"] == 120
     assert ROI_REFINEMENT_INPUT_BYTES_PER_JOB == 100_000_000
-
-
-def test_roi_refinement_without_a_stored_crop_charges_the_source_frame(monkeypatch):
-    import Pelagia.services.processing_queue as processing_queue
-
-    class MissingCropRepository(QueueRepository):
-        def plan_roi_refinement_detections(self, *, project_id, filters, frame_payload_kind="preprocessed"):
-            return [
-                {
-                    "detection_id": f"detection-{index}", "frame_id": "frame-a",
-                    "asset_id": "asset-1", "run_id": "run-1", "roi_index": index,
-                    "bbox_w": 10, "bbox_h": 1,
-                    "has_roi_payload": False, "has_mask_payload": False,
-                    "frame_payload_shape": [80], "frame_payload_dtype": "uint8",
-                }
-                for index in range(2)
-            ]
-
-    monkeypatch.setattr(processing_queue, "ROI_REFINEMENT_INPUT_BYTES_PER_JOB", 100)
-    service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=MissingCropRepository()))
-
-    result = service.queue_roi_refinement(
-        PreprocessQueueRequest(filters={}, options={"allow_frame_expansion": False}, dry_run=True),
-        project_id="project-1",
-    )
-
-    # Each reconstructed mask costs 10 bytes; the 80-byte source frame is
-    # loaded once because there is no stored ROI crop, even with expansion off.
-    assert result["batch_sizes"] == [2]
 
 
 def test_initial_job_progress_counts_queued_frame_and_roi_units():
@@ -598,3 +570,21 @@ def test_resume_series_dispatches_the_next_step_when_a_pause_stranded_it():
     assert repository.resume_arguments == ("series-1", "project-1", "operator approved")
     assert series["status"] == "active"
     assert repository.attached == [("step-0", ["job-1"], 3)]
+
+
+@pytest.mark.parametrize("allow_expansion", [True, False])
+def test_durable_refinement_batch_uses_only_roi_and_mask_bytes(monkeypatch, allow_expansion):
+    import Pelagia.services.processing_queue as processing_queue
+
+    monkeypatch.setattr(processing_queue, "ROI_REFINEMENT_INPUT_BYTES_PER_JOB", 50)
+    rows = [
+        {"frame_id": f"frame-{index}", "has_roi_payload": True, "roi_shape": [10],
+         "roi_dtype": "uint8", "has_mask_payload": False, "bbox_w": 10, "bbox_h": 1,
+         "frame_payload_shape": None, "frame_payload_dtype": None}
+        for index in range(3)
+    ]
+    batch = processing_queue._submission_page_batch(
+        rows, stage="roi_refinement", options={"allow_frame_expansion": allow_expansion}, max_units=100,
+    )
+    assert len(batch) == 2
+    assert [row["input_bytes"] for row in batch] == [20, 20]

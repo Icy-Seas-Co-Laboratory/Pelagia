@@ -24,10 +24,15 @@ switch a checkpointed endpoint to a different underlying store.
 After copying cold objects, run `pelagia migrate-roi-storage` to move candidate
 and refined ROI images and masks, then `pelagia migrate-registry-assets` to move
 Registry workspace assets. Both commands accept `--project-id` to limit their
-scope. Verify their reported counts before restarting writers.
+scope. Verify their reported counts before restarting writers. Once every project
+has been copied, run `pelagia migrate-db` to apply subsequent schema migrations.
+Migration 0037 refuses to run while either detection table still
+contains inline ROI or mask bytes. Migration 0037 then removes those columns
+from both detection tables. Upgrade an older database through migration 0035 before
+running the ROI copy; do not start the new application until the copy is complete.
 
 Keep the legacy stores and database backup until the migrated application has
-been checked. SkerryKV is immutable and does not currently offer object deletion
-or garbage collection, so failed uploads may leave unreferenced objects. The
+been checked. SkerryKV supports object deletion and garbage collection, but Pelagia does not
+yet automatically collect unreferenced objects, so failed uploads may leave them. The
 cold and hot endpoints can be the same service or separate services. See the
 SkerryKV documentation for its backup and recovery procedures.

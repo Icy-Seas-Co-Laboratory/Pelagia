@@ -141,6 +141,18 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return as_response(result)
 
+    @router.get("/refinement-counts")
+    def get_refinement_queue_counts(
+        request: Request,
+        asset_id: list[str] | None = Query(None),
+        collection: list[str] | None = Query(None),
+    ) -> dict:
+        auth = require_project_read(request)
+        return as_response(get_repository(request).get_refinement_queue_counts(
+            project_id=auth.project_id,
+            asset_ids=_query_values(asset_id), collections=_query_values(collection),
+        ))
+
     @router.get("/frames/ids", response_model=ProcessingStatusFrameIdsResponse)
     def list_frame_status_ids(
         request: Request,

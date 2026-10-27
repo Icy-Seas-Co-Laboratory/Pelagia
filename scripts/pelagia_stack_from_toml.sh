@@ -122,6 +122,7 @@ def stack_slug(value: str) -> str:
 
 
 stage_aliases = {
+    "interchange_create": "interchange_create",
     "ingest": "extract_frames",
     "extract": "extract_frames",
     "extract_frame": "extract_frames",

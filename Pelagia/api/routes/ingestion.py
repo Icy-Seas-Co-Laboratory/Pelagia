@@ -49,6 +49,20 @@ if APIRouter is not None:
         metadata["line_scan_geometry"] = {"scan_axis": axis}
         return metadata
 
+    class CreateInterchangeRequest(BaseModel):
+        source_path: str = Field(min_length=1)
+        output_path: str = Field(min_length=1)
+        title: str | None = None
+        description: str = ""
+        stream: str = Field(default="camera", min_length=1)
+        recursive: bool = False
+        shard_target_size: str = "10GB"
+        jpeg_quality: int = Field(default=90, ge=1, le=100)
+        jpeg_subsampling: Literal["444", "422", "420"] = "444"
+        grayscale: bool = False
+        source_file_boundary: bool = False
+        generate_previews: bool = True
+
     class QueueVideoRequest(BaseModel):
         source_path: str
         n_tile: int | None = None
@@ -725,6 +739,28 @@ if APIRouter is not None:
                 "jobs": jobs,
             }
         )
+
+    @router.post("/interchange")
+    def queue_interchange(request: Request, body: CreateInterchangeRequest) -> dict:
+        auth = require_project_write(request)
+        source = _resolve_allowed_import_path(request, body.source_path)
+        output = _resolve_allowed_import_path(request, body.output_path)
+        if not source.is_dir():
+            raise HTTPException(status_code=400, detail="Source must be an existing video directory.")
+        if output == source or source in output.parents or output in source.parents:
+            raise HTTPException(status_code=400, detail="Source and output directories must not overlap.")
+        if output.exists():
+            raise HTTPException(status_code=400, detail="Output path already exists; choose a new path.")
+        if not output.parent.is_dir():
+            raise HTTPException(status_code=400, detail="Output parent directory does not exist.")
+        payload = body.model_dump()
+        payload.update(source_path=str(source), output_path=str(output))
+        job = PipelineService(get_context(request)).queue(
+            PipelineStage.INTERCHANGE_CREATE, project_id=auth.project_id, payload=payload,
+            max_attempts=1, summary=f"Create interchange: {output.name}",
+            submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+        )
+        return as_response({"job": job})
 
     @router.post("/videos")
     def queue_video_ingestion(request: Request, body: QueueVideoRequest) -> dict:

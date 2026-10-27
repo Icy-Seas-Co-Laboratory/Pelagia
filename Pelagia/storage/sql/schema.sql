@@ -527,8 +527,6 @@ ALTER TABLE {schema}.detection_candidate
     ADD COLUMN IF NOT EXISTS crop_bbox_y integer,
     ADD COLUMN IF NOT EXISTS crop_bbox_w integer,
     ADD COLUMN IF NOT EXISTS crop_bbox_h integer,
-    ADD COLUMN IF NOT EXISTS roi_payload bytea,
-    ADD COLUMN IF NOT EXISTS mask_payload bytea,
     ADD COLUMN IF NOT EXISTS roi_payload_ref text,
     ADD COLUMN IF NOT EXISTS mask_payload_ref text,
     ADD COLUMN IF NOT EXISTS roi_payload_bytes bigint,
@@ -544,14 +542,26 @@ ALTER TABLE {schema}.detection_candidate
 
 DO $$
 BEGIN
+    -- Legacy columns are needed until their contents have been copied to SkerryKV.
+    IF NOT EXISTS (SELECT 1 FROM {schema}.schema_migrations WHERE migration_id = '0037_drop_inline_detection_payloads') THEN
+        ALTER TABLE {schema}.detection_candidate
+            ADD COLUMN IF NOT EXISTS roi_payload bytea,
+            ADD COLUMN IF NOT EXISTS mask_payload bytea;
+    END IF;
     IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name = 'detection_candidate'
+          AND column_name = 'roi_payload'
+    ) AND EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = '{schema}'
           AND table_name = 'detection_candidate'
           AND column_name = 'crop_png'
     ) THEN
-        EXECUTE 'UPDATE {schema}.detection_candidate SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL';
+        EXECUTE 'UPDATE {schema}.detection_candidate SET roi_payload = COALESCE(roi_payload, crop_png) WHERE roi_payload IS NULL AND roi_payload_ref IS NULL';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -559,8 +569,11 @@ BEGIN
         WHERE table_schema = '{schema}'
           AND table_name = 'detection_candidate'
           AND column_name = 'mask_png'
+    ) AND EXISTS (
+        SELECT 1 FROM information_schema.columns WHERE table_schema = '{schema}'
+          AND table_name = 'detection_candidate' AND column_name = 'mask_payload'
     ) THEN
-        EXECUTE 'UPDATE {schema}.detection_candidate SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL';
+        EXECUTE 'UPDATE {schema}.detection_candidate SET mask_payload = COALESCE(mask_payload, mask_png) WHERE mask_payload IS NULL AND mask_payload_ref IS NULL';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint

@@ -97,6 +97,15 @@ The response contains the normal `summary` and `snapshot`, plus:
 Multiple values use OR semantics within their group. All returned facet counts
 describe the same filtered frame set as `summary`.
 
+### Refinement Queue Counts
+
+`GET /processing/status/refinement-counts` returns counts of candidate detections
+with a stored ROI crop, grouped into `refined` and `unrefined` by candidate.
+Each candidate counts once even if multiple refined outputs exist. Repeated
+`asset_id` and `collection` parameters use the same filtering as facets. These
+are current counts, not reservations; a submission may select different work
+if data changes or candidates are reserved before planning completes.
+
 ### Frame Rows
 
 Use `/processing/status/frames` when the frontend needs per-frame status fields:

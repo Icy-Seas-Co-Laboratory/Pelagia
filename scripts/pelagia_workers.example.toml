@@ -63,7 +63,7 @@ roi_refinement = "cpu"
 
 [[worker]]
 name = "ingest-1"
-capabilities = ["ingest"]
+capabilities = ["ingest", "interchange_create"]
 
 [[worker]]
 name = "telemetry-1"

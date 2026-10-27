@@ -139,9 +139,8 @@ def _submission_page_batch(
 ) -> list[dict[str, Any]]:
     """Select one durable planning page under count and decoded-input limits.
 
-    ROI expansion retains a decoded source frame once per distinct frame in a
-    job.  The callback charges that shared array exactly once while the stored
-    ROI and mask arrays are charged for each detection.
+    Refinement budgets decoded ROI crops and masks; optional source-frame
+    reads for expansion do not determine batch size.
     """
     if stage in {"preprocess_frames", "segment"}:
         max_bytes = (
@@ -157,13 +156,8 @@ def _submission_page_batch(
         raise ValueError(f"Unsupported processing stage: {stage}.")
 
     prepared = [{**row, "input_bytes": _roi_input_bytes(row)} for row in rows]
-    allow_expansion = bool(options.get("allow_frame_expansion", True))
-
     batches = batch_processing_units_by_limit(
         prepared, max_units, ROI_REFINEMENT_INPUT_BYTES_PER_JOB,
-        extra_bytes_for_batch=lambda current, candidate: _roi_expansion_frame_bytes(
-            current, candidate, allow_frame_expansion=allow_expansion,
-        ),
     )
     return batches[0] if batches else []
 
@@ -202,28 +196,6 @@ def _roi_input_bytes(row: dict[str, Any]) -> int | None:
             return None
         total += mask_width * mask_height
     return total
-
-
-def _roi_expansion_frame_bytes(
-    current_frame_ids: set[str],
-    candidate: dict[str, Any],
-    *,
-    allow_frame_expansion: bool,
-) -> int | None:
-    """Account once for a frame loaded by ROI refinement within one job."""
-    has_roi = candidate.get("has_roi_payload")
-    if not isinstance(has_roi, bool):
-        return None
-    if not allow_frame_expansion and has_roi:
-        return 0
-    frame_id = candidate.get("frame_id")
-    if not frame_id:
-        return None
-    if str(frame_id) in current_frame_ids:
-        return 0
-    return decoded_array_input_bytes(
-        candidate.get("frame_payload_shape"), candidate.get("frame_payload_dtype"),
-    )
 
 
 # Processing presets are a UI-facing flat document. Queue payloads are also
@@ -473,6 +445,13 @@ class ProcessingSubmissionService:
                         rows[-1]["detection_id" if stage == "roi_refinement" else "frame_id"]
                     ),
                 }
+                if stage in {"preprocess_frames", "segment"} and page["boundary"].get("frame_order") == "asset_frame_v1":
+                    page["cursor"].update({"asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"]})
+                if stage == "roi_refinement" and page["boundary"].get("roi_order") == "generation_v1":
+                    page["cursor"].update({
+                        "asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"],
+                        "frame_id": str(rows[-1]["frame_id"]), "roi_index": rows[-1]["roi_index"],
+                    })
             job = None
             unit_ids: list[str] = []
             if rows:
@@ -633,6 +612,13 @@ class ProcessingSubmissionService:
                         rows[-1]["detection_id" if stage == "roi_refinement" else "frame_id"]
                     ),
                 }
+                if stage in {"preprocess_frames", "segment"} and page["boundary"].get("frame_order") == "asset_frame_v1":
+                    page["cursor"].update({"asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"]})
+                if stage == "roi_refinement" and page["boundary"].get("roi_order") == "generation_v1":
+                    page["cursor"].update({
+                        "asset_id": str(rows[-1]["asset_id"]), "frame_index": rows[-1]["frame_index"],
+                        "frame_id": str(rows[-1]["frame_id"]), "roi_index": rows[-1]["roi_index"],
+                    })
             job = None
             unit_ids: list[str] = []
             if rows:
@@ -729,7 +715,7 @@ class ProcessingQueueService:
         filters = {**request.filters}
         filters["preprocessing_status"] = filters.get("preprocessing_status") or ["unknown", "failed", "cancelled"]
         frames = self._plan_by_assets("plan_preprocess_frames", project_id=project_id, filters=filters)
-        frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
+        frames.sort(key=lambda row: (str(row["asset_id"]), int(row.get("frame_index") or 0), str(row["frame_id"])))
         self._set_frame_input_bytes(frames)
         batches = batch_processing_units_by_limit(
             frames, PREPROCESS_FRAMES_PER_JOB, PREPROCESS_INPUT_BYTES_PER_JOB,
@@ -740,7 +726,7 @@ class ProcessingQueueService:
             "unit": "frames",
             "matched_count": len(frames),
             "job_count": len(planned_jobs),
-            "ordering": "kvstore_hash",
+            "ordering": "asset_frame",
             "max_units_per_job": PREPROCESS_FRAMES_PER_JOB,
             "max_input_bytes_per_job": PREPROCESS_INPUT_BYTES_PER_JOB,
             "batch_sizes": [len(batch) for batch in batches],
@@ -775,7 +761,7 @@ class ProcessingQueueService:
             command=SegmentFramesCommand,
             max_units=SEGMENT_FRAMES_PER_JOB,
             max_input_bytes=SEGMENT_INPUT_BYTES_PER_JOB,
-            ordering="kvstore_hash",
+            ordering="asset_frame",
         )
 
     def queue_roi_refinement(self, request: PreprocessQueueRequest, *, project_id: str) -> dict[str, Any]:
@@ -1058,7 +1044,7 @@ class ProcessingQueueService:
         max_input_bytes: int,
         ordering: str,
     ) -> dict[str, Any]:
-        frames.sort(key=lambda row: (str(row.get("payload_ref") or ""), str(row["frame_id"])))
+        frames.sort(key=lambda row: (str(row["asset_id"]), int(row.get("frame_index") or 0), str(row["frame_id"])))
         self._set_frame_input_bytes(frames)
         batches = batch_processing_units_by_limit(frames, max_units, max_input_bytes)
         result = {
@@ -1104,24 +1090,16 @@ class ProcessingQueueService:
         max_units: int,
         max_input_bytes: int,
     ) -> dict[str, Any]:
-        detections.sort(key=lambda row: (str(row["frame_id"]), int(row.get("roi_index") or 0), str(row["detection_id"])))
+        detections.sort(key=lambda row: (str(row.get("unit_created_at") or ""), str(row["asset_id"]), int(row.get("frame_index") or 0), str(row["frame_id"]), int(row.get("roi_index") or 0), str(row["detection_id"])))
         for detection in detections:
             detection["input_bytes"] = _roi_input_bytes(detection)
-        allow_frame_expansion = bool(request.options.get("allow_frame_expansion", True))
-        batches = batch_processing_units_by_limit(
-            detections,
-            max_units,
-            max_input_bytes,
-            extra_bytes_for_batch=lambda current, candidate: _roi_expansion_frame_bytes(
-                current, candidate, allow_frame_expansion=allow_frame_expansion,
-            ),
-        )
+        batches = batch_processing_units_by_limit(detections, max_units, max_input_bytes)
         result = {
             "stage": "roi_refinement",
             "unit": "detections",
             "matched_count": len(detections),
             "job_count": len(batches),
-            "ordering": "frame_id",
+            "ordering": "candidate_generation",
             "max_units_per_job": max_units,
             "max_input_bytes_per_job": max_input_bytes,
             "batch_sizes": [len(batch) for batch in batches],

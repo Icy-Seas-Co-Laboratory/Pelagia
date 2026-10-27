@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from functools import lru_cache
 import hashlib
 import io
 import uuid
@@ -1033,6 +1034,13 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     missing_ids = list(dict.fromkeys(detection_id for detection_id in detection_ids if detection_id not in loaded_ids))
     if missing_ids:
         raise KeyError(f"Detection(s) not found: {', '.join(missing_ids)}")
+    skipped_count = sum(row.get("roi_payload") is None for row in candidate_rows)
+    candidate_rows = [row for row in candidate_rows if row.get("roi_payload") is not None]
+    if not candidate_rows:
+        progress.finish(completed=0, skipped=skipped_count, message="Skipped candidates without stored ROI crops")
+        return {"stage": PipelineStage.ROI_REFINEMENT.value, "project_id": project_id,
+                "detection_count": 0, "refined_count": 0, "stored_count": 0,
+                "skipped_count": skipped_count, "detection_ids": detection_ids}
     candidate_frame_ids = sorted({str(row["frame_id"]) for row in candidate_rows if row.get("frame_id")})
     _mark_frame_stage_status(
         context,
@@ -1122,18 +1130,12 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         raise ValueError(f"{requested_method} requires preprocessed frame intensities for crop expansion.")
     frame_loader = None
     if allow_frame_expansion:
-        # Expansion can revisit one frame for many ROIs, so retain one decoded frame per job.
-        frame_cache: dict[str, Any] = {}
-
+        # Keep only a small working set when expansion revisits source frames.
+        @lru_cache(maxsize=2)
         def frame_loader(frame_id: str):
-            resolved_frame_id = str(frame_id)
-            if resolved_frame_id not in frame_cache:
-                frame_cache[resolved_frame_id] = retrieve_frame(
-                    resolved_frame_id,
-                    context=context,
-                    payload_kind=expansion_payload_kind,
-                ).read()
-            return frame_cache[resolved_frame_id]
+            return retrieve_frame(
+                str(frame_id), context=context, payload_kind=expansion_payload_kind,
+            ).read()
 
     with measure_phase("refinement.record_construction"):
         detection_records = [DetectionRecord.from_row(row) for row in candidate_rows]
@@ -1217,6 +1219,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
     _touch_processing_status_snapshot(context, project_id=project_id)
     progress.finish(
         completed=len(detection_records),
+        skipped=skipped_count,
         secondary={
             "refined_created": len(refined_records),
             "stored_count": len(stored),
@@ -1232,6 +1235,7 @@ def roi_refinement_handler(job: dict[str, Any], context: AppContext) -> dict[str
         "run_id": job.get("run_id") or payload.get("run_id") or (run_ids[0] if len(run_ids) == 1 else None),
         "asset_id": job.get("asset_id") or payload.get("asset_id"),
         "detection_count": len(detection_records),
+        "skipped_count": skipped_count,
         "refined_count": len(refined_records),
         "stored_count": len(stored),
         "connection_assessment": connection_assessment,

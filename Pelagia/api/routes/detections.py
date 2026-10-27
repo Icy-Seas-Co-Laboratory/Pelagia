@@ -250,6 +250,7 @@ if APIRouter is not None:
             limit=limit,
             offset=offset,
             telemetry_filters=telemetry_filters,
+            include_payload=False,
         )
         summaries = [detection_summary(detection) for detection in detections]
         return {
@@ -266,6 +267,7 @@ if APIRouter is not None:
     ) -> dict:
         rows = get_repository(request).list_refined_detections(
             frame_id, project_id=scoped_project_id(request), limit=limit, offset=offset,
+            include_payload=False,
         )
         summaries = [detection_summary(row) for row in rows]
         return {

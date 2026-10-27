@@ -286,8 +286,9 @@ def test_recording_can_store_masks_without_small_roi_image_payloads():
 
     assert detection.roi_payload is None
     assert detection.roi_encoding is None
-    assert detection.mask_payload is not None
-    assert detection.mask_encoding == "zstd"
+    assert detection.mask_payload is None
+    assert detection.mask_encoding is None
+    assert detection.metadata["mask_payload_stored"] is False
 
 
 def test_preprocess_frame_for_segmentation_applies_ordered_steps():

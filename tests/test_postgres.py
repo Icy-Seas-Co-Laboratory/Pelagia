@@ -399,10 +399,26 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0033_storage_reencode",
             "0034_external_roi_payloads",
             "0035_registry_assets_hot_storage",
+            "0037_drop_inline_detection_payloads",
+            "0038_object_gc_candidates",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
     assert "{schema}" not in rendered
+
+    gc_candidates = postgres.render_migration(migrations[-1], "pelagia_unit")
+    assert "CREATE TABLE IF NOT EXISTS pelagia_unit.object_gc_candidates" in gc_candidates
+    assert "ON CONFLICT (hash) DO UPDATE" in gc_candidates
+    assert "old_hash IS NOT DISTINCT FROM new_hash" in gc_candidates
+    assert "frames_object_gc_candidates" in gc_candidates
+    assert "detection_candidate_object_gc_candidates" in gc_candidates
+    assert "detections_refined_object_gc_candidates" in gc_candidates
+    assert "registry_assets_object_gc_candidates" in gc_candidates
+    assert "classification_evidence_object_gc_candidates" in gc_candidates
+    assert "clustering_evidence_object_gc_candidates" in gc_candidates
+    assert "embedding_evidence_object_gc_candidates" in gc_candidates
+    assert "telemetry_sources_object_gc_candidates" in gc_candidates
+    assert "{schema}" not in gc_candidates
 
 
     projectless_sessions = postgres.render_migration(migrations[1], "pelagia_unit")
@@ -495,7 +511,16 @@ def test_project_storage_reencode_job_is_deduplicated_while_active(postgres_repo
     assert postgres_repo.latest_project_storage_reencode_job(str(project["id"]))["id"] == first["id"]
 
 
+def _add_legacy_detection_payload_columns(repo):
+    with repo.connect() as connection:
+        with connection.cursor() as cursor:
+            for table in ("detection_candidate", "detections_refined"):
+                cursor.execute(f"ALTER TABLE {repo.schema}.{table} ADD COLUMN roi_payload bytea, ADD COLUMN mask_payload bytea")
+        connection.commit()
+
+
 def test_roi_hot_storage_migration_is_project_scoped_and_verifies_payloads(postgres_repo):
+    _add_legacy_detection_payload_columns(postgres_repo)
     project = postgres_repo.create_project(f"roi-hot-{uuid.uuid4().hex}")
     other = postgres_repo.create_project(f"roi-hot-other-{uuid.uuid4().hex}")
 
@@ -534,6 +559,23 @@ def test_roi_hot_storage_migration_is_project_scoped_and_verifies_payloads(postg
 
     detection_id = legacy_detection(str(project["id"]))
     other_id = legacy_detection(str(other["id"]))
+    legacy_summaries = postgres_repo.list_detections(project_id=str(project["id"]), include_payload=False)
+    assert len(legacy_summaries) == 1
+    assert "roi_payload" not in legacy_summaries[0]
+    assert "mask_payload" not in legacy_summaries[0]
+    migration = next(m for m in postgres.available_migrations() if m["migration_id"] == "0037_drop_inline_detection_payloads")
+    with pytest.raises(Exception, match="Migrate all inline candidate and refined ROI payloads"):
+        with postgres_repo.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(postgres.render_migration(migration, postgres_repo.schema))
+    # A previous partial migration may have left inline bytes beside references.
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {postgres_repo.schema}.detection_candidate SET roi_payload_ref = %s WHERE id = %s",
+                ("stale-reference", detection_id),
+            )
+        connection.commit()
     migrated = postgres_repo.migrate_roi_payloads_to_hot_storage(project_id=str(project["id"]))
     assert migrated == {"candidate_rows": 1, "refined_rows": 0, "objects": 2}
     migrated_row = postgres_repo.get_detection(detection_id, project_id=str(project["id"]))
@@ -548,6 +590,25 @@ def test_roi_hot_storage_migration_is_project_scoped_and_verifies_payloads(postg
             other_row = cursor.fetchone()
     assert other_row["roi_payload"] == b"roi-hot"
     assert other_row["roi_payload_ref"] is None
+    drop_migration = next(m for m in postgres.available_migrations() if m["migration_id"] == "0037_drop_inline_detection_payloads")
+    with pytest.raises(Exception, match="Migrate all inline candidate and refined ROI payloads"):
+        with postgres_repo.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(postgres.render_migration(drop_migration, postgres_repo.schema))
+    postgres_repo.migrate_roi_payloads_to_hot_storage(project_id=str(other["id"]))
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(postgres.render_migration(drop_migration, postgres_repo.schema))
+        connection.commit()
+    assert postgres_repo.get_detection(detection_id, project_id=str(project["id"]))["roi_payload"] == b"roi-hot"
+    assert postgres_repo.migrate_roi_payloads_to_hot_storage() == {"candidate_rows": 0, "refined_rows": 0, "objects": 0}
+    postgres_repo.initialize_schema()
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT count(*) AS count FROM information_schema.columns
+                WHERE table_schema = %s AND table_name IN ('detection_candidate', 'detections_refined')
+                  AND column_name IN ('roi_payload', 'mask_payload')""", (postgres_repo.schema,))
+            assert cursor.fetchone()["count"] == 0
 
 
 def test_storage_reencode_worker_availability_uses_capability_and_recent_heartbeat(postgres_repo):
@@ -566,6 +627,7 @@ def test_storage_reencode_worker_availability_uses_capability_and_recent_heartbe
 
 
 def test_project_storage_reencode_rows_are_scoped_and_compare_and_swap(postgres_repo):
+    _add_legacy_detection_payload_columns(postgres_repo)
     project = postgres_repo.create_project(f"storage-rows-{uuid.uuid4().hex}")
     project_id = str(project["id"])
     other = postgres_repo.create_project(f"storage-other-{uuid.uuid4().hex}")
@@ -677,10 +739,56 @@ def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 35
-    assert status["migrations"]["applied_count"] == 35
+    assert status["migrations"]["available_count"] == 37
+    assert status["migrations"]["applied_count"] == 37
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+
+
+def test_frame_reference_updates_enqueue_unique_gc_candidates(postgres_repo):
+    project = postgres_repo.create_project(f"gc-candidates-{uuid.uuid4().hex}")
+    old_refs = [f"old-ref-{index}" for index in range(6)]
+    new_refs = [f"new-ref-{index}" for index in range(6)]
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.runs
+                    (project_id, run_key, instrument, source_path, source_type)
+                    VALUES (%s, %s, 'test', '/tmp/source', 'image') RETURNING id""",
+                (project["id"], f"gc-candidates-run-{uuid.uuid4().hex}"),
+            )
+            run_id = cursor.fetchone()["id"]
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.raw_assets
+                    (project_id, run_id, filename, path, kind, checksum, size_bytes)
+                    VALUES (%s, %s, 'source.png', '/tmp/source.png', 'image', 'sha256:test', 1)
+                    RETURNING id""",
+                (project["id"], run_id),
+            )
+            asset_id = cursor.fetchone()["id"]
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.frames
+                    (run_id, asset_id, frame_index, width, height, kvstore_hash, preview_thumbhash,
+                     payload_ref, preprocessed_kvstore_hash, preprocessed_payload_ref,
+                     background_kvstore_hash, background_payload_ref)
+                    VALUES (%s, %s, 0, 1, 1, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id""",
+                (run_id, asset_id, old_refs[0], b"thumb", *old_refs[1:]),
+            )
+            frame_id = cursor.fetchone()["id"]
+            cursor.execute(
+                f"""UPDATE {postgres_repo.schema}.frames
+                    SET kvstore_hash=%s, payload_ref=%s,
+                        preprocessed_kvstore_hash=%s, preprocessed_payload_ref=%s,
+                        background_kvstore_hash=%s, background_payload_ref=%s
+                    WHERE id=%s""",
+                (*new_refs, frame_id),
+            )
+            cursor.execute(
+                f"SELECT hash FROM {postgres_repo.schema}.object_gc_candidates ORDER BY hash"
+            )
+            assert [row["hash"] for row in cursor.fetchall()] == sorted(old_refs)
+        connection.commit()
 
 
 def test_incremental_submission_indexes_remain_distinct_in_long_test_schema(postgres_repo):
@@ -2070,6 +2178,24 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert inserted_detections[0]["crop_bbox_w"] == 5
     assert inserted_detections[0]["roi_encoding"] == "raw"
     assert inserted_detections[0]["mask_shape"] == [4, 5]
+
+    # A mask-only small detection must not become an identity-protection seed.
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {postgres_repo.schema}.detection_candidate
+                    (run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h, mask_payload_ref)
+                    VALUES (%s, %s, 2, 0, 0, 1, 1, %s) RETURNING id""",
+                (run_id, inserted_frames[0]["id"], inserted_detections[0]["mask_payload_ref"]),
+            )
+            small_id = cursor.fetchone()["id"]
+        connection.commit()
+    seeds = postgres_repo.get_frame_candidate_seed_records([str(inserted_frames[0]["id"])])
+    assert [str(seed["id"]) for seed in seeds] == [str(inserted_detections[0]["id"])]
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {postgres_repo.schema}.detection_candidate WHERE id = %s", (small_id,))
+        connection.commit()
 
     inserted_ids = postgres_repo.replace_frame_detections(
         run_id,

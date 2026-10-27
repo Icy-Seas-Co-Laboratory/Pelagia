@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import json
 import uuid
 
+import pytest
+
 from Pelagia.config import CoreConfig
 from Pelagia.domain import AssetKind, DetectionRecord, FrameRecord, PlannedRun, RawAssetManifest, RunManifest
 from Pelagia.services.context import AppContext
@@ -153,8 +155,8 @@ def test_frame_byte_limit_creates_checkpointed_pages_before_frame_count_limit(po
     assert [len(job["payload"]["frame_ids"]) for job in jobs] == [1, 1, 1]
 
 
-def test_roi_byte_limit_pages_without_duplicate_detections_and_dedupes_expansion_frames(postgres_repo):
-    """Refinement pages count a shared expansion frame only once per job."""
+def test_roi_byte_limit_pages_exclude_expansion_frames(postgres_repo):
+    """Refinement budgets crops and masks, not their source frames."""
     project_id, asset_id = _project_with_frames(postgres_repo, count=2)
     frames = postgres_repo.list_frames(asset_id)
     run_id = str(frames[0]["run_id"])
@@ -214,23 +216,13 @@ def test_roi_byte_limit_pages_without_duplicate_detections_and_dedupes_expansion
     )
 
     assert service.dispatch(limit=1) == 1
-    after_first = postgres_repo.get_processing_submission(str(submitted["id"]), project_id=project_id)
-    assert after_first["status"] == "planning"
-    assert after_first["progress"]["scheduled_count"] in {1, 2}
-    assert after_first["planning_cursor"]["detection_id"]
-
-    assert service.dispatch(limit=1) == 1
     finished = postgres_repo.get_processing_submission(str(submitted["id"]), project_id=project_id)
     assert finished["status"] == "processing"
     jobs = _submission_jobs(postgres_repo, str(submitted["id"]))
     scheduled_ids = [detection_id for job in jobs for detection_id in job["payload"]["detection_ids"]]
-    assert len(jobs) == 2
+    assert len(jobs) == 1
     assert set(scheduled_ids) == inserted_ids
     assert len(scheduled_ids) == len(set(scheduled_ids)) == 3
-
-    two_roi_job = next(job for job in jobs if len(job["payload"]["detection_ids"]) == 2)
-    two_roi_rows = postgres_repo.get_detections(two_roi_job["payload"]["detection_ids"], project_id=project_id)
-    assert {str(row["frame_id"]) for row in two_roi_rows} == {str(frames[0]["id"])}
 
 
 def test_equivalent_active_selection_is_reused_but_settings_change_creates_new_submission(postgres_repo):
@@ -355,3 +347,113 @@ def test_cancellation_after_first_page_prevents_future_planning_and_cancels_link
     assert retried["id"] != submitted["id"]
     assert service.dispatch(limit=1) == 1
     assert len(_submission_jobs(postgres_repo, str(retried["id"]))) == 1
+
+
+def test_refinement_seek_preserves_generation_order_and_legacy_cursors(postgres_repo):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=2)
+    frames = sorted(postgres_repo.list_frames(asset_id), key=lambda row: row["frame_index"])
+    run_id = str(frames[0]["run_id"])
+    records = [
+        DetectionRecord(
+            run_id=run_id, frame_id=str(frame["id"]), roi_index=index,
+            bbox_x=0, bbox_y=0, bbox_w=2, bbox_h=2, area=4,
+            perimeter=8, major_axis_length=2, minor_axis_length=2,
+            min_gray_value=0, mean_gray_value=0, roi_payload=bytes([index + 1]),
+            roi_encoding="raw", roi_format="raw_ndarray_c_order", roi_dtype="uint8", roi_shape=[2, 2],
+        )
+        for frame in frames for index in range(3)
+    ]
+    inserted = postgres_repo.replace_detections(run_id, asset_id, records)
+    expected = [str(row["id"]) for row in inserted]
+    boundary, cursor, actual = None, None, []
+    while True:
+        page = postgres_repo.plan_processing_submission_page(
+            submission_id=str(uuid.uuid4()), project_id=project_id, stage="roi_refinement",
+            filters={"asset_ids": [asset_id], "refinement_state": ["refined", "unrefined"]},
+            boundary=boundary, planning_cursor=cursor, limit=1,
+        )
+        actual.extend(str(row["detection_id"]) for row in page["rows"])
+        boundary, cursor = page["boundary"], page["cursor"]
+        if not page["has_more"]:
+            break
+    assert boundary["roi_order"] == "generation_v1"
+    assert actual == expected
+
+    legacy_boundary = {"created_before": boundary["created_before"]}
+    cursor, legacy_ids = None, []
+    while True:
+        page = postgres_repo.plan_processing_submission_page(
+            submission_id=str(uuid.uuid4()), project_id=project_id, stage="roi_refinement",
+            filters={"asset_ids": [asset_id], "refinement_state": ["refined", "unrefined"]},
+            boundary=legacy_boundary, planning_cursor=cursor, limit=1,
+        )
+        legacy_ids.extend(str(row["detection_id"]) for row in page["rows"])
+        cursor = page["cursor"]
+        if not page["has_more"]:
+            break
+    assert set(legacy_ids) == set(expected)
+    assert len(legacy_ids) == len(expected)
+    assert "frame_index" not in cursor
+
+
+@pytest.mark.parametrize("stage", ["preprocess_frames", "segment"])
+def test_frame_seek_uses_asset_frame_order_and_legacy_cursor(postgres_repo, stage):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=4)
+    frames = sorted(postgres_repo.list_frames(asset_id), key=lambda row: row["frame_index"])
+    expected = [str(row["id"]) for row in frames]
+    boundary, cursor, actual = None, None, []
+    while True:
+        page = postgres_repo.plan_processing_submission_page(
+            submission_id=str(uuid.uuid4()), project_id=project_id, stage=stage,
+            filters={"asset_ids": [asset_id]}, boundary=boundary, planning_cursor=cursor, limit=1,
+        )
+        actual.extend(str(row["frame_id"]) for row in page["rows"])
+        boundary, cursor = page["boundary"], page["cursor"]
+        if not page["has_more"]:
+            break
+    assert boundary["frame_order"] == "asset_frame_v1"
+    assert actual == expected
+
+    legacy_boundary = {"created_before": boundary["created_before"]}
+    cursor, actual = None, []
+    while True:
+        page = postgres_repo.plan_processing_submission_page(
+            submission_id=str(uuid.uuid4()), project_id=project_id, stage=stage,
+            filters={"asset_ids": [asset_id]}, boundary=legacy_boundary, planning_cursor=cursor, limit=1,
+        )
+        actual.extend(str(row["frame_id"]) for row in page["rows"])
+        cursor = page["cursor"]
+        if not page["has_more"]:
+            break
+    assert set(actual) == set(expected)
+    assert len(actual) == len(expected)
+    assert "asset_id" not in cursor
+
+
+def test_refinement_queue_counts_only_candidates_with_crops(postgres_repo):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=1)
+    frame = postgres_repo.list_frames(asset_id)[0]
+    run_id, frame_id = str(frame["run_id"]), str(frame["id"])
+    def record(index, payload):
+        return DetectionRecord(
+            run_id=run_id, frame_id=frame_id, roi_index=index,
+            bbox_x=0, bbox_y=0, bbox_w=2, bbox_h=2, area=4,
+            perimeter=8, major_axis_length=2, minor_axis_length=2,
+            min_gray_value=0, mean_gray_value=0, roi_payload=payload,
+            roi_encoding="raw", roi_format="raw_ndarray_c_order", roi_dtype="uint8", roi_shape=[2, 2],
+        )
+    rows = postgres_repo.replace_detections(run_id, asset_id, [record(0, b"crop1"), record(1, b"crop2"), record(2, None)])
+    postgres_repo.upsert_refined_detections(
+        [(str(rows[0]["id"]), record(0, b"refined")), (str(rows[0]["id"]), record(1, b"refined2")),
+         (str(rows[2]["id"]), record(2, b"old-refined"))], project_id=project_id,
+    )
+    assert postgres_repo.get_refinement_queue_counts(project_id=project_id) == {
+        "candidates": 2, "refined": 1, "unrefined": 1,
+    }
+    assert postgres_repo.get_refinement_queue_counts(project_id=project_id, asset_ids=[str(uuid.uuid4())]) == {
+        "candidates": 0, "refined": 0, "unrefined": 0,
+    }
+    other_project, _ = _project_with_frames(postgres_repo, count=0)
+    assert postgres_repo.get_refinement_queue_counts(project_id=other_project) == {
+        "candidates": 0, "refined": 0, "unrefined": 0,
+    }

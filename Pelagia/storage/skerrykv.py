@@ -72,6 +72,25 @@ class SkerryKVStore:
             return False
         return True
 
+    def delete_object(self, key: str) -> None:
+        """Delete an object after the caller has established that it is unreferenced.
+
+        SkerryKV requires an administrator token and treats a missing hash as a
+        successful deletion. This low-level method does not check Pelagia references.
+        """
+        self._request(f"/v1/objects/{self._validate_key(key)}", method="DELETE")
+
+    def collect_garbage(self, *, force: bool = False) -> dict[str, Any]:
+        """Ask SkerryKV to reclaim space occupied by already-deleted objects."""
+        response = self._request(f"/v1/admin/gc?force={'true' if force else 'false'}", method="POST")
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError as exc:
+            raise SkerryKVError("SkerryKV returned an invalid garbage collection response.") from exc
+        if not isinstance(result, dict):
+            raise SkerryKVError("SkerryKV returned a non-object garbage collection response.")
+        return result
+
     def status(self, *, deep: bool = True) -> dict[str, Any]:
         del deep
         response = self._request("/v1/status")

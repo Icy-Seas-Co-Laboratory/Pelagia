@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from Pelagia.storage.skerrykv import SkerryKVStore
+from Pelagia.storage.skerrykv import SkerryKVError, SkerryKVStore
 
 
 class _Response:
@@ -83,3 +83,58 @@ def test_health_reports_status_and_connection_failures(monkeypatch):
     assert health["healthy"] is False
     assert "503" in health["errors"][0]
 
+
+
+def test_delete_and_gc_use_admin_protocol(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request.full_url, request.get_method(), request.headers))
+        return _Response(b'{"state":"complete"}' if request.get_method() == "POST" else b"")
+
+    monkeypatch.setattr("Pelagia.storage.skerrykv.urlopen", fake_urlopen)
+    store = SkerryKVStore("http://skerry.test", token="secret")
+    store.delete_object("a" * 64)
+    assert store.collect_garbage(force=True) == {"state": "complete"}
+    assert requests[0] == (f"http://skerry.test/v1/objects/{'a' * 64}", "DELETE", {"Accept": "application/json", "Authorization": "Bearer secret"})
+    assert requests[1][0:2] == ("http://skerry.test/v1/admin/gc?force=true", "POST")
+    assert requests[1][2]["Authorization"] == "Bearer secret"
+    with pytest.raises(ValueError):
+        store.delete_object("../bad")
+
+
+def test_gc_defaults_to_non_forced_and_rejects_invalid_responses(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request.full_url, request.get_method(), request.headers))
+        return _Response(b"not json")
+
+    monkeypatch.setattr("Pelagia.storage.skerrykv.urlopen", fake_urlopen)
+    store = SkerryKVStore("http://skerry.test", token="secret")
+
+    with pytest.raises(SkerryKVError, match="invalid garbage collection response"):
+        store.collect_garbage()
+    assert requests == [
+        (
+            "http://skerry.test/v1/admin/gc?force=false",
+            "POST",
+            {"Accept": "application/json", "Authorization": "Bearer secret"},
+        )
+    ]
+
+    def non_object_urlopen(request, timeout):
+        return _Response(b"[]")
+
+    monkeypatch.setattr("Pelagia.storage.skerrykv.urlopen", non_object_urlopen)
+    with pytest.raises(SkerryKVError, match="non-object garbage collection response"):
+        store.collect_garbage()
+
+
+def test_delete_surfaces_v1_conflict(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise HTTPError(request.full_url, 409, "conflict", None, BytesIO(b"upgrade required"))
+
+    monkeypatch.setattr("Pelagia.storage.skerrykv.urlopen", fake_urlopen)
+    with pytest.raises(SkerryKVError, match="409.*upgrade required"):
+        SkerryKVStore("http://skerry.test", token="secret").delete_object("a" * 64)

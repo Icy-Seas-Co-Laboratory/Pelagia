@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Literal
 
 try:
@@ -314,7 +315,7 @@ if APIRouter is not None:
         return as_response(
             {
                 "endpoint": "/roi-refinement",
-                "description": "Refine stored candidate detections using stored ROI payloads or frame crops.",
+                "description": "Refine candidate detections with stored ROI crops.",
                 "methods": {
                     "POST": "Run ROI refinement immediately for the supplied detection_ids.",
                 },
@@ -325,7 +326,7 @@ if APIRouter is not None:
                 },
                 "notes": [
                     "Set method=identity to promote candidates unchanged without Oracle inference.",
-                    "Candidate detections without ROI payloads require frame loading to be enabled.",
+                    "Candidates without stored ROI crops are not eligible for refinement.",
                     "Use POST /roi-refinement/jobs to queue longer refinement work.",
                 ],
             }
@@ -355,6 +356,13 @@ if APIRouter is not None:
                 detail=f"Detection(s) not found: {', '.join(missing_ids)}",
             )
 
+        missing_payload_ids = _missing_roi_payload_ids(candidate_rows)
+        if missing_payload_ids:
+            raise HTTPException(status_code=422, detail=(
+                "Candidates without stored ROI crops are not eligible for refinement: "
+                + ", ".join(missing_payload_ids)
+            ))
+
         if body.dry_run:
             return as_response(
                 {
@@ -366,17 +374,6 @@ if APIRouter is not None:
                     **model_metadata,
                 }
             )
-
-        missing_payload_ids = _missing_roi_payload_ids(candidate_rows)
-        if missing_payload_ids:
-            if not body.allow_frame_expansion:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "Detection(s) do not include ROI payload data and frame loading is disabled: "
-                        f"{', '.join(missing_payload_ids)}"
-                    ),
-                )
 
         try:
             backend = (
@@ -407,17 +404,11 @@ if APIRouter is not None:
 
         frame_loader = None
         if body.allow_frame_expansion:
-            frame_cache: dict[str, Any] = {}
-
+            @lru_cache(maxsize=2)
             def frame_loader(frame_id: str):
-                resolved_frame_id = str(frame_id)
-                if resolved_frame_id not in frame_cache:
-                    frame_cache[resolved_frame_id] = retrieve_frame(
-                        resolved_frame_id,
-                        context=context,
-                        payload_kind="preprocessed",
-                    ).read()
-                return frame_cache[resolved_frame_id]
+                return retrieve_frame(
+                    str(frame_id), context=context, payload_kind="preprocessed",
+                ).read()
 
         try:
             results = (
@@ -581,6 +572,18 @@ if APIRouter is not None:
         first_detection = repository.get_detection(body.detection_ids[0], project_id=auth.project_id)
         if first_detection is None:
             raise HTTPException(status_code=404, detail=f"Detection {body.detection_ids[0]!r} was not found.")
+        remaining_rows = []
+        for detection_id in body.detection_ids[1:]:
+            row = repository.get_detection(detection_id, project_id=auth.project_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Detection {detection_id!r} was not found.")
+            remaining_rows.append(row)
+        missing_payload_ids = _missing_roi_payload_ids([first_detection, *remaining_rows])
+        if missing_payload_ids:
+            raise HTTPException(status_code=422, detail=(
+                "Candidates without stored ROI crops are not eligible for refinement: "
+                + ", ".join(missing_payload_ids)
+            ))
         payload = {
             "detection_ids": body.detection_ids,
             "method": body.method,

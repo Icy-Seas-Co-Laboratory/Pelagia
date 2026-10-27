@@ -49,6 +49,7 @@ class AssetKind(str, Enum):
 
 class PipelineStage(str, Enum):
     INGEST_RUN = "ingest_run"
+    INTERCHANGE_CREATE = "interchange_create"
     EXTRACT_FRAMES = "extract_frames"
     BACKGROUND_FRAMES = "background_frames"
     PREPROCESS_FRAMES = "preprocess_frames"

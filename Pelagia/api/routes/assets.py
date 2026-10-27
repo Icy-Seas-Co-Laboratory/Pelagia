@@ -402,6 +402,7 @@ if APIRouter is not None:
             mask_format=mask_format,
             limit=limit,
             offset=offset,
+            include_payload=False,
         )
         summaries = [detection_summary(detection) for detection in detections]
         return {

@@ -17,9 +17,12 @@ segmentation and overlap decisions, but are not presented as ROI area.
 New records include `metadata.roi_measurements.version = 1` and explicit
 `area_method`/`perimeter_method` values. Detection responses add nullable
 `bbox_area`, `contour_area`, and `contour_perimeter`. The historical `area`
-field is retained for compatibility. For old refined records, the API measures
-a saved mask when available; an unavailable contour area is null, never zero
-or the old foreground count. Reading does not mutate stored records. See
+field is retained for compatibility. Summary listings do not fetch image objects;
+for old refined records without versioned measurements, contour area is null
+and the displayed perimeter is the stored historical value. ROI detail and export
+paths can measure a saved mask when available. An
+unavailable contour area is null, never zero or the old foreground count.
+Reading does not mutate stored records. See
 [export compatibility](exports.md) before comparing historical exports.
 
 Explorer pages through both candidate and refined frame records, including

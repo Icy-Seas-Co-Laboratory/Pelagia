@@ -98,3 +98,39 @@ def test_corrupt_legacy_zstd_mask_returns_unknown_contour_area():
     result = detection_summary(dict(area=42, candidate_detection_id="candidate",
         mask_payload=b"corrupt", mask_encoding="zstd", mask_dtype="uint8", mask_shape=[3, 4]))
     assert result["contour_area"] is None
+
+
+@pytest.mark.parametrize("refined", [False, True])
+def test_summary_listing_does_not_read_objects(monkeypatch, refined):
+    repository, cursor = repository_with_cursor(monkeypatch)
+    row = {
+        "id": "detection", "roi_payload_ref": "roi", "mask_payload_ref": "mask",
+        "roi_payload_bytes": 10, "mask_payload_bytes": 4,
+    }
+    monkeypatch.setattr(cursor, "fetchall", lambda: [row.copy()])
+
+    class UnavailableStore:
+        def get_store(self, key):
+            raise RuntimeError("object store unavailable")
+
+    repository.hot_store = UnavailableStore()
+    if refined:
+        rows = repository.list_refined_detections("frame", include_payload=False)
+        with pytest.raises(RuntimeError, match="object store unavailable"):
+            repository.list_refined_detections("frame")
+    else:
+        rows = repository.list_detections(frame_id="frame", include_payload=False)
+        assert "detections.*" not in cursor.sql
+        assert "detections.roi_payload," not in cursor.sql
+        assert "detections.mask_payload," not in cursor.sql
+        with pytest.raises(RuntimeError, match="object store unavailable"):
+            repository.list_detections(frame_id="frame")
+    assert rows[0]["roi_payload_bytes"] == 10
+    assert rows[0]["mask_payload_bytes"] == 4
+    assert "roi_payload" not in rows[0] and "mask_payload" not in rows[0]
+
+
+def test_seed_lookup_excludes_candidates_without_roi_payload(monkeypatch):
+    repository, cursor = repository_with_cursor(monkeypatch)
+    assert repository.get_frame_candidate_seed_records(["frame"], project_id="project") == []
+    assert "detections.roi_payload_ref IS NOT NULL" in cursor.sql

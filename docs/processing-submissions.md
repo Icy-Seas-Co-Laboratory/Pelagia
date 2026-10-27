@@ -73,11 +73,21 @@ refinement jobs contain at most 10,000 candidate detections or an estimated
 100,000,000 decoded input bytes. The same limits apply to durable submissions
 and the synchronous queue endpoints. Byte estimates use the selected payload's
 stored shape and dtype, not compressed blob size. Refinement counts the decoded
-candidate crop and mask, plus a full expansion frame once per source frame when
-expansion is enabled. A candidate without a stored crop requires a full frame.
+candidate crop and mask; optional source frames loaded for expansion are not
+counted in the batch budget. Candidates without a stored ROI crop are excluded from refinement; they remain available as candidate records. Existing queued jobs skip such candidates when processed by an updated worker.
 Inputs with missing or invalid size metadata, and individual inputs larger than
 the cap, are scheduled alone so work is not lost. These are input-work budgets;
 intermediate arrays and model allocations can make peak worker memory higher.
+
+Preprocessing and candidate-detection batches are ordered by asset and frame index. Submissions already
+in progress retain their previous seek order when resumed.
+
+Refinement batches use candidate creation time, then asset, frame index, and
+ROI index to approximate the order in which candidate payloads were written to
+SkerryKV. This is a locality heuristic, not a physical disk-order guarantee;
+creation timestamps are shared by a database transaction and storage can
+deduplicate or reorganize payloads. In-progress submissions retain their
+original cursor order when resumed.
 
 The API's background dispatcher owns materialization independently of the
 browser. Navigation after acceptance does not stop it. Pending submissions
