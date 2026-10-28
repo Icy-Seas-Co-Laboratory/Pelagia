@@ -97,6 +97,12 @@ PASSWORD_HASH_ITERATIONS = 260_000
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 DETECTION_INSERT_BATCH_ROWS = 250
 DETECTION_INSERT_BATCH_BYTES = 8 * 1024 * 1024
+# SkerryKV accepts at most 250 objects in a request and we intentionally keep
+# the request body below its 64 MiB aggregation limit.  Refinement writes use
+# the same limits even though their SQL rows are inserted one at a time: the
+# blob round trips, rather than the inserts, are the expensive part.
+HOT_STORAGE_BATCH_ITEMS = 250
+HOT_STORAGE_BATCH_BYTES = 64 * 1024 * 1024
 
 _SUBMISSION_SET_KEYS = frozenset({
     "asset_ids", "frame_ids", "collection", "collections", "preprocessing_status",
@@ -3145,10 +3151,9 @@ class PostgresRepository:
         if batch_bytes < 1:
             raise ValueError("batch_bytes must be at least 1")
 
-        def parameters(detection: DetectionRecord) -> tuple[Any, ...]:
+        def parameters(detection: DetectionRecord, stored: DetectionRecord) -> tuple[Any, ...]:
             roi_size = None if detection.roi_payload is None else len(detection.roi_payload)
             mask_size = None if detection.mask_payload is None else len(detection.mask_payload)
-            stored = self._store_detection_payloads(detection)
             return (
                 run_id,
                 detection.frame_id,
@@ -3199,7 +3204,7 @@ class PostgresRepository:
                     total += len(str(value))
             return total
 
-        pending: list[tuple[Any, ...]] = []
+        pending: list[DetectionRecord] = []
         pending_bytes = 0
         inserted: list[dict[str, Any]] = []
 
@@ -3207,6 +3212,29 @@ class PostgresRepository:
             nonlocal pending, pending_bytes
             if not pending:
                 return
+            payloads: list[bytes] = []
+            for detection in pending:
+                if detection.roi_payload is not None:
+                    payloads.append(bytes(detection.roi_payload))
+                if detection.mask_payload is not None:
+                    payloads.append(bytes(detection.mask_payload))
+            if payloads and self.hot_store is None:
+                raise RuntimeError("Hot object storage is not configured for ROI payloads.")
+            put_many = getattr(self.hot_store, "put_many", None)
+            if payloads and callable(put_many):
+                refs = list(put_many(payloads))
+            else:
+                refs = [self.hot_store.put_store(payload) for payload in payloads]
+            if len(refs) != len(payloads):
+                raise RuntimeError("Hot object storage returned an incorrect number of references.")
+            ref_iter = iter(refs)
+            parameter_rows = []
+            for detection in pending:
+                roi_ref = next(ref_iter) if detection.roi_payload is not None else detection.roi_payload_ref
+                mask_ref = next(ref_iter) if detection.mask_payload is not None else detection.mask_payload_ref
+                stored = replace(detection, roi_payload=None, mask_payload=None,
+                                 roi_payload_ref=roi_ref, mask_payload_ref=mask_ref)
+                parameter_rows.append(parameters(detection, stored))
             returning_sql = {
                 "full": "RETURNING *",
                 "ids": "RETURNING id",
@@ -3228,7 +3256,7 @@ class PostgresRepository:
                 """
             cursor.executemany(
                 statement,
-                pending,
+                parameter_rows,
                 returning=returning != "none",
             )
             if returning != "none":
@@ -3240,12 +3268,13 @@ class PostgresRepository:
             pending_bytes = 0
 
         for detection in detections:
-            row = parameters(detection)
-            # Bound work by source bytes as well as the smaller external refs.
-            row_bytes = parameter_bytes(row) + len(detection.roi_payload or b"") + len(detection.mask_payload or b"")
+            # Estimate reference sizes before upload and include the source bytes.
+            row = parameters(detection, detection)
+            row_bytes = (parameter_bytes(row) + 128
+                         + len(detection.roi_payload or b"") + len(detection.mask_payload or b""))
             if pending and (len(pending) >= batch_rows or pending_bytes + row_bytes > batch_bytes):
                 flush()
-            pending.append(row)
+            pending.append(detection)
             pending_bytes += row_bytes
         flush()
         return [self._hydrate_detection_row(row) for row in inserted]
@@ -3259,7 +3288,9 @@ class PostgresRepository:
     ) -> list[dict[str, Any]]:
         if not refined_detections:
             return []
-        inserted: list[dict[str, Any]] = []
+        # Keep input order when a retry lookup is found while earlier rows are
+        # waiting for their SkerryKV batch to be published.
+        inserted: list[dict[str, Any] | None] = [None] * len(refined_detections)
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 self._ensure_project_scope(
@@ -3269,10 +3300,106 @@ class PostgresRepository:
                     detection_ids=[candidate_id for candidate_id, _ in refined_detections],
                     frame_ids=[detection.frame_id for _, detection in refined_detections],
                 )
-                for candidate_detection_id, detection in refined_detections:
-                    roi_size = None if detection.roi_payload is None else len(detection.roi_payload)
-                    mask_size = None if detection.mask_payload is None else len(detection.mask_payload)
-                    stored_detection = self._store_detection_payloads(detection)
+                pending: list[tuple[int, str, DetectionRecord, int | None, int | None]] = []
+                pending_payloads = 0
+                pending_bytes = 0
+
+                def flush_pending() -> None:
+                    nonlocal pending, pending_payloads, pending_bytes
+                    if not pending:
+                        return
+                    payloads: list[bytes] = []
+                    for _, _, detection, _, _ in pending:
+                        if detection.roi_payload is not None:
+                            payloads.append(bytes(detection.roi_payload))
+                        if detection.mask_payload is not None:
+                            payloads.append(bytes(detection.mask_payload))
+                    if payloads and self.hot_store is None:
+                        raise RuntimeError("Hot object storage is not configured for ROI payloads.")
+                    put_many = getattr(self.hot_store, "put_many", None)
+                    if payloads and callable(put_many):
+                        refs = list(put_many(payloads))
+                    else:
+                        refs = [self.hot_store.put_store(payload) for payload in payloads]
+                    if len(refs) != len(payloads):
+                        raise RuntimeError("Hot object storage returned an incorrect number of references.")
+                    ref_iter = iter(refs)
+                    for index, candidate_detection_id, detection, roi_size, mask_size in pending:
+                        roi_ref = (
+                            next(ref_iter)
+                            if detection.roi_payload is not None
+                            else detection.roi_payload_ref
+                        )
+                        mask_ref = (
+                            next(ref_iter)
+                            if detection.mask_payload is not None
+                            else detection.mask_payload_ref
+                        )
+                        stored_detection = replace(
+                            detection,
+                            roi_payload=None,
+                            mask_payload=None,
+                            roi_payload_ref=roi_ref,
+                            mask_payload_ref=mask_ref,
+                        )
+                        cursor.execute(
+                            f"""
+                            INSERT INTO {self.schema}.detections_refined
+                            (candidate_detection_id, job_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                             crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
+                             area, perimeter, major_axis_length, minor_axis_length,
+                             centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
+                             major_axis_orientation_degrees, major_axis_direction_degrees,
+                             min_gray_value, mean_gray_value, roi_payload_ref, mask_payload_ref,
+                             roi_payload_bytes, mask_payload_bytes,
+                             roi_encoding, roi_format, roi_dtype, roi_shape,
+                             mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s,
+                                    %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s,
+                                    %s, %s, %s, %s::jsonb,
+                                    %s, %s, %s, %s::jsonb,
+                                    %s, %s::jsonb)
+                            RETURNING *;
+                            """,
+                            (
+                                candidate_detection_id, job_id, detection.run_id, detection.frame_id,
+                                detection.roi_index, detection.bbox_x, detection.bbox_y,
+                                detection.bbox_w, detection.bbox_h, detection.crop_bbox_x,
+                                detection.crop_bbox_y, detection.crop_bbox_w, detection.crop_bbox_h,
+                                detection.area, detection.perimeter, detection.major_axis_length,
+                                detection.minor_axis_length, detection.centroid_x, detection.centroid_y,
+                                detection.major_axis_center_x, detection.major_axis_center_y,
+                                detection.major_axis_orientation_degrees,
+                                detection.major_axis_direction_degrees, detection.min_gray_value,
+                                detection.mean_gray_value, stored_detection.roi_payload_ref,
+                                stored_detection.mask_payload_ref, roi_size, mask_size,
+                                stored_detection.roi_encoding, stored_detection.roi_format,
+                                stored_detection.roi_dtype,
+                                json.dumps(json_ready(stored_detection.roi_shape)),
+                                stored_detection.mask_encoding, stored_detection.mask_format,
+                                stored_detection.mask_dtype,
+                                json.dumps(json_ready(stored_detection.mask_shape)),
+                                stored_detection.metadata.get("refinement_method", "identity"),
+                                json.dumps(json_ready(stored_detection.metadata)),
+                            ),
+                        )
+                        inserted[index] = cursor.fetchone()
+                    pending = []
+                    pending_payloads = 0
+                    pending_bytes = 0
+
+                pending_identities: set[tuple[str, int]] = set()
+                for index, (candidate_detection_id, detection) in enumerate(refined_detections):
+                    identity = (candidate_detection_id, int(detection.roi_index))
+                    # Preserve the old sequential semantics when an input happens
+                    # to repeat an output identity: write the earlier one before
+                    # its duplicate performs its retry lookup.
+                    if job_id is not None and identity in pending_identities:
+                        flush_pending()
+                        pending_identities.clear()
                     if job_id is not None:
                         # Residual/split results retain a distinct ROI index but are
                         # stored against their real parent candidate.  The ROI index
@@ -3297,75 +3424,26 @@ class PostgresRepository:
                         )
                         existing = cursor.fetchone()
                         if existing is not None:
-                            inserted.append(existing)
+                            inserted[index] = existing
                             continue
-                    cursor.execute(
-                        f"""
-                        INSERT INTO {self.schema}.detections_refined
-                        (candidate_detection_id, job_id, run_id, frame_id, roi_index, bbox_x, bbox_y, bbox_w, bbox_h,
-                         crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h,
-                         area, perimeter, major_axis_length, minor_axis_length,
-                         centroid_x, centroid_y, major_axis_center_x, major_axis_center_y,
-                         major_axis_orientation_degrees, major_axis_direction_degrees,
-                         min_gray_value, mean_gray_value, roi_payload_ref, mask_payload_ref,
-                         roi_payload_bytes, mask_payload_bytes,
-                         roi_encoding, roi_format, roi_dtype, roi_shape,
-                         mask_encoding, mask_format, mask_dtype, mask_shape, refinement_method, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s,
-                                %s, %s, %s, %s::jsonb,
-                                %s, %s, %s, %s::jsonb,
-                                %s, %s::jsonb)
-                        RETURNING *;
-                        """,
-                        (
-                            candidate_detection_id,
-                            job_id,
-                            detection.run_id,
-                            detection.frame_id,
-                            detection.roi_index,
-                            detection.bbox_x,
-                            detection.bbox_y,
-                            detection.bbox_w,
-                            detection.bbox_h,
-                            detection.crop_bbox_x,
-                            detection.crop_bbox_y,
-                            detection.crop_bbox_w,
-                            detection.crop_bbox_h,
-                            detection.area,
-                            detection.perimeter,
-                            detection.major_axis_length,
-                            detection.minor_axis_length,
-                            detection.centroid_x,
-                            detection.centroid_y,
-                            detection.major_axis_center_x,
-                            detection.major_axis_center_y,
-                            detection.major_axis_orientation_degrees,
-                            detection.major_axis_direction_degrees,
-                            detection.min_gray_value,
-                            detection.mean_gray_value,
-                            stored_detection.roi_payload_ref,
-                            stored_detection.mask_payload_ref,
-                            roi_size,
-                            mask_size,
-                            stored_detection.roi_encoding,
-                            stored_detection.roi_format,
-                            stored_detection.roi_dtype,
-                            json.dumps(json_ready(stored_detection.roi_shape)),
-                            stored_detection.mask_encoding,
-                            stored_detection.mask_format,
-                            stored_detection.mask_dtype,
-                            json.dumps(json_ready(stored_detection.mask_shape)),
-                            stored_detection.metadata.get("refinement_method", "identity"),
-                            json.dumps(json_ready(stored_detection.metadata)),
-                        ),
-                    )
-                    inserted.append(cursor.fetchone())
+                    roi_size = None if detection.roi_payload is None else len(detection.roi_payload)
+                    mask_size = None if detection.mask_payload is None else len(detection.mask_payload)
+                    payload_count = int(detection.roi_payload is not None) + int(detection.mask_payload is not None)
+                    payload_bytes = (roi_size or 0) + (mask_size or 0)
+                    if pending and (
+                        len(pending) >= HOT_STORAGE_BATCH_ITEMS
+                        or pending_payloads + payload_count > HOT_STORAGE_BATCH_ITEMS
+                        or pending_bytes + payload_bytes > HOT_STORAGE_BATCH_BYTES
+                    ):
+                        flush_pending()
+                        pending_identities.clear()
+                    pending.append((index, candidate_detection_id, detection, roi_size, mask_size))
+                    pending_identities.add(identity)
+                    pending_payloads += payload_count
+                    pending_bytes += payload_bytes
+                flush_pending()
             connection.commit()
-        return [self._hydrate_detection_row(row) for row in inserted]
+        return [self._hydrate_detection_row(row) for row in inserted if row is not None]
 
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:

@@ -204,6 +204,45 @@ def test_detection_insert_batches_by_row_count_and_returns_ids_only():
     assert len(rows) == 5
 
 
+def test_detection_insert_publishes_bounded_skerry_batches_before_sql():
+    class BatchStore(_MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def put_many(self, payloads):
+            self.batches.append(list(payloads))
+            return [self.put_store(payload) for payload in payloads]
+
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository.hot_store = BatchStore()
+    cursor = _DetectionInsertCursor()
+    records = [_unit_detection(index) for index in range(5)]
+    records[1].roi_payload = None
+    records[2].mask_payload = None
+    repository._insert_detection_rows(cursor, "run-1", records, returning="none", batch_rows=2)
+    assert [len(batch) for batch in repository.hot_store.batches] == [3, 3, 2]
+    assert [len(rows) for _, rows in cursor.executions] == [2, 2, 1]
+    first = cursor.executions[0][1]
+    assert first[0][23] == hashlib.sha256(b"r").hexdigest()
+    assert first[1][23] is None
+
+
+def test_detection_insert_does_not_publish_sql_after_failed_blob_batch():
+    class FailedStore:
+        def put_many(self, payloads):
+            raise RuntimeError("partial batch failure")
+
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository.hot_store = FailedStore()
+    cursor = _DetectionInsertCursor()
+    with pytest.raises(RuntimeError, match="partial batch failure"):
+        repository._insert_detection_rows(cursor, "run-1", [_unit_detection(0)], returning="none")
+    assert cursor.executions == []
+
+
 def test_detection_payloads_are_externalized_and_hydrated_from_hot_store():
     repository = object.__new__(PostgresRepository)
     repository.hot_store = _MemoryBlobStore()
@@ -244,9 +283,18 @@ def test_detection_insert_batches_by_payload_bytes_and_can_skip_returning():
 
 
 def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
+    class CountingStore(_MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.put_calls = 0
+
+        def put_store(self, payload):
+            self.put_calls += 1
+            return super().put_store(payload)
+
     repository = object.__new__(PostgresRepository)
     repository.schema = "pelagia_unit"
-    repository.hot_store = _MemoryBlobStore()
+    repository.hot_store = CountingStore()
     repository._ensure_project_scope = lambda *_args, **_kwargs: None
     existing = {"id": "refined-existing", "candidate_detection_id": "candidate-1"}
     cursor = _ExistingRowCursor(existing)
@@ -269,6 +317,95 @@ def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
     )
     assert cursor.executions[1][1] == ("job-1", "candidate-1", 1)
     assert all("INSERT INTO" not in statement for statement, _ in cursor.executions)
+    assert repository.hot_store.put_calls == 0
+
+
+def test_refinement_upsert_publishes_one_skerry_batch_before_inserts():
+    class BatchStore(_MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def put_many(self, payloads):
+            payloads = list(payloads)
+            self.batches.append(payloads)
+            return [self.put_store(payload) for payload in payloads]
+
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository.hot_store = BatchStore()
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    cursor = _RefinedRetryCursor()
+    repository.connect = lambda: _ExistingRowConnection(cursor)
+
+    rows = repository.upsert_refined_detections(
+        [(f"candidate-{index}", _unit_detection(index)) for index in range(3)],
+        job_id="job-1",
+        project_id="project-1",
+    )
+
+    assert len(rows) == 3
+    assert [len(batch) for batch in repository.hot_store.batches] == [6]
+    inserts = [statement for statement, _ in cursor.executions if "INSERT INTO" in statement]
+    assert len(inserts) == 3
+
+
+def test_refinement_upsert_limits_skerry_batches_to_250_payloads():
+    class BatchStore(_MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def put_many(self, payloads):
+            payloads = list(payloads)
+            self.batches.append(payloads)
+            return [self.put_store(payload) for payload in payloads]
+
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository.hot_store = BatchStore()
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    cursor = _RefinedRetryCursor()
+    repository.connect = lambda: _ExistingRowConnection(cursor)
+
+    repository.upsert_refined_detections(
+        [(f"candidate-{index}", _unit_detection(index)) for index in range(126)],
+        job_id="job-1",
+        project_id="project-1",
+    )
+
+    assert [len(batch) for batch in repository.hot_store.batches] == [250, 2]
+
+
+def test_refinement_batching_preserves_input_order_around_existing_retry():
+    repository = object.__new__(PostgresRepository)
+    repository.schema = "pelagia_unit"
+    repository.hot_store = _MemoryBlobStore()
+    repository._ensure_project_scope = lambda *_args, **_kwargs: None
+    cursor = _RefinedRetryCursor()
+    existing = {
+        "id": "refined-existing",
+        "job_id": "job-1",
+        "candidate_detection_id": "candidate-existing",
+        "roi_index": 2,
+    }
+    cursor.rows[("job-1", "candidate-existing", 2)] = existing
+    repository.connect = lambda: _ExistingRowConnection(cursor)
+
+    rows = repository.upsert_refined_detections(
+        [
+            ("candidate-new", _unit_detection(1)),
+            ("candidate-existing", _unit_detection(2)),
+        ],
+        job_id="job-1",
+        project_id="project-1",
+    )
+
+    assert [row["candidate_detection_id"] for row in rows] == [
+        "candidate-new",
+        "candidate-existing",
+    ]
+    assert rows[1] == existing
 
 
 def test_refinement_retry_preserves_parent_and_residual_children():

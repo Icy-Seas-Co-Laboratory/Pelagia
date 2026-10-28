@@ -26,6 +26,11 @@ class RegistryTransferError(ValueError):
     pass
 
 
+_REGISTRY_ASSET_BATCH_ITEMS = 250
+_REGISTRY_ASSET_BATCH_BYTES = 64 * 1024 * 1024
+_REGISTRY_ASSET_BATCH_ROWS = 250
+
+
 def _json(value: Any, default: Any = None) -> Any:
     if value is None:
         return {} if default is None else default
@@ -191,22 +196,61 @@ def _load_assets(repository, cursor, schema: str, workspace_id: Any, source: sql
     hot_store = getattr(repository, "hot_store", None)
     if hot_store is None:
         raise RegistryTransferError("Hot object storage is not configured for Registry assets")
+
+    pending: list[tuple[sqlite3.Row, bytes | None]] = []
+    pending_payload_count = 0
+    pending_payload_bytes = 0
+
+    def flush() -> None:
+        nonlocal pending, pending_payload_count, pending_payload_bytes
+        if not pending:
+            return
+
+        payloads = [payload for _, payload in pending if payload is not None]
+        put_many = getattr(hot_store, "put_many", None)
+        if payloads and callable(put_many):
+            payload_refs = list(put_many(payloads))
+        else:
+            payload_refs = [hot_store.put_store(payload) for payload in payloads]
+        if len(payload_refs) != len(payloads):
+            raise RegistryTransferError("Hot storage returned an incorrect number of Registry asset references")
+
+        ref_iter = iter(payload_refs)
+        for row, payload in pending:
+            payload_ref = next(ref_iter) if payload is not None else None
+            cursor.execute(
+                f"""INSERT INTO {schema}.registry_assets (
+                  workspace_id,asset_id,content_sha256,payload,payload_ref,payload_bytes,external_uri,encoding,media_type,
+                  shape,dtype,original_filename,metadata,created_at
+                ) VALUES (%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    workspace_id,row["asset_id"],row["content_sha256"],payload_ref,None if payload is None else len(payload),row["external_uri"],
+                    row["encoding"],row["media_type"],_jsonb(row["shape_json"]),row["dtype"],
+                    row["original_filename"],_jsonb(row["metadata_json"]),row["created_at"],
+                ),
+            )
+        pending = []
+        pending_payload_count = 0
+        pending_payload_bytes = 0
+
     for row in _rows(source, "assets"):
         payload = None if row["payload"] is None else bytes(row["payload"])
-        payload_ref = None if payload is None else hot_store.put_store(payload)
-        if payload is not None and hot_store.get_store(payload_ref) != payload:
-            raise RegistryTransferError(f"Hot storage verification failed for Registry asset {row['asset_id']}")
-        cursor.execute(
-            f"""INSERT INTO {schema}.registry_assets (
-              workspace_id,asset_id,content_sha256,payload,payload_ref,payload_bytes,external_uri,encoding,media_type,
-              shape,dtype,original_filename,metadata,created_at
-            ) VALUES (%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (
-                workspace_id,row["asset_id"],row["content_sha256"],payload_ref,None if payload is None else len(payload),row["external_uri"],
-                row["encoding"],row["media_type"],_jsonb(row["shape_json"]),row["dtype"],
-                row["original_filename"],_jsonb(row["metadata_json"]),row["created_at"],
-            ),
-        )
+        payload_bytes = 0 if payload is None else len(payload)
+        if pending and (
+            len(pending) >= _REGISTRY_ASSET_BATCH_ROWS
+            or (payload is not None and pending_payload_count >= _REGISTRY_ASSET_BATCH_ITEMS)
+            or (payload is not None and pending_payload_bytes + payload_bytes > _REGISTRY_ASSET_BATCH_BYTES)
+        ):
+            flush()
+        pending.append((row, payload))
+        pending_payload_count += 1 if payload is not None else 0
+        pending_payload_bytes += payload_bytes
+        if (
+            pending_payload_count >= _REGISTRY_ASSET_BATCH_ITEMS
+            or pending_payload_bytes >= _REGISTRY_ASSET_BATCH_BYTES
+        ):
+            flush()
+    flush()
 
 
 def _load_items(cursor, schema: str, workspace_id: Any, source: sqlite3.Connection, dataset_type: str) -> None:

@@ -67,6 +67,43 @@ from ..services.job_commands import (
 from .progress import JobControlInterrupt, JobProgressReporter
 from .registry import HandlerRegistry
 
+
+EMBEDDING_STORAGE_BATCH_ITEMS = 250
+EMBEDDING_STORAGE_BATCH_BYTES = 64 * 1024 * 1024
+
+
+def _store_embedding_payloads(kvstore: Any, payloads: list[bytes]) -> list[str]:
+    """Store embeddings in bounded SkerryKV batches, preserving payload order."""
+    refs: list[str] = []
+    pending: list[bytes] = []
+    pending_bytes = 0
+
+    def flush() -> None:
+        nonlocal pending, pending_bytes
+        if not pending:
+            return
+        put_many = getattr(kvstore, "put_many", None)
+        batch_refs = list(put_many(pending)) if callable(put_many) else [
+            kvstore.put_store(payload) for payload in pending
+        ]
+        if len(batch_refs) != len(pending):
+            raise RuntimeError("Embedding storage returned an incorrect number of references.")
+        refs.extend(str(ref) for ref in batch_refs)
+        pending = []
+        pending_bytes = 0
+
+    for payload in payloads:
+        if pending and (
+            len(pending) >= EMBEDDING_STORAGE_BATCH_ITEMS
+            or pending_bytes + len(payload) > EMBEDDING_STORAGE_BATCH_BYTES
+        ):
+            flush()
+        pending.append(payload)
+        pending_bytes += len(payload)
+    flush()
+    return refs
+
+
 def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
     payload = job.get("payload") or {}
     if not isinstance(payload, dict):
@@ -1555,6 +1592,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                 class_records = []
                 embedding_records = []
                 cluster_records = []
+                embedding_payload_records: list[tuple[list[dict[str, Any]], bytes]] = []
                 for (target, _), response in zip(pairs, responses, strict=True):
                     row = response.result
                     item_id = str(row["item_id"])
@@ -1604,11 +1642,7 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                             embedding_sha256 = hashlib.sha256(payload).hexdigest()
                             embedding_dtype = str(embedding.dtype)
                             embedding_shape = list(embedding.shape)
-                        kvstore = context.kvstore_for_project(project_id)
-                        if kvstore is not None:
-                            with measure_phase("classification.embedding_store"):
-                                embedding_ref = kvstore.put_store(payload)
-                    if command.evidence_kind in {"embedding", "clustering"} and embedding_ref is None:
+                    if command.evidence_kind in {"embedding", "clustering"} and not isinstance(embedding, np.ndarray):
                         raise RuntimeError("The project embedding store is unavailable")
                     output_packet = dict(output_v2)
                     if isinstance(output_packet.get("embedding"), dict):
@@ -1630,18 +1664,45 @@ def classification_handler(job: dict[str, Any], context: AppContext) -> dict[str
                               "oracle_result": oracle_result, "embedding_payload_ref": embedding_ref,
                               "embedding_dtype": embedding_dtype, "embedding_shape": embedding_shape,
                               "embedding_sha256": embedding_sha256}
+                    persisted_records: list[dict[str, Any]] = []
                     if command.evidence_kind == "classification":
                         class_records.append(record)
+                        persisted_records.append(record)
                         if output.get("clustering_evidence") is not None:
                             if clustering_context is None:
                                 clustering_context = context.repository.prepare_clustering_evidence_context(
                                     project_id=project_id, inference_run_id=str(inference_run["id"]), model=model)
-                            cluster_records.append({**record, "evidence_packet": output["clustering_evidence"]})
+                            cluster_record = {**record, "evidence_packet": output["clustering_evidence"]}
+                            cluster_records.append(cluster_record)
+                            persisted_records.append(cluster_record)
                     elif command.evidence_kind == "embedding":
-                        embedding_records.append({**record, "embedding_normalized": output["embedding_normalized"]})
+                        embedding_record = {**record, "embedding_normalized": output["embedding_normalized"]}
+                        embedding_records.append(embedding_record)
+                        persisted_records.append(embedding_record)
                     else:
-                        cluster_records.append({**record, "evidence_packet": output["clustering_evidence"]})
+                        cluster_record = {**record, "evidence_packet": output["clustering_evidence"]}
+                        cluster_records.append(cluster_record)
+                        persisted_records.append(cluster_record)
+                    if isinstance(embedding, np.ndarray):
+                        embedding_payload_records.append((persisted_records, payload))
                     unresolved.remove(item_id)
+                if embedding_payload_records:
+                    kvstore = context.kvstore_for_project(project_id)
+                    if kvstore is not None:
+                        with measure_phase("classification.embedding_store"):
+                            refs = _store_embedding_payloads(
+                            kvstore, [payload for _, payload in embedding_payload_records]
+                            )
+                        for (persisted_records, _), embedding_ref in zip(
+                            embedding_payload_records, refs, strict=True
+                        ):
+                            for persisted_record in persisted_records:
+                                persisted_record["embedding_payload_ref"] = embedding_ref
+                                output_packet = persisted_record["oracle_result"]["output_packet"]
+                                if isinstance(output_packet.get("embedding"), dict):
+                                    output_packet["embedding"]["payload_ref"] = embedding_ref
+                    if command.evidence_kind in {"embedding", "clustering"} and kvstore is None:
+                        raise RuntimeError("The project embedding store is unavailable")
                 with measure_phase("classification.evidence_database_batch_write"):
                     context.repository.finalize_classification_inference_batch(
                         project_id=project_id,

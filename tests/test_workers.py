@@ -17,6 +17,7 @@ from Pelagia.workers.handlers import (
     preprocess_frames_handler,
     roi_detection_handler,
     roi_refinement_handler,
+    _store_embedding_payloads,
 )
 from Pelagia.workers.worker import Worker
 from Pelagia.workers.memory import MemoryAvailability
@@ -685,6 +686,125 @@ def test_clustering_handler_persists_cluster_packet_without_classification_label
     assert result["evidence_kind"] == "clustering"
     assert stored[0]["records"][0]["evidence_packet"]["decision"]["cluster_id"] == "cluster-0001"
     assert stored[0]["records"][0]["embedding_payload_ref"] == "cluster-embedding-key"
+
+
+def test_embedding_storage_batches_payloads_and_preserves_reference_order():
+    class BatchStore:
+        def __init__(self):
+            self.batches = []
+
+        def put_many(self, payloads):
+            batch = list(payloads)
+            self.batches.append(batch)
+            return [f"ref-{payload.decode()}" for payload in batch]
+
+    store = BatchStore()
+    payloads = [str(index).encode() for index in range(251)]
+
+    assert _store_embedding_payloads(store, payloads) == [f"ref-{index}" for index in range(251)]
+    assert [len(batch) for batch in store.batches] == [250, 1]
+
+
+def test_classification_batches_embeddings_and_maps_refs_to_derived_cluster_records():
+    repo = FakeRepository()
+    repo.create_classification_inference_run = lambda **values: {"id": "multi-run", **values}
+    rows = [
+        {
+            "id": f"refined-{index}", "created_at": f"2026-01-0{index}T00:00:00+00:00",
+            "bbox_x": 0, "bbox_y": 0, "bbox_w": 2, "bbox_h": 2,
+            "crop_bbox_x": 0, "crop_bbox_y": 0, "crop_bbox_w": 2, "crop_bbox_h": 2,
+            "roi_payload": np.full((2, 2), index, dtype="uint8").tobytes(),
+            "roi_encoding": "raw", "roi_format": "raw_ndarray_c_order",
+            "roi_dtype": "uint8", "roi_shape": [2, 2],
+        }
+        for index in (1, 2)
+    ]
+    repo.list_classification_targets = lambda **values: [] if values.get("after_id") else rows
+    repo.prepare_classification_evidence_context = lambda **values: {"id": "class-context", **values}
+    repo.prepare_clustering_evidence_context = lambda **values: {"id": "cluster-context", **values}
+    repo.complete_classification_inference_run = lambda run_id, **values: {"id": run_id, **values}
+
+    class MultiOracle:
+        def predict_batch(self, _model_ref, items):
+            return [type("Response", (), {"result": {
+                "result_id": f"result-{index}", "execution": {"duration_ms": 1.0},
+                "model": {"artifact_id": "unused", "task": "classification"},
+                "output": {
+                    "type": "classification", "decision": {"class_index": 0},
+                    "probabilities": [{"class_index": 0, "probability": 1.0}],
+                    "embedding": np.asarray([float(index), 0.0], dtype="float32"),
+                    "clustering_evidence": {"decision": {"cluster_id": f"cluster-{index}"}},
+                },
+            }})() for index, _ in enumerate(items, start=1)]
+
+    class BatchStore:
+        def __init__(self):
+            self.batches = []
+
+        def put_many(self, payloads):
+            batch = list(payloads)
+            self.batches.append(batch)
+            return [f"embedding-ref-{index}" for index in range(1, len(batch) + 1)]
+
+    store = BatchStore()
+    context = AppContext(config=CoreConfig(), repository=repo, kvstore=store,
+                         oracle=_v2_evidence_oracle(MultiOracle(), model_task="classification"))
+    context._project_kvstores["project-1"] = store
+
+    classification_handler({
+        "id": "job-multi", "project_id": "project-1", "stage": PipelineStage.CLASSIFY.value,
+        "payload": {"model_ref": "classifier", "roi_ids": []},
+    }, context)
+
+    assert [len(batch) for batch in store.batches] == [2]
+    finalized = repo.finalized_oracle_batches[0]
+    assert [record["embedding_payload_ref"] for record in finalized["classification_records"]] == [
+        "embedding-ref-1", "embedding-ref-2"
+    ]
+    assert [record["embedding_payload_ref"] for record in finalized["clustering_records"]] == [
+        "embedding-ref-1", "embedding-ref-2"
+    ]
+
+
+def test_embedding_batch_failure_does_not_finalize_evidence():
+    repo = FakeRepository()
+    repo.create_classification_inference_run = lambda **values: {"id": "failed-store-run", **values}
+    row = {
+        "id": "refined-1", "created_at": "2026-01-01T00:00:00+00:00",
+        "bbox_x": 0, "bbox_y": 0, "bbox_w": 2, "bbox_h": 2,
+        "crop_bbox_x": 0, "crop_bbox_y": 0, "crop_bbox_w": 2, "crop_bbox_h": 2,
+        "roi_payload": np.ones((2, 2), dtype="uint8").tobytes(),
+        "roi_encoding": "raw", "roi_format": "raw_ndarray_c_order",
+        "roi_dtype": "uint8", "roi_shape": [2, 2],
+    }
+    repo.list_classification_targets = lambda **values: [] if values.get("after_id") else [row]
+    repo.prepare_embedding_evidence_context = lambda **values: {"id": "embedding-context", **values}
+    repo.complete_classification_inference_run = lambda run_id, **values: {"id": run_id, **values}
+
+    class EmbeddingOracle:
+        def predict_batch(self, _model_ref, _items):
+            return [type("Response", (), {"result": {
+                "result_id": "result-1", "execution": {"duration_ms": 1.0},
+                "model": {"artifact_id": "unused", "task": "embedding"},
+                "output": {"type": "embedding", "embedding": np.asarray([1.0], dtype="float32"),
+                           "embedding_normalized": True},
+            }})()]
+
+    class FailedBatchStore:
+        def put_many(self, _payloads):
+            raise RuntimeError("batch write failed")
+
+    store = FailedBatchStore()
+    context = AppContext(config=CoreConfig(), repository=repo, kvstore=store,
+                         oracle=_v2_evidence_oracle(EmbeddingOracle(), model_task="embedding"))
+    context._project_kvstores["project-1"] = store
+
+    with pytest.raises(RuntimeError, match="batch write failed"):
+        classification_handler({
+            "id": "job-failed-store", "project_id": "project-1", "stage": PipelineStage.CLASSIFY.value,
+            "payload": {"model_ref": "embedder", "evidence_kind": "embedding", "roi_ids": []},
+        }, context)
+    assert repo.finalized_oracle_batches == []
 
 
 def test_embedding_handler_persists_embedding_product_without_cluster_evidence():
