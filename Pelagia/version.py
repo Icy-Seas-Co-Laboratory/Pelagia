@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.0.1"
+__version__ = "0.2.0"
 
 
 def _repo_root() -> Path:
