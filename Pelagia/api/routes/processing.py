@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 from uuid import UUID
 
 try:
     from fastapi import APIRouter, HTTPException, Request
-    from pydantic import BaseModel, ConfigDict, Field, ValidationError
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
@@ -32,8 +33,19 @@ if APIRouter is not None:
         candidate_detection_status: list[str] = Field(default_factory=list)
         roi_refinement_status: list[str] = Field(default_factory=list)
         refinement_state: list[Literal["unrefined", "refined"]] = Field(default_factory=lambda: ["unrefined"])
+        min_area: float | None = Field(default=None, ge=0)
+        max_area: float | None = Field(default=None, ge=0)
         start_frame: int | None = None
         end_frame: int | None = None
+
+        @model_validator(mode="after")
+        def validate_bbox_area_range(self):
+            for value in (self.min_area, self.max_area):
+                if value is not None and not math.isfinite(value):
+                    raise ValueError("ROI bounding-box area limits must be finite.")
+            if self.min_area is not None and self.max_area is not None and self.min_area > self.max_area:
+                raise ValueError("min_area must be less than or equal to max_area.")
+            return self
 
     class ProcessingQueueRequest(BaseModel):
         model_config = ConfigDict(extra="forbid")

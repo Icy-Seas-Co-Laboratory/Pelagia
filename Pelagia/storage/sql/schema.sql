@@ -960,6 +960,8 @@ CREATE TABLE IF NOT EXISTS {schema}.frame_processing_status (
     roi_refinement_completed_at timestamptz,
     refined_detection_count integer NOT NULL DEFAULT 0,
     unrefined_candidate_count integer NOT NULL DEFAULT 0,
+    refinement_queue_candidate_count integer,
+    refinement_queue_refined_candidate_count integer,
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     PRIMARY KEY (project_id, frame_id),
     CONSTRAINT frame_processing_status_preprocessing_known CHECK (
@@ -989,6 +991,8 @@ ALTER TABLE {schema}.frame_processing_status
     ADD COLUMN IF NOT EXISTS roi_refinement_completed_at timestamptz,
     ADD COLUMN IF NOT EXISTS refined_detection_count integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS unrefined_candidate_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS refinement_queue_candidate_count integer,
+    ADD COLUMN IF NOT EXISTS refinement_queue_refined_candidate_count integer,
     ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS {schema}.worker_sessions (
@@ -1083,9 +1087,13 @@ CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_project_id ON {schema}.raw_as
 CREATE INDEX IF NOT EXISTS idx_{schema}_raw_assets_collections ON {schema}.raw_assets USING gin (collections);
 CREATE INDEX IF NOT EXISTS idx_{schema}_frames_asset_id ON {schema}.frames (asset_id, frame_index);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detection_candidate_frame_id ON {schema}.detection_candidate (frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_dc_area
+    ON {schema}.detection_candidate ((bbox_w::double precision * bbox_h), id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_candidate_id ON {schema}.detections_refined (candidate_detection_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_job_id ON {schema}.detections_refined (job_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_detections_refined_frame_id ON {schema}.detections_refined (frame_id);
+CREATE INDEX IF NOT EXISTS idx_{schema}_dr_area
+    ON {schema}.detections_refined ((bbox_w::double precision * bbox_h), id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_classification_results_detection_id ON {schema}.classification_results (detection_id);
 CREATE INDEX IF NOT EXISTS idx_{schema}_models_project_id ON {schema}.models (project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_{schema}_processing_jobs_project_id ON {schema}.processing_jobs (project_id, status, updated_at DESC);

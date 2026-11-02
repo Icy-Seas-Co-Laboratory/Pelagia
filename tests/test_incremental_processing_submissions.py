@@ -457,3 +457,69 @@ def test_refinement_queue_counts_only_candidates_with_crops(postgres_repo):
     assert postgres_repo.get_refinement_queue_counts(project_id=other_project) == {
         "candidates": 0, "refined": 0, "unrefined": 0,
     }
+
+
+def test_refinement_area_filters_apply_to_legacy_incremental_and_locking_plans(postgres_repo):
+    project_id, asset_id = _project_with_frames(postgres_repo, count=1)
+    frame = postgres_repo.list_frames(asset_id)[0]
+    run_id, frame_id = str(frame["run_id"]), str(frame["id"])
+
+    def record(index: int, size: int) -> DetectionRecord:
+        return DetectionRecord(
+            run_id=run_id, frame_id=frame_id, roi_index=index,
+            bbox_x=0, bbox_y=0, bbox_w=size, bbox_h=size, area=size * size,
+            perimeter=size * 4, major_axis_length=size, minor_axis_length=size,
+            min_gray_value=0, mean_gray_value=0, roi_payload=bytes([size]),
+            roi_encoding="raw", roi_format="raw_ndarray_c_order", roi_dtype="uint8", roi_shape=[size, size],
+        )
+
+    candidates = postgres_repo.replace_detections(
+        run_id, asset_id, [record(0, 1), record(1, 2), record(2, 3)],
+    )
+    candidate_ids = {row["bbox_w"] * row["bbox_h"]: str(row["id"]) for row in candidates}
+
+    other_project, other_asset = _project_with_frames(postgres_repo, count=1)
+    other_frame = postgres_repo.list_frames(other_asset)[0]
+    postgres_repo.replace_detections(
+        str(other_frame["run_id"]), other_asset,
+        [DetectionRecord(
+            run_id=str(other_frame["run_id"]), frame_id=str(other_frame["id"]), roi_index=0,
+            bbox_x=0, bbox_y=0, bbox_w=2, bbox_h=2, area=4,
+            perimeter=8, major_axis_length=2, minor_axis_length=2,
+            min_gray_value=0, mean_gray_value=0, roi_payload=b"other",
+            roi_encoding="raw", roi_format="raw_ndarray_c_order", roi_dtype="uint8", roi_shape=[2, 2],
+        )],
+    )
+
+    base_filters = {"asset_ids": [asset_id], "refinement_state": ["refined", "unrefined"]}
+    assert {str(row["detection_id"]) for row in postgres_repo.plan_roi_refinement_detections(
+        project_id=project_id, filters=base_filters,
+    )} == set(candidate_ids.values())
+    assert {str(row["detection_id"]) for row in postgres_repo.plan_roi_refinement_detections(
+        project_id=project_id, filters={**base_filters, "min_area": 0},
+    )} == set(candidate_ids.values())
+
+    area_filters = {**base_filters, "min_area": 4, "max_area": 4}
+    legacy = postgres_repo.plan_roi_refinement_detections(project_id=project_id, filters=area_filters)
+    assert [str(row["detection_id"]) for row in legacy] == [candidate_ids[4]]
+    page = postgres_repo.plan_processing_submission_page(
+        submission_id=str(uuid.uuid4()), project_id=project_id, stage="roi_refinement",
+        filters=area_filters, limit=10,
+    )
+    assert [str(row["detection_id"]) for row in page["rows"]] == [candidate_ids[4]]
+
+    # A candidate selected by an earlier page can leave the inclusive range
+    # before its job is committed. Locking must reapply the durable criteria.
+    with postgres_repo.connect() as connection:
+        connection.execute(
+            f"UPDATE {postgres_repo.schema}.detection_candidate SET bbox_w = 3, bbox_h = 3 WHERE id = %s",
+            (candidate_ids[4],),
+        )
+        connection.commit()
+    assert postgres_repo.lock_processing_submission_page(
+        project_id=project_id, stage="roi_refinement", unit_ids=[candidate_ids[4]], filters=area_filters,
+    ) == []
+    assert postgres_repo.plan_roi_refinement_detections(
+        project_id=other_project,
+        filters={"min_area": 4, "max_area": 4, "refinement_state": ["refined", "unrefined"]},
+    )

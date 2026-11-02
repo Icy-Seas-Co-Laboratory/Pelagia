@@ -1,0 +1,160 @@
+{
+  "measured_on": "2026-11-02",
+  "iterations": 3,
+  "query_timeout_ms": 8000,
+  "notes": [
+    "Timings include connection setup, read-only transaction setup and fetching SQL results; they exclude HTTP/browser rendering.",
+    "Catalog row estimates were read from pg_stat_user_tables.",
+    "Three repetitions are descriptive timings, not a production latency guarantee."
+  ],
+  "environments": {
+    "local": {
+      "database": "PostgreSQL 18.4",
+      "candidate_rows_estimate": 345616,
+      "candidate_heap_pages": 451845,
+      "status_heap_pages": 896,
+      "candidate_sample_percent": 0.05665659684183735,
+      "status_sample_percent": 100.0,
+      "refinement_summary_columns_present": true,
+      "queries": {
+        "status_groups": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 16.6423749178648,
+          "p95_ms": 29.399124905467033,
+          "errors": []
+        },
+        "area_top100": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 526.6611250117421,
+          "p95_ms": 578.8437500596046,
+          "errors": []
+        },
+        "candidate_count_area_100_10000": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 520.1832503080368,
+          "p95_ms": 523.1330003589392,
+          "errors": []
+        },
+        "auto_candidate_area_refinement": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 5.715250037610531,
+          "p95_ms": 7.459708955138922,
+          "errors": []
+        },
+        "auto_status_groups": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 5.55791612714529,
+          "p95_ms": 7.946833036839962,
+          "errors": []
+        },
+        "exact_facets": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 15.497999731451273,
+          "p95_ms": 15.716916881501675,
+          "errors": []
+        },
+        "auto_facets": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 13.950542081147432,
+          "p95_ms": 14.460958074778318,
+          "errors": []
+        },
+        "refinement_summary": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 5.045291967689991,
+          "p95_ms": 5.32104168087244,
+          "errors": []
+        }
+      }
+    },
+    "remote": {
+      "database": "PostgreSQL 16",
+      "candidate_rows_estimate": 26496209,
+      "candidate_heap_pages": 6617600,
+      "status_heap_pages": 28795,
+      "candidate_sample_percent": 0.0038684719535783366,
+      "status_sample_percent": 0.8890432366730335,
+      "refinement_summary_columns_present": false,
+      "queries": {
+        "status_groups": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 201.4655601233244,
+          "p95_ms": 231.75637610256672,
+          "errors": []
+        },
+        "area_top100": {
+          "iterations": 3,
+          "completed": 0,
+          "median_ms": null,
+          "p95_ms": null,
+          "errors": [
+            "QueryCanceled (sqlstate 57014)",
+            "QueryCanceled (sqlstate 57014)",
+            "QueryCanceled (sqlstate 57014)"
+          ]
+        },
+        "candidate_count_area_100_10000": {
+          "iterations": 3,
+          "completed": 0,
+          "median_ms": null,
+          "p95_ms": null,
+          "errors": [
+            "QueryCanceled (sqlstate 57014)",
+            "QueryCanceled (sqlstate 57014)",
+            "QueryCanceled (sqlstate 57014)"
+          ]
+        },
+        "auto_candidate_area_refinement": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 69.10094618797302,
+          "p95_ms": 71.97912177070975,
+          "errors": []
+        },
+        "auto_status_groups": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 30.424514319747686,
+          "p95_ms": 31.80358838289976,
+          "errors": []
+        },
+        "exact_facets": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 2701.245689764619,
+          "p95_ms": 2811.1266777850688,
+          "errors": []
+        },
+        "auto_facets": {
+          "iterations": 3,
+          "completed": 3,
+          "median_ms": 42.3158947378397,
+          "p95_ms": 45.40712386369705,
+          "errors": []
+        },
+        "refinement_summary": {
+          "skipped": true,
+          "reason": "deployed schema lacks refinement_queue_candidate_count; use candidate_count_area query"
+        }
+      }
+    }
+  },
+  "isolated_remote_area_index_experiment": {
+    "rows": 1000000,
+    "source": "Temporary geometry-only copy of existing candidate rows; production frames/assets joined for project scoping.",
+    "iterations": 1,
+    "before_index_ms": 1061.569,
+    "index_with_old_explicit_null_order_ms": 990.263,
+    "index_with_matching_default_null_order_ms": 0.707,
+    "plan_after": "Backward expression-index scan, nested joins and incremental sort; no production index created."
+  }
+}

@@ -17,6 +17,7 @@ row per project and frame. Each row tracks:
 - `candidate_detection_status`
 - `roi_refinement_status`
 - candidate, refined, and unrefined ROI counts
+- refinement-queue counts for eligible candidates and refined candidate parents
 - frame, asset, run, collection, and update metadata
 
 Statuses use the same broad values as jobs:
@@ -24,6 +25,14 @@ Statuses use the same broad values as jobs:
 ```text
 unknown, queued, leased, working, succeeded, failed, cancelled, dead_lettered
 ```
+
+The refinement job status is separate from coverage: a successful job does
+not imply that every candidate in a frame has been refined. Queue counts include
+only candidates with a stored ROI payload. A candidate is counted as refined
+once if it has at least one refined result, even if it has multiple outputs.
+Unrefined queue candidates are the difference between those two counts. The
+broader frame counts retain their original meanings and can differ from queue
+totals.
 
 ## When It Updates
 
@@ -97,6 +106,22 @@ The response contains the normal `summary` and `snapshot`, plus:
 Multiple values use OR semantics within their group. All returned facet counts
 describe the same filtered frame set as `summary`.
 
+Queue previews can request `count_mode=auto` on the facets and refinement-count
+endpoints. The default `exact` mode retains exact counting. Auto mode reads
+small tables exactly; for tables larger than 1,024 heap pages it uses a
+repeatable PostgreSQL block sample targeting 256 pages and scales the observed
+counts by the sampling fraction. This limits expected read work independently
+of the number of ROIs. It is not a hard latency limit or a confidence interval:
+block clustering, a small project within a shared table, and narrow filters can
+make estimates noisy or leave no matching sample rows.
+
+Auto responses add `counts` metadata: `exact`, `method` (`exact` or
+`block_sample`), `sample_fraction`, and `matching_sample_rows`. Clients must
+label sampled totals as estimates. Zero `matching_sample_rows` on a sampled
+response means insufficient sample evidence, not an empty queue. Estimated
+facets must never replace the exact project snapshot. Submission criteria,
+candidate reservations, and worker inputs always use exact predicates.
+
 ### Refinement Queue Counts
 
 `GET /processing/status/refinement-counts` returns counts of candidate detections
@@ -105,6 +130,33 @@ Each candidate counts once even if multiple refined outputs exist. Repeated
 `asset_id` and `collection` parameters use the same filtering as facets. These
 are current counts, not reservations; a submission may select different work
 if data changes or candidates are reserved before planning completes.
+
+Pass `min_area` and/or `max_area` to count candidates by inclusive
+bounding-box area in px², for example `?min_area=64&max_area=4096`. The same
+limits can be supplied in an `roi_refinement` queue request and are applied
+again when each candidate is reserved for a job. Limits must be finite,
+non-negative numbers and `min_area` cannot exceed `max_area`.
+
+The `0040_roi_bbox_area_indexes` migration adds expression indexes for this
+metric to candidate and refined ROI tables. Migrations run inside one
+transaction, so an automatic index build can block writes on a large existing
+catalog. Before applying the migration in such an environment, create both
+indexes concurrently with these exact names; the migration's `IF NOT EXISTS`
+then recognizes them:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pelagia_dc_area
+    ON pelagia.detection_candidate ((bbox_w::double precision * bbox_h), id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pelagia_dr_area
+    ON pelagia.detections_refined ((bbox_w::double precision * bbox_h), id);
+```
+
+These commands use the default `pelagia` schema; substitute the configured
+schema in both the relation and index names when needed. Run concurrent builds
+outside a transaction, verify `pg_index.indisvalid` for both indexes, and
+resolve an interrupted invalid build before applying the migration. Area
+browsing relies on the default B-tree null ordering to allow both scan
+directions; bbox dimensions are non-null, so this preserves size ordering.
 
 ### Frame Rows
 
@@ -179,6 +231,12 @@ curl -X POST -H "Authorization: Bearer $PELAGIA_TOKEN" \
 Rebuild uses existing frames, stored preprocessed payloads, candidate
 detections, and refined detections to reconstruct the projection. It preserves
 non-derived status values where there is no stored artifact proving success.
+After upgrading to the frame-level refinement queue counts, rebuild each
+existing asset to backfill them. Until all selected frames have been backfilled,
+the refinement-count endpoint falls back to the exact candidate query, which
+can be slow on large projects. Rebuilds read candidate and refined data and
+can contend with processing; schedule large backfills accordingly. The rebuild
+endpoint accepts one asset per request, so assets can be reconciled separately.
 
 ## Frontend Usage Pattern
 

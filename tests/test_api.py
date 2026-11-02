@@ -23,6 +23,7 @@ from Pelagia.processing.frame_model import FrameData
 from Pelagia.processing.detection_refinement import RoiRefinementPrediction
 from Pelagia.services.context import AppContext
 from Pelagia.observability import DatabaseLogger
+from Pelagia.version import __version__
 from pelagia_interchange import Dataset, DatasetBuilder, StorageFormat
 
 
@@ -1941,7 +1942,7 @@ def test_api_lists_system_status_without_live_database():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["build"]["version"] == "0.0.1"
+    assert body["build"]["version"] == __version__
     assert "git_commit" in body["build"]
     assert body["database"]["ready"] is True
     assert body["database"]["migrations"]["pending_count"] == 0
@@ -2091,7 +2092,7 @@ def test_api_exposes_system_capabilities():
     assert response.status_code == 200
     body = response.json()
     assert body["name"] == "Pelagia"
-    assert body["version"] == "0.0.1"
+    assert body["version"] == __version__
     assert "git_commit" in body["build"]
     assert body["api"]["endpoints"]["segmentation_options"] == "/segmentation/options"
     assert body["api"]["endpoints"]["preprocessing_options"] == "/preprocessing/options"
@@ -5373,6 +5374,27 @@ def test_api_refinement_queue_counts_are_project_scoped():
     assert repo.frame_status_filter_calls[-1]["project_id"]
     assert repo.frame_status_filter_calls[-1]["asset_ids"] == ["asset-1"]
     assert repo.frame_status_filter_calls[-1]["collections"] == ["test"]
+    assert repo.frame_status_filter_calls[-1]["min_area"] is None
+    assert repo.frame_status_filter_calls[-1]["max_area"] is None
+
+
+def test_api_refinement_queue_counts_accepts_bbox_area_range():
+    client, repo, _ = make_client()
+
+    response = client.get("/processing/status/refinement-counts?min_area=4&max_area=25")
+
+    assert response.status_code == 200
+    assert repo.frame_status_filter_calls[-1]["min_area"] == 4
+    assert repo.frame_status_filter_calls[-1]["max_area"] == 25
+
+
+def test_api_refinement_queue_counts_rejects_invalid_bbox_area_range():
+    client, _, _ = make_client()
+
+    response = client.get("/processing/status/refinement-counts?min_area=25&max_area=4")
+
+    assert response.status_code == 422
+    assert "min_area" in response.text
 
 
 def test_api_processing_status_facets_group_counts_in_one_request():
@@ -5392,6 +5414,39 @@ def test_api_processing_status_facets_group_counts_in_one_request():
     assert len(repo.frame_status_filter_calls) == 1
     assert repo.frame_status_filter_calls[0]["asset_ids"] == ["asset-1"]
     assert repo.frame_status_filter_calls[0]["collections"] == ["test"]
+
+
+def test_api_auto_counts_forward_mode_and_do_not_cache_estimates_in_snapshot():
+    client, repo, _ = make_client()
+    calls = []
+    original = repo.get_frame_status_facets
+
+    def sampled_facets(**kwargs):
+        calls.append(kwargs)
+        return {**original(**kwargs), "counts": {
+            "exact": False, "method": "block_sample", "sample_fraction": 0.1,
+            "matching_sample_rows": 2,
+        }}
+
+    repo.get_frame_status_facets = sampled_facets
+    response = client.get("/processing/status/facets?count_mode=auto")
+    assert response.status_code == 200
+    assert response.json()["counts"]["exact"] is False
+    assert calls[0]["count_mode"] == "auto"
+    assert repo.processing_status_snapshots == []
+
+    repo.get_refinement_queue_counts = lambda **kwargs: calls.append(kwargs) or {
+        "candidates": 10, "refined": 3, "unrefined": 7,
+        "counts": {"exact": False, "method": "block_sample", "sample_fraction": 0.1,
+                   "matching_sample_rows": 1},
+    }
+    response = client.get("/processing/status/refinement-counts?min_area=10&count_mode=auto")
+    assert response.status_code == 200
+    assert response.json()["counts"]["exact"] is False
+    assert calls[-1]["min_area"] == 10
+    assert calls[-1]["count_mode"] == "auto"
+    assert client.get("/processing/status/facets?count_mode=invalid").status_code == 422
+    assert client.get("/processing/status/refinement-counts?count_mode=invalid").status_code == 422
 
 
 def test_api_processing_status_frames_and_ids_are_filterable():

@@ -100,6 +100,11 @@ class _ExistingRowCursor:
     def fetchone(self):
         return self.row
 
+    def fetchall(self):
+        # Unit retry tests do not model durable candidate rows; returning no
+        # affected frames keeps their focus on retry identity behavior.
+        return []
+
 
 class _ExistingRowConnection:
     def __init__(self, cursor):
@@ -138,6 +143,9 @@ class _RefinedRetryCursor:
         if normalized.startswith("SELECT pg_advisory_xact_lock"):
             self._current = None
             return
+        if normalized.startswith("SELECT DISTINCT frame_id FROM"):
+            self._current = None
+            return
         if normalized.startswith("SELECT * FROM"):
             job_id, candidate_detection_id, roi_index = parameters
             self._current = self.rows.get(
@@ -160,6 +168,11 @@ class _RefinedRetryCursor:
 
     def fetchone(self):
         return self._current
+
+    def fetchall(self):
+        # The retry fixtures only model refined rows. No queue frame refresh is
+        # required when their candidate lookup has no result.
+        return []
 
 
 def _unit_detection(index: int, *, payload_bytes: int = 1) -> DetectionRecord:
@@ -308,14 +321,15 @@ def test_refinement_retry_reuses_row_for_same_job_candidate_and_roi():
     )
 
     assert rows == [existing]
-    assert len(cursor.executions) == 2
-    assert "pg_advisory_xact_lock" in cursor.executions[0][0]
-    assert cursor.executions[0][1] == ("roi-refinement:job-1:candidate-1:1",)
+    assert len(cursor.executions) == 3
+    assert "SELECT DISTINCT frame_id" in cursor.executions[0][0]
+    assert "pg_advisory_xact_lock" in cursor.executions[1][0]
+    assert cursor.executions[1][1] == ("roi-refinement:job-1:candidate-1:1",)
     assert (
         "WHERE job_id = %s AND candidate_detection_id = %s AND roi_index = %s"
-        in cursor.executions[1][0]
+        in cursor.executions[2][0]
     )
-    assert cursor.executions[1][1] == ("job-1", "candidate-1", 1)
+    assert cursor.executions[2][1] == ("job-1", "candidate-1", 1)
     assert all("INSERT INTO" not in statement for statement, _ in cursor.executions)
     assert repository.hot_store.put_calls == 0
 
@@ -538,12 +552,15 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0035_registry_assets_hot_storage",
             "0037_drop_inline_detection_payloads",
             "0038_object_gc_candidates",
+            "0039_frame_refinement_queue_counts",
+            "0040_roi_bbox_area_indexes",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered
     assert "{schema}" not in rendered
 
-    gc_candidates = postgres.render_migration(migrations[-1], "pelagia_unit")
+    gc_migration = next(migration for migration in migrations if migration["migration_id"] == "0038_object_gc_candidates")
+    gc_candidates = postgres.render_migration(gc_migration, "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.object_gc_candidates" in gc_candidates
     assert "ON CONFLICT (hash) DO UPDATE" in gc_candidates
     assert "old_hash IS NOT DISTINCT FROM new_hash" in gc_candidates
@@ -556,6 +573,15 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     assert "embedding_evidence_object_gc_candidates" in gc_candidates
     assert "telemetry_sources_object_gc_candidates" in gc_candidates
     assert "{schema}" not in gc_candidates
+
+    area_indexes = postgres.render_migration(
+        next(migration for migration in migrations if migration["migration_id"] == "0040_roi_bbox_area_indexes"),
+        "pelagia_unit",
+    )
+    assert "idx_pelagia_unit_dc_area" in area_indexes
+    assert "idx_pelagia_unit_dr_area" in area_indexes
+    assert "bbox_w::double precision * bbox_h" in area_indexes
+    assert "{schema}" not in area_indexes
 
 
     projectless_sessions = postgres.render_migration(migrations[1], "pelagia_unit")
@@ -623,6 +649,58 @@ def test_packaged_migrations_are_discoverable_and_rendered():
     external_roi_schema = postgres.render_migration(migrations[33], "pelagia_unit")
     assert "roi_payload_ref text" in external_roi_schema
     assert "{schema}" not in external_roi_schema
+
+
+@pytest.mark.parametrize(
+    ("table", "index_name"),
+    [
+        ("detection_candidate", "dc_area"),
+        ("detections_refined", "dr_area"),
+    ],
+)
+def test_bbox_area_expression_indexes_support_area_first_scans(postgres_repo, table, index_name):
+    expected_index = f"idx_{postgres_repo.schema}_{index_name}"
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT indexdef FROM pg_indexes
+            WHERE schemaname = %s AND indexname = %s""",
+            (postgres_repo.schema, expected_index),
+        )
+        index = cursor.fetchone()
+        assert index is not None
+        assert "bbox_w" in index["indexdef"]
+        assert "bbox_h" in index["indexdef"]
+        assert ", id" in index["indexdef"]
+        cursor.execute("SET LOCAL enable_seqscan = off")
+        cursor.execute(
+            f"""EXPLAIN (FORMAT JSON)
+            SELECT id FROM {postgres_repo.schema}.{table}
+            WHERE (bbox_w::double precision * bbox_h) >= 1
+            ORDER BY (bbox_w::double precision * bbox_h), id
+            LIMIT 10"""
+        )
+        plan = cursor.fetchone()["QUERY PLAN"]
+    assert expected_index in str(plan)
+
+
+@pytest.mark.parametrize("direction", ["ASC", "DESC"])
+def test_candidate_bbox_area_index_supports_joined_browse_order(postgres_repo, direction):
+    expected_index = f"idx_{postgres_repo.schema}_dc_area"
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SET LOCAL enable_seqscan = off")
+        cursor.execute(
+            f"""EXPLAIN (FORMAT JSON)
+            SELECT detections.id
+            FROM {postgres_repo.schema}.detection_candidate detections
+            JOIN {postgres_repo.schema}.frames frames ON frames.id = detections.frame_id
+            JOIN {postgres_repo.schema}.raw_assets assets ON assets.id = frames.asset_id
+            WHERE (detections.bbox_w::double precision * detections.bbox_h) >= 1
+            ORDER BY (detections.bbox_w::double precision * detections.bbox_h) {direction},
+                     frames.frame_index DESC, detections.roi_index ASC
+            LIMIT 10"""
+        )
+        plan = cursor.fetchone()["QUERY PLAN"]
+    assert expected_index in str(plan)
 
 
 def test_project_storage_reencode_job_is_deduplicated_while_active(postgres_repo):
@@ -873,13 +951,15 @@ def test_postgres_project_columns_are_mandatory_without_defaults(postgres_repo):
 
 def test_postgres_schema_status_reports_applied_migrations(postgres_repo):
     status = postgres_repo.schema_status()
+    migrations = postgres.available_migrations()
 
     assert status["ready"] is True
     assert "schema_migrations" in status["existing_tables"]
-    assert status["migrations"]["available_count"] == 37
-    assert status["migrations"]["applied_count"] == 37
+    assert status["migrations"]["available_count"] == len(migrations)
+    assert status["migrations"]["applied_count"] == len(migrations)
     assert status["migrations"]["pending_count"] == 0
     assert status["migrations"]["applied"][0]["migration_id"] == "0001_processing_status"
+    assert status["migrations"]["applied"][-1]["migration_id"] == migrations[-1]["migration_id"]
 
 
 def test_frame_reference_updates_enqueue_unique_gc_candidates(postgres_repo):
@@ -2757,9 +2837,9 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
     )
     assert [str(row["frame_id"]) for row in working_rows["frames"]] == [frame_ids[0]]
 
-    detections = postgres_repo.replace_detections(
+    detections = postgres_repo.replace_frame_detections(
         run_id,
-        asset_id,
+        frame_ids,
         [
             DetectionRecord(
                 run_id=run_id,
@@ -2775,7 +2855,10 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
                 minor_axis_length=2,
                 min_gray_value=1,
                 mean_gray_value=2.0,
-                roi_payload=None,
+                # Only candidates with a stored ROI payload are eligible for
+                # the refinement queue. Keep the second frame payload-less
+                # below to exercise the queue-specific frame summary.
+                roi_payload=b"candidate-roi",
             ),
             DetectionRecord(
                 run_id=run_id,
@@ -2794,7 +2877,14 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
                 roi_payload=None,
             ),
         ],
+        project_id=DEFAULT_PROJECT_ID,
     )
+    # Candidate publication maintains queue counts in the same durable write;
+    # callers must not need a separate projection refresh.
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID,
+        asset_ids=[asset_id],
+    ) == {"candidates": 1, "refined": 0, "unrefined": 1}
     refined_job = postgres_repo.create_job(
         PipelineStage.ROI_REFINEMENT,
         project_id=DEFAULT_PROJECT_ID,
@@ -2832,7 +2922,47 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
         job_id=str(refined_job["id"]),
         project_id=DEFAULT_PROJECT_ID,
     )
+    # Refinement publication updates the affected parent frame in the same
+    # transaction as the refined result.
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID,
+        asset_ids=[asset_id],
+    ) == {"candidates": 1, "refined": 1, "unrefined": 0}
     assert postgres_repo.refresh_frame_status_counts(project_id=DEFAULT_PROJECT_ID, asset_id=asset_id) == 2
+
+    # Queue totals use the maintained frame projection. They count eligible
+    # candidate parents, rather than all detections or refined output rows.
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID,
+        asset_ids=[asset_id],
+    ) == {"candidates": 1, "refined": 1, "unrefined": 0}
+
+    queue_status_rows = postgres_repo.list_frame_status(
+        project_id=DEFAULT_PROJECT_ID, asset_id=asset_id
+    )["frames"]
+    queue_status_by_frame = {str(row["frame_id"]): row for row in queue_status_rows}
+    assert queue_status_by_frame[frame_ids[0]]["refinement_queue_candidate_count"] == 1
+    assert queue_status_by_frame[frame_ids[0]]["refinement_queue_refined_candidate_count"] == 1
+    assert queue_status_by_frame[frame_ids[1]]["refinement_queue_candidate_count"] == 0
+    assert queue_status_by_frame[frame_ids[1]]["refinement_queue_refined_candidate_count"] == 0
+
+    # Rows introduced before the migration are deliberately nullable. A NULL
+    # value forces the exact candidate-level fallback until that frame is
+    # backfilled, rather than returning an incorrect partial aggregate.
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""UPDATE {postgres_repo.schema}.frame_processing_status
+                    SET refinement_queue_candidate_count = NULL,
+                        refinement_queue_refined_candidate_count = NULL
+                    WHERE project_id = %s AND frame_id = %s""",
+                (DEFAULT_PROJECT_ID, frame_ids[0]),
+            )
+        connection.commit()
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID,
+        asset_ids=[asset_id],
+    ) == {"candidates": 1, "refined": 1, "unrefined": 0}
 
     refined_ids = postgres_repo.list_frame_status_ids(project_id=DEFAULT_PROJECT_ID, has_refined_rois=True)
     assert refined_ids["frame_ids"] == [frame_ids[0]]
@@ -2843,11 +2973,46 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
     assert summary["unrefined_candidate_count"] == 1
     assert summary["by_status"]["preprocessing"] == {"unknown": 1, "working": 1}
 
+    # A refinement can emit more than one row for a candidate. The queue still
+    # reports that parent candidate once, as refined.
+    postgres_repo.upsert_refined_detections(
+        [
+            (
+                str(detections[0]["id"]),
+                DetectionRecord(
+                    run_id=run_id,
+                    frame_id=frame_ids[0],
+                    roi_index=2,
+                    bbox_x=0,
+                    bbox_y=0,
+                    bbox_w=2,
+                    bbox_h=2,
+                    area=4,
+                    perimeter=8,
+                    major_axis_length=2,
+                    minor_axis_length=2,
+                    min_gray_value=1,
+                    mean_gray_value=2.0,
+                    roi_payload=b"refined-split-roi",
+                ),
+            )
+        ],
+        project_id=DEFAULT_PROJECT_ID,
+    )
+    assert postgres_repo.refresh_frame_status_counts(
+        project_id=DEFAULT_PROJECT_ID, frame_ids=[frame_ids[0]]
+    ) == 1
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID,
+        asset_ids=[asset_id],
+    ) == {"candidates": 1, "refined": 1, "unrefined": 0}
+
     facets = postgres_repo.get_frame_status_facets(project_id=DEFAULT_PROJECT_ID)
     assert facets["summary"]["total_frame_count"] == 2
     assert facets["facets"]["assets"] == {asset_id: 2}
     assert facets["facets"]["preprocessing_status"] == {"unknown": 1, "working": 1}
-    assert facets["facets"]["refinement_state"] == {"refined": 1, "unrefined": 1}
+    # Frame-status facets retain their existing refined-output-row semantics.
+    assert facets["facets"]["refinement_state"] == {"refined": 2, "unrefined": 1}
 
     snapshot = postgres_repo.get_or_create_processing_status_snapshot(
         project_id=DEFAULT_PROJECT_ID,
@@ -2867,6 +3032,51 @@ def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(pos
     first_touch = postgres_repo.touch_processing_status_snapshot(project_id=DEFAULT_PROJECT_ID)
     second_touch = postgres_repo.touch_processing_status_snapshot(project_id=DEFAULT_PROJECT_ID)
     assert second_touch["status_version"] == first_touch["status_version"] + 1
+
+    def queue_record(roi_index: int, *, payload: bytes | None) -> DetectionRecord:
+        return DetectionRecord(
+            run_id=run_id,
+            frame_id=frame_ids[0],
+            roi_index=roi_index,
+            bbox_x=0,
+            bbox_y=0,
+            bbox_w=2,
+            bbox_h=2,
+            area=4,
+            perimeter=8,
+            major_axis_length=2,
+            minor_axis_length=2,
+            min_gray_value=1,
+            mean_gray_value=2.0,
+            roi_payload=payload,
+        )
+
+    # Replacing candidates clears stale coverage for the frame atomically.
+    # Concurrent refinement publications then serialize on that frame and leave
+    # both distinct candidate parents counted as refined.
+    replacement = postgres_repo.replace_frame_detections(
+        run_id,
+        [frame_ids[0]],
+        [queue_record(10, payload=b"replacement-one"), queue_record(11, payload=b"replacement-two")],
+        project_id=DEFAULT_PROJECT_ID,
+    )
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID, asset_ids=[asset_id]
+    ) == {"candidates": 2, "refined": 0, "unrefined": 2}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                postgres_repo.upsert_refined_detections,
+                [(str(candidate["id"]), queue_record(index, payload=None))],
+                project_id=DEFAULT_PROJECT_ID,
+            )
+            for index, candidate in enumerate(replacement, start=10)
+        ]
+        for future in futures:
+            assert len(future.result()) == 1
+    assert postgres_repo.get_refinement_queue_counts(
+        project_id=DEFAULT_PROJECT_ID, asset_ids=[asset_id]
+    ) == {"candidates": 2, "refined": 2, "unrefined": 0}
 
 
 def test_postgres_repository_manages_users_projects_memberships_and_sessions(postgres_repo):

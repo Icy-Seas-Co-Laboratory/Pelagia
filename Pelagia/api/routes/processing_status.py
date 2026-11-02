@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Literal
+
+import math
+
 try:
     from fastapi import APIRouter, HTTPException, Query, Request
 except ImportError:  # pragma: no cover
@@ -119,6 +123,7 @@ if APIRouter is not None:
         has_refined_rois: bool | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
+        count_mode: Literal["exact", "auto"] = "exact",
     ) -> dict:
         auth = require_project_read(request)
         repository = get_repository(request)
@@ -132,6 +137,8 @@ if APIRouter is not None:
             "start_frame": start_frame,
             "end_frame": end_frame,
         }
+        if count_mode != "exact":
+            filters["count_mode"] = count_mode
         try:
             result = ProcessingStatusService(repository).facets(
                 project_id=auth.project_id,
@@ -146,11 +153,20 @@ if APIRouter is not None:
         request: Request,
         asset_id: list[str] | None = Query(None),
         collection: list[str] | None = Query(None),
+        min_area: float | None = Query(None, ge=0),
+        max_area: float | None = Query(None, ge=0),
+        count_mode: Literal["exact", "auto"] = "exact",
     ) -> dict:
+        if any(value is not None and not math.isfinite(value) for value in (min_area, max_area)):
+            raise HTTPException(status_code=422, detail="ROI bounding-box area limits must be finite.")
+        if min_area is not None and max_area is not None and min_area > max_area:
+            raise HTTPException(status_code=422, detail="min_area must be less than or equal to max_area.")
         auth = require_project_read(request)
         return as_response(get_repository(request).get_refinement_queue_counts(
             project_id=auth.project_id,
             asset_ids=_query_values(asset_id), collections=_query_values(collection),
+            min_area=min_area, max_area=max_area,
+            **({"count_mode": count_mode} if count_mode != "exact" else {}),
         ))
 
     @router.get("/frames/ids", response_model=ProcessingStatusFrameIdsResponse)

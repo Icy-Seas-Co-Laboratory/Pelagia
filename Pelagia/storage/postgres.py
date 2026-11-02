@@ -17,6 +17,7 @@ from ..domain import AssetKind, ClassificationResultRecord, DetectionRecord, Fra
 from ..utils.serialization import json_ready
 from ..utils.validation import validate_schema_name
 from .blob_store import create_skerrykv_store
+from .count_sampling import count_sample
 
 try:
     import psycopg
@@ -3300,6 +3301,12 @@ class PostgresRepository:
                     detection_ids=[candidate_id for candidate_id, _ in refined_detections],
                     frame_ids=[detection.frame_id for _, detection in refined_detections],
                 )
+                cursor.execute(
+                    f"SELECT DISTINCT frame_id FROM {self.schema}.detection_candidate WHERE id = ANY(%s::uuid[])",
+                    ([candidate_id for candidate_id, _ in refined_detections],),
+                )
+                queue_frame_ids = [str(row["frame_id"]) for row in cursor.fetchall()]
+                self._lock_refinement_queue_frames(cursor, queue_frame_ids)
                 pending: list[tuple[int, str, DetectionRecord, int | None, int | None]] = []
                 pending_payloads = 0
                 pending_bytes = 0
@@ -3442,12 +3449,64 @@ class PostgresRepository:
                     pending_payloads += payload_count
                     pending_bytes += payload_bytes
                 flush_pending()
+                self._refresh_refinement_queue_frames(cursor, queue_frame_ids)
             connection.commit()
         return [self._hydrate_detection_row(row) for row in inserted if row is not None]
+
+    def _lock_refinement_queue_frames(self, cursor, frame_ids: Sequence[str]) -> None:
+        """Serialize changes to candidate coverage for each affected frame."""
+        if frame_ids:
+            cursor.execute(
+                f"SELECT id FROM {self.schema}.frames WHERE id = ANY(%s::uuid[]) ORDER BY id FOR NO KEY UPDATE",
+                (sorted(set(str(frame_id) for frame_id in frame_ids)),),
+            )
+            cursor.fetchall()
+
+    def _refresh_refinement_queue_frames(self, cursor, frame_ids: Sequence[str]) -> None:
+        """Recompute queue coverage under frame locks in the caller's transaction."""
+        if not frame_ids:
+            return
+        ids = sorted(set(str(frame_id) for frame_id in frame_ids))
+        cursor.execute(
+            f"""INSERT INTO {self.schema}.frame_processing_status
+                (project_id, frame_id, asset_id, run_id, frame_index, collections)
+                SELECT assets.project_id, frames.id, frames.asset_id, frames.run_id,
+                       frames.frame_index, assets.collections
+                FROM {self.schema}.frames frames
+                JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                WHERE frames.id = ANY(%s::uuid[])
+                ON CONFLICT (project_id, frame_id) DO NOTHING""", (ids,),
+        )
+        cursor.execute(
+            f"""UPDATE {self.schema}.frame_processing_status status
+                SET refinement_queue_candidate_count = counts.candidates,
+                    refinement_queue_refined_candidate_count = counts.refined,
+                    updated_at = NOW()
+                FROM (
+                    SELECT frames.id,
+                        COUNT(detections.id)::integer AS candidates,
+                        COUNT(detections.id) FILTER (WHERE EXISTS (
+                            SELECT 1 FROM {self.schema}.detections_refined refined
+                            WHERE refined.candidate_detection_id = detections.id
+                        ))::integer AS refined
+                    FROM {self.schema}.frames frames
+                    LEFT JOIN {self.schema}.detection_candidate detections
+                        ON detections.frame_id = frames.id AND detections.roi_payload_ref IS NOT NULL
+                    WHERE frames.id = ANY(%s::uuid[])
+                    GROUP BY frames.id
+                ) counts
+                WHERE status.frame_id = counts.id""", (ids,),
+        )
 
     def replace_detections(self, run_id: str, asset_id: str, detections: Sequence[DetectionRecord]) -> list[dict[str, Any]]:
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                cursor.execute(f"SELECT id FROM {self.schema}.frames WHERE asset_id = %s ORDER BY id", (asset_id,))
+                frame_ids = [str(row["id"]) for row in cursor.fetchall()]
+                selected_frame_ids = set(frame_ids)
+                if any(str(detection.frame_id) not in selected_frame_ids for detection in detections):
+                    raise ValueError("Detection frame does not belong to the selected asset.")
+                self._lock_refinement_queue_frames(cursor, frame_ids)
                 cursor.execute(
                     f"""
                     DELETE FROM {self.schema}.detection_candidate
@@ -3456,6 +3515,7 @@ class PostgresRepository:
                     (asset_id,),
                 )
                 inserted = self._insert_detection_rows(cursor, run_id, detections)
+                self._refresh_refinement_queue_frames(cursor, frame_ids)
             connection.commit()
         return inserted
 
@@ -3471,6 +3531,9 @@ class PostgresRepository:
         resolved_frame_ids = [str(frame_id) for frame_id in frame_ids]
         if not resolved_frame_ids:
             return []
+        selected_frame_ids = set(resolved_frame_ids)
+        if any(str(detection.frame_id) not in selected_frame_ids for detection in detections):
+            raise ValueError("Detection frame is not among the frames being replaced.")
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 self._ensure_project_scope(
@@ -3479,6 +3542,7 @@ class PostgresRepository:
                     run_id=run_id,
                     frame_ids=resolved_frame_ids,
                 )
+                self._lock_refinement_queue_frames(cursor, resolved_frame_ids)
                 cursor.execute(
                     f"""
                     DELETE FROM {self.schema}.detection_candidate
@@ -3487,6 +3551,7 @@ class PostgresRepository:
                     (resolved_frame_ids,),
                 )
                 inserted = self._insert_detection_rows(cursor, run_id, detections, returning=returning)
+                self._refresh_refinement_queue_frames(cursor, resolved_frame_ids)
             connection.commit()
         return inserted
 
@@ -3630,8 +3695,10 @@ class PostgresRepository:
 
         direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
         sort_key = str(sort_by or "asset_frame").lower()
+        # Bbox dimensions are NOT NULL. Leave area null ordering implicit so
+        # the same expression index supports forward and backward scans.
         order_by_options = {
-            "area": f"(detections.bbox_w::double precision * detections.bbox_h) {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
+            "area": f"(detections.bbox_w::double precision * detections.bbox_h) {direction}, frames.frame_index DESC, detections.roi_index ASC",
             "byte_size": f"detections.roi_payload_bytes {direction} NULLS LAST, frames.frame_index DESC, detections.roi_index ASC",
             "id": f"detections.id {direction}",
             "asset_frame": f"assets.filename {direction} NULLS LAST, frames.frame_index {direction}, detections.roi_index {direction}",
@@ -4658,7 +4725,8 @@ class PostgresRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO {self.schema}.frame_processing_status
-                        (project_id, frame_id, asset_id, run_id, frame_index, collections, updated_at)
+                        (project_id, frame_id, asset_id, run_id, frame_index, collections,
+                         refinement_queue_candidate_count, refinement_queue_refined_candidate_count, updated_at)
                     SELECT
                         assets.project_id,
                         frames.id,
@@ -4666,6 +4734,8 @@ class PostgresRepository:
                         frames.run_id,
                         frames.frame_index,
                         assets.collections,
+                        CASE WHEN NOT EXISTS (SELECT 1 FROM {self.schema}.detection_candidate d WHERE d.frame_id = frames.id) THEN 0 END,
+                        CASE WHEN NOT EXISTS (SELECT 1 FROM {self.schema}.detection_candidate d WHERE d.frame_id = frames.id) THEN 0 END,
                         NOW()
                     FROM {self.schema}.frames frames
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
@@ -4794,6 +4864,11 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
+                    f"SELECT COUNT(*) FROM (SELECT frames.id FROM {self.schema}.frames frames JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id WHERE {' AND '.join(clauses)} ORDER BY frames.id FOR NO KEY UPDATE OF frames) locked_frames",
+                    tuple(params),
+                )
+                cursor.fetchone()
+                cursor.execute(
                     f"""
                     WITH candidate_counts AS (
                         SELECT detections.frame_id, COUNT(*)::integer AS candidate_detection_count
@@ -4801,6 +4876,20 @@ class PostgresRepository:
                         JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                         JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                         WHERE {' AND '.join(clauses)}
+                        GROUP BY detections.frame_id
+                    ),
+                    refinement_queue_counts AS (
+                        SELECT
+                            detections.frame_id,
+                            COUNT(DISTINCT detections.id)::integer AS candidate_count,
+                            COUNT(DISTINCT refined.candidate_detection_id)::integer AS refined_candidate_count
+                        FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        LEFT JOIN {self.schema}.detections_refined refined
+                          ON refined.candidate_detection_id = detections.id
+                        WHERE {' AND '.join(clauses)}
+                          AND detections.roi_payload_ref IS NOT NULL
                         GROUP BY detections.frame_id
                     ),
                     refined_counts AS (
@@ -4829,14 +4918,17 @@ class PostgresRepository:
                             - COALESCE(refined_counts.refined_candidate_detection_count, 0),
                             0
                         ),
+                        refinement_queue_candidate_count = COALESCE(refinement_queue_counts.candidate_count, 0),
+                        refinement_queue_refined_candidate_count = COALESCE(refinement_queue_counts.refined_candidate_count, 0),
                         updated_at = NOW()
                     FROM selected_frames
                     LEFT JOIN candidate_counts ON candidate_counts.frame_id = selected_frames.frame_id
                     LEFT JOIN refined_counts ON refined_counts.frame_id = selected_frames.frame_id
+                    LEFT JOIN refinement_queue_counts ON refinement_queue_counts.frame_id = selected_frames.frame_id
                     WHERE status.project_id = %s
                       AND status.frame_id = selected_frames.frame_id
                     """,
-                    tuple(params + params + params + [resolved_project_id]),
+                    tuple(params + params + params + params + [resolved_project_id]),
                 )
                 count = cursor.rowcount
             connection.commit()
@@ -4857,6 +4949,11 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
+                    f"SELECT COUNT(*) FROM (SELECT frames.id FROM {self.schema}.frames frames JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id WHERE {' AND '.join(clauses)} ORDER BY frames.id FOR NO KEY UPDATE OF frames) locked_frames",
+                    tuple(params),
+                )
+                cursor.fetchone()
+                cursor.execute(
                     f"""
                     WITH candidate_counts AS (
                         SELECT detections.frame_id, COUNT(*)::integer AS candidate_detection_count
@@ -4876,6 +4973,19 @@ class PostgresRepository:
                         JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                         WHERE {' AND '.join(clauses)}
                         GROUP BY refined.frame_id
+                    ),
+                    refinement_queue_counts AS (
+                        SELECT detections.frame_id,
+                               COUNT(DISTINCT detections.id)::integer AS candidate_count,
+                               COUNT(DISTINCT refined.candidate_detection_id)::integer AS refined_candidate_count
+                        FROM {self.schema}.detection_candidate detections
+                        JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
+                        JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                        LEFT JOIN {self.schema}.detections_refined refined
+                          ON refined.candidate_detection_id = detections.id
+                        WHERE {' AND '.join(clauses)}
+                          AND detections.roi_payload_ref IS NOT NULL
+                        GROUP BY detections.frame_id
                     ),
                     source_rows AS (
                         SELECT
@@ -4907,11 +5017,14 @@ class PostgresRepository:
                                 COALESCE(candidate_counts.candidate_detection_count, 0)
                                 - COALESCE(refined_counts.refined_candidate_detection_count, 0),
                                 0
-                            ) AS unrefined_candidate_count
+                            ) AS unrefined_candidate_count,
+                            COALESCE(refinement_queue_counts.candidate_count, 0) AS refinement_queue_candidate_count,
+                            COALESCE(refinement_queue_counts.refined_candidate_count, 0) AS refinement_queue_refined_candidate_count
                         FROM {self.schema}.frames frames
                         JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                         LEFT JOIN candidate_counts ON candidate_counts.frame_id = frames.id
                         LEFT JOIN refined_counts ON refined_counts.frame_id = frames.id
+                        LEFT JOIN refinement_queue_counts ON refinement_queue_counts.frame_id = frames.id
                         LEFT JOIN {self.schema}.frame_processing_status existing
                           ON existing.project_id = assets.project_id
                          AND existing.frame_id = frames.id
@@ -4923,12 +5036,14 @@ class PostgresRepository:
                                 project_id, frame_id, asset_id, run_id, frame_index, collections,
                                 preprocessing_status, candidate_detection_status, candidate_detection_count,
                                 roi_refinement_status, refined_detection_count, unrefined_candidate_count,
+                                refinement_queue_candidate_count, refinement_queue_refined_candidate_count,
                                 updated_at
                             )
                         SELECT
                             project_id, frame_id, asset_id, run_id, frame_index, collections,
                             preprocessing_status, candidate_detection_status, candidate_detection_count,
-                            roi_refinement_status, refined_detection_count, unrefined_candidate_count,
+                                roi_refinement_status, refined_detection_count, unrefined_candidate_count,
+                                refinement_queue_candidate_count, refinement_queue_refined_candidate_count,
                             NOW()
                         FROM source_rows
                         ON CONFLICT (project_id, frame_id) DO UPDATE SET
@@ -4942,12 +5057,14 @@ class PostgresRepository:
                             roi_refinement_status = EXCLUDED.roi_refinement_status,
                             refined_detection_count = EXCLUDED.refined_detection_count,
                             unrefined_candidate_count = EXCLUDED.unrefined_candidate_count,
+                            refinement_queue_candidate_count = EXCLUDED.refinement_queue_candidate_count,
+                            refinement_queue_refined_candidate_count = EXCLUDED.refinement_queue_refined_candidate_count,
                             updated_at = NOW()
                         RETURNING frame_id
                     )
                     SELECT COUNT(*)::bigint AS rebuilt_frame_count FROM upserted
                     """,
-                    tuple(params + params + params),
+                    tuple(params + params + params + params),
                 )
                 row = cursor.fetchone()
             connection.commit()
@@ -5147,31 +5264,93 @@ class PostgresRepository:
 
     def get_refinement_queue_counts(
         self, *, project_id: str, asset_ids: Sequence[str] | None = None,
-        collections: Sequence[str] | None = None,
-    ) -> dict[str, int]:
-        """Count eligible candidates by candidate-level refinement state."""
+        collections: Sequence[str] | None = None, min_area: float | None = None,
+        max_area: float | None = None, count_mode: str = "exact",
+    ) -> dict[str, Any]:
+        """Count candidate parents, optionally estimating informational previews."""
         resolved_project_id = self._required_project_id(project_id, "get_refinement_queue_counts")
         clauses, params = self._frame_status_filters(
             project_id=resolved_project_id, asset_ids=asset_ids, collections=collections,
         )
+        area_clauses, area_params = self._candidate_bbox_area_clauses(
+            min_area=min_area, max_area=max_area,
+        )
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                if not area_clauses:
+                    sample = count_sample(cursor, self.schema, "frame_processing_status", count_mode)
+                    cursor.execute(
+                        f"""SELECT
+                            COUNT(*)::bigint AS matching_rows,
+                            COUNT(*) FILTER (WHERE refinement_queue_candidate_count IS NULL
+                                               OR refinement_queue_refined_candidate_count IS NULL)::bigint
+                                AS uninitialized_frames,
+                            COALESCE(SUM(refinement_queue_candidate_count), 0)::bigint AS candidates,
+                            COALESCE(SUM(refinement_queue_refined_candidate_count), 0)::bigint AS refined
+                        FROM {self.schema}.frame_processing_status status{sample.sql}
+                        WHERE {' AND '.join(clauses)}""", tuple(params),
+                    )
+                    row = cursor.fetchone() or {}
+                    if int(row.get("uninitialized_frames") or 0) == 0:
+                        candidates = sample.count(row.get("candidates"))
+                        refined = sample.count(row.get("refined"))
+                        result = {"candidates": candidates, "refined": refined,
+                                  "unrefined": max(0, candidates - refined)}
+                        if count_mode == "auto":
+                            result["counts"] = sample.metadata(int(row.get("matching_rows") or 0))
+                        return result
+                # Area gates cannot use the frame totals. Likewise, legacy
+                # frames without initialized totals need candidate-level reads.
+                sample = count_sample(cursor, self.schema, "detection_candidate", count_mode)
                 cursor.execute(
-                    f"""WITH eligible AS (
+                    f"""WITH eligible AS MATERIALIZED (
                         SELECT detections.id,
                             EXISTS (SELECT 1 FROM {self.schema}.detections_refined refined
                                     WHERE refined.candidate_detection_id = detections.id) AS refined
-                        FROM {self.schema}.frame_processing_status status
-                        JOIN {self.schema}.detection_candidate detections ON detections.frame_id = status.frame_id
-                        WHERE {' AND '.join(clauses)} AND detections.roi_payload_ref IS NOT NULL
+                        FROM {self.schema}.detection_candidate detections{sample.sql}
+                        JOIN {self.schema}.frame_processing_status status ON status.frame_id = detections.frame_id
+                        WHERE {' AND '.join([*clauses, 'detections.roi_payload_ref IS NOT NULL', *area_clauses])}
                     )
                     SELECT COUNT(*)::bigint AS candidates,
-                           COUNT(*) FILTER (WHERE refined)::bigint AS refined,
-                           COUNT(*) FILTER (WHERE NOT refined)::bigint AS unrefined
-                    FROM eligible""", tuple(params),
+                           COUNT(*) FILTER (WHERE refined)::bigint AS refined
+                    FROM eligible""", tuple([*params, *area_params]),
                 )
                 row = cursor.fetchone() or {}
-        return {key: int(row.get(key) or 0) for key in ("candidates", "refined", "unrefined")}
+        candidates = sample.count(row.get("candidates"))
+        refined = sample.count(row.get("refined"))
+        result = {"candidates": candidates, "refined": refined,
+                  "unrefined": max(0, candidates - refined)}
+        if count_mode == "auto":
+            result["counts"] = sample.metadata(int(row.get("candidates") or 0))
+        return result
+
+    @staticmethod
+    def _candidate_bbox_area_clauses(
+        *, min_area: float | None, max_area: float | None,
+        alias: str = "detections",
+    ) -> tuple[list[str], list[float]]:
+        """Build inclusive, validated bounding-box area predicates in px²."""
+        values = {"min_area": min_area, "max_area": max_area}
+        normalized: dict[str, float] = {}
+        for key, value in values.items():
+            if value is None:
+                continue
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0:
+                raise ValueError("ROI bounding-box area limits must be finite non-negative values.")
+            normalized[key] = numeric
+        if (minimum := normalized.get("min_area")) is not None and (maximum := normalized.get("max_area")) is not None and minimum > maximum:
+            raise ValueError("min_area must be less than or equal to max_area.")
+        expression = f"({alias}.bbox_w::double precision * {alias}.bbox_h)"
+        clauses: list[str] = []
+        params: list[float] = []
+        if "min_area" in normalized:
+            clauses.append(f"{expression} >= %s")
+            params.append(normalized["min_area"])
+        if "max_area" in normalized:
+            clauses.append(f"{expression} <= %s")
+            params.append(normalized["max_area"])
+        return clauses, params
 
     def get_frame_status_facets(
         self,
@@ -5187,6 +5366,7 @@ class PostgresRepository:
         has_refined_rois: bool | None = None,
         start_frame: int | None = None,
         end_frame: int | None = None,
+        count_mode: str = "exact",
     ) -> dict[str, Any]:
         resolved_project_id = self._required_project_id(project_id, "get_frame_status_facets")
         clauses, params = self._frame_status_filters(
@@ -5204,6 +5384,7 @@ class PostgresRepository:
         )
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                sample = count_sample(cursor, self.schema, "frame_processing_status", count_mode)
                 cursor.execute(
                     f"""
                     WITH filtered AS MATERIALIZED (
@@ -5217,7 +5398,7 @@ class PostgresRepository:
                             refined_detection_count,
                             unrefined_candidate_count,
                             updated_at
-                        FROM {self.schema}.frame_processing_status status
+                        FROM {self.schema}.frame_processing_status status{sample.sql}
                         WHERE {' AND '.join(clauses)}
                     ),
                     summary AS (
@@ -5250,12 +5431,20 @@ class PostgresRepository:
                     tuple(params),
                 )
                 row = cursor.fetchone() or {}
+        matching_rows = int(row.get("total_frame_count") or 0)
         summary = self._frame_status_summary_from_row(row)
-        return {
+        if sample.fraction != 1:
+            summary = {
+                key: ({stage: {state: sample.count(count) for state, count in counts.items()}
+                       for stage, counts in value.items()} if key == "by_status"
+                      else value if key == "updated_at" else sample.count(value))
+                for key, value in summary.items()
+            }
+        result = {
             "summary": summary,
             "facets": {
-                "assets": row.get("asset_facets") or {},
-                "collections": row.get("collection_facets") or {},
+                "assets": {key: sample.count(value) for key, value in (row.get("asset_facets") or {}).items()},
+                "collections": {key: sample.count(value) for key, value in (row.get("collection_facets") or {}).items()},
                 "preprocessing_status": summary["by_status"]["preprocessing"],
                 "candidate_detection_status": summary["by_status"]["candidate_detection"],
                 "roi_refinement_status": summary["by_status"]["roi_refinement"],
@@ -5265,6 +5454,9 @@ class PostgresRepository:
                 },
             },
         }
+        if count_mode == "auto":
+            result["counts"] = sample.metadata(matching_rows)
+        return result
 
     def get_processing_status_snapshot(
         self,
@@ -5746,8 +5938,8 @@ class PostgresRepository:
         order = {
             "oldest": "refined.created_at ASC, refined.id ASC",
             "newest": "refined.created_at DESC, refined.id DESC",
-            "area_asc": "(refined.bbox_w::double precision * refined.bbox_h) ASC NULLS LAST, refined.id ASC",
-            "area_desc": "(refined.bbox_w::double precision * refined.bbox_h) DESC NULLS LAST, refined.id ASC",
+            "area_asc": "(refined.bbox_w::double precision * refined.bbox_h) ASC, refined.id ASC",
+            "area_desc": "(refined.bbox_w::double precision * refined.bbox_h) DESC, refined.id ASC",
             "confidence_asc": "evidence.confidence ASC NULLS FIRST, refined.id ASC",
             "confidence_desc": "evidence.confidence DESC NULLS LAST, refined.id ASC",
             "disagreement": "(coalesce(evidence.prototype_class_index <> evidence.predicted_class_index, false)::int + coalesce(evidence.knn_class_index <> evidence.predicted_class_index, false)::int) DESC, refined.id ASC",
@@ -7807,7 +7999,8 @@ class PostgresRepository:
         cursor.execute(
             f"""
             INSERT INTO {self.schema}.frame_processing_status
-                (project_id, frame_id, asset_id, run_id, frame_index, collections, updated_at)
+                (project_id, frame_id, asset_id, run_id, frame_index, collections,
+                 refinement_queue_candidate_count, refinement_queue_refined_candidate_count, updated_at)
             SELECT
                 assets.project_id,
                 frames.id,
@@ -7815,6 +8008,8 @@ class PostgresRepository:
                 frames.run_id,
                 frames.frame_index,
                 assets.collections,
+                CASE WHEN NOT EXISTS (SELECT 1 FROM {self.schema}.detection_candidate d WHERE d.frame_id = frames.id) THEN 0 END,
+                CASE WHEN NOT EXISTS (SELECT 1 FROM {self.schema}.detection_candidate d WHERE d.frame_id = frames.id) THEN 0 END,
                 NOW()
             FROM {self.schema}.frames frames
             JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
@@ -8242,6 +8437,21 @@ class PostgresRepository:
         mask_ref = None if mask_payload is None else self.hot_store.put_store(mask_payload)
         with self.connect() as connection:
             with connection.cursor() as cursor:
+                # Locate the frame before changing payload eligibility, then
+                # serialize coverage changes through its frame lock.
+                cursor.execute(
+                    f"""SELECT item.frame_id
+                    FROM {self.schema}.{resource} item
+                    JOIN {self.schema}.frames frames ON frames.id = item.frame_id
+                    JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
+                    WHERE item.id = %s AND assets.project_id = %s""",
+                    (resource_id, project_id),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    return False
+                frame_ids = [str(target["frame_id"])]
+                self._lock_refinement_queue_frames(cursor, frame_ids)
                 cursor.execute(
                     f"""UPDATE {self.schema}.{resource} item SET
                     roi_payload_ref = %s, roi_payload_bytes = %s, roi_encoding = %s, roi_format = %s,
@@ -8258,6 +8468,8 @@ class PostgresRepository:
                      row_version),
                 )
                 updated = cursor.fetchone() is not None
+                if updated:
+                    self._refresh_refinement_queue_frames(cursor, frame_ids)
             connection.commit()
         return updated
 
@@ -8304,13 +8516,32 @@ class PostgresRepository:
                             clauses.append("assets.project_id = %s")
                             params.append(project_id)
                         params.append(batch_size)
+                        # Discover a bounded set without locking candidate rows.
+                        # The frame lock comes first so this follows the same
+                        # order as normal detection replacement (frame, then
+                        # candidate) and cannot deadlock with that path.
                         cursor.execute(
-                            f"""SELECT item.id, item.roi_payload, item.mask_payload
+                            f"""SELECT item.id, item.frame_id
                             FROM {self.schema}.{table} item {join}
                             WHERE {' AND '.join(clauses)}
-                            ORDER BY item.id LIMIT %s FOR UPDATE SKIP LOCKED""", tuple(params),
+                            ORDER BY item.id LIMIT %s""", tuple(params),
                         )
-                        rows = cursor.fetchall()
+                        candidates = cursor.fetchall()
+                        frame_ids = sorted({str(row["frame_id"]) for row in candidates})
+                        self._lock_refinement_queue_frames(cursor, frame_ids)
+                        candidate_ids = [str(row["id"]) for row in candidates]
+                        if candidate_ids:
+                            cursor.execute(
+                                f"""SELECT id, frame_id, roi_payload, mask_payload
+                                FROM {self.schema}.{table}
+                                WHERE id = ANY(%s::uuid[])
+                                  AND (roi_payload IS NOT NULL OR mask_payload IS NOT NULL)
+                                ORDER BY id FOR UPDATE""",
+                                (candidate_ids,),
+                            )
+                            rows = cursor.fetchall()
+                        else:
+                            rows = []
                         from concurrent.futures import ThreadPoolExecutor
 
                         def copy_row(row):
@@ -8345,8 +8576,10 @@ class PostgresRepository:
                             )
                             result[counter] += 1
                             result["objects"] += int(roi is not None) + int(mask is not None)
+                        if table == "detection_candidate":
+                            self._refresh_refinement_queue_frames(cursor, frame_ids)
                     connection.commit()
-                if len(rows) < batch_size:
+                if not candidates:
                     break
             with self.connect() as connection:
                 with connection.cursor() as cursor:
@@ -9563,6 +9796,11 @@ class PostgresRepository:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
         clauses.append("detections.roi_payload_ref IS NOT NULL")
+        area_clauses, area_params = self._candidate_bbox_area_clauses(
+            min_area=filters.get("min_area"), max_area=filters.get("max_area"),
+        )
+        clauses.extend(area_clauses)
+        params.extend(area_params)
         refinement_clause = self._candidate_refinement_state_clause(
             schema=self.schema, refinement_states=filters.get("refinement_state"),
         )
@@ -9638,14 +9876,19 @@ class PostgresRepository:
         with self._operation_connection(_connection) as connection:
             with connection.cursor() as cursor:
                 if stage == "roi_refinement":
+                    area_clauses, area_params = self._candidate_bbox_area_clauses(
+                        min_area=filters.get("min_area"), max_area=filters.get("max_area"),
+                    )
+                    area_where = "".join(f" AND {clause}" for clause in area_clauses)
                     cursor.execute(
                         f"""SELECT detections.id FROM {self.schema}.detection_candidate detections
                         JOIN {self.schema}.frames frames ON frames.id = detections.frame_id
                         JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                         WHERE assets.project_id = %s AND detections.id = ANY(%s::uuid[])
                           AND detections.roi_payload_ref IS NOT NULL
+                          {area_where}
                         FOR UPDATE OF detections""",
-                        (resolved_project_id, list(unit_ids)),
+                        tuple([resolved_project_id, list(unit_ids), *area_params]),
                     )
                     locked = {str(row["id"]) for row in cursor.fetchall()}
                     refinement_states = {str(value) for value in filters.get("refinement_state") or ["unrefined"]}
@@ -9754,6 +9997,11 @@ class PostgresRepository:
             clauses.append("status.collections && %s::text[]")
             params.append(collections)
         clauses.append("detections.roi_payload_ref IS NOT NULL")
+        area_clauses, area_params = self._candidate_bbox_area_clauses(
+            min_area=filters.get("min_area"), max_area=filters.get("max_area"),
+        )
+        clauses.extend(area_clauses)
+        params.extend(area_params)
         refinement_clause = self._candidate_refinement_state_clause(
             schema=self.schema,
             refinement_states=filters.get("refinement_state"),

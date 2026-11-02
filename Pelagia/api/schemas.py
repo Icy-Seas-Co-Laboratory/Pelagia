@@ -284,10 +284,18 @@ class ProcessingStatusFacets(FlexibleModel):
     refinement_state: dict[str, int] = Field(default_factory=dict)
 
 
+class ProcessingCountAccuracy(FlexibleModel):
+    exact: bool
+    method: str
+    sample_fraction: float
+    matching_sample_rows: int
+
+
 class ProcessingStatusFacetsResponse(FlexibleModel):
     summary: ProcessingStatusSummary
     facets: ProcessingStatusFacets
     snapshot: ProcessingStatusSnapshot
+    counts: ProcessingCountAccuracy | None = None
 
 
 class ProcessingStatusFramesResponse(FlexibleModel):

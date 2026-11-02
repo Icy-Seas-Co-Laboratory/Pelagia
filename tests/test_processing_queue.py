@@ -101,6 +101,34 @@ def test_processing_queue_refinement_state_filters_match_frontend_contract():
     assert default == unrefined
 
 
+@pytest.mark.parametrize(
+    "filters, message",
+    [
+        ({"min_area": -1}, "greater than or equal to 0"),
+        ({"min_area": 10, "max_area": 9}, "min_area must be less than or equal"),
+        ({"max_area": float("inf")}, "must be finite"),
+    ],
+)
+def test_processing_queue_request_validates_refinement_bbox_area_range(filters, message):
+    from Pelagia.api.routes.processing import ProcessingQueueRequest
+
+    with pytest.raises(ValueError, match=message):
+        ProcessingQueueRequest(stage="roi_refinement", filters=filters)
+
+
+def test_refinement_bbox_area_predicate_uses_inclusive_bbox_area_in_px_squared():
+    clauses, params = PostgresRepository._candidate_bbox_area_clauses(
+        min_area=4,
+        max_area=25,
+    )
+
+    assert clauses == [
+        "(detections.bbox_w::double precision * detections.bbox_h) >= %s",
+        "(detections.bbox_w::double precision * detections.bbox_h) <= %s",
+    ]
+    assert params == [4.0, 25.0]
+
+
 def test_preprocess_queue_orders_frames_by_asset_and_frame_with_backend_batch_limit():
     repository = QueueRepository()
     service = ProcessingQueueService(AppContext(config=CoreConfig(), repository=repository))
