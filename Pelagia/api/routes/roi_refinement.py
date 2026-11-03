@@ -103,7 +103,10 @@ if APIRouter is not None:
         model_config = ConfigDict(protected_namespaces=(), extra="forbid")
         asset_id: str
         scan_axis: Literal["x", "y"] | None = None
-        boundary_band_pixels: int | None = None
+        boundary_band_pixels: int | None = Field(
+            default=None,
+            description="Legacy compatibility option; continuity requires exact foreground frame-edge contact.",
+        )
         min_link_score: float | None = None
         priority: int | None = None
         depends_on: list[str] | None = None

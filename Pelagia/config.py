@@ -477,7 +477,9 @@ class RoiContinuityProcessingConfig:
     enabled: bool = True
     require_line_scan_metadata: bool = True
     scan_axis: str = "y"
-    boundary_band_pixels: int = 32
+    # Legacy settings remain readable; continuity now requires exact edge contact
+    # and consecutive frames regardless of these two values.
+    boundary_band_pixels: int = 0
     max_frame_gap: int = 1
     min_link_score: float = 0.7
 

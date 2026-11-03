@@ -4082,9 +4082,16 @@ class PostgresRepository:
 
     def list_refined_detections_for_continuity(
         self, asset_id: str, *, project_id: str, start_frame: int | None = None, end_frame: int | None = None,
+        scan_axis: str | None = None,
     ) -> list[dict[str, Any]]:
+        if scan_axis is not None and scan_axis not in {"x", "y"}:
+            raise ValueError("scan_axis must be 'x' or 'y'.")
         clauses = ["frames.asset_id = %s", "assets.project_id = %s"]
         params: list[Any] = [asset_id, project_id]
+        if scan_axis == "y":
+            clauses.append("(refined.bbox_y = 0 OR refined.bbox_y + refined.bbox_h = frames.height)")
+        elif scan_axis == "x":
+            clauses.append("(refined.bbox_x = 0 OR refined.bbox_x + refined.bbox_w = frames.width)")
         if start_frame is not None:
             clauses.append("frames.frame_index >= %s")
             params.append(start_frame)
@@ -4094,15 +4101,23 @@ class PostgresRepository:
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"""
-                    SELECT refined.*, frames.asset_id, frames.frame_index, frames.width AS frame_width,
-                           frames.height AS frame_height
+                    SELECT refined.id, refined.frame_id, refined.roi_index,
+                           refined.bbox_x, refined.bbox_y, refined.bbox_w, refined.bbox_h,
+                           jsonb_build_object(
+                               'dominant_edge_angle_degrees', refined.metadata->'dominant_edge_angle_degrees',
+                               'edge_strength', refined.metadata->'edge_strength'
+                           ) AS metadata, frames.asset_id, frames.frame_index,
+                           frames.width AS frame_width, frames.height AS frame_height
                     FROM {self.schema}.detections_refined refined
                     JOIN {self.schema}.frames frames ON frames.id = refined.frame_id
                     JOIN {self.schema}.raw_assets assets ON assets.id = frames.asset_id
                     WHERE {' AND '.join(clauses)}
                     ORDER BY frames.frame_index ASC, refined.roi_index ASC, refined.id ASC
                 """, tuple(params))
-                return [self._hydrate_detection_row(row) for row in cursor.fetchall()]
+                # Continuity operates on persisted foreground geometry and
+                # refinement metadata.  Do not hydrate ROI or mask payloads
+                # while this read holds a database connection.
+                return cursor.fetchall()
 
     def record_roi_continuity(
         self, *, project_id: str, asset_id: str, run_id: str | None, job_id: str | None,
@@ -4139,17 +4154,30 @@ class PostgresRepository:
                         continuity_run["id"], assembly["assembly_id"], json.dumps(json_ready(assembly))))
                     assembly_ids[str(assembly["assembly_id"])] = str(cursor.fetchone()["id"])
                 pair_assemblies = {
-                    pair: assembly["assembly_id"] for assembly in assemblies
+                    tuple(str(segment_id) for segment_id in pair): assembly["assembly_id"]
+                    for assembly in assemblies
                     for pair in assembly.get("link_pairs", [])
                 }
-                for decision in decisions:
-                    pair = [decision["source_segment_id"], decision["target_segment_id"]]
-                    cursor.execute(f"""INSERT INTO {self.schema}.roi_continuity_links
+                selected_links = [decision for decision in decisions if decision.get("accepted")]
+                if selected_links:
+                    link_rows = []
+                    for decision in selected_links:
+                        pair = (
+                            str(decision["source_segment_id"]),
+                            str(decision["target_segment_id"]),
+                        )
+                        link_rows.append((
+                            continuity_run["id"],
+                            assembly_ids.get(str(pair_assemblies.get(pair))),
+                            *pair,
+                            decision["score"],
+                            True,
+                            None,
+                            "{}",
+                        ))
+                    cursor.executemany(f"""INSERT INTO {self.schema}.roi_continuity_links
                         (continuity_run_id, assembly_id, source_refined_detection_id, target_refined_detection_id,
-                         score, accepted, reason, features) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)""", (
-                        continuity_run["id"], assembly_ids.get(str(pair_assemblies.get(tuple(pair)))),
-                        *pair, decision["score"], decision["accepted"], decision.get("reason"),
-                        json.dumps(json_ready(decision.get("features") or {}))))
+                         score, accepted, reason, features) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)""", link_rows)
             connection.commit()
         return continuity_run
 

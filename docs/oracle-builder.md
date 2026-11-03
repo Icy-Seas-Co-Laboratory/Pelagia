@@ -26,17 +26,43 @@ islands after optimization. `v3_max_graph_pixels` bounds graph memory; crops
 that exceed it fail explicitly so the search limit can be adjusted.
 
 Every refinement method runs a split/merge assessment before publication.
-Configured residual discovery and overlap reconciliation then apply, except
-that all built-in heuristics retain separate candidate identities. After
-publication, Pelagia automatically reassesses cross-frame connections for
-assets declared as line scans; other assets are skipped. The assessment run is
-recorded with the refinement result. Ingestion declares this geometry with
+Configured residual discovery and overlap reconciliation then apply. Merge
+assessment first rejects pairs whose tight foreground bounding boxes do not
+intersect, then computes mask overlap only inside the shared rectangle. Per-ROI
+mask geometry and area are cached for the pass; the audit keeps the selected
+keeper/consumed lineage and its chosen metrics, not losing alternatives. All
+built-in heuristics retain separate candidate identities. Identity promotion
+also derives its foreground bounds from the unchanged mask, rather than trusting
+a potentially padded imported candidate box.
+
+After publication,
+Pelagia automatically reassesses cross-frame connections for assets declared as
+line scans; other assets are skipped. The assessment run is recorded with the
+refinement result. Ingestion declares this geometry with
 `metadata.line_scan_geometry={"scan_axis":"x"}` or `{"scan_axis":"y"}`;
 Pelagia validates and stores that canonical field on the asset and extracted
-frames. Queued refinement retries reuse each refined output by its parent
-candidate and ROI index, preserving distinct split/residual children, and reuse
-the continuity run already written by the same job, including when continuity
-fails after the refined rows commit. Direct refinement reports a
+frames. The `line_scan_continuity_v2` check considers only consecutive frames:
+the source and target foreground boxes must touch their joining frame edges,
+their transverse intervals must overlap, and the existing geometry score then
+selects deterministic one-to-one links that form logical assemblies; pixels are
+never merged. Continuity reads only IDs, metadata, dimensions, and bounding
+boxes for ROIs touching either joining edge; interior ROIs are excluded by the
+database query. It records selected links plus compact run parameters, an input
+fingerprint, and counts. `segment_count` counts these edge ROIs, and the fingerprint
+identifies their geometry and edge metadata, without copying image payloads.
+An eligible run with no links is still recorded; rejected and
+competing alternatives are not persisted. Historical `v1` audits remain
+readable. `boundary_band_pixels` and `max_frame_gap` remain accepted legacy
+fields but cannot relax exact edge contact or adjacency. Explicit continuity
+jobs use the asset's declared scan axis by default and share this persistence
+path, while an explicit request may override the axis. Automatic assessment still
+recomputes the asset's edge connections after each refinement batch.
+
+Queued refinement retries
+reuse each refined output by its parent candidate and ROI index, preserving
+distinct split/residual children, and reuse the continuity run already written
+by the same job, including when continuity fails after the refined rows commit.
+Direct refinement reports a
 continuity-specific error in `connection_assessment` while retaining its
 successfully stored ROI results. That error names the continuity-only retry
 endpoint; it does not ask clients to repeat refinement. A failure to refresh

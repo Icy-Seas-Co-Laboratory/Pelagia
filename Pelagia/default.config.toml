@@ -324,7 +324,9 @@ enabled = true
 require_line_scan_metadata = true
 # Consecutive frames append along this axis; "y" is the usual line-scan layout.
 scan_axis = "y"
-boundary_band_pixels = 32
+# Legacy compatibility fields: continuity requires exact foreground edge contact
+# and consecutive frames regardless of these values.
+boundary_band_pixels = 0
 max_frame_gap = 1
 min_link_score = 0.7
 

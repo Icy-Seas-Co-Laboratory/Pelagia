@@ -2,10 +2,12 @@ import numpy as np
 import pytest
 
 from Pelagia.domain import DetectionRecord
+from Pelagia.processing import detection_refinement
 from Pelagia.processing.detection_refinement import (
     RoiRefinementOptions,
     RoiRefinementPrediction,
     identity_refine_detections,
+    reconcile_overlapping_refinements,
     refine_detection,
     refine_detections,
 )
@@ -182,7 +184,6 @@ def test_identity_refinement_records_split_merge_assessment():
         "refined_component_count": 2,
         "candidate_pixels": 2,
         "refined_pixels": 2,
-        "overlaps": [],
     }
 
 
@@ -211,7 +212,101 @@ def test_generic_backend_records_split_merge_assessment():
     assert assessment["refined_component_count"] == 1
     assert assessment["candidate_pixels"] == 2
     assert assessment["refined_pixels"] == 3
-    assert assessment["overlaps"] == []
+    assert "overlaps" not in assessment
+
+
+def test_identity_refinement_persists_foreground_bounds_instead_of_padded_candidate_bounds():
+    roi = np.full((10, 10), 20, dtype=np.uint8)
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[2:5, 3:6] = 255
+    detection = _detection(
+        "padded", roi=roi, mask=mask, crop_x=90, crop_y=90,
+        bbox_x=90, bbox_y=90, bbox_w=10, bbox_h=10,
+    )
+
+    [result] = identity_refine_detections([detection])
+    stored = result.as_detection_record(encoding="raw", mask_encoding="raw")
+
+    assert (stored.bbox_x, stored.bbox_y, stored.bbox_w, stored.bbox_h) == (93, 92, 3, 3)
+    assert (stored.crop_bbox_x, stored.crop_bbox_y, stored.crop_bbox_w, stored.crop_bbox_h) == (90, 90, 10, 10)
+    assert stored.bbox_x + stored.bbox_w < 100
+    assert stored.bbox_y + stored.bbox_h < 100
+
+
+def test_reconciliation_skips_masks_with_disjoint_foreground_boxes_in_shared_crops(monkeypatch):
+    roi = np.full((10, 10), 20, dtype=np.uint8)
+    left_mask = np.zeros((10, 10), dtype=np.uint8)
+    left_mask[4:6, 1:3] = 255
+    right_mask = np.zeros((10, 10), dtype=np.uint8)
+    right_mask[4:6, 7:9] = 255
+    detections = [
+        _detection("det-left", roi=roi, mask=left_mask, roi_index=1),
+        _detection("det-right", roi=roi, mask=right_mask, roi_index=2),
+    ]
+
+    slice_calls: list[object] = []
+    original_slice = detection_refinement._mask_slice_for_frame_rect
+
+    def record_slice(*args):
+        slice_calls.append(args)
+        return original_slice(*args)
+
+    monkeypatch.setattr(detection_refinement, "_mask_slice_for_frame_rect", record_slice)
+    results = identity_refine_detections(detections)
+
+    assert {result.candidate_detection.id for result in results} == {"det-left", "det-right"}
+    assert all("overlaps" not in result.metadata["split_merge_assessment"] for result in results)
+    assert slice_calls == []
+
+
+def test_reconciliation_reuses_a_previously_consumed_result_when_no_current_keeper_matches():
+    roi = np.full((10, 10), 20, dtype=np.uint8)
+    left_mask = np.zeros((10, 10), dtype=np.uint8)
+    left_mask[4:6, 1:3] = 255
+    right_mask = np.zeros((10, 10), dtype=np.uint8)
+    right_mask[4:6, 7:9] = 255
+    results = identity_refine_detections([
+        _detection("det-left", roi=roi, mask=left_mask, roi_index=1),
+        _detection("det-right", roi=roi, mask=right_mask, roi_index=2),
+    ])
+    stale = results[0]
+    stale.metadata.update({
+        "overlap_reconciliation_action": "consumed",
+        "overlap_reconciliation_consumed_count": 99,
+        "consumed_by_candidate_detection_id": "old-keeper",
+        "consumed_overlap_metrics": {"iou": 1.0},
+    })
+
+    reassessed = reconcile_overlapping_refinements(results)
+
+    assert {result.candidate_detection.id for result in reassessed} == {"det-left", "det-right"}
+    assert stale.metadata["overlap_reconciliation_action"] == "kept"
+    assert stale.metadata["overlap_reconciliation_consumed_count"] == 0
+    assert "consumed_by_candidate_detection_id" not in stale.metadata
+
+
+def test_reconciliation_preserves_previously_applied_keeper_lineage():
+    roi = np.full((10, 10), 20, dtype=np.uint8)
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[1:4, 1:4] = 255
+    kept = identity_refine_detections([
+        _detection("keeper", roi=roi, mask=mask, roi_index=1),
+        _detection("consumed", roi=roi, mask=mask, roi_index=2),
+    ])
+    assert len(kept) == 1
+    lineage = list(kept[0].metadata["overlap_reconciliation_consumed"])
+    other_mask = np.zeros_like(mask)
+    other_mask[7:9, 7:9] = 255
+    other = identity_refine_detections([
+        _detection("other", roi=roi, mask=other_mask, roi_index=3),
+    ])
+
+    reassessed = reconcile_overlapping_refinements(kept + other)
+
+    assert len(reassessed) == 2
+    assert kept[0].metadata["overlap_reconciliation_consumed"] == lineage
+    assert kept[0].metadata["consumed_candidate_detection_ids"] == ["consumed"]
+    assert kept[0].metadata["overlap_reconciliation_consumed_count"] == 1
 
 
 @pytest.mark.parametrize("backend", [HeuristicV2RefinementBackend(), HeuristicV3RefinementBackend()])

@@ -1,5 +1,6 @@
 import pytest
 
+from Pelagia.processing import roi_continuity
 from Pelagia.processing.roi_continuity import (
     FrameLocalRoiSegment,
     LineScanGeometry,
@@ -35,7 +36,7 @@ def _segment(
     )
 
 
-def test_continuity_links_adjacent_boundary_segments_and_retains_audit_evidence():
+def test_continuity_links_adjacent_edge_touching_segments_and_retains_selected_evidence():
     source = _segment("refined-a", 10, y=90, x=40)
     target = _segment("refined-b", 11, y=0, x=43)
 
@@ -57,15 +58,14 @@ def test_continuity_links_adjacent_boundary_segments_and_retains_audit_evidence(
 
 
 @pytest.mark.parametrize("angle", [0.0, 90.0, 180.0])
-def test_continuity_rejects_literal_axis_aligned_edges(angle):
+def test_continuity_omits_axis_aligned_edges_from_selected_links(angle):
     result = assemble_line_scan_continuity(
         [_segment("refined-a", 0, y=90, angle=angle), _segment("refined-b", 1, y=0)],
         geometry=LineScanGeometry(declared=True, scan_axis="y"),
     )
 
     assert result.accepted_links == ()
-    assert result.decisions[0].reason == "axis_aligned_edge"
-    assert result.decisions[0].features["source_axis_aligned"] is True
+    assert result.decisions == ()
 
 
 def test_continuity_only_considers_adjacent_frames():
@@ -78,15 +78,54 @@ def test_continuity_only_considers_adjacent_frames():
     assert result.assemblies == ()
 
 
-def test_continuity_emits_rejected_pair_audit_for_boundary_mismatch():
+@pytest.mark.parametrize("axis", ["x", "y"])
+@pytest.mark.parametrize("near_edge_role", ["source", "target"])
+def test_continuity_requires_exact_frame_edge_contact_not_a_boundary_band(axis, near_edge_role):
+    source_position = 89 if near_edge_role == "source" else 90
+    target_position = 1 if near_edge_role == "target" else 0
+    segments = (
+        [_segment("refined-a", 0, y=source_position), _segment("refined-b", 1, y=target_position)]
+        if axis == "y" else [
+            _segment("refined-a", 0, x=source_position, y=40, width=10),
+            _segment("refined-b", 1, x=target_position, y=40, width=10),
+        ]
+    )
     result = assemble_line_scan_continuity(
-        [_segment("refined-a", 0, y=50), _segment("refined-b", 1, y=0)],
-        geometry=LineScanGeometry(declared=True, scan_axis="y"),
+        segments,
+        geometry=LineScanGeometry(declared=True, scan_axis=axis),
+        options=RoiContinuityOptions(boundary_band_pixels=32),
     )
 
     assert result.accepted_links == ()
-    assert result.decisions[0].reason == "outside_boundary_band"
-    assert result.decisions[0].features["source_boundary_distance"] == 40
+    assert result.decisions == ()
+
+
+def test_continuity_omits_nonoverlapping_transverse_boxes_without_scoring(monkeypatch):
+    def unexpected_score(*_args, **_kwargs):
+        raise AssertionError("Disjoint transverse boxes must not reach scoring")
+
+    monkeypatch.setattr(roi_continuity, "_score_pair", unexpected_score)
+    result = assemble_line_scan_continuity(
+        [_segment("refined-a", 0, y=90, x=0), _segment("refined-b", 1, y=0, x=40)],
+        geometry=LineScanGeometry(declared=True, scan_axis="y"),
+    )
+
+    assert result.decisions == ()
+    assert result.assemblies == ()
+
+
+def test_continuity_links_horizontal_scan_edges():
+    result = assemble_line_scan_continuity(
+        [
+            _segment("refined-a", 0, x=90, y=40, width=10),
+            _segment("refined-b", 1, x=0, y=43, width=10),
+        ],
+        geometry=LineScanGeometry(declared=True, scan_axis="x"),
+    )
+
+    assert [(link.source_segment_id, link.target_segment_id) for link in result.accepted_links] == [
+        ("refined-a", "refined-b")
+    ]
 
 
 def test_continuity_requires_an_explicit_line_scan_declaration():
@@ -94,7 +133,7 @@ def test_continuity_requires_an_explicit_line_scan_declaration():
         LineScanGeometry(declared=False, scan_axis="y")
 
 
-def test_continuity_association_is_one_to_one_and_audits_competing_link():
+def test_continuity_association_is_one_to_one_and_stores_only_selected_link():
     source = _segment("refined-a", 0, y=90, x=40)
     stronger_target = _segment("refined-b", 1, y=0, x=40)
     competing_target = _segment("refined-c", 1, y=0, x=42)
@@ -107,4 +146,20 @@ def test_continuity_association_is_one_to_one_and_audits_competing_link():
     assert [(link.source_segment_id, link.target_segment_id) for link in result.accepted_links] == [
         ("refined-a", "refined-b")
     ]
-    assert any(decision.reason == "competing_association" for decision in result.decisions)
+    assert len(result.decisions) == 1
+
+
+def test_continuity_assembles_a_chain_without_including_isolated_edge_segments():
+    result = assemble_line_scan_continuity(
+        [
+            _segment("refined-a", 0, y=90),
+            _segment("refined-b", 1, y=0, height=100),
+            _segment("refined-d", 2, y=0),
+            _segment("isolated", 2, y=90, x=0),
+        ],
+        geometry=LineScanGeometry(declared=True, scan_axis="y"),
+    )
+
+    assert [assembly.segment_ids for assembly in result.assemblies] == [
+        ("refined-a", "refined-b", "refined-d")
+    ]

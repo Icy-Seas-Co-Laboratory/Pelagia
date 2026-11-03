@@ -657,12 +657,9 @@ def identity_refine_detections(
                 candidate_mask=candidate_mask,
                 refined_mask=candidate_mask,
                 crop_bbox=crop_bbox,
-                bbox=(
-                    detection.bbox_x,
-                    detection.bbox_y,
-                    detection.bbox_w,
-                    detection.bbox_h,
-                ),
+                # Imported candidate extents may describe a padded crop.
+                # Persist foreground bounds so continuity can trust edge contact.
+                bbox=_mask_bbox_in_frame(candidate_mask, crop_bbox),
                 method="identity",
                 metadata={
                     "candidate_mask_kind": "candidate",
@@ -990,10 +987,20 @@ def refine_detections(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _RefinedMaskGeometry:
+    """Cached foreground geometry used by one split/merge assessment pass."""
+
+    mask: np.ndarray
+    crop_rect: tuple[int, int, int, int]
+    foreground_rect: tuple[int, int, int, int] | None
+    area: int
+
+
 def assess_split_merge_refinements(
     results: Iterable[DetectionRefinementResult],
 ) -> None:
-    """Record component and overlap evidence before optional reconciliation."""
+    """Record per-ROI component evidence before optional reconciliation."""
     resolved = list(results)
     for result in resolved:
         candidate = as_binary_mask(result.candidate_mask)
@@ -1005,16 +1012,7 @@ def assess_split_merge_refinements(
             "refined_component_count": refined_components,
             "candidate_pixels": int(np.count_nonzero(candidate)),
             "refined_pixels": int(np.count_nonzero(refined)),
-            "overlaps": [],
         }
-    for index, left in enumerate(resolved):
-        for right in resolved[index + 1:]:
-            if left.candidate_detection.frame_id != right.candidate_detection.frame_id:
-                continue
-            metrics = _refined_overlap_metrics(left, right)
-            if metrics["intersection_area"]:
-                left.metadata["split_merge_assessment"]["overlaps"].append(metrics)
-                right.metadata["split_merge_assessment"]["overlaps"].append(metrics)
 
 
 def discover_residual_refinements(
@@ -1131,20 +1129,32 @@ def reconcile_overlapping_refinements(
     if len(resolved_results) <= 1:
         for result in resolved_results:
             result.metadata["overlap_reconciliation_enabled"] = True
-            result.metadata.setdefault("overlap_reconciliation_action", "kept")
-            result.metadata.setdefault("overlap_reconciliation_consumed_count", 0)
+            _mark_refinement_kept(result)
         return resolved_results
 
+    geometry_by_result = {
+        id(result): _refined_mask_geometry(result)
+        for result in resolved_results
+    }
+    kept_by_frame: dict[str, list[DetectionRefinementResult]] = {}
     kept: list[DetectionRefinementResult] = []
     # Larger, stronger refinements claim overlaps before smaller fragments are considered.
-    sorted_results = sorted(resolved_results, key=_reconciliation_sort_key)
+    sorted_results = sorted(
+        resolved_results,
+        key=lambda result: _reconciliation_sort_key(result, geometry_by_result[id(result)].area),
+    )
     for current in sorted_results:
         consumed_by: DetectionRefinementResult | None = None
         consumed_metrics: dict[str, Any] | None = None
-        for keeper in kept:
-            if current.candidate_detection.frame_id != keeper.candidate_detection.frame_id:
-                continue
-            metrics = _refined_overlap_metrics(current, keeper)
+        current_geometry = geometry_by_result[id(current)]
+        frame_id = str(current.candidate_detection.frame_id)
+        for keeper in kept_by_frame.get(frame_id, []):
+            metrics = _refined_overlap_metrics(
+                current,
+                keeper,
+                current_geometry,
+                geometry_by_result[id(keeper)],
+            )
             if _substantial_refined_overlap(metrics, resolved_options):
                 consumed_by = keeper
                 consumed_metrics = metrics
@@ -1152,8 +1162,8 @@ def reconcile_overlapping_refinements(
 
         current.metadata["overlap_reconciliation_enabled"] = True
         if consumed_by is None:
-            current.metadata.setdefault("overlap_reconciliation_action", "kept")
-            current.metadata.setdefault("overlap_reconciliation_consumed_count", 0)
+            _mark_refinement_kept(current)
+            kept_by_frame.setdefault(frame_id, []).append(current)
             kept.append(current)
             continue
 
@@ -1399,6 +1409,18 @@ def _record_consumed_refinement(
     )
 
 
+def _mark_refinement_kept(result: DetectionRefinementResult) -> None:
+    """Clear a prior in-memory consumption decision before retaining this result."""
+    result.metadata["overlap_reconciliation_action"] = "kept"
+    # A keeper may already represent consumed inputs omitted from this pass.
+    # Preserve that applied lineage even when reassessing it with new peers.
+    result.metadata["overlap_reconciliation_consumed_count"] = len(
+        result.metadata.get("overlap_reconciliation_consumed") or []
+    )
+    result.metadata.pop("consumed_by_candidate_detection_id", None)
+    result.metadata.pop("consumed_overlap_metrics", None)
+
+
 def _substantial_refined_overlap(
     metrics: dict[str, Any],
     options: RoiRefinementOptions,
@@ -1415,16 +1437,17 @@ def _substantial_refined_overlap(
 def _refined_overlap_metrics(
     a: DetectionRefinementResult,
     b: DetectionRefinementResult,
+    a_geometry: _RefinedMaskGeometry,
+    b_geometry: _RefinedMaskGeometry,
 ) -> dict[str, Any]:
-    a_mask = as_binary_mask(a.refined_mask)
-    b_mask = as_binary_mask(b.refined_mask)
-    a_area = int(np.count_nonzero(a_mask))
-    b_area = int(np.count_nonzero(b_mask))
-    rect = _intersection_rect(
-        _result_mask_frame_rect(a),
-        _result_mask_frame_rect(b),
+    a_area = a_geometry.area
+    b_area = b_geometry.area
+    rect = (
+        None
+        if a_geometry.foreground_rect is None or b_geometry.foreground_rect is None
+        else _intersection_rect(a_geometry.foreground_rect, b_geometry.foreground_rect)
     )
-    if rect is None or a_area == 0 or b_area == 0:
+    if rect is None:
         return {
             "a_candidate_detection_id": _detection_identifier(a.candidate_detection),
             "b_candidate_detection_id": _detection_identifier(b.candidate_detection),
@@ -1436,8 +1459,8 @@ def _refined_overlap_metrics(
             "a_containment": 0.0,
             "b_containment": 0.0,
         }
-    a_slice = _mask_slice_for_frame_rect(a_mask, _result_mask_frame_rect(a), rect)
-    b_slice = _mask_slice_for_frame_rect(b_mask, _result_mask_frame_rect(b), rect)
+    a_slice = _mask_slice_for_frame_rect(a_geometry.mask, a_geometry.crop_rect, rect)
+    b_slice = _mask_slice_for_frame_rect(b_geometry.mask, b_geometry.crop_rect, rect)
     intersection_area = int(np.count_nonzero((a_slice > 0) & (b_slice > 0)))
     union_area = int(a_area + b_area - intersection_area)
     return {
@@ -1453,10 +1476,16 @@ def _refined_overlap_metrics(
     }
 
 
-def _result_mask_frame_rect(result: DetectionRefinementResult) -> tuple[int, int, int, int]:
-    crop_x, crop_y, _, _ = result.crop_bbox or _detection_crop_bbox(result.candidate_detection)
+def _refined_mask_geometry(result: DetectionRefinementResult) -> _RefinedMaskGeometry:
     mask = as_binary_mask(result.refined_mask)
-    return (int(crop_x), int(crop_y), int(mask.shape[1]), int(mask.shape[0]))
+    crop_x, crop_y, _, _ = result.crop_bbox or _detection_crop_bbox(result.candidate_detection)
+    crop_rect = (int(crop_x), int(crop_y), int(mask.shape[1]), int(mask.shape[0]))
+    area = int(np.count_nonzero(mask))
+    if area == 0:
+        return _RefinedMaskGeometry(mask, crop_rect, None, area)
+    x, y, width, height = cv2.boundingRect(mask)
+    foreground_rect = (int(crop_x + x), int(crop_y + y), int(width), int(height))
+    return _RefinedMaskGeometry(mask, crop_rect, foreground_rect, area)
 
 
 def _intersection_rect(
@@ -1486,8 +1515,7 @@ def _mask_slice_for_frame_rect(
     return mask[local_y:local_y + height, local_x:local_x + width]
 
 
-def _reconciliation_sort_key(result: DetectionRefinementResult) -> tuple[int, int, int, str]:
-    refined_area = _refined_mask_area(result)
+def _reconciliation_sort_key(result: DetectionRefinementResult, refined_area: int) -> tuple[int, int, int, str]:
     candidate_area = int(result.candidate_detection.area or 0)
     return (
         -refined_area,

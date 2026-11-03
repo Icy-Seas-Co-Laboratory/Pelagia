@@ -92,7 +92,9 @@ class FrameLocalRoiSegment:
 class RoiContinuityOptions:
     """Deterministic association limits for adjacent line-scan frames."""
 
-    boundary_band_pixels: int = 32
+    # Retained in the persisted option shape for compatibility.  Associations
+    # require exact frame-edge contact regardless of this legacy setting.
+    boundary_band_pixels: int = 0
     min_boundary_overlap: float = 0.25
     max_center_displacement_pixels: float = 64.0
     min_link_score: float = 0.7
@@ -152,12 +154,13 @@ def assemble_line_scan_continuity(
     geometry: LineScanGeometry,
     options: RoiContinuityOptions | None = None,
 ) -> RoiContinuityResult:
-    """Link compatible refined ROI segments in adjacent frames only.
+    """Link edge-touching refined ROI segments in adjacent frames.
 
-    Associations are one-to-one for each pair of frames.  Links are selected in
-    a stable score order, then assembled transitively into logical parents.
-    Every considered adjacent-frame pair is emitted as a decision, including
-    orientation, boundary, score, and competing-link rejections.
+    Associations are one-to-one for each pair of frames.  Only foreground
+    bounding boxes that touch their respective frame boundary and overlap on
+    the transverse axis are considered.  The result records selected links,
+    rather than every rejected candidate, then assembles them transitively
+    into logical parents.
     """
     resolved = options or RoiContinuityOptions()
     _validate_segments(segments)
@@ -170,49 +173,82 @@ def assemble_line_scan_continuity(
         for segment in asset_segments:
             by_index.setdefault(segment.frame_index, []).append(segment)
         for frame_index in sorted(by_index):
-            sources = by_index[frame_index]
-            targets = by_index.get(frame_index + 1, [])
-            candidates = [
-                _score_pair(source, target, geometry=geometry, options=resolved)
-                for source in sources for target in targets
+            sources = [
+                (segment, _segment_features(segment, geometry=geometry, options=resolved))
+                for segment in by_index[frame_index]
+                if _touches_positive_boundary(segment, geometry.scan_axis)
             ]
-            viable = [item for item in candidates if item.accepted]
+            targets = [
+                (segment, _segment_features(segment, geometry=geometry, options=resolved))
+                for segment in by_index.get(frame_index + 1, [])
+                if _touches_zero_boundary(segment, geometry.scan_axis)
+            ]
+            viable: list[RoiContinuityDecision] = []
+            for source, source_features in sources:
+                source_interval = _transverse_interval(source, geometry.scan_axis)
+                for target, target_features in targets:
+                    target_interval = _transverse_interval(target, geometry.scan_axis)
+                    if not _intervals_overlap(source_interval, target_interval):
+                        continue
+                    candidate = _score_pair(
+                        source, target, source_features=source_features,
+                        target_features=target_features, geometry=geometry, options=resolved,
+                    )
+                    if candidate is not None:
+                        viable.append(candidate)
             used_sources: set[str] = set()
             used_targets: set[str] = set()
             for candidate in sorted(viable, key=lambda item: (-item.score, item.source_segment_id, item.target_segment_id)):
                 if candidate.source_segment_id in used_sources or candidate.target_segment_id in used_targets:
-                    decisions.append(_replace_reason(candidate, "competing_association"))
                     continue
                 used_sources.add(candidate.source_segment_id)
                 used_targets.add(candidate.target_segment_id)
                 decisions.append(candidate)
                 accepted_pairs.append((candidate.source_segment_id, candidate.target_segment_id))
-            decisions.extend(item for item in candidates if not item.accepted)
     decisions.sort(key=lambda item: (item.source_frame_index, item.target_frame_index, item.source_segment_id, item.target_segment_id))
     assemblies = _assemble_components(ordered, accepted_pairs)
     return RoiContinuityResult(decisions=tuple(decisions), assemblies=tuple(assemblies))
 
 
-def _score_pair(source: FrameLocalRoiSegment, target: FrameLocalRoiSegment, *, geometry: LineScanGeometry, options: RoiContinuityOptions) -> RoiContinuityDecision:
+def _segment_features(
+    segment: FrameLocalRoiSegment,
+    *,
+    geometry: LineScanGeometry,
+    options: RoiContinuityOptions,
+) -> dict[str, float | bool | None]:
+    return {
+        "edge_angle_degrees": segment.edge_angle_degrees,
+        "axis_aligned": _is_axis_aligned(segment.edge_angle_degrees, options.axis_alignment_tolerance_degrees),
+        "edge_strength": segment.edge_strength,
+    }
+
+
+def _score_pair(
+    source: FrameLocalRoiSegment,
+    target: FrameLocalRoiSegment,
+    *,
+    source_features: dict[str, float | bool | None],
+    target_features: dict[str, float | bool | None],
+    geometry: LineScanGeometry,
+    options: RoiContinuityOptions,
+) -> RoiContinuityDecision | None:
     features: dict[str, float | bool | None] = {
         "source_boundary_distance": _positive_boundary_distance(source, geometry.scan_axis),
         "target_boundary_distance": _zero_boundary_distance(target, geometry.scan_axis),
-        "source_edge_angle_degrees": source.edge_angle_degrees,
-        "target_edge_angle_degrees": target.edge_angle_degrees,
-        "source_axis_aligned": _is_axis_aligned(source.edge_angle_degrees, options.axis_alignment_tolerance_degrees),
-        "target_axis_aligned": _is_axis_aligned(target.edge_angle_degrees, options.axis_alignment_tolerance_degrees),
-        "source_edge_strength": source.edge_strength,
-        "target_edge_strength": target.edge_strength,
+        "source_edge_angle_degrees": source_features["edge_angle_degrees"],
+        "target_edge_angle_degrees": target_features["edge_angle_degrees"],
+        "source_axis_aligned": source_features["axis_aligned"],
+        "target_axis_aligned": target_features["axis_aligned"],
+        "source_edge_strength": source_features["edge_strength"],
+        "target_edge_strength": target_features["edge_strength"],
     }
     if bool(features["source_axis_aligned"]) or bool(features["target_axis_aligned"]):
-        return _decision(source, target, 0.0, False, "axis_aligned_edge", features)
+        return None
     if options.min_edge_strength is not None and any(
         value is not None and float(value) < options.min_edge_strength
         for value in (source.edge_strength, target.edge_strength)
     ):
-        return _decision(source, target, 0.0, False, "weak_edge", features)
-    if float(features["source_boundary_distance"]) > options.boundary_band_pixels or float(features["target_boundary_distance"]) > options.boundary_band_pixels:
-        return _decision(source, target, 0.0, False, "outside_boundary_band", features)
+        return None
     source_interval = _transverse_interval(source, geometry.scan_axis)
     target_interval = _transverse_interval(target, geometry.scan_axis)
     overlap = _interval_overlap_ratio(source_interval, target_interval)
@@ -221,9 +257,9 @@ def _score_pair(source: FrameLocalRoiSegment, target: FrameLocalRoiSegment, *, g
     score = (0.75 * overlap) + (0.25 * positional)
     features.update({"transverse_overlap": overlap, "center_displacement": displacement, "positional_score": positional})
     if overlap < options.min_boundary_overlap:
-        return _decision(source, target, score, False, "insufficient_boundary_overlap", features)
+        return None
     if score < options.min_link_score:
-        return _decision(source, target, score, False, "below_link_score", features)
+        return None
     return _decision(source, target, score, True, None, features)
 
 
@@ -231,16 +267,15 @@ def _decision(source: FrameLocalRoiSegment, target: FrameLocalRoiSegment, score:
     return RoiContinuityDecision(source.segment_id, target.segment_id, source.frame_index, target.frame_index, round(score, 8), accepted, reason, features)
 
 
-def _replace_reason(decision: RoiContinuityDecision, reason: str) -> RoiContinuityDecision:
-    return RoiContinuityDecision(decision.source_segment_id, decision.target_segment_id, decision.source_frame_index, decision.target_frame_index, decision.score, False, reason, decision.features)
-
-
 def _assemble_components(segments: list[FrameLocalRoiSegment], links: list[tuple[str, str]]) -> list[RoiContinuityAssembly]:
     by_id = {segment.segment_id: segment for segment in segments}
     neighbours = {segment_id: set() for segment_id in by_id}
+    pairs_by_segment: dict[str, set[tuple[str, str]]] = {segment_id: set() for segment_id in by_id}
     for source, target in links:
         neighbours[source].add(target)
         neighbours[target].add(source)
+        pairs_by_segment[source].add((source, target))
+        pairs_by_segment[target].add((source, target))
     result: list[RoiContinuityAssembly] = []
     seen: set[str] = set()
     for segment_id in sorted(neighbours):
@@ -257,7 +292,7 @@ def _assemble_components(segments: list[FrameLocalRoiSegment], links: list[tuple
         seen.update(component)
         segment_ids = tuple(sorted(component, key=lambda item: (by_id[item].frame_index, item)))
         asset_id = by_id[segment_ids[0]].asset_id
-        pairs = tuple(sorted((pair for pair in links if pair[0] in component and pair[1] in component)))
+        pairs = tuple(sorted({pair for segment_id in component for pair in pairs_by_segment[segment_id]}))
         digest = sha256("|".join(segment_ids).encode("utf-8")).hexdigest()[:20]
         result.append(RoiContinuityAssembly(f"line-scan:{asset_id}:{digest}", asset_id, segment_ids, pairs))
     return result
@@ -290,6 +325,14 @@ def _zero_boundary_distance(segment: FrameLocalRoiSegment, axis: ScanAxis) -> fl
     return float(segment.bbox_y if axis == "y" else segment.bbox_x)
 
 
+def _touches_positive_boundary(segment: FrameLocalRoiSegment, axis: ScanAxis) -> bool:
+    return _positive_boundary_distance(segment, axis) == 0.0
+
+
+def _touches_zero_boundary(segment: FrameLocalRoiSegment, axis: ScanAxis) -> bool:
+    return _zero_boundary_distance(segment, axis) == 0.0
+
+
 def _transverse_interval(segment: FrameLocalRoiSegment, axis: ScanAxis) -> tuple[float, float]:
     return (float(segment.bbox_x), float(segment.bbox_x + segment.bbox_w)) if axis == "y" else (float(segment.bbox_y), float(segment.bbox_y + segment.bbox_h))
 
@@ -297,6 +340,10 @@ def _transverse_interval(segment: FrameLocalRoiSegment, axis: ScanAxis) -> tuple
 def _interval_overlap_ratio(left: tuple[float, float], right: tuple[float, float]) -> float:
     overlap = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
     return overlap / min(left[1] - left[0], right[1] - right[0])
+
+
+def _intervals_overlap(left: tuple[float, float], right: tuple[float, float]) -> bool:
+    return min(left[1], right[1]) > max(left[0], right[0])
 
 
 def _interval_center(interval: tuple[float, float]) -> float:

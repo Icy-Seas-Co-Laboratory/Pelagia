@@ -46,14 +46,13 @@ from ..processing.heuristic_refinement_v3 import (
 from ..processing.oracle_client import OracleInferenceClient, OracleInferenceItem, OracleRoiRefinementBackend
 from ..processing.oracle_evidence import json_image_output, normalize_image_output, IMAGE_OUTPUT_VERSION
 from ..processing.roi_continuity import (
-    FrameLocalRoiSegment, LineScanGeometry, RoiContinuityOptions,
-    assemble_line_scan_continuity,
+    LineScanGeometry, RoiContinuityOptions,
 )
 from ..processing.segmentation_options import resolve_segmentation_options, segment_frame_kwargs
 from ..processing.timing import collect_result_timings, measure_phase
 from ..services.context import AppContext
 from ..services.project_settings import resolve_project_storage_settings, validate_allowed_storage_encodings
-from ..services.roi_connection_assessment import assess_refined_roi_connections
+from ..services.roi_connection_assessment import assess_asset_roi_connections, assess_refined_roi_connections
 from ..services.job_commands import (
     ExtractFramesCommand,
     ClassificationCommand,
@@ -1334,34 +1333,30 @@ def roi_continuity_handler(job: dict[str, Any], context: AppContext) -> dict[str
     declared = bool(metadata.get("line_scan") or metadata.get("line_scan_geometry"))
     if defaults.require_line_scan_metadata and not declared:
         raise ValueError("ROI continuity requires asset metadata declaring line_scan geometry.")
-    geometry = LineScanGeometry(declared=declared or not defaults.require_line_scan_metadata,
-                                scan_axis=str(payload.get("scan_axis", defaults.scan_axis)))
+    geometry_metadata = metadata.get("line_scan_geometry") or metadata.get("line_scan")
+    asset_axis = (
+        geometry_metadata.get("scan_axis", geometry_metadata.get("axis", defaults.scan_axis))
+        if isinstance(geometry_metadata, dict)
+        else defaults.scan_axis
+    )
+    geometry = LineScanGeometry(
+        declared=declared or not defaults.require_line_scan_metadata,
+        scan_axis=str(payload.get("scan_axis", asset_axis)),
+    )
     options = RoiContinuityOptions(
-        boundary_band_pixels=int(payload.get("boundary_band_pixels", defaults.boundary_band_pixels)),
         min_link_score=float(payload.get("min_link_score", defaults.min_link_score)),
     )
-    rows = context.repository.list_refined_detections_for_continuity(asset_id, project_id=project_id)
-    segments = [FrameLocalRoiSegment(
-        segment_id=str(row["id"]), frame_id=str(row["frame_id"]), asset_id=str(row["asset_id"]),
-        frame_index=int(row["frame_index"]), frame_width=int(row["frame_width"]), frame_height=int(row["frame_height"]),
-        bbox_x=int(row["bbox_x"]), bbox_y=int(row["bbox_y"]), bbox_w=int(row["bbox_w"]), bbox_h=int(row["bbox_h"]),
-        edge_angle_degrees=(row.get("metadata") or {}).get("dominant_edge_angle_degrees"),
-        edge_strength=(row.get("metadata") or {}).get("edge_strength"), metadata=dict(row.get("metadata") or {}),
-    ) for row in rows]
-    result = assemble_line_scan_continuity(segments, geometry=geometry, options=options)
-    assemblies = [{"assembly_id": item.assembly_id, "segment_ids": list(item.segment_ids),
-                   "link_pairs": [list(pair) for pair in item.link_pairs]} for item in result.assemblies]
-    decisions = [{"source_segment_id": item.source_segment_id, "target_segment_id": item.target_segment_id,
-                  "score": item.score, "accepted": item.accepted, "reason": item.reason,
-                  "features": item.features} for item in result.decisions]
-    stored = context.repository.record_roi_continuity(
-        project_id=project_id, asset_id=asset_id, run_id=job.get("run_id"), job_id=job.get("id"),
-        method="line_scan_continuity_v1", parameters={"scan_axis": geometry.scan_axis, **payload},
-        assemblies=assemblies, decisions=decisions, metadata={"line_scan_declared": declared},
+    assessed = assess_asset_roi_connections(
+        repository=context.repository,
+        project_id=project_id,
+        asset_id=asset_id,
+        geometry=geometry,
+        options=options,
+        line_scan_declared=declared,
+        run_id=job.get("run_id"),
+        job_id=job.get("id"),
     )
-    return {"stage": PipelineStage.ROI_CONTINUITY.value, "project_id": project_id, "asset_id": asset_id,
-            "continuity_run_id": stored.get("id"), "segment_count": len(segments),
-            "accepted_link_count": len(result.accepted_links), "assembly_count": len(result.assemblies)}
+    return {"stage": PipelineStage.ROI_CONTINUITY.value, "project_id": project_id, **assessed}
 
 
 def _classification_target_snapshot(repository, *, project_id: str, command: ClassificationCommand) -> list[str]:
