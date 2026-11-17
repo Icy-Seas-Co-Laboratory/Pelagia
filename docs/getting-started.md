@@ -24,6 +24,24 @@ the source file is not modified. Registry edits are recorded in PostgreSQL and
 can be exported as a new child SQLite revision, explicitly written back to the
 current source (with a backup and hash guard), or purged from PostgreSQL. The
 portable schema remains owned by the existing `oracle_data_contracts` package.
+
+Use **Import SQLite** in an open Registry workspace to add ROIs from another
+Oracle Dataset SQLite database of the same dataset type. Upload a local file
+(up to 2 GiB), or browse the server's configured import roots for larger files.
+Inspect the source before importing to review new ROIs, duplicates, annotations,
+and model evidence. Labels, descriptors, and model evidence are retained by
+default. Imports preserve source history and record their provenance; failures
+roll back the PostgreSQL transaction. The source SQLite file is left unchanged.
+Use **Download SQLite** to download a validated snapshot of the active workspace
+including its current edits, evidence, and history, without choosing a server
+destination or changing the workspace's source file. Server-side export remains
+available for saving a child revision to a chosen path.
+Uploaded files are scoped to their project and owner. API clients must start
+Registry load/export jobs through `/registry/dataset/open` and
+`/registry/dataset/export`, and generation through `/curation/registry-datasets`;
+the generic `/jobs` endpoint rejects these stages to preserve path and ownership
+validation.
+
 In the Registry gallery, open an ROI with its magnifying-glass button to inspect
 the full-resolution image, pixel scale, and measurements. Edit mode lets you
 adjust the object bounding box inside the stored crop. For mask-refinement

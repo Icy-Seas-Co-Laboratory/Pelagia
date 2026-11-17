@@ -217,36 +217,58 @@ print(result.acquisition_segments, result.frames, result.dataset.frame_count)
 
 ### Use the interactive creator
 
-Run the guided workflow without remembering the flags:
+Open the full-screen creator with a folder and file browser:
 
 ```bash
-pii create --interactive
+pii create --tui
 ```
 
-The prompts collect:
+Use **Up/Down** to select a setting and **Enter** to edit it. On a path field,
+Enter opens a browser starting at the current directory or the supplied path.
+Open directories with **Enter**, go to their parent with **Left**, and press
+**s** to select the current folder. Metadata and library fields select files
+with Enter. Hidden folders and mounted volumes are included. Press **/** to
+jump to a typed path if preferred; typing a path is optional.
 
-- input video directory;
-- output dataset directory;
-- title and initial description;
-- camera/stream name;
-- target shard size;
-- recursive discovery choice;
-- color or grayscale output;
-- whether each source video should force a new shard (default: no);
-- whether to generate previews, plus count per video and maximum width (default: yes, 1, 512 px);
-- whether preview failure should fail creation (default: no);
-- optional existing `metadata.toml` path;
-- confirmation after displaying the discovered videos.
+For the output, select its parent folder and enter a new dataset name. If the
+output is left blank, creation uses a sibling of the source named
+`<source>_interchange`. To resume, enable **Resume incomplete dataset** and
+browse to the existing dataset itself. Use the original scratch directory when
+resuming a build that used custom scratch.
 
-Options can be supplied before entering interactive mode to become prompt defaults:
+The form includes title, description, stream, recursive discovery, JPEG quality
+and subsampling, grayscale, worker and queue settings, shard size, hashing,
+previews, scratch storage, metadata, and tool locations. **Space/Enter** toggles
+booleans. **Backspace** clears optional paths and worker/queue settings. Text
+editors support **Ctrl+U** to clear and **Esc** to discard an edit.
+
+Press **F5** to validate settings and review the configuration, discovered videos,
+and total source bytes. Use Up/Down to scroll the review, Esc to return to the
+form, and Enter to start. Validation reads the source listing and metadata; it
+does not decode videos or estimate output size. Creation displays the existing
+ingestion progress messages in the terminal. External FFmpeg, FFprobe, and
+libjpeg-turbo checks still run in the importer. **Ctrl+C** interrupts using the
+importer's existing recovery behavior; incomplete data can be resumed.
+
+The creator rejects overlapping source/output directories and populated output
+directories unless resuming an incomplete dataset. Esc from the settings form
+cancels before writing any dataset files (exit status 130).
+
+Existing flags populate the form:
 
 ```bash
 pii create deployment_042 \
   --from-videos /acquisition/deployment_042 \
   --stream port \
   --shard-target-size 10GB \
-  --interactive
+  --tui
 ```
+
+`pii create --interactive` also opens the full-screen creator when standard input
+and output are terminals with a usable `TERM`. Otherwise it uses the original
+plain prompts. Explicit `--tui` requires a terminal with Python curses support;
+no additional Python dependency is installed. A terminal of at least 50 columns
+and 10 rows is recommended.
 
 ### Resulting package
 

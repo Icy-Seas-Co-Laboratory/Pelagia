@@ -4,18 +4,25 @@ import sqlite3
 import shutil
 import base64
 import binascii
+import hashlib
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 try:
     from fastapi import APIRouter, HTTPException, Query, Request, Response
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
 
 if APIRouter is not None:
+    from oracle_data_contracts.datasets import DatasetSchemaError
+
     from ..auth import require_project_read, require_project_write
     from ...services.registry_transfer import RegistryTransferError
     from ...services.registry_workspace import RegistryWorkspaceService
@@ -35,6 +42,15 @@ if APIRouter is not None:
     class ExportDatasetRequest(BaseModel):
         path: str
         replace_source: bool = False
+
+    class ImportDatasetRequest(BaseModel):
+        path: str
+        workspace_id: str | None = None
+        expected_source_sha256: str | None = None
+        include_labels: bool = True
+        include_evidence: bool = True
+        duplicate_policy: Literal["skip", "merge"] = "skip"
+        duplicate_actions: dict[str, Literal["skip", "merge"]] = Field(default_factory=dict)
 
     class LabelCreate(BaseModel):
         name: str = Field(min_length=1, max_length=160)
@@ -103,11 +119,20 @@ if APIRouter is not None:
         roots = [browser.root_path_import_dir, *browser.allowed_root_paths]
         return list(dict.fromkeys(Path(value).expanduser().resolve() for value in roots))
 
+    def upload_paths(request: Request) -> tuple[Path, Path]:
+        auth = require_project_read(request)
+        root = (allowed_roots(request)[0] / "registry-uploads").resolve()
+        scope = hashlib.sha256(f"{auth.project_id}\x00{auth.username}".encode()).hexdigest()
+        return root, root / scope
+
     def resolve_path(request: Request, value: str, *, must_exist: bool = False) -> Path:
         path = Path(value).expanduser().resolve()
         roots = allowed_roots(request)
         if roots and not any(path == root or path.is_relative_to(root) for root in roots):
             raise HTTPException(403, "Path is outside the configured Registry roots")
+        upload_root, own_uploads = upload_paths(request)
+        if path.is_relative_to(upload_root) and path != upload_root and not path.is_relative_to(own_uploads):
+            raise HTTPException(403, "Uploaded datasets belong to another Registry user or project")
         if must_exist and not path.is_file():
             raise HTTPException(404, "SQLite dataset was not found")
         return path
@@ -122,11 +147,16 @@ if APIRouter is not None:
 
     @router.get("/files")
     def files(request: Request, path: str | None = None):
+        require_project_read(request)
         roots = allowed_roots(request)
         current = resolve_path(request, path, must_exist=False) if path else (roots[0] if roots else Path.cwd())
         if not current.is_dir(): raise HTTPException(400, "Path is not a directory")
         entries = []
+        upload_root, own_uploads = upload_paths(request)
         for entry in sorted(current.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
+            resolved = entry.resolve()
+            if resolved.is_relative_to(upload_root) and resolved != upload_root and not resolved.is_relative_to(own_uploads):
+                continue
             if not entry.is_dir() and entry.suffix.lower() not in {".sqlite", ".sqlite3", ".db"}: continue
             stat = entry.stat()
             entries.append({"name": entry.name, "path": str(entry), "is_directory": entry.is_dir(),
@@ -135,6 +165,50 @@ if APIRouter is not None:
         parent = current.parent if current.parent != current and (not roots or any(current.parent == root or current.parent.is_relative_to(root) for root in roots)) else None
         return {"current_path": str(current), "parent_path": str(parent) if parent else None,
                 "root_path": str(roots[0]) if roots else str(current), "roots": [str(root) for root in roots], "entries": entries}
+
+    @router.post("/dataset/upload", status_code=201)
+    async def upload_dataset(request: Request, filename: str = Query("dataset.sqlite")):
+        require_project_write(request)
+        if Path(filename).suffix.lower() not in {".sqlite", ".sqlite3", ".db"}:
+            raise HTTPException(422, "Upload a .sqlite, .sqlite3, or .db dataset")
+        _, directory = upload_paths(request)
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = resolve_path(request, str(directory / f"{uuid.uuid4().hex}.sqlite"))
+        size = 0
+        try:
+            with destination.open("xb") as output:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > 2 * 1024**3:
+                        raise HTTPException(413, "SQLite uploads are limited to 2 GiB; use server browsing for larger files")
+                    output.write(chunk)
+            with destination.open("rb") as source:
+                if source.read(16) != b"SQLite format 3\x00":
+                    raise HTTPException(400, "The uploaded file is not a SQLite database")
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        return {"path": str(destination), "size_bytes": size}
+
+    @router.get("/dataset/download")
+    def download_dataset(request: Request):
+        from ...services.registry_download import snapshot_sqlite_workspace
+
+        auth = require_project_read(request)
+        temporary = tempfile.NamedTemporaryFile(prefix="pelagia-download-", suffix=".sqlite", delete=False)
+        destination = Path(temporary.name)
+        temporary.close()
+        try:
+            snapshot_sqlite_workspace(get_repository(request), destination,
+                                      project_id=str(auth.project_id), owner_username=auth.username)
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            if isinstance(exc, RegistryTransferError):
+                raise translated_error(exc) from exc
+            raise
+        return FileResponse(destination, media_type="application/vnd.sqlite3", filename="pelagia-registry.sqlite",
+                            headers={"Cache-Control": "no-store"},
+                            background=BackgroundTask(destination.unlink, missing_ok=True))
 
     @router.post("/dataset/open", status_code=202)
     def open_dataset(request: Request, body: OpenDatasetRequest):
@@ -357,19 +431,28 @@ if APIRouter is not None:
         except RegistryTransferError as exc: raise translated_error(exc) from exc
 
     @router.post("/import/preview")
-    def import_preview(request: Request, body: dict[str, Any]):
-        source = resolve_path(request, str(body.get("path", "")), must_exist=True)
-        with sqlite3.connect(source) as connection:
-            connection.row_factory = sqlite3.Row
-            dataset = connection.execute("SELECT * FROM dataset WHERE singleton=1").fetchone()
-            count = connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0]
-        return {"source": {"path": str(source), "dataset_id": dataset["dataset_id"], "name": dataset["name"],
-          "dataset_type": dataset["dataset_type"], "lifecycle": dataset["lifecycle"], "schema_version": "unknown", "size_bytes": source.stat().st_size},
-          "total_items": count, "new_items": count, "duplicate_count": 0, "duplicates": [],
-          "labels": {"available": True, "annotation_count": 0}, "descriptors": {"available": True, "annotation_count": 0},
-          "evidence": {"available": True, "registry_count": 0, "legacy_count": 0}}
+    def import_preview(request: Request, body: ImportDatasetRequest):
+        from ...services.registry_import import preview_sqlite_import
+
+        auth = require_project_read(request)
+        source = resolve_path(request, body.path, must_exist=True)
+        try:
+            return as_response(preview_sqlite_import(get_repository(request), source,
+                project_id=str(auth.project_id), owner_username=auth.username, workspace_id=body.workspace_id))
+        except (RegistryTransferError, DatasetSchemaError, sqlite3.Error) as exc:
+            raise translated_error(exc) from exc
 
     @router.post("/import/execute")
-    def import_execute(request: Request):
-        require_project_write(request)
-        raise HTTPException(501, "Merging a second SQLite revision into a loaded PostgreSQL workspace is not yet available")
+    def import_execute(request: Request, body: ImportDatasetRequest):
+        from ...services.registry_import import import_sqlite_into_workspace
+
+        auth = require_project_write(request)
+        source = resolve_path(request, body.path, must_exist=True)
+        try:
+            return as_response(import_sqlite_into_workspace(get_repository(request), source,
+                project_id=str(auth.project_id), owner_username=auth.username, workspace_id=body.workspace_id,
+                expected_source_sha256=body.expected_source_sha256, include_labels=body.include_labels,
+                include_evidence=body.include_evidence, duplicate_policy=body.duplicate_policy,
+                duplicate_actions=body.duplicate_actions, actor=auth.username))
+        except (RegistryTransferError, DatasetSchemaError, sqlite3.Error) as exc:
+            raise translated_error(exc) from exc

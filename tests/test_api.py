@@ -1440,6 +1440,139 @@ def test_registry_workspace_catalog_and_activation(monkeypatch):
     assert client.post("/registry/workspaces/missing/activate").status_code == 404
 
 
+def test_registry_upload_streams_sqlite_and_cleans_invalid_files(tmp_path):
+    client, _, _ = make_client()
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    payload = b"SQLite format 3\x00" + bytes(100)
+    response = client.post("/registry/dataset/upload?filename=rois.sqlite", content=payload)
+    assert response.status_code == 201
+    uploaded = Path(response.json()["path"])
+    assert uploaded.is_relative_to(tmp_path)
+    assert uploaded.read_bytes() == payload
+    assert client.post("/registry/dataset/upload?filename=rois.txt", content=payload).status_code == 422
+    assert client.post("/registry/dataset/upload", content=b"not sqlite").status_code == 400
+    assert list(uploaded.parent.iterdir()) == [uploaded]
+
+
+def test_registry_transfer_routes_require_project_access(tmp_path):
+    client, repository, _ = make_client(auth_enabled=True)
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    for route in ("/registry/files", "/registry/dataset/download"):
+        assert client.get(route).status_code == 401
+    assert client.post("/registry/dataset/upload", content=b"SQLite format 3\x00").status_code == 401
+    headers = auth_headers(client)
+    repository.memberships[("user-1", "project-1")] = "viewer"
+    assert client.post("/registry/dataset/upload", headers=headers, content=b"SQLite format 3\x00").status_code == 403
+    assert not (tmp_path / "registry-uploads").exists()
+
+
+def test_registry_upload_paths_are_user_and_project_scoped(tmp_path):
+    client, _, _ = make_client(auth_enabled=True)
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    owner = auth_headers(client, username="admin")
+    other_project = auth_headers(client, username="admin", project_key="other")
+    other_user = auth_headers(client, username="ada")
+    response = client.post("/registry/dataset/upload", headers=owner, content=b"SQLite format 3\x00")
+    assert response.status_code == 201
+    path = Path(response.json()["path"])
+    shared = tmp_path / "shared.sqlite"
+    shared.write_bytes(b"shared")
+    alias = tmp_path / "alias.sqlite"
+    alias.symlink_to(path)
+    for headers in (other_user, other_project):
+        for stage in (PipelineStage.REGISTRY_LOAD, PipelineStage.REGISTRY_EXPORT, PipelineStage.REGISTRY_GENERATE):
+            assert client.post("/jobs", headers=headers, json={"stage": stage.value,
+                "payload": {"source_path": str(path), "owner_username": "admin"}}).status_code == 403
+        for route in ("/registry/import/preview", "/registry/import/execute", "/registry/dataset/open"):
+            assert client.post(route, headers=headers, json={"path": str(path)}).status_code == 403
+        assert client.get("/registry/files", headers=headers, params={"path": str(path.parent)}).status_code == 403
+        listing = client.get("/registry/files", headers=headers, params={"path": str(path.parent.parent)})
+        assert listing.status_code == 200
+        assert listing.json()["entries"] == []
+        listing = client.get("/registry/files", headers=headers).json()
+        assert "shared.sqlite" in [entry["name"] for entry in listing["entries"]]
+        assert "alias.sqlite" not in [entry["name"] for entry in listing["entries"]]
+        assert client.post("/registry/dataset/open", headers=headers, json={"path": str(alias)}).status_code == 403
+    assert client.get("/registry/files", headers=owner, params={"path": str(path.parent)}).json()["entries"][0]["name"] == path.name
+
+
+def test_registry_download_scopes_snapshot_and_removes_temporary_file(monkeypatch):
+    from Pelagia.services import registry_download
+
+    client, repository, _ = make_client()
+    captured = {}
+
+    def snapshot(repo, destination, **scope):
+        assert repo is repository
+        captured.update(scope, destination=destination)
+        destination.write_bytes(b"portable snapshot")
+
+    monkeypatch.setattr(registry_download, "snapshot_sqlite_workspace", snapshot)
+    response = client.get("/registry/dataset/download")
+    assert response.status_code == 200
+    assert response.content == b"portable snapshot"
+    assert 'attachment;' in response.headers['content-disposition']
+    assert captured["project_id"] == "project-1"
+    assert captured["owner_username"] == "dev"
+    assert not captured["destination"].exists()
+
+
+def test_registry_download_cleans_failed_snapshot(monkeypatch):
+    from Pelagia.services import registry_download
+    from Pelagia.services.registry_transfer import RegistryTransferError
+
+    client, _, _ = make_client()
+    paths = []
+
+    def snapshot(repo, destination, **scope):
+        paths.append(destination)
+        raise RegistryTransferError("No Registry dataset is loaded")
+
+    monkeypatch.setattr(registry_download, "snapshot_sqlite_workspace", snapshot)
+    assert client.get("/registry/dataset/download").status_code == 400
+    assert not paths[0].exists()
+
+
+def test_registry_import_routes_scope_destination_and_forward_preview_guards(tmp_path, monkeypatch):
+    from Pelagia.services import registry_import
+
+    client, repository, _ = make_client()
+    client.app.state.config.file_browser.root_path_import_dir = tmp_path
+    source = tmp_path / "source.sqlite"
+    source.write_bytes(b"SQLite format 3\x00")
+    captured = []
+
+    def operation(repo, path, **options):
+        assert repo is repository
+        assert path == source
+        captured.append(options)
+        return {"workspace_id": "target"}
+
+    monkeypatch.setattr(registry_import, "preview_sqlite_import", operation)
+    monkeypatch.setattr(registry_import, "import_sqlite_into_workspace", operation)
+    body = {"path": str(source), "workspace_id": "target"}
+    assert client.post("/registry/import/preview", json=body).json() == {"workspace_id": "target"}
+    assert captured[-1] == {"project_id": "project-1", "owner_username": "dev", "workspace_id": "target"}
+    body.update(expected_source_sha256="expected-digest", duplicate_policy="merge", duplicate_actions={"roi": "skip"})
+    assert client.post("/registry/import/execute", json=body).status_code == 200
+    assert captured[-1]["expected_source_sha256"] == "expected-digest"
+    assert captured[-1]["include_labels"] is True
+    assert captured[-1]["include_evidence"] is True
+    assert captured[-1]["workspace_id"] == "target"
+    assert captured[-1]["duplicate_actions"] == {"roi": "skip"}
+    assert client.post("/registry/import/execute", json={**body, "duplicate_policy": "overwrite"}).status_code == 422
+    assert client.post("/registry/import/preview", json={"path": str(tmp_path.parent / "outside.sqlite")}).status_code == 403
+    from oracle_data_contracts.datasets import DatasetSchemaError
+
+    def invalid(*args, **kwargs):
+        raise DatasetSchemaError("Unsupported dataset schema")
+
+    monkeypatch.setattr(registry_import, "preview_sqlite_import", invalid)
+    rejected = client.post("/registry/import/preview", json=body)
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "Unsupported dataset schema"
+
+
 def test_registry_roi_geometry_and_mask_routes_use_revision_tokens(monkeypatch):
     from Pelagia.api.routes import registry as registry_routes
 

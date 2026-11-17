@@ -77,3 +77,12 @@ def test_registry_assets_write_failure_inserts_no_current_batch_rows(monkeypatch
     assert store.put_batches == []
     assert cursor.executions == []
 
+
+def test_registry_import_rejects_active_sqlite_wal(tmp_path):
+    source = tmp_path / "source.sqlite"
+    source.write_bytes(b"sqlite-main")
+    source.with_name(source.name + "-wal").write_bytes(b"uncheckpointed")
+
+    with pytest.raises(registry_transfer.RegistryTransferError, match="close or checkpoint"):
+        registry_transfer._require_checkpointed_sqlite(source)
+

@@ -1824,6 +1824,218 @@ def postgres_repo(tmp_path):
         repo.close()
 
 
+def test_registry_download_snapshot_preserves_workspace_state(postgres_repo, tmp_path):
+    from Pelagia.services.registry_download import snapshot_sqlite_workspace
+    from Pelagia.services.registry_transfer import RegistryTransferError
+
+    source = tmp_path / "source.sqlite"
+    with sqlite3.connect(source) as output:
+        initialize_database(output, "classification", name="snapshot")
+        output.commit()
+    project = postgres_repo.create_project(f"snapshot-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "snapshot-owner"}
+    loaded = load_sqlite_workspace(postgres_repo, source, **scope)
+    service = RegistryWorkspaceService(postgres_repo, **scope)
+    before = service.active_workspace()
+    destination = tmp_path / "download.sqlite"
+    snapshot_sqlite_workspace(postgres_repo, destination, **scope)
+    assert service.active_workspace() == before
+    with sqlite3.connect(destination) as output:
+        assert validate_database(output)["valid"]
+        identity = output.execute("SELECT dataset_id,revision_id,parent_revision_id FROM dataset").fetchone()
+        assert identity[0] == before["dataset_id"]
+        assert identity[1] != before["revision_id"]
+        assert identity[2] == before["revision_id"]
+    assert loaded["workspace_id"] == str(before["id"])
+    with pytest.raises(RegistryTransferError):
+        snapshot_sqlite_workspace(postgres_repo, tmp_path / "forbidden.sqlite",
+                                  project_id=scope["project_id"], owner_username="other-owner")
+
+
+def test_registry_import_round_trips_annotations_evidence_and_history(postgres_repo, tmp_path):
+    from Pelagia.services.registry_download import snapshot_sqlite_workspace
+    from Pelagia.services.registry_import import import_sqlite_into_workspace, preview_sqlite_import
+
+    destination = tmp_path / "destination.sqlite"
+    with sqlite3.connect(destination) as connection:
+        initialize_database(connection, "classification", name="unified")
+        connection.commit()
+    project = postgres_repo.create_project(f"registry-import-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "registry-importer"}
+    load_sqlite_workspace(postgres_repo, destination, **scope)
+
+    source = tmp_path / "additional.sqlite"
+    image = b"additional-roi"
+    embedding = b"embedding"
+    identifiers = {key: str(uuid.uuid4()) for key in (
+        "asset", "item", "label", "annotation", "review", "descriptor", "descriptor_annotation",
+        "run", "array", "evidence", "event", "import_event",
+    )}
+    with sqlite3.connect(source) as connection:
+        info = initialize_database(connection, "classification", name="additional")
+        connection.execute(
+            """INSERT INTO assets
+            (asset_id,dataset_id,content_sha256,payload,encoding,media_type,shape_json,dtype,metadata_json,created_at)
+            VALUES (?,?,?,?,?,'application/octet-stream','[8,8]','uint8','{}','2026-11-01T00:00:00Z')""",
+            (identifiers["asset"], info["dataset_id"], hashlib.sha256(image).hexdigest(), image, "raw"),
+        )
+        connection.execute(
+            """INSERT INTO dataset_items
+            (item_id,dataset_id,source_key,metadata_json,created_at,updated_at)
+            VALUES (?,?,?,'{}','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')""",
+            (identifiers["item"], info["dataset_id"], "additional-1"),
+        )
+        connection.execute(
+            "INSERT INTO item_geometry VALUES (?,'image_pixels',0,0,8,8,0,0,8,8,'{}')",
+            (identifiers["item"],),
+        )
+        connection.execute("INSERT INTO classification_items VALUES (?,?)", (identifiers["item"], identifiers["asset"]))
+        connection.execute(
+            """INSERT INTO annotation_labels VALUES
+            (?,?,'copepod','Copepod',NULL,'species',NULL,'{}','2026-11-01T00:00:00Z',NULL)""",
+            (identifiers["label"], info["dataset_id"]),
+        )
+        connection.execute(
+            """INSERT INTO item_label_annotations VALUES
+            (?,?,?,'2026-11-01T01:00:00Z','scientist','manual',1.0,'accepted',1,NULL,'{}','curated','{}')""",
+            (identifiers["annotation"], identifiers["item"], identifiers["label"]),
+        )
+        connection.execute(
+            """INSERT INTO annotation_reviews VALUES
+            (?,?,?,'verified','2026-11-01T02:00:00Z','reviewed','{}')""",
+            (identifiers["review"], identifiers["annotation"], "reviewer"),
+        )
+        connection.execute(
+            """INSERT INTO descriptor_definitions VALUES
+            (?,?, 'target','intact',NULL,NULL,'condition',1,0,1,'{}','2026-11-01T00:00:00Z',NULL)""",
+            (identifiers["descriptor"], info["dataset_id"]),
+        )
+        connection.execute(
+            """INSERT INTO item_descriptor_annotations VALUES
+            (?,?,?,'2026-11-01T02:30:00Z','scientist','accepted',1,NULL,NULL,'{}')""",
+            (identifiers["descriptor_annotation"], identifiers["item"], identifiers["descriptor"]),
+        )
+        connection.execute(
+            """INSERT INTO inference_runs VALUES
+            (?,?,?,'model','run','model-sha','Field model','complete','2026-11-01T00:00:00Z',
+             '2026-11-01T00:10:00Z','{}','{}','{}','{}')""",
+            (identifiers["run"], info["dataset_id"], "dataset-sha"),
+        )
+        connection.execute(
+            """INSERT INTO evidence_arrays VALUES
+            (?,?,?,'raw','application/octet-stream','[1]','float32','2026-11-01T00:00:00Z','{}')""",
+            (identifiers["array"], hashlib.sha256(embedding).hexdigest(), embedding),
+        )
+        connection.execute(
+            """INSERT INTO model_evidence VALUES
+            (?,?,?,?,0.97,NULL,NULL,NULL,NULL,NULL,?,NULL,'{}','{}','2026-11-01T00:10:00Z')""",
+            (identifiers["evidence"], identifiers["run"], identifiers["item"], identifiers["label"], identifiers["array"]),
+        )
+        connection.execute(
+            """INSERT INTO import_events VALUES
+            (?,?,?,'2026-11-01T00:00:00Z','field-import','file:///field','{}','{}')""",
+            (identifiers["import_event"], info["dataset_id"], info["revision_id"]),
+        )
+        connection.execute(
+            """INSERT INTO dataset_events VALUES
+            (?,?,?,'field.reviewed','2026-11-01T03:00:00Z','scientist','{}')""",
+            (identifiers["event"], info["dataset_id"], info["revision_id"]),
+        )
+        connection.commit()
+        assert validate_database(connection)["valid"]
+
+    preview = preview_sqlite_import(postgres_repo, source, **scope)
+    assert (preview["new_items"], preview["labels"]["annotation_count"],
+            preview["descriptors"]["annotation_count"], preview["evidence"]["registry_count"]) == (1, 1, 1, 1)
+    result = import_sqlite_into_workspace(
+        postgres_repo, source, expected_source_sha256=preview["source"]["sha256"], **scope,
+    )
+    assert (result["imported_items"], result["imported_labels"],
+            result["imported_descriptors"], result["imported_evidence"]) == (1, 1, 1, 1)
+    assert import_sqlite_into_workspace(
+        postgres_repo, source, expected_source_sha256=preview["source"]["sha256"], **scope,
+    )["reused"] is True
+    changed_options = import_sqlite_into_workspace(
+        postgres_repo, source, expected_source_sha256=preview["source"]["sha256"],
+        include_evidence=False, **scope,
+    )
+    assert changed_options["skipped_items"] == 1
+
+    exported = tmp_path / "unified.sqlite"
+    snapshot_sqlite_workspace(postgres_repo, exported, **scope)
+    with sqlite3.connect(exported) as connection:
+        assert validate_database(connection)["valid"]
+        for table in ("dataset_items", "item_label_annotations", "annotation_reviews",
+                      "item_descriptor_annotations", "model_evidence", "import_events"):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1
+        assert connection.execute("SELECT predicted_label_id FROM model_evidence").fetchone()[0] is not None
+
+
+def test_registry_import_round_trips_mask_revision_history(postgres_repo, tmp_path):
+    from Pelagia.services.registry_download import snapshot_sqlite_workspace
+    from Pelagia.services.registry_import import import_sqlite_into_workspace, preview_sqlite_import
+
+    destination = tmp_path / "mask-destination.sqlite"
+    with sqlite3.connect(destination) as connection:
+        initialize_database(connection, "mask_refinement", name="mask-unified")
+        connection.commit()
+    project = postgres_repo.create_project(f"registry-mask-import-{uuid.uuid4().hex}")
+    scope = {"project_id": str(project["id"]), "owner_username": "mask-importer"}
+    load_sqlite_workspace(postgres_repo, destination, **scope)
+
+    source = tmp_path / "mask-additional.sqlite"
+    ids = {key: str(uuid.uuid4()) for key in ("image", "candidate", "edited", "item", "first", "second")}
+    payloads = {"image": b"roi-image", "candidate": b"candidate-mask", "edited": b"edited-mask"}
+    with sqlite3.connect(source) as connection:
+        info = initialize_database(connection, "mask_refinement", name="mask-additional")
+        for role in ("image", "candidate", "edited"):
+            connection.execute(
+                """INSERT INTO assets
+                (asset_id,dataset_id,content_sha256,payload,encoding,media_type,shape_json,dtype,metadata_json,created_at)
+                VALUES (?,?,?,?,'raw','application/octet-stream','[8,8]','uint8','{}','2026-11-01T00:00:00Z')""",
+                (ids[role], info["dataset_id"], hashlib.sha256(payloads[role]).hexdigest(), payloads[role]),
+            )
+        connection.execute(
+            """INSERT INTO dataset_items
+            (item_id,dataset_id,source_key,metadata_json,created_at,updated_at)
+            VALUES (?,?,?,'{}','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')""",
+            (ids["item"], info["dataset_id"], "mask-additional-1"),
+        )
+        connection.execute(
+            "INSERT INTO item_geometry VALUES (?,'image_pixels',0,0,8,8,0,0,8,8,'{}')", (ids["item"],),
+        )
+        connection.execute("INSERT INTO mask_refinement_items VALUES (?,?,?)", (ids["item"], ids["image"], ids["candidate"]))
+        connection.execute(
+            """INSERT INTO mask_annotations VALUES
+            (?,?,?,'2026-11-01T01:00:00Z','scientist','manual','{}','{}','accepted',0,NULL,'first pass')""",
+            (ids["first"], ids["item"], ids["edited"]),
+        )
+        connection.execute(
+            """INSERT INTO mask_annotations VALUES
+            (?,?,?,'2026-11-01T02:00:00Z','reviewer','manual','{}','{}','accepted',1,?,'reviewed')""",
+            (ids["second"], ids["item"], ids["edited"], ids["first"]),
+        )
+        connection.commit()
+        assert validate_database(connection)["valid"]
+
+    preview = preview_sqlite_import(postgres_repo, source, **scope)
+    assert preview["new_items"] == 1
+    result = import_sqlite_into_workspace(
+        postgres_repo, source, expected_source_sha256=preview["source"]["sha256"], **scope,
+    )
+    assert result["imported_items"] == 1
+    exported = tmp_path / "mask-unified.sqlite"
+    snapshot_sqlite_workspace(postgres_repo, exported, **scope)
+    with sqlite3.connect(exported) as connection:
+        assert validate_database(connection)["valid"]
+        assert connection.execute("SELECT count(*) FROM mask_annotations").fetchone()[0] == 2
+        current = connection.execute(
+            "SELECT parent_annotation_id FROM mask_annotations WHERE is_current=1"
+        ).fetchone()
+        assert current is not None and current[0] is not None
+        assert connection.execute("SELECT candidate_mask_asset_id FROM mask_refinement_items").fetchone()[0]
+
+
 def test_postgres_imports_default_curation_labels_idempotently(postgres_repo):
     project = postgres_repo.create_project(f"taxonomy-{uuid.uuid4().hex}")
     dictionary = default_taxonomy_dictionary()

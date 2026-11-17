@@ -36,10 +36,10 @@ Creation also produces one 512-pixel thumbnail per video by default, a contact s
 For a guided workflow:
 
 ```bash
-pii create --interactive
+pii create --tui
 ```
 
-Interactive mode prompts for the video directory, output, title, description, stream name, shard size, recursive discovery, color/grayscale choice, optional metadata TOML, and final confirmation.
+The full-screen creator browses directories and metadata files without requiring typed paths. Use Up/Down and Enter to open folders, **s** to select a folder, and **Left** to go to its parent. Choose an output parent and a dataset name, edit encoding/storage settings, then press **F5** to validate and review before starting. **Esc** returns or cancels; progress messages appear during creation. The creator uses standard-library curses. `--interactive` opens the same interface on a terminal and retains plain prompts for redirected input.
 
 The automatic workflow is also available in Python:
 

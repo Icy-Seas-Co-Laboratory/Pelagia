@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Callable
 
 from .builder import DatasetBuilder
 from .constants import FORMAT_VERSION, LIBRARY_VERSION, SCHEMA_VERSION
@@ -13,6 +14,7 @@ from .extraction import extract_frames
 from .ingestion import DEFAULT_FFMPEG_QSCALE, discover_videos, ingest_video_directory
 from .metadata import Metadata
 from .validation import Validator
+from .tui import CreationCancelled
 
 
 def _range(value: str) -> tuple[int | None, int | None]:
@@ -35,7 +37,10 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--shard-target-size", default="10GB")
     create.add_argument("--from-videos", type=Path, metavar="DIRECTORY")
     create.add_argument("--recursive", action="store_true"); create.add_argument("--stream", default="camera")
-    create.add_argument("--metadata", type=Path, metavar="TOML"); create.add_argument("--interactive", action="store_true")
+    create.add_argument("--metadata", type=Path, metavar="TOML")
+    modes = create.add_mutually_exclusive_group()
+    modes.add_argument("--interactive", action="store_true", help="guided creator (full screen on a terminal)")
+    modes.add_argument("--tui", action="store_true", help="full-screen creator with folder and file browsing")
     create.add_argument("--ffmpeg", default="ffmpeg"); create.add_argument("--ffprobe", default="ffprobe")
     create.add_argument("--ffmpeg-qscale", type=int, default=DEFAULT_FFMPEG_QSCALE,
                         help="deprecated compatibility option; use --jpeg-quality")
@@ -118,41 +123,51 @@ def _interactive_create(args: argparse.Namespace) -> None:
         raise ValueError("creation cancelled")
 
 
+def _execute_create(args: argparse.Namespace, progress: Callable[[str], None]) -> str:
+    if args.output is None and args.from_videos is not None:
+        source_directory = args.from_videos.resolve()
+        args.output = source_directory.parent / f"{source_directory.name}_interchange"
+    if args.output is None: raise ValueError("output path is required (or use --interactive)")
+    if args.from_videos is not None:
+        metadata = Metadata.read(args.metadata) if args.metadata else None
+        result = ingest_video_directory(args.from_videos, args.output, title=args.title,
+                                        description=args.description, stream=args.stream,
+                                        recursive=args.recursive, shard_target_size=args.shard_target_size,
+                                        metadata=metadata, ffmpeg=args.ffmpeg, ffprobe=args.ffprobe,
+                                        ffmpeg_qscale=args.ffmpeg_qscale, grayscale=args.grayscale,
+                                        jpeg_quality=args.jpeg_quality, jpeg_subsampling=args.jpeg_subsampling,
+                                        jpeg_workers=args.jpeg_workers,
+                                        preflight_workers=args.preflight_workers,
+                                        queue_depth=args.queue_depth,
+                                        turbojpeg_library=args.turbojpeg_library,
+                                        staging_dir=args.staging_dir,
+                                        hash_sources=not args.no_source_hash,
+                                        source_file_boundary=args.source_file_boundary,
+                                        generate_previews=not args.no_previews,
+                                        preview_count=args.preview_count, preview_width=args.preview_width,
+                                        require_previews=args.require_previews,
+                                        resume=args.resume,
+                                        progress=progress)
+        return f"Created {args.output}: {result.acquisition_segments} acquisition segment(s), {result.frames} frame(s), {result.previews} representative preview(s)"
+    if args.resume:
+        raise ValueError("--resume requires --from-videos")
+    DatasetBuilder(args.output, title=args.title, description=args.description, shard_target_size=args.shard_target_size).finalize()
+    return f"Created {args.output}"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "create":
-            if args.interactive: _interactive_create(args)
-            if args.output is None and args.from_videos is not None:
-                source_directory = args.from_videos.resolve()
-                args.output = source_directory.parent / f"{source_directory.name}_interchange"
-            if args.output is None: raise ValueError("output path is required (or use --interactive)")
-            if args.from_videos is not None:
-                metadata = Metadata.read(args.metadata) if args.metadata else None
-                result = ingest_video_directory(args.from_videos, args.output, title=args.title,
-                                                description=args.description, stream=args.stream,
-                                                recursive=args.recursive, shard_target_size=args.shard_target_size,
-                                                metadata=metadata, ffmpeg=args.ffmpeg, ffprobe=args.ffprobe,
-                                                ffmpeg_qscale=args.ffmpeg_qscale, grayscale=args.grayscale,
-                                                jpeg_quality=args.jpeg_quality, jpeg_subsampling=args.jpeg_subsampling,
-                                                jpeg_workers=args.jpeg_workers,
-                                                preflight_workers=args.preflight_workers,
-                                                queue_depth=args.queue_depth,
-                                                turbojpeg_library=args.turbojpeg_library,
-                                                staging_dir=args.staging_dir,
-                                                hash_sources=not args.no_source_hash,
-                                                source_file_boundary=args.source_file_boundary,
-                                                generate_previews=not args.no_previews,
-                                                preview_count=args.preview_count, preview_width=args.preview_width,
-                                                require_previews=args.require_previews,
-                                                resume=args.resume,
-                                                progress=lambda message: print(message, file=sys.stderr))
-                print(f"Created {args.output}: {result.acquisition_segments} acquisition segment(s), {result.frames} frame(s), {result.previews} representative preview(s)")
-                return 0
-            if args.resume:
-                raise ValueError("--resume requires --from-videos")
-            DatasetBuilder(args.output, title=args.title, description=args.description, shard_target_size=args.shard_target_size).finalize()
-            print(f"Created {args.output}"); return 0
+            from .tui import run_creator, terminal_available
+            use_terminal = args.interactive and terminal_available()
+            if args.interactive and not use_terminal:
+                _interactive_create(args)
+            if args.tui or use_terminal:
+                print(run_creator(args, _execute_create))
+            else:
+                print(_execute_create(args, lambda message: print(message, file=sys.stderr)))
+            return 0
         if args.command == "verify":
             result = Validator(args.path).verify(args.level, image_signatures=args.image_signatures)
             if args.json:
@@ -192,6 +207,15 @@ def main(argv: list[str] | None = None) -> int:
         records = dataset.manifest.shards if args.command == "shards" else dataset.manifest.acquisition_segments
         _pretty(records) if args.json else [print(json.dumps(item, sort_keys=True)) for item in records]
         return 0
+    except CreationCancelled:
+        print("pii: creation cancelled", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        print("pii: interrupted; incomplete video ingestion can be resumed with --resume", file=sys.stderr)
+        return 130
+    except EOFError:
+        print("pii: input closed; creation cancelled", file=sys.stderr)
+        return 130
     except (InterchangeError, OSError, ValueError) as exc:
         print(f"pii: {exc}", file=sys.stderr); return 2
 

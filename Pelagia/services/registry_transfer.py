@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -53,6 +54,14 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _require_checkpointed_sqlite(path: Path) -> None:
+    wal_path = path.with_name(path.name + "-wal")
+    if wal_path.is_file() and wal_path.stat().st_size > 0:
+        raise RegistryTransferError(
+            "SQLite source has an active WAL; close or checkpoint the database before importing it"
+        )
 
 
 def _tables(connection: sqlite3.Connection) -> set[str]:
@@ -434,6 +443,783 @@ def _load_auxiliary_records(cursor, schema: str, workspace_id: Any, source: sqli
             )
 
 
+def _import_id(source_sha256: str, kind: str, value: Any) -> str:
+    """Return a stable, contract-compatible identifier for an imported record."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"pelagia-registry-import:{source_sha256}:{kind}:{value}"))
+
+
+def _source_items(source: sqlite3.Connection, dataset_type: str) -> list[dict[str, Any]]:
+    relation = "classification_items" if dataset_type == "classification" else "mask_refinement_items"
+    tasks = {str(row["item_id"]): row for row in _rows(source, relation)}
+    assets = {str(row["asset_id"]): row for row in _rows(source, "assets")}
+    result = []
+    for row in _rows(source, "dataset_items"):
+        task = tasks[str(row["item_id"])]
+        image = assets[str(task["image_asset_id"])]
+        result.append({
+            "item": row,
+            "task": task,
+            "image_sha256": str(image["content_sha256"]),
+        })
+    return result
+
+
+def _import_workspace(cursor, schema: str, *, project_id: str, owner_username: str,
+                      workspace_id: str | None, for_update: bool) -> dict[str, Any]:
+    lock = " FOR UPDATE" if for_update else ""
+    if workspace_id is None:
+        cursor.execute(
+            f"""SELECT * FROM {schema}.registry_workspaces
+            WHERE project_id=%s AND owner_username=%s AND is_active=true AND status='loaded'{lock}""",
+            (project_id, owner_username),
+        )
+    else:
+        cursor.execute(
+            f"""SELECT * FROM {schema}.registry_workspaces
+            WHERE id=%s AND project_id=%s AND owner_username=%s AND status='loaded'{lock}""",
+            (workspace_id, project_id, owner_username),
+        )
+    workspace = cursor.fetchone()
+    if workspace is None:
+        raise RegistryTransferError("Loaded Registry workspace was not found")
+    return workspace
+
+
+def _import_duplicate_inventory(cursor, schema: str, workspace_id: Any,
+                                source_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cursor.execute(
+        f"""SELECT item.item_id,item.source_key,asset.content_sha256 image_sha256,item.metadata
+        FROM {schema}.registry_items item
+        JOIN {schema}.registry_assets asset
+          ON asset.workspace_id=item.workspace_id AND asset.asset_id=item.image_asset_id
+        WHERE item.workspace_id=%s""",
+        (workspace_id,),
+    )
+    target_rows = list(cursor.fetchall())
+    by_id = {str(row["item_id"]): row for row in target_rows}
+    by_hash: dict[str, list[dict[str, Any]]] = {}
+    for row in target_rows:
+        by_hash.setdefault(str(row["image_sha256"]), []).append(row)
+    duplicates = []
+    for entry in source_items:
+        row = entry["item"]
+        source_id = str(row["item_id"])
+        matches: dict[str, dict[str, Any]] = {}
+        reasons: dict[str, set[str]] = {}
+        if source_id in by_id:
+            matches[source_id] = by_id[source_id]
+            reasons.setdefault(source_id, set()).add("uuid")
+        for target in by_hash.get(entry["image_sha256"], []):
+            target_id = str(target["item_id"])
+            matches[target_id] = target
+            reasons.setdefault(target_id, set()).add("roi_hash")
+        if not matches:
+            continue
+        # UUID is authoritative; otherwise choose a stable first hash match and
+        # report every candidate so callers can see an ambiguous content match.
+        target_id = source_id if source_id in matches else sorted(matches)[0]
+        source_metadata = _json(row["metadata_json"])
+        target_metadata = _json(matches[target_id].get("metadata"))
+        conflicts = sorted(
+            key for key in source_metadata.keys() & target_metadata.keys()
+            if source_metadata[key] != target_metadata[key]
+        )
+        all_reasons = sorted({reason for value in reasons.values() for reason in value})
+        duplicates.append({
+            "source_item_id": source_id,
+            "source_key": row["source_key"],
+            "target_item_id": target_id,
+            "matching_item_ids": sorted(matches),
+            "reasons": all_reasons,
+            "roi_hash": entry["image_sha256"],
+            "target_roi_hash": str(matches[target_id]["image_sha256"]),
+            "metadata_conflicts": conflicts,
+        })
+    return duplicates
+
+
+def preview_sqlite_import(repository, source_path: str | Path, *, project_id: str,
+                          owner_username: str, workspace_id: str | None = None) -> dict[str, Any]:
+    """Validate and compare an SQLite revision with a scoped Registry workspace."""
+    source_path = Path(source_path).expanduser().resolve()
+    if not source_path.is_file():
+        raise RegistryTransferError(f"SQLite dataset does not exist: {source_path}")
+    _require_checkpointed_sqlite(source_path)
+    source_sha256 = _sha256(source_path)
+    temporary_path, source = _migrated_copy(source_path)
+    try:
+        _require_checkpointed_sqlite(source_path)
+        if _sha256(source_path) != source_sha256:
+            raise RegistryTransferError("Source SQLite file changed while it was being inspected")
+        info = read_dataset_info(source)
+        source_items = _source_items(source, info["dataset_type"])
+        with repository.connect() as connection, connection.cursor() as cursor:
+            workspace = _import_workspace(
+                cursor, repository.schema, project_id=project_id, owner_username=owner_username,
+                workspace_id=workspace_id, for_update=False,
+            )
+            if workspace["dataset_type"] != info["dataset_type"]:
+                raise RegistryTransferError("Source and destination Registry dataset types must match")
+            duplicates = _import_duplicate_inventory(cursor, repository.schema, workspace["id"], source_items)
+        tables = _tables(source)
+        label_annotations = sum(
+            int(source.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+            for table in ("classification_annotations", "item_label_annotations") if table in tables
+        )
+        descriptor_annotations = (
+            int(source.execute("SELECT count(*) FROM item_descriptor_annotations").fetchone()[0])
+            if "item_descriptor_annotations" in tables else 0
+        )
+        evidence = int(source.execute("SELECT count(*) FROM model_evidence").fetchone()[0]) if "model_evidence" in tables else 0
+        schema_row = source.execute("SELECT schema_version FROM ob_schema WHERE singleton=1").fetchone()
+        return {
+            "source": {
+                "path": str(source_path), "sha256": source_sha256,
+                "dataset_id": info["dataset_id"], "revision_id": info["revision_id"],
+                "name": info["name"], "dataset_type": info["dataset_type"],
+                "lifecycle": info["lifecycle"], "schema_version": str(schema_row[0]),
+                "size_bytes": source_path.stat().st_size,
+            },
+            "workspace_id": str(workspace["id"]),
+            "total_items": len(source_items), "new_items": len(source_items) - len(duplicates),
+            "duplicate_count": len(duplicates), "duplicates": duplicates,
+            "labels": {"available": label_annotations > 0, "annotation_count": label_annotations},
+            "descriptors": {"available": descriptor_annotations > 0, "annotation_count": descriptor_annotations},
+            "evidence": {"available": evidence > 0, "registry_count": evidence, "legacy_count": 0},
+        }
+    finally:
+        source.close()
+        temporary_path.unlink(missing_ok=True)
+
+
+def _put_import_assets(repository, cursor, schema: str, workspace_id: Any,
+                       source: sqlite3.Connection, source_sha256: str) -> dict[str, str]:
+    cursor.execute(
+        f"SELECT asset_id,content_sha256,encoding,shape,dtype,media_type FROM {schema}.registry_assets WHERE workspace_id=%s",
+        (workspace_id,),
+    )
+    existing_rows = list(cursor.fetchall())
+    by_content = {(str(row["content_sha256"]), str(row["encoding"])): row for row in existing_rows}
+    existing_ids = {str(row["asset_id"]) for row in existing_rows}
+    result: dict[str, str] = {}
+    hot_store = getattr(repository, "hot_store", None)
+    if hot_store is None:
+        raise RegistryTransferError("Hot object storage is not configured for Registry assets")
+    for row in _rows(source, "assets"):
+        source_id = str(row["asset_id"])
+        content_key = (str(row["content_sha256"]), str(row["encoding"]))
+        if content_key in by_content:
+            existing = by_content[content_key]
+            if (_json(existing.get("shape"), None) != _json(row["shape_json"], None)
+                    or existing.get("dtype") != row["dtype"]
+                    or existing.get("media_type") != row["media_type"]):
+                raise RegistryTransferError(
+                    f"Asset {source_id} has the same content hash and encoding as a destination asset but incompatible shape, dtype, or media type"
+                )
+            result[source_id] = str(existing["asset_id"])
+            continue
+        target_id = source_id if source_id not in existing_ids else _import_id(source_sha256, "asset", source_id)
+        payload = None if row["payload"] is None else bytes(row["payload"])
+        payload_ref = hot_store.put_store(payload) if payload is not None else None
+        cursor.execute(
+            f"""INSERT INTO {schema}.registry_assets
+            (workspace_id,asset_id,content_sha256,payload,payload_ref,payload_bytes,external_uri,
+             encoding,media_type,shape,dtype,original_filename,metadata,created_at)
+            VALUES (%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (workspace_id, target_id, row["content_sha256"], payload_ref,
+             len(payload) if payload is not None else None, row["external_uri"], row["encoding"],
+             row["media_type"], _jsonb(row["shape_json"]), row["dtype"], row["original_filename"],
+             _jsonb(row["metadata_json"]), row["created_at"]),
+        )
+        existing_ids.add(target_id)
+        by_content[content_key] = {
+            "asset_id": target_id, "shape": _json(row["shape_json"], None),
+            "dtype": row["dtype"], "media_type": row["media_type"],
+        }
+        result[source_id] = target_id
+    return result
+
+
+def _import_labels(cursor, schema: str, workspace_id: Any, source: sqlite3.Connection,
+                   source_sha256: str) -> tuple[dict[tuple[str, str], str], int, int]:
+    cursor.execute(f"SELECT * FROM {schema}.registry_labels WHERE workspace_id=%s", (workspace_id,))
+    existing = list(cursor.fetchall())
+    by_name = {(row["origin"], str(row["name"])): row for row in existing}
+    ids = {str(row["label_id"]) for row in existing}
+    next_class = max((int(row["class_index"]) for row in existing if row["class_index"] is not None), default=-1) + 1
+    mapping: dict[tuple[str, str], str] = {}
+    created = conflicts = 0
+    specs = (("classification_labels", "classification"), ("annotation_labels", "workspace"))
+    pending = [(table, origin, row) for table, origin in specs for row in _rows(source, table)]
+    # Parent references are filled after all definitions exist.
+    for table, origin, row in pending:
+        source_id = str(row["label_id"])
+        match = by_name.get((origin, str(row["name"])))
+        if match is not None:
+            mapping[(origin, source_id)] = str(match["label_id"])
+            incoming_metadata = _json(row["metadata_json"])
+            if incoming_metadata and incoming_metadata != _json(match.get("metadata")):
+                conflicts += 1
+            continue
+        target_id = source_id if source_id not in ids else _import_id(source_sha256, "label", source_id)
+        metadata = _json(row["metadata_json"])
+        registry_metadata = metadata.get("registry", {}) if isinstance(metadata, dict) else {}
+        cursor.execute(
+            f"""INSERT INTO {schema}.registry_labels
+            (workspace_id,label_id,origin,class_index,name,display_name,parent_label_id,rank,
+             description,metadata,created_at,deprecated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s)""",
+            (workspace_id, target_id, origin, next_class if origin == "classification" else None,
+             row["name"], registry_metadata.get("display_name") if origin == "classification" else row["display_name"],
+             registry_metadata.get("rank") if origin == "classification" else row["rank"],
+             registry_metadata.get("description") if origin == "classification" else row["description"],
+             _jsonb(metadata), None if origin == "classification" else row["created_at"],
+             registry_metadata.get("deprecated_at") if origin == "classification" else row["deprecated_at"]),
+        )
+        if origin == "classification":
+            next_class += 1
+        mapping[(origin, source_id)] = target_id
+        ids.add(target_id)
+        created += 1
+    for table, origin, row in pending:
+        parent = row["parent_label_id"]
+        child_key = (origin, str(row["label_id"]))
+        parent_key = (origin, str(parent)) if parent is not None else None
+        if parent_key is not None and child_key in mapping and parent_key in mapping:
+            cursor.execute(
+                f"UPDATE {schema}.registry_labels SET parent_label_id=%s WHERE workspace_id=%s AND label_id=%s AND parent_label_id IS NULL",
+                (mapping[parent_key], workspace_id, mapping[child_key]),
+            )
+    return mapping, created, conflicts
+
+
+def _import_descriptors(cursor, schema: str, workspace_id: Any, source: sqlite3.Connection,
+                        source_sha256: str) -> tuple[dict[str, str], int]:
+    cursor.execute(f"SELECT * FROM {schema}.registry_descriptors WHERE workspace_id=%s", (workspace_id,))
+    existing = list(cursor.fetchall())
+    by_name = {(str(row["scope"]), str(row["name"])): str(row["descriptor_id"]) for row in existing}
+    ids = {str(row["descriptor_id"]) for row in existing}
+    rows = list(_rows(source, "descriptor_definitions"))
+    mapping: dict[str, str] = {}
+    created = 0
+    for row in rows:
+        source_id = str(row["descriptor_id"])
+        key = (str(row["scope"]), str(row["name"]))
+        if key in by_name:
+            mapping[source_id] = by_name[key]
+            continue
+        target_id = source_id if source_id not in ids else _import_id(source_sha256, "descriptor", source_id)
+        cursor.execute(
+            f"""INSERT INTO {schema}.registry_descriptors
+            (workspace_id,descriptor_id,scope,name,parent_descriptor_id,concept_id,concept_type,
+             selectable,exclusive_within_parent,preferred,metadata,created_at,deprecated_at)
+            VALUES (%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (workspace_id,target_id,row["scope"],row["name"],row["concept_id"],row["concept_type"],
+             bool(row["selectable"]),bool(row["exclusive_within_parent"]),bool(row["preferred"]),
+             _jsonb(row["metadata_json"]),row["created_at"],row["deprecated_at"]),
+        )
+        mapping[source_id] = target_id
+        by_name[key] = target_id
+        ids.add(target_id)
+        created += 1
+    for row in rows:
+        parent = row["parent_descriptor_id"]
+        if parent is not None:
+            cursor.execute(
+                f"UPDATE {schema}.registry_descriptors SET parent_descriptor_id=%s WHERE workspace_id=%s AND descriptor_id=%s AND parent_descriptor_id IS NULL",
+                (mapping.get(str(parent)), workspace_id, mapping[str(row["descriptor_id"])]),
+            )
+    return mapping, created
+
+
+def _import_auxiliary_records(cursor, schema: str, workspace: dict[str, Any], source: sqlite3.Connection,
+                              source_sha256: str, label_map: dict[tuple[str, str], str]) -> dict[str, str]:
+    """Keep portable metadata/import/taxonomy records and translate their references."""
+    workspace_id = workspace["id"]
+    cursor.execute(
+        f"SELECT relation,ordinal,record FROM {schema}.registry_contract_records WHERE workspace_id=%s ORDER BY relation,ordinal",
+        (workspace_id,),
+    )
+    existing = list(cursor.fetchall())
+    next_ordinal: dict[str, int] = {}
+    existing_concepts: dict[tuple[str, str], str] = {}
+    existing_primary_keys: dict[str, set[str]] = {
+        "metadata_documents": set(), "import_events": set(), "taxonomy_concepts": set(),
+        "taxonomy_concept_mappings": set(), "classification_label_concepts": set(),
+    }
+    primary_columns = {
+        "metadata_documents": "document_id", "import_events": "import_id",
+        "taxonomy_concepts": "concept_id", "taxonomy_concept_mappings": "mapping_id",
+        "classification_label_concepts": "label_id",
+    }
+    for row in existing:
+        relation = str(row["relation"])
+        next_ordinal[relation] = max(next_ordinal.get(relation, 0), int(row["ordinal"]) + 1)
+        record = _json(row["record"])
+        primary_column = primary_columns.get(relation)
+        if primary_column is not None and record.get(primary_column) is not None:
+            existing_primary_keys[relation].add(str(record[primary_column]))
+        if relation == "taxonomy_concepts":
+            existing_concepts[(str(record.get("vocabulary_id")), str(record.get("vocabulary_node_id")))] = str(record.get("concept_id"))
+
+    concept_rows = list(_rows(source, "taxonomy_concepts"))
+    concept_map: dict[str, str] = {}
+    for row in concept_rows:
+        source_id = str(row["concept_id"])
+        stable_key = (str(row["vocabulary_id"]), str(row["vocabulary_node_id"]))
+        concept_map[source_id] = existing_concepts.get(stable_key) or _import_record_id(source_sha256, "taxonomy-concept", source_id)
+
+    relation_rows: list[tuple[str, dict[str, Any]]] = []
+    for row in _rows(source, "metadata_documents"):
+        record = {key: row[key] for key in row.keys()}
+        record["document_id"] = _import_record_id(source_sha256, "metadata-document", row["document_id"])
+        record["dataset_id"] = workspace["dataset_id"]
+        # Dataset document names are unique; retain both by making imported
+        # provenance explicit in the portable name.
+        record["name"] = f"import:{str(source_sha256)[:12]}:{row['name']}"
+        relation_rows.append(("metadata_documents", record))
+    for row in _rows(source, "import_events"):
+        record = {key: row[key] for key in row.keys()}
+        record["import_id"] = _import_record_id(source_sha256, "source-import-event", row["import_id"])
+        record["dataset_id"] = workspace["dataset_id"]
+        record["revision_id"] = workspace["revision_id"]
+        relation_rows.append(("import_events", record))
+    for row in concept_rows:
+        record = {key: row[key] for key in row.keys()}
+        record["concept_id"] = concept_map[str(row["concept_id"])]
+        if row["parent_concept_id"] is not None:
+            record["parent_concept_id"] = concept_map[str(row["parent_concept_id"])]
+        # A stable vocabulary node already present in the destination should
+        # remain a single row on export.
+        if (str(row["vocabulary_id"]), str(row["vocabulary_node_id"])) not in existing_concepts:
+            relation_rows.append(("taxonomy_concepts", record))
+    for row in _rows(source, "taxonomy_concept_mappings"):
+        record = {key: row[key] for key in row.keys()}
+        record["mapping_id"] = _import_record_id(source_sha256, "taxonomy-mapping", row["mapping_id"])
+        record["concept_id"] = concept_map[str(row["concept_id"])]
+        relation_rows.append(("taxonomy_concept_mappings", record))
+    for row in _rows(source, "classification_label_concepts"):
+        target_label = label_map.get(("classification", str(row["label_id"])))
+        if target_label is None:
+            continue
+        record = {key: row[key] for key in row.keys()}
+        record["label_id"] = target_label
+        record["concept_id"] = concept_map[str(row["concept_id"])]
+        relation_rows.append(("classification_label_concepts", record))
+
+    for relation, record in relation_rows:
+        primary_column = primary_columns[relation]
+        primary_value = str(record[primary_column])
+        if primary_value in existing_primary_keys[relation]:
+            continue
+        ordinal = next_ordinal.get(relation, 0)
+        cursor.execute(
+            f"INSERT INTO {schema}.registry_contract_records (workspace_id,relation,ordinal,record) VALUES (%s,%s,%s,%s)",
+            (workspace_id, relation, ordinal, _jsonb(record)),
+        )
+        next_ordinal[relation] = ordinal + 1
+        existing_primary_keys[relation].add(primary_value)
+    return concept_map
+
+
+def _existing_ids(cursor, schema: str, table: str, column: str, workspace_id: Any) -> set[str]:
+    cursor.execute(f"SELECT {column} value FROM {schema}.{table} WHERE workspace_id=%s", (workspace_id,))
+    return {str(row["value"]) for row in cursor.fetchall()}
+
+
+def _import_record_id(source_sha256: str, kind: str, source_id: Any) -> str:
+    # Always namespace history/evidence IDs. This avoids confusing an unrelated
+    # same-text ID with a retry, and stays stable for idempotent retries.
+    return _import_id(source_sha256, kind, source_id)
+
+
+def _remap_json_strings(value: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(value, dict):
+        return {key: _remap_json_strings(item, mapping) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_remap_json_strings(item, mapping) for item in value]
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    return value
+
+
+def import_sqlite_into_workspace(
+    repository,
+    source_path: str | Path,
+    *,
+    project_id: str,
+    owner_username: str,
+    include_labels: bool = True,
+    include_evidence: bool = True,
+    duplicate_policy: str = "skip",
+    duplicate_actions: dict[str, str] | None = None,
+    expected_source_sha256: str | None = None,
+    workspace_id: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Merge an Oracle Dataset SQLite revision into one scoped Registry workspace.
+
+    The PostgreSQL changes are atomic. Blob publication is content-addressed and
+    may leave unreachable objects after a rollback; normal object GC can reclaim
+    them without exposing partial Registry state.
+    """
+    if duplicate_policy not in {"skip", "merge"}:
+        raise RegistryTransferError("Duplicate policy must be 'skip' or 'merge'")
+    duplicate_actions = dict(duplicate_actions or {})
+    if any(value not in {"skip", "merge"} for value in duplicate_actions.values()):
+        raise RegistryTransferError("Duplicate actions must be 'skip' or 'merge'")
+    source_path = Path(source_path).expanduser().resolve()
+    if not source_path.is_file():
+        raise RegistryTransferError(f"SQLite dataset does not exist: {source_path}")
+    _require_checkpointed_sqlite(source_path)
+    source_sha256 = _sha256(source_path)
+    if expected_source_sha256 is not None and source_sha256 != expected_source_sha256:
+        raise RegistryTransferError("Source SQLite file changed after it was inspected")
+    temporary_path, source = _migrated_copy(source_path)
+    try:
+        _require_checkpointed_sqlite(source_path)
+        if _sha256(source_path) != source_sha256:
+            raise RegistryTransferError("Source SQLite file changed while it was being prepared for import")
+        info = read_dataset_info(source)
+        source_items = _source_items(source, info["dataset_type"])
+        options_fingerprint = hashlib.sha256(json.dumps({
+            "include_labels": include_labels, "include_evidence": include_evidence,
+            "duplicate_policy": duplicate_policy, "duplicate_actions": duplicate_actions,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        import_event_id = _import_id(source_sha256, "import-operation", options_fingerprint)
+        schema = repository.schema
+        with repository.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"registry:{project_id}:{owner_username}",),
+                )
+                workspace = _import_workspace(
+                    cursor, schema, project_id=project_id, owner_username=owner_username,
+                    workspace_id=workspace_id, for_update=True,
+                )
+                if workspace["dataset_type"] != info["dataset_type"]:
+                    raise RegistryTransferError("Source and destination Registry dataset types must match")
+                cursor.execute(
+                    f"SELECT details FROM {schema}.registry_dataset_events WHERE workspace_id=%s AND event_id=%s",
+                    (workspace["id"], import_event_id),
+                )
+                prior = cursor.fetchone()
+                if prior is not None:
+                    result = _json(prior["details"]).get("result")
+                    if isinstance(result, dict):
+                        return {**result, "reused": True}
+
+                duplicates = _import_duplicate_inventory(cursor, schema, workspace["id"], source_items)
+                duplicate_by_source = {row["source_item_id"]: row for row in duplicates}
+                item_map: dict[str, str] = {}
+                merged_source_items: set[str] = set()
+                skipped = 0
+                for entry in source_items:
+                    source_id = str(entry["item"]["item_id"])
+                    duplicate = duplicate_by_source.get(source_id)
+                    if duplicate is None:
+                        item_map[source_id] = source_id
+                        continue
+                    action = duplicate_actions.get(source_id, duplicate_policy)
+                    item_map[source_id] = str(duplicate["target_item_id"])
+                    if action == "merge":
+                        if len(duplicate["matching_item_ids"]) != 1:
+                            raise RegistryTransferError(
+                                f"ROI {source_id} matches multiple destination items; choose skip because merge is ambiguous"
+                            )
+                        if duplicate["roi_hash"] != duplicate["target_roi_hash"]:
+                            raise RegistryTransferError(
+                                f"ROI {source_id} has the same UUID as a destination item but different image content; choose skip"
+                            )
+                        merged_source_items.add(source_id)
+                    else:
+                        skipped += 1
+
+                asset_map = _put_import_assets(repository, cursor, schema, workspace["id"], source, source_sha256)
+                cursor.execute(f"SELECT coalesce(max(ordinal),-1) value FROM {schema}.registry_items WHERE workspace_id=%s", (workspace["id"],))
+                ordinal = int(cursor.fetchone()["value"]) + 1
+                cursor.execute(f"SELECT source_key FROM {schema}.registry_items WHERE workspace_id=%s AND source_key IS NOT NULL", (workspace["id"],))
+                source_keys = {str(row["source_key"]) for row in cursor.fetchall()}
+                geometry = {str(row["item_id"]): row for row in _rows(source, "item_geometry")}
+                imported_item_ids: set[str] = set()
+                for entry in source_items:
+                    row, task = entry["item"], entry["task"]
+                    source_id = str(row["item_id"])
+                    if source_id in duplicate_by_source:
+                        continue
+                    target_id = item_map[source_id]
+                    source_key = row["source_key"]
+                    if source_key is not None and str(source_key) in source_keys:
+                        source_key = f"import:{info['dataset_id']}:{source_key}"
+                    if source_key is not None:
+                        source_keys.add(str(source_key))
+                    geo = geometry.get(source_id)
+                    cursor.execute(
+                        f"""INSERT INTO {schema}.registry_items
+                        (workspace_id,item_id,ordinal,sample_weight,source_key,image_asset_id,candidate_mask_asset_id,
+                         metadata,created_at,updated_at,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+                         crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,spatial_metadata)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (workspace["id"],target_id,ordinal,row["sample_weight"],source_key,
+                         asset_map[str(task["image_asset_id"])],
+                         (asset_map.get(str(task["candidate_mask_asset_id"]))
+                          if info["dataset_type"] == "mask_refinement" and task["candidate_mask_asset_id"] is not None
+                          else None),
+                         _jsonb(row["metadata_json"]),row["created_at"],row["updated_at"],
+                         geo["coordinate_space"] if geo else None,geo["bbox_x"] if geo else None,
+                         geo["bbox_y"] if geo else None,geo["bbox_w"] if geo else None,geo["bbox_h"] if geo else None,
+                         geo["crop_bbox_x"] if geo else None,geo["crop_bbox_y"] if geo else None,
+                         geo["crop_bbox_w"] if geo else None,geo["crop_bbox_h"] if geo else None,
+                         _jsonb(geo["metadata_json"] if geo else {})),
+                    )
+                    imported_item_ids.add(source_id)
+                    ordinal += 1
+
+                eligible_items = imported_item_ids | merged_source_items
+                for entry in source_items:
+                    source_id = str(entry["item"]["item_id"])
+                    if source_id not in merged_source_items:
+                        continue
+                    cursor.execute(
+                        f"SELECT metadata FROM {schema}.registry_items WHERE workspace_id=%s AND item_id=%s",
+                        (workspace["id"], item_map[source_id]),
+                    )
+                    target_metadata = _json(cursor.fetchone()["metadata"])
+                    source_metadata = _json(entry["item"]["metadata_json"])
+                    merged_metadata = {**source_metadata, **target_metadata}
+                    cursor.execute(
+                        f"UPDATE {schema}.registry_items SET metadata=%s WHERE workspace_id=%s AND item_id=%s",
+                        (_jsonb(merged_metadata), workspace["id"], item_map[source_id]),
+                    )
+                label_map: dict[tuple[str, str], str] = {}
+                descriptor_map: dict[str, str] = {}
+                created_labels = label_conflicts = created_descriptors = 0
+                # Evidence label references are part of ML provenance even when
+                # human annotations/descriptors were excluded by the caller.
+                if include_labels or include_evidence:
+                    label_map, created_labels, label_conflicts = _import_labels(
+                        cursor, schema, workspace["id"], source, source_sha256,
+                    )
+                concept_map = _import_auxiliary_records(
+                    cursor, schema, workspace, source, source_sha256, label_map,
+                )
+                if include_labels:
+                    descriptor_map, created_descriptors = _import_descriptors(
+                        cursor, schema, workspace["id"], source, source_sha256,
+                    )
+                    for row in _rows(source, "descriptor_definitions"):
+                        if row["concept_id"] is not None and str(row["concept_id"]) in concept_map:
+                            cursor.execute(
+                                f"UPDATE {schema}.registry_descriptors SET concept_id=%s WHERE workspace_id=%s AND descriptor_id=%s AND concept_id IS NULL",
+                                (concept_map[str(row["concept_id"])], workspace["id"], descriptor_map[str(row["descriptor_id"])]),
+                            )
+
+                imported_annotations = 0
+                annotation_map: dict[str, str] = {}
+                annotation_specs = (
+                    ("classification_annotations", "classification"),
+                    ("item_label_annotations", "workspace"),
+                )
+                if include_labels:
+                    for table, origin in annotation_specs:
+                        rows = [row for row in _rows(source, table) if str(row["item_id"]) in eligible_items]
+                        for row in rows:
+                            annotation_map[str(row["annotation_id"])] = _import_record_id(source_sha256, f"{origin}-annotation", row["annotation_id"])
+                        for row in rows:
+                            source_item_id = str(row["item_id"])
+                            target_item_id = item_map[source_item_id]
+                            is_current = bool(row["is_current"])
+                            if source_item_id in merged_source_items and is_current:
+                                cursor.execute(
+                                    f"SELECT 1 FROM {schema}.registry_annotations WHERE workspace_id=%s AND item_id=%s AND origin=%s AND is_current LIMIT 1",
+                                    (workspace["id"], target_item_id, origin),
+                                )
+                                is_current = cursor.fetchone() is None
+                            cursor.execute(
+                                f"""INSERT INTO {schema}.registry_annotations
+                                (workspace_id,annotation_id,item_id,label_id,origin,created_at,annotator,method,
+                                 confidence,status,is_current,parent_annotation_id,parameters,notes,metadata)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (workspace_id,annotation_id) DO NOTHING""",
+                                (workspace["id"],annotation_map[str(row["annotation_id"])],target_item_id,
+                                 label_map[(origin, str(row["label_id"]))],origin,row["created_at"],row["annotator"],
+                                 row["source"] if origin == "classification" else row["method"],row["confidence"],
+                                 row["status"],is_current,annotation_map.get(str(row["parent_annotation_id"])),
+                                 _jsonb({} if origin == "classification" else row["parameters_json"]),row["notes"],
+                                 _jsonb(row["metadata_json"])),
+                            )
+                            imported_annotations += cursor.rowcount
+                        review_table = "classification_annotation_reviews" if origin == "classification" else "annotation_reviews"
+                        for row in _rows(source, review_table):
+                            source_annotation = str(row["annotation_id"])
+                            if source_annotation not in annotation_map:
+                                continue
+                            cursor.execute(
+                                f"""INSERT INTO {schema}.registry_reviews
+                                (workspace_id,review_id,annotation_id,origin,reviewer,decision,created_at,notes,metadata)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (workspace_id,review_id) DO NOTHING""",
+                                (workspace["id"],_import_record_id(source_sha256, f"{origin}-review", row["review_id"]),
+                                 annotation_map[source_annotation],origin,row["reviewer"],row["decision"],row["created_at"],
+                                 row["notes"],_jsonb(row["metadata_json"])),
+                            )
+
+                descriptor_annotation_map: dict[str, str] = {}
+                imported_descriptor_annotations = 0
+                if include_labels:
+                    descriptor_rows = [row for row in _rows(source, "item_descriptor_annotations") if str(row["item_id"]) in eligible_items]
+                    for row in descriptor_rows:
+                        descriptor_annotation_map[str(row["annotation_id"])] = _import_record_id(source_sha256, "descriptor-annotation", row["annotation_id"])
+                    for row in descriptor_rows:
+                        source_item_id = str(row["item_id"])
+                        target_item_id = item_map[source_item_id]
+                        target_descriptor = descriptor_map[str(row["descriptor_id"])]
+                        is_current = bool(row["is_current"])
+                        if source_item_id in merged_source_items and is_current:
+                            cursor.execute(
+                                f"SELECT 1 FROM {schema}.registry_descriptor_annotations WHERE workspace_id=%s AND item_id=%s AND descriptor_id=%s AND is_current LIMIT 1",
+                                (workspace["id"],target_item_id,target_descriptor),
+                            )
+                            is_current = cursor.fetchone() is None
+                        cursor.execute(
+                            f"""INSERT INTO {schema}.registry_descriptor_annotations
+                            (workspace_id,annotation_id,item_id,descriptor_id,created_at,annotator,status,is_current,
+                             parent_annotation_id,notes,metadata)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (workspace_id,annotation_id) DO NOTHING""",
+                            (workspace["id"],descriptor_annotation_map[str(row["annotation_id"])],target_item_id,
+                             target_descriptor,row["created_at"],row["annotator"],row["status"],is_current,
+                             descriptor_annotation_map.get(str(row["parent_annotation_id"])),row["notes"],
+                             _jsonb(row["metadata_json"])),
+                        )
+                        imported_descriptor_annotations += cursor.rowcount
+
+                mask_map: dict[str, str] = {}
+                mask_rows = [row for row in _rows(source, "mask_annotations") if str(row["item_id"]) in eligible_items]
+                for row in mask_rows:
+                    mask_map[str(row["annotation_id"])] = _import_record_id(source_sha256, "mask-annotation", row["annotation_id"])
+                for row in mask_rows:
+                    source_item_id = str(row["item_id"])
+                    is_current = bool(row["is_current"])
+                    if source_item_id in merged_source_items and is_current:
+                        cursor.execute(
+                            f"SELECT 1 FROM {schema}.registry_mask_annotations WHERE workspace_id=%s AND item_id=%s AND is_current LIMIT 1",
+                            (workspace["id"],item_map[source_item_id]),
+                        )
+                        is_current = cursor.fetchone() is None
+                    cursor.execute(
+                        f"""INSERT INTO {schema}.registry_mask_annotations
+                        (workspace_id,annotation_id,item_id,mask_asset_id,created_at,annotator,method,parameters,
+                         validation,status,is_current,parent_annotation_id,notes)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (workspace_id,annotation_id) DO NOTHING""",
+                        (workspace["id"],mask_map[str(row["annotation_id"])],item_map[source_item_id],
+                         asset_map[str(row["mask_asset_id"])],row["created_at"],row["annotator"],row["method"],
+                         _jsonb(row["parameters_json"]),_jsonb(row["validation_json"]),row["status"],is_current,
+                         mask_map.get(str(row["parent_annotation_id"])),row["notes"]),
+                    )
+
+                imported_evidence = 0
+                run_map: dict[str, str] = {}
+                array_map: dict[str, str] = {}
+                if include_evidence:
+                    for row in _rows(source, "inference_runs"):
+                        target_id = _import_record_id(source_sha256, "inference-run", row["inference_run_id"])
+                        run_map[str(row["inference_run_id"])] = target_id
+                        cursor.execute(
+                            f"""INSERT INTO {schema}.registry_inference_runs
+                            (workspace_id,inference_run_id,dataset_fingerprint_sha256,model_artifact_id,model_run_id,
+                             model_artifact_fingerprint_sha256,name,status,created_at,completed_at,input_contract,
+                             parameters,software_environment,metadata)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (workspace_id,inference_run_id) DO NOTHING""",
+                            (workspace["id"],target_id,row["dataset_fingerprint_sha256"],row["model_artifact_id"],
+                             row["model_run_id"],row["model_artifact_fingerprint_sha256"],row["name"],row["status"],
+                             row["created_at"],row["completed_at"],_jsonb(row["input_contract_json"]),
+                             _jsonb(row["parameters_json"]),_jsonb(row["software_environment_json"]),
+                             _jsonb(row["metadata_json"])),
+                        )
+                    cursor.execute(f"SELECT array_id,content_sha256 FROM {schema}.registry_evidence_arrays WHERE workspace_id=%s", (workspace["id"],))
+                    arrays_by_hash = {str(row["content_sha256"]): str(row["array_id"]) for row in cursor.fetchall()}
+                    for row in _rows(source, "evidence_arrays"):
+                        source_id = str(row["array_id"])
+                        target_id = arrays_by_hash.get(str(row["content_sha256"])) or _import_record_id(source_sha256, "evidence-array", source_id)
+                        array_map[source_id] = target_id
+                        cursor.execute(
+                            f"""INSERT INTO {schema}.registry_evidence_arrays
+                            (workspace_id,array_id,content_sha256,payload,encoding,media_type,shape,dtype,created_at,metadata)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT DO NOTHING""",
+                            (workspace["id"],target_id,row["content_sha256"],row["payload"],row["encoding"],
+                             row["media_type"],_jsonb(row["shape_json"]),row["dtype"],row["created_at"],
+                             _jsonb(row["metadata_json"])),
+                        )
+                    for row in _rows(source, "model_evidence"):
+                        source_item_id = str(row["item_id"])
+                        if source_item_id not in eligible_items:
+                            continue
+                        predicted_label = row["predicted_label_id"]
+                        cursor.execute(
+                            f"""INSERT INTO {schema}.registry_model_evidence
+                            (workspace_id,evidence_id,inference_run_id,item_id,predicted_label_id,prediction_confidence,
+                             nearest_neighbor_similarity,top_k_label_agreement,weighted_label_support,label_margin,
+                             logits_array_id,embedding_array_id,output_array_id,packet,metadata,created_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT DO NOTHING""",
+                            (workspace["id"],_import_record_id(source_sha256, "model-evidence", row["evidence_id"]),
+                             run_map[str(row["inference_run_id"])],item_map[source_item_id],
+                             label_map.get(("workspace", str(predicted_label))) if predicted_label is not None else None,
+                             row["prediction_confidence"],row["nearest_neighbor_similarity"],row["top_k_label_agreement"],
+                             row["weighted_label_support"],row["label_margin"],array_map.get(str(row["logits_array_id"])),
+                             array_map.get(str(row["embedding_array_id"])),array_map.get(str(row["output_array_id"])),
+                             _jsonb(_remap_json_strings(_json(row["packet_json"]), item_map)),
+                             _jsonb(row["metadata_json"]),row["created_at"]),
+                        )
+                        imported_evidence += cursor.rowcount
+
+                for row in _rows(source, "dataset_events"):
+                    cursor.execute(
+                        f"""INSERT INTO {schema}.registry_dataset_events
+                        (workspace_id,event_id,revision_id,event_type,created_at,actor,details)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                        (workspace["id"],_import_record_id(source_sha256,"source-event",row["event_id"]),
+                         row["revision_id"],row["event_type"],row["created_at"],row["actor"],_jsonb(row["details_json"])),
+                    )
+
+                result = {
+                    "workspace_id": str(workspace["id"]), "imported_items": len(imported_item_ids),
+                    "merged_items": len(merged_source_items), "skipped_items": skipped,
+                    "metadata_conflicts": sum(len(row["metadata_conflicts"]) for row in duplicates),
+                    "imported_labels": imported_annotations, "label_conflicts": label_conflicts,
+                    "imported_label_definitions": created_labels,
+                    "imported_descriptors": imported_descriptor_annotations,
+                    "imported_descriptor_definitions": created_descriptors,
+                    "imported_evidence": imported_evidence, "source_path": str(source_path),
+                    "source_sha256": source_sha256, "backup_path": None,
+                }
+                now = datetime.now(timezone.utc).isoformat()
+                details = {
+                    "source_dataset_id": info["dataset_id"], "source_revision_id": info["revision_id"],
+                    "source_sha256": source_sha256, "options_sha256": options_fingerprint, "result": result,
+                }
+                cursor.execute(
+                    f"""INSERT INTO {schema}.registry_dataset_events
+                    (workspace_id,event_id,revision_id,event_type,created_at,actor,details)
+                    VALUES (%s,%s,%s,'registry.sqlite_imported',%s,%s,%s)""",
+                    (workspace["id"],import_event_id,workspace["revision_id"],now,actor or owner_username,_jsonb(details)),
+                )
+                cursor.execute(
+                    f"UPDATE {schema}.registry_workspaces SET dirty_at=NOW() WHERE id=%s",
+                    (workspace["id"],),
+                )
+            connection.commit()
+        return result
+    finally:
+        source.close()
+        temporary_path.unlink(missing_ok=True)
+
+
 def export_sqlite_workspace(
     repository,
     workspace_id: str,
@@ -534,6 +1320,26 @@ def _write_workspace(repository, cursor, schema: str, workspace_id: str, output:
         cursor.execute(f"SELECT * FROM {schema}.{table} WHERE workspace_id=%s ORDER BY {order}", (workspace_id,))
         return list(cursor.fetchall())
 
+    contract_rows = pg_rows("registry_contract_records", "relation,ordinal")
+
+    def write_contract_row(row: dict[str, Any]) -> None:
+        relation = row["relation"]
+        columns = [entry[1] for entry in output.execute(f'PRAGMA table_info("{relation}")')]
+        if not columns:
+            return
+        record = row["record"]
+        values = [record.get(column) for column in columns]
+        marks = ",".join("?" for _ in columns)
+        names = ",".join(f'"{column}"' for column in columns)
+        output.execute(f'INSERT OR IGNORE INTO "{relation}" ({names}) VALUES ({marks})', values)
+
+    # Descriptor definitions can reference taxonomy concepts. Materialize these
+    # dependency tables before the editable Registry relations.
+    for relation in ("taxonomy_concepts", "taxonomy_concept_mappings"):
+        for row in contract_rows:
+            if row["relation"] == relation:
+                write_contract_row(row)
+
     hot_store = getattr(repository, "hot_store", None)
     if hot_store is None:
         raise RegistryTransferError("Hot object storage is not configured for Registry assets")
@@ -629,14 +1435,7 @@ def _write_workspace(repository, cursor, schema: str, workspace_id: str, output:
         output.execute("INSERT OR IGNORE INTO dataset_events VALUES(?,?,?,?,?,?,?)",
           (row["event_id"],workspace["dataset_id"],row["revision_id"],row["event_type"],row["created_at"],row["actor"],json.dumps(row["details"],sort_keys=True)))
     if progress_callback: progress_callback(7, "Exported dataset events")
-    for row in pg_rows("registry_contract_records", "relation,ordinal"):
-        relation = row["relation"]
-        columns = [entry[1] for entry in output.execute(f'PRAGMA table_info("{relation}")')]
-        if not columns:
-            continue
-        record = row["record"]
-        values = [record.get(column) for column in columns]
-        marks = ",".join("?" for _ in columns)
-        names = ",".join(f'"{column}"' for column in columns)
-        output.execute(f'INSERT OR IGNORE INTO "{relation}" ({names}) VALUES ({marks})', values)
+    for row in contract_rows:
+        if row["relation"] not in {"taxonomy_concepts", "taxonomy_concept_mappings"}:
+            write_contract_row(row)
     if progress_callback: progress_callback(8, "Exported auxiliary contract records")
