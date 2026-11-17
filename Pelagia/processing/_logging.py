@@ -27,11 +27,11 @@ def log_processing_event(
     core_logger=None,
 ) -> None:
     """Write a structured processing event when an AppContext logger exists."""
-    database_logger = None if context is None else getattr(context, "logger", None)
-    if database_logger is None:
+    output_logger = None if context is None else getattr(context, "logger", None)
+    if output_logger is None:
         return
     try:
-        database_logger.log(
+        output_logger.log(
             event_type=event_type,
             message=message,
             level=level,
@@ -50,4 +50,4 @@ def log_processing_event(
         )
     except Exception:
         fallback = core_logger or processing_core_logger("logging")
-        fallback.exception("Failed to write processing database log event %s", event_type)
+        fallback.exception("Failed to write processing output event %s", event_type)

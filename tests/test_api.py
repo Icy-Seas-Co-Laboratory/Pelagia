@@ -877,7 +877,9 @@ class FakeRepository:
             for event in self.job_events
             if after_id is None or event["id"] > after_id
         ]
-        return list(reversed(rows))
+        rows.sort(key=lambda row: row["id"], reverse=not kwargs.get("ascending", False))
+        offset = kwargs.get("offset", 0)
+        return rows[offset:offset + kwargs.get("limit", 100)]
 
     def list_logs(self, **kwargs):
         return [{"id": 1, "event_type": "job.created", "level": kwargs.get("level") or "info", **kwargs}]
@@ -1320,6 +1322,7 @@ def make_client(*, auth_enabled=False):
     config = CoreConfig()
     config.auth.enabled = auth_enabled
     config.auth.dev_project_key = "default"
+    config.logging.log_path = Path(tempfile.mkdtemp(prefix="pelagia-api-test-output-"))
     config.kvstore.root_path = Path(tempfile.mkdtemp(prefix="pelagia-api-test-kvstore-"))
     app = create_app(config)
     repository = FakeRepository()
@@ -3854,6 +3857,28 @@ def test_api_streams_project_scoped_job_event_replay():
     assert repository.job_event_calls[-1]["after_id"] == 2
 
 
+def test_api_job_stream_replays_backlog_without_skipping_pages():
+    client, repository, _ = make_client(auth_enabled=True)
+    repository.job_events = [
+        {"id": event_id, "event_type": "job.progress_updated"}
+        for event_id in range(1, 8)
+    ]
+    headers = auth_headers(client)
+    cursor = 0
+    received = []
+    for _ in range(4):
+        response = client.get(
+            f"/jobs/stream?after_id={cursor}&limit=2&wait_seconds=0",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        ids = [int(line.removeprefix("id: ")) for line in response.text.splitlines() if line.startswith("id: ")]
+        received.extend(ids)
+        cursor = ids[-1]
+    assert received == list(range(1, 8))
+    assert repository.job_event_calls[-1]["ascending"] is True
+
+
 def test_api_job_stream_requires_auth_and_emits_heartbeat_when_idle():
     client, repository, _ = make_client(auth_enabled=True)
 
@@ -4076,6 +4101,85 @@ def test_api_can_list_and_read_physical_log_files(tmp_path):
     assert body["lines"] == ["second", "third"]
     assert body["text"] == "second\nthird"
     assert traversal_response.status_code == 422
+
+
+def test_api_physical_logs_require_admin_and_support_zstd(tmp_path):
+    import zstandard
+
+    client, _, _ = make_client(auth_enabled=True)
+    client.app.state.context.config.logging.log_path = tmp_path
+    path = tmp_path / "output.1.jsonl.zst"
+    path.write_bytes(zstandard.ZstdCompressor().compress(b'{"message":"first"}\n{"message":"second"}\n'))
+    (tmp_path / ".sequence").write_text("123")
+    editor_headers = auth_headers(client)
+    assert client.get("/logs/files?root=configured", headers=editor_headers).status_code == 403
+    assert client.get(f"/logs/files/{path.name}?root=configured", headers=editor_headers).status_code == 403
+    admin_headers = auth_headers(client, username="admin")
+    listing = client.get("/logs/files?root=configured", headers=admin_headers)
+    assert [entry["name"] for entry in listing.json()["files"]] == [path.name]
+    response = client.get(f"/logs/files/{path.name}?root=configured&tail_lines=1", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["lines"] == ['{"message":"second"}']
+    assert client.get("/logs/files/.sequence?root=configured", headers=admin_headers).status_code == 422
+
+
+def test_api_file_output_preserves_project_scope_and_replay_after_rotation(tmp_path):
+    from Pelagia.storage.output import OutputStore
+
+    client, repository, _ = make_client(auth_enabled=True)
+    config = client.app.state.context.config.logging
+    config.log_path = tmp_path
+    config.max_bytes = 200
+    store = OutputStore(config)
+    repository.append_log = lambda **record: store.append(record)
+    repository.list_logs = store.list_logs
+    repository.list_job_events = store.list_job_events
+    headers = auth_headers(client)
+    assert client.post("/logs", headers=headers, json={"event_type": "ui.output"}).status_code == 200
+    first = store.append({"event_type": "job.created", "project_id": "project-1"}, stream="events")
+    store.append({"event_type": "job.created", "project_id": "project-2"}, stream="events")
+    second = store.append({"event_type": "job.completed", "project_id": "project-1"}, stream="events")
+    store.prune()
+
+    logs = client.get("/logs", headers=headers).json()["logs"]
+    assert logs and all(row["project_id"] == "project-1" for row in logs)
+    response = client.get("/jobs/stream?after_id=0&limit=1&wait_seconds=0", headers=headers)
+    assert f'id: {first["id"]}\n' in response.text
+    response = client.get(f'/jobs/stream?after_id={first["id"]}&limit=1&wait_seconds=0', headers=headers)
+    assert f'id: {second["id"]}\n' in response.text
+    assert "project-2" not in response.text
+
+
+def test_api_physical_logs_reject_escaping_symlinks(tmp_path):
+    client, _, _ = make_client()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("secret")
+    (log_dir / "escape.jsonl").symlink_to(secret)
+    client.app.state.context.config.logging.log_path = log_dir
+    assert client.get("/logs/files/escape.jsonl?root=configured").status_code == 404
+    assert client.get("/logs/files?root=configured").json()["files"] == []
+
+
+@pytest.mark.parametrize("query", [
+    "/logs?offset=10001", "/jobs/events?offset=10001", "/jobs/events?limit=1001",
+])
+def test_api_output_history_bounds_query_memory(query):
+    client, _, _ = make_client()
+    assert client.get(query).status_code == 422
+
+
+def test_api_output_rejects_resource_ids_outside_selected_project():
+    client, repository, _ = make_client(auth_enabled=True)
+    headers = auth_headers(client)
+    response = client.post("/logs", headers=headers, json={
+        "event_type": "ui.output", "job_id": "00000000-0000-0000-0000-000000000099",
+    })
+    assert response.status_code == 404
+    assert repository.logs == []
+    response = client.post("/logs", headers=headers, json={"event_type": "ui.output", "job_id": "invalid"})
+    assert response.status_code == 422
 
 
 def test_api_can_queue_segmentation_job():
@@ -5082,6 +5186,8 @@ def test_api_refined_detection_id_endpoints_return_contract_and_payloads():
     assert refined["refinement_relationship"] == "one_to_one"
     assert refined["refined_roi_url"] == "/refined-detections/refined-det-1/roi"
     assert refined["refined_mask_url"] == "/refined-detections/refined-det-1/mask"
+    assert refined["roi_payload_bytes"] == 4
+    assert refined["mask_payload_bytes"] == 4
     assert matrix_response.status_code == 200
     assert matrix_response.json()["detection_id"] == "refined-det-1"
     assert matrix_response.json()["payload_kind"] == "roi"

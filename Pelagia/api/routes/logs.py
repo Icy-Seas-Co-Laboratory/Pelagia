@@ -3,16 +3,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, HTTPException, Query, Request
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     APIRouter = None  # type: ignore
 
 
 if APIRouter is not None:
-    from ..auth import require_auth, scoped_project_id
+    from ..auth import require_admin, require_project_write, scoped_project_id
     from ._common import as_response, get_context, get_repository
 
     def _bounded_limit(limit: int | None) -> int:
@@ -75,11 +76,16 @@ if APIRouter is not None:
             raise HTTPException(status_code=422, detail="Log file path must be a relative file name below a known log root.")
         return relative
 
+    def _is_log_file(path: Path) -> bool:
+        return path.name.endswith((".log", ".jsonl", ".jsonl.zst"))
+
     def _resolve_log_file(request: Request, file_name: str, root: str | None) -> tuple[str, Path, Path]:
         roots = _log_roots(request)
         if not roots:
             raise HTTPException(status_code=404, detail="No physical log roots were found.")
         relative = _safe_relative_path(file_name)
+        if not _is_log_file(relative):
+            raise HTTPException(status_code=422, detail="Only log output files can be read.")
         if root is not None:
             root_path = roots.get(root)
             if root_path is None:
@@ -109,6 +115,35 @@ if APIRouter is not None:
         return matches[0]
 
     def _read_tail(path: Path, *, tail_lines: int, max_bytes: int) -> tuple[str, list[str], bool]:
+        if path.name.endswith(".zst"):
+            import zstandard
+
+            # Bound the response buffer and the decompression work independently.
+            # Oversized archives can be inspected offline rather than monopolize
+            # an API worker, even when their compressed representation is small.
+            scan_budget = 64 * 1024 * 1024
+            payload = bytearray()
+            scanned = 0
+            try:
+                with path.open("rb") as handle, zstandard.ZstdDecompressor().stream_reader(handle) as reader:
+                    while chunk := reader.read(min(64 * 1024, scan_budget - scanned + 1)):
+                        scanned += len(chunk)
+                        if scanned > scan_budget:
+                            raise HTTPException(status_code=413, detail="Archive exceeds the 64 MiB decompressed read budget; inspect it offline.")
+                        payload.extend(chunk)
+                        if len(payload) > max_bytes:
+                            del payload[:-max_bytes]
+            except zstandard.ZstdError as exc:
+                raise HTTPException(status_code=422, detail="Log archive is not valid zstd output.") from exc
+            truncated = scanned > max_bytes
+            text = payload.decode("utf-8", errors="replace")
+            if truncated:
+                _, _, text = text.partition("\n")
+            lines = text.splitlines()
+            if len(lines) > tail_lines:
+                lines = lines[-tail_lines:]
+                text = "\n".join(lines)
+            return text, lines, truncated
         size = path.stat().st_size
         truncated = size > max_bytes
         with path.open("rb") as handle:
@@ -153,7 +188,7 @@ if APIRouter is not None:
         worker_id: str | None = None,
         request_id: str | None = None,
         limit: int | None = 100,
-        offset: int = 0,
+        offset: int = Query(0, ge=0, le=10000),
     ) -> dict[str, list]:
         repository = get_repository(request)
         logs = repository.list_logs(
@@ -175,16 +210,19 @@ if APIRouter is not None:
 
     @router.get("/files")
     def list_log_files(request: Request, root: str | None = None, limit: int | None = 200) -> dict[str, Any]:
-        require_auth(request)
+        require_admin(request)
         roots = _log_roots(request)
         selected_roots = {root: roots[root]} if root is not None and root in roots else roots
         if root is not None and root not in roots:
             raise HTTPException(status_code=404, detail=f"Log root {root!r} was not found.")
         files = []
         for root_key, root_path in selected_roots.items():
-            for path in sorted(root_path.rglob("*.log")):
-                if path.is_file():
-                    files.append(_file_summary(root_key, root_path, path))
+            for path in sorted(root_path.rglob("*")):
+                if _is_log_file(path) and path.is_file() and path.resolve().is_relative_to(root_path):
+                    try:
+                        files.append(_file_summary(root_key, root_path, path))
+                    except FileNotFoundError:
+                        continue  # A sealed segment was compressed or expired.
         files.sort(key=lambda item: item["modified_at"], reverse=True)
         resolved_limit = min(max(1, 200 if limit is None else limit), 1000)
         return {
@@ -200,17 +238,21 @@ if APIRouter is not None:
         tail_lines: int | None = 200,
         max_bytes: int | None = 256 * 1024,
     ) -> dict[str, Any]:
-        require_auth(request)
+        require_admin(request)
         root_key, root_path, path = _resolve_log_file(request, file_name, root)
         resolved_tail_lines = _bounded_tail_lines(tail_lines)
         resolved_max_bytes = _bounded_max_bytes(max_bytes)
-        text, lines, truncated = _read_tail(
-            path,
-            tail_lines=resolved_tail_lines,
-            max_bytes=resolved_max_bytes,
-        )
+        try:
+            text, lines, truncated = _read_tail(
+                path,
+                tail_lines=resolved_tail_lines,
+                max_bytes=resolved_max_bytes,
+            )
+            summary = _file_summary(root_key, root_path, path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Log file was rotated or expired; refresh the file listing.") from exc
         return {
-            "file": as_response(_file_summary(root_key, root_path, path)),
+            "file": as_response(summary),
             "tail_lines": resolved_tail_lines,
             "max_bytes": resolved_max_bytes,
             "truncated": truncated,
@@ -222,9 +264,22 @@ if APIRouter is not None:
     @router.post("")
     def create_log(request: Request, body: CreateLogRequest) -> dict:
         repository = get_repository(request)
+        auth = require_project_write(request)
+        # HTTP callers cannot attach another project's resource identifiers to
+        # output. Internal scoped loggers already carry trusted job context.
+        for field, lookup in (("run_id", repository.get_run), ("asset_id", repository.get_asset), ("job_id", repository.get_job)):
+            resource_id = getattr(body, field)
+            if resource_id is None:
+                continue
+            try:
+                UUID(resource_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"{field} must be a UUID.") from exc
+            if lookup(resource_id, project_id=auth.project_id) is None:
+                raise HTTPException(status_code=404, detail=f"{field} was not found in the selected project.")
         row = repository.append_log(
             event_type=body.event_type,
-            project_id=scoped_project_id(request),
+            project_id=auth.project_id,
             message=body.message,
             level=body.level,
             logger=body.logger,

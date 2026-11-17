@@ -133,7 +133,7 @@ def test_logging_config_defaults_to_core_file_logger():
     config = LoggingConfig()
 
     assert config.log_path.as_posix() == "logs"
-    assert config.file_name == "pelagia.log"
+    assert config.file_name == "pelagia.jsonl"
     assert config.level == "INFO"
     assert config.console is True
 
@@ -235,7 +235,7 @@ def test_core_config_loads_packaged_defaults_without_local_config():
     assert config.processing.roi_refinement.v3_growth_penalty == 0.2
     assert config.processing.roi_refinement.v3_gradient_sigma is None
     assert config.logging.log_path.as_posix() == "logs"
-    assert config.logging.file_name == "pelagia.log"
+    assert config.logging.file_name == "pelagia.jsonl"
     assert config.logging.level == "INFO"
 
 
@@ -622,3 +622,31 @@ def test_logging_retention_settings_and_positive_bounds(tmp_path, monkeypatch):
     config_path.write_text("[logging]\ncleanup_interval_seconds = 0\n", encoding="utf-8")
     with pytest.raises(ValueError, match="logging.cleanup_interval_seconds must be positive"):
         CoreConfig.load(config_path=config_path, use_env=False)
+
+
+def test_logging_rotation_settings_load_from_toml_and_env(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[logging]\ncompression_level = 5\nrotation_interval_seconds = 3600\nmax_total_bytes = 99999\n",
+        encoding="utf-8",
+    )
+    config = CoreConfig.load(config_path=config_path, use_env=False)
+    assert config.logging.compression_level == 5
+    assert config.logging.rotation_interval_seconds == 3600
+    assert config.logging.max_total_bytes == 99999
+    monkeypatch.setenv("PELAGIA_LOG_COMPRESSION_LEVEL", "1")
+    monkeypatch.setenv("PELAGIA_LOG_ROTATION_INTERVAL_SECONDS", "600")
+    monkeypatch.setenv("PELAGIA_LOG_MAX_TOTAL_BYTES", "100000")
+    config = CoreConfig.load(config_path=config_path)
+    assert config.logging.compression_level == 1
+    assert config.logging.rotation_interval_seconds == 600
+    assert config.logging.max_total_bytes == 100000
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_bytes": 0}, {"backup_count": 0}, {"rotation_interval_seconds": 0},
+    {"max_total_bytes": 0}, {"compression_level": 23}, {"file_name": "../output.jsonl"},
+])
+def test_logging_rejects_unsafe_rotation_configuration(kwargs):
+    with pytest.raises(ValueError, match="logging\\."):
+        LoggingConfig(**kwargs)

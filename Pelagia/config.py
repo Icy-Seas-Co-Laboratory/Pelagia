@@ -210,14 +210,17 @@ class AuthConfig:
 
 @dataclass(slots=True)
 class LoggingConfig:
-    """Operational file logging and database event retention settings."""
+    """Structured output rotation, compression, and retention settings."""
 
     log_path: Path = Path("./logs")
-    file_name: str = "pelagia.log"
+    file_name: str = "pelagia.jsonl"
     level: str = "INFO"
     console: bool = True
     max_bytes: int = 10 * 1024 * 1024
     backup_count: int = 10
+    compression_level: int = 3
+    rotation_interval_seconds: int = 86400
+    max_total_bytes: int = 1024 * 1024 * 1024
     high_frequency_retention_days: int = 7
     job_event_retention_days: int = 90
     routine_log_retention_days: int = 90
@@ -227,12 +230,17 @@ class LoggingConfig:
 
     def __post_init__(self) -> None:
         for name in (
+            "max_bytes", "backup_count", "rotation_interval_seconds", "max_total_bytes",
             "high_frequency_retention_days", "job_event_retention_days",
             "routine_log_retention_days", "important_log_retention_days",
             "cleanup_interval_seconds", "cleanup_batch_size",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"logging.{name} must be positive.")
+        if not -131072 <= self.compression_level <= 22:
+            raise ValueError("logging.compression_level must be between -131072 and 22.")
+        if not self.file_name or Path(self.file_name).name != self.file_name or self.file_name in {".", ".."}:
+            raise ValueError("logging.file_name must be a file name without directories.")
 
 
 @dataclass(slots=True)
@@ -712,6 +720,9 @@ def _apply_env_overrides(settings: dict[str, Any]) -> None:
     _set_from_env(settings, "logging", "console", "PELAGIA_LOG_CONSOLE", _env_bool)
     _set_from_env(settings, "logging", "max_bytes", "PELAGIA_LOG_MAX_BYTES", int)
     _set_from_env(settings, "logging", "backup_count", "PELAGIA_LOG_BACKUP_COUNT", int)
+    _set_from_env(settings, "logging", "compression_level", "PELAGIA_LOG_COMPRESSION_LEVEL", int)
+    _set_from_env(settings, "logging", "rotation_interval_seconds", "PELAGIA_LOG_ROTATION_INTERVAL_SECONDS", int)
+    _set_from_env(settings, "logging", "max_total_bytes", "PELAGIA_LOG_MAX_TOTAL_BYTES", int)
     for key, env_name in (
         ("high_frequency_retention_days", "PELAGIA_LOG_HIGH_FREQUENCY_RETENTION_DAYS"),
         ("job_event_retention_days", "PELAGIA_LOG_JOB_EVENT_RETENTION_DAYS"),
@@ -1048,6 +1059,9 @@ def _config_from_mapping(settings: dict[str, Any]) -> CoreConfig:
             console=bool(logging.get("console", LoggingConfig.console)),
             max_bytes=int(logging.get("max_bytes", LoggingConfig.max_bytes)),
             backup_count=int(logging.get("backup_count", LoggingConfig.backup_count)),
+            compression_level=int(logging.get("compression_level", LoggingConfig.compression_level)),
+            rotation_interval_seconds=int(logging.get("rotation_interval_seconds", LoggingConfig.rotation_interval_seconds)),
+            max_total_bytes=int(logging.get("max_total_bytes", LoggingConfig.max_total_bytes)),
             high_frequency_retention_days=int(logging.get("high_frequency_retention_days", LoggingConfig.high_frequency_retention_days)),
             job_event_retention_days=int(logging.get("job_event_retention_days", LoggingConfig.job_event_retention_days)),
             routine_log_retention_days=int(logging.get("routine_log_retention_days", LoggingConfig.routine_log_retention_days)),

@@ -150,7 +150,14 @@ def frame_summary(row: Any) -> dict[str, Any]:
 
 
 def detection_summary(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
-    item = as_response(_as_dict(row)) if include_payload else without_payload_bytes(row, ("roi_payload", "mask_payload"))
+    if include_payload:
+        item = _as_dict(row)
+        for field in ("roi_payload", "mask_payload"):
+            if item.get(field) is not None:
+                item[f"{field}_bytes"] = len(item[field])
+        item = as_response(item)
+    else:
+        item = without_payload_bytes(row, ("roi_payload", "mask_payload"))
     metadata = item.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}

@@ -65,6 +65,9 @@ if APIRouter is not None:
                     "console": config.logging.console,
                     "max_bytes": config.logging.max_bytes,
                     "backup_count": config.logging.backup_count,
+                    "compression_level": config.logging.compression_level,
+                    "rotation_interval_seconds": config.logging.rotation_interval_seconds,
+                    "max_total_bytes": config.logging.max_total_bytes,
                 },
             }
         )

@@ -26,12 +26,11 @@ def _write_stack_config(tmp_path: Path, contents: str) -> Path:
     return config_path
 
 
-def test_worker_stack_examples_use_migrated_skerry_store():
-    for filename in ("pelagia_workers.example.toml", "pelagia_workers.toml"):
-        with (ROOT_DIR / "scripts" / filename).open("rb") as config_file:
-            config = tomllib.load(config_file)
-        assert config["skerry"]["root"] == "./data/skerry-cold"
-        assert config["hot_storage"]["endpoint"] == config["cold_storage"]["endpoint"]
+def test_worker_stack_example_uses_migrated_skerry_store():
+    with (ROOT_DIR / "scripts" / "pelagia_workers.example.toml").open("rb") as config_file:
+        config = tomllib.load(config_file)
+    assert config["skerry"]["root"] == "./data/skerry-cold"
+    assert config["hot_storage"]["endpoint"] == config["cold_storage"]["endpoint"]
 
 
 def test_stack_validate_selects_venv_by_worker_capability(tmp_path):

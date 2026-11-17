@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import CoreConfig
-from ..observability import DatabaseLogger
+from ..observability import OutputLogger
+from ..storage.output import OutputStore
 from ..storage.blob_store import BlobStore, create_kvstore, create_skerrykv_store, initialize_kvstore
 from ..storage.skerrykv import SkerryKVStore
 from ..storage.postgres import DEFAULT_PROJECT_ID, PostgresRepository
@@ -19,7 +20,7 @@ class AppContext:
     repository: PostgresRepository | None = None
     kvstore: BlobStore | None = None
     hot_storage: BlobStore | None = None
-    logger: DatabaseLogger | None = None
+    logger: OutputLogger | None = None
     oracle: Any | None = None
     active_project_id: str | None = None
     _project_kvstores: dict[str, BlobStore] = field(default_factory=dict)
@@ -30,7 +31,11 @@ class AppContext:
         """Create a context without opening a KVStore until a project is selected."""
         resolved = config or CoreConfig.load()
         repository = PostgresRepository(resolved)
-        logger = DatabaseLogger(repository)
+        output_store = OutputStore(resolved.logging)
+        # The repository publishes committed lifecycle events through the same
+        # store; explicit application output never needs a database lookup.
+        repository.output_store = output_store
+        logger = OutputLogger(output_store)
         hot_storage = create_skerrykv_store(resolved.hot_storage)
         # Repository methods resolve persisted ROI/mask references through this
         # service without making HTTP concerns part of SQL code.
@@ -83,6 +88,7 @@ class AppContext:
             self,
             kvstore=self.kvstore_for_project(project_id),
             active_project_id=str(project_id),
+            logger=None if self.logger is None else self.logger.for_project(str(project_id)),
         )
 
     def close(self) -> None:

@@ -1655,15 +1655,12 @@ if typer is not None:
         database_dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> None:
-        """Inspect or delete one bounded batch of expired PostgreSQL log rows."""
-        from ..storage.postgres import PostgresRepository
+        """Inspect or maintain rotated JSONL output without connecting to PostgreSQL."""
+        from ..storage.output import OutputStore
 
-        repository = PostgresRepository(_config_from_options(None, database_dsn, schema))
-        try:
-            result = repository.prune_operational_logs(dry_run=dry_run)
-            typer.echo(json.dumps(result, sort_keys=True))
-        finally:
-            repository.close()
+        config = _config_from_options(None, database_dsn, schema)
+        result = OutputStore(config.logging).prune(dry_run=dry_run)
+        typer.echo(json.dumps(result, sort_keys=True))
 
     @app.command("worker_run_once")
     def worker_run_once(

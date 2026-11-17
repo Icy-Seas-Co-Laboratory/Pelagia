@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from ..config import CoreConfig
 from ..observability import configure_core_logging
 from ..services.context import AppContext
+from ..storage.output import OutputStore
 from ..version import __version__
 from .routes import assets, auth, collections, curation, detections, exports, frame, health, ingestion, jobs, kvstore, live, live_preview, live_sandbox, logs, models, processing, processing_status, registry, roi_refinement, runs, segmentation, system, telemetry, workers
 
@@ -54,11 +55,25 @@ def create_app(config: CoreConfig | None = None):
                     pass
 
         dispatcher_task = asyncio.create_task(dispatch_processing_submissions())
+
+        async def maintain_output() -> None:
+            store = OutputStore(resolved_config.logging)
+            while not stop_dispatcher.is_set():
+                try:
+                    await asyncio.to_thread(store.prune)
+                except Exception:
+                    core_logger.exception("Output compression and retention maintenance failed")
+                try:
+                    await asyncio.wait_for(stop_dispatcher.wait(), timeout=resolved_config.logging.cleanup_interval_seconds)
+                except TimeoutError:
+                    pass
+
+        output_task = asyncio.create_task(maintain_output())
         try:
             yield
         finally:
             stop_dispatcher.set()
-            await dispatcher_task
+            await asyncio.gather(dispatcher_task, output_task)
             context.close()
 
     app = FastAPI(

@@ -262,8 +262,8 @@ if APIRouter is not None:
         after_id: int | None = None,
         run_id: str | None = None,
         job_id: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=10000),
     ) -> dict[str, list]:
         repository = get_repository(request)
         events = repository.list_job_events(
@@ -307,10 +307,11 @@ if APIRouter is not None:
                     job_id=job_id,
                     limit=limit,
                     offset=0,
+                    ascending=True,
                 )
                 if events:
-                    # Storage's list endpoint is newest-first; SSE replay must
-                    # be oldest-first so Last-Event-ID advances monotonically.
+                    # Fetch the earliest page after the cursor, then deliver in
+                    # order so reconnects cannot skip a backlog larger than limit.
                     for event in sorted(events, key=lambda item: int(item.get("id", 0))):
                         yield _sse_event(event)
                     return

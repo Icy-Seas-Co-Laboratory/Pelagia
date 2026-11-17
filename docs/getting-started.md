@@ -207,8 +207,9 @@ default, the TOML stack uses:
 <repo>/.pelagia/run/<stack-name>/
 ```
 
-PostgreSQL job events and structured logs have separate age-based retention;
-see [operational log retention](operational-logs.md).
+Diagnostic output and job-event history use JSONL files with zstd rotation;
+current job state remains in PostgreSQL. API and workers must share the same
+`logging.log_path`; see [operational output and retention](operational-logs.md).
 
 On shared Linux machines, set an explicit writable run directory. For example,
 if the repo is cloned at `/scratch/Pelagia`:

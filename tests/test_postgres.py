@@ -1783,7 +1783,7 @@ def test_postgres_worker_can_start_without_any_projects(postgres_repo):
 
 
 @pytest.fixture()
-def postgres_repo():
+def postgres_repo(tmp_path):
     if postgres.psycopg is None:
         pytest.skip("psycopg is not installed.")
 
@@ -1791,6 +1791,7 @@ def postgres_repo():
     config = CoreConfig()
     config.database.dsn = POSTGRES_TEST_DSN
     config.database.schema_name = schema
+    config.logging.log_path = tmp_path / "output"
 
     repo = PostgresRepository(config)
     repo.hot_store = _MemoryBlobStore()
@@ -2688,43 +2689,86 @@ def test_postgres_repository_registers_frames_and_jobs(postgres_repo):
     assert "worker.shutdown_requested" in [event["event_type"] for event in worker_events]
 
 
-def test_postgres_operational_log_cleanup_is_bounded_and_preserves_recent_rows(postgres_repo):
-    project = postgres_repo.ensure_default_project()
+def test_postgres_operational_log_cleanup_delegates_to_output_store(postgres_repo, monkeypatch):
+    expected = {"dry_run": True, "acquired": True, "deleted": {"segments": 2}}
+    calls = []
+    monkeypatch.setattr(
+        postgres_repo.output_store,
+        "prune",
+        lambda *, dry_run=False: calls.append(dry_run) or expected,
+    )
+
+    assert postgres_repo.prune_operational_logs(dry_run=True) == expected
+    assert calls == [True]
+
+
+def test_postgres_output_is_published_after_commit_and_discarded_on_rollback(postgres_repo):
+    project = postgres_repo.create_project(f"output-{uuid.uuid4().hex}")
     project_id = str(project["id"])
-    old_progress = postgres_repo.append_job_event(None, "job.progress_updated", {"worker_id": "old"})
-    old_event = postgres_repo.append_job_event(None, "job.completed", {})
-    old_debug = postgres_repo.append_log(project_id=project_id, event_type="job.progress_updated", level="debug")
-    old_routine = postgres_repo.append_log(project_id=project_id, event_type="pipeline.completed", level="info")
-    old_routine_2 = postgres_repo.append_log(project_id=project_id, event_type="pipeline.completed", level="info")
-    old_important = postgres_repo.append_log(project_id=project_id, event_type="jobs.deleted", level="info")
-    recent = postgres_repo.append_log(project_id=project_id, event_type="pipeline.recent", level="info")
+    job = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=project_id)
+    job_id = str(job["id"])
+
+    assert postgres_repo.list_job_events(job_id=job_id)[0]["event_type"] == "job.created"
     with postgres_repo.connect() as connection:
         with connection.cursor() as cursor:
-            for table, row_id, age_days in (
-                ("job_events", old_progress["id"], 10),
-                ("job_events", old_event["id"], 100),
-                ("logs", old_debug["id"], 10),
-                ("logs", old_routine["id"], 100),
-                ("logs", old_routine_2["id"], 100),
-                ("logs", old_important["id"], 400),
-            ):
-                cursor.execute(
-                    f"UPDATE {postgres_repo.schema}.{table} SET created_at = NOW() - (%s * INTERVAL '1 day') WHERE id = %s",
-                    (age_days, row_id),
-                )
-        connection.commit()
+            postgres_repo._append_job_event(
+                cursor,
+                job_id,
+                "job.rollback_probe",
+                {"project_id": project_id},
+            )
+        connection.rollback()
 
-    postgres_repo.config.logging.cleanup_batch_size = 1
-    preview = postgres_repo.prune_operational_logs(dry_run=True)
-    assert preview["deleted"]["logs_routine"] == 2
-    assert all(count == 1 for name, count in preview["deleted"].items() if name != "logs_routine")
-    first_pass = postgres_repo.prune_operational_logs()
-    assert all(count == 1 for count in first_pass["deleted"].values())
-    assert postgres_repo.prune_operational_logs()["deleted"]["logs_routine"] == 1
-    assert postgres_repo.prune_operational_logs(dry_run=True)["deleted"] == {
-        name: 0 for name in preview["deleted"]
-    }
-    assert postgres_repo.list_logs(event_type="pipeline.recent")[0]["id"] == recent["id"]
+    assert [row["event_type"] for row in postgres_repo.list_job_events(job_id=job_id)] == ["job.created"]
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) AS total FROM {postgres_repo.schema}.job_events")
+            event_count = int(cursor.fetchone()["total"])
+            cursor.execute(f"SELECT count(*) AS total FROM {postgres_repo.schema}.logs")
+            log_count = int(cursor.fetchone()["total"])
+    assert (event_count, log_count) == (0, 0)
+
+
+def test_postgres_output_failure_does_not_roll_back_job_state(postgres_repo, monkeypatch):
+    project = postgres_repo.create_project(f"output-failure-{uuid.uuid4().hex}")
+
+    def fail_append(*args, **kwargs):
+        raise OSError("output disk unavailable")
+
+    monkeypatch.setattr(postgres_repo.output_store, "append", fail_append)
+    job = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))
+
+    persisted = postgres_repo.get_job(str(job["id"]), project_id=str(project["id"]))
+    assert persisted is not None
+    assert persisted["status"] == "queued"
+
+
+def test_postgres_output_serialization_failure_does_not_change_committed_state(postgres_repo, monkeypatch):
+    project = postgres_repo.create_project(f"serialization-failure-{uuid.uuid4().hex}")
+
+    def fail_serialization(record):
+        raise ValueError("diagnostic serializer failed")
+
+    monkeypatch.setattr(postgres, "_redact_output_secrets", fail_serialization)
+    job = postgres_repo.create_job(PipelineStage.EXTRACT_FRAMES, project_id=str(project["id"]))
+    assert postgres_repo.get_job(str(job["id"]))["status"] == "queued"
+
+
+def test_postgres_explicit_project_log_never_opens_database(postgres_repo, monkeypatch):
+    project_id = str(uuid.uuid4())
+
+    def fail_connect():
+        raise AssertionError("explicitly scoped output must not open PostgreSQL")
+
+    monkeypatch.setattr(postgres_repo, "connect", fail_connect)
+    row = postgres_repo.append_log(
+        project_id=project_id,
+        event_type="output.direct",
+        payload={"lease_token": "secret", "nested": {"lease_token": "also-secret", "kept": True}},
+    )
+
+    assert row["project_id"] == project_id
+    assert row["payload"] == {"nested": {"kept": True}}
 
 
 def test_postgres_job_telemetry_avoids_redundant_log_rows(postgres_repo):
@@ -2736,16 +2780,36 @@ def test_postgres_job_telemetry_avoids_redundant_log_rows(postgres_repo):
 
     assert postgres_repo.heartbeat("telemetry-worker", job_id, lease_token=lease_token) is not None
     assert postgres_repo.update_job_progress(
-        job_id, {"completed": 1}, worker_id="telemetry-worker", lease_token=lease_token,
+        job_id, {"completed": 1}, log_message="Processed one frame",
+        worker_id="telemetry-worker", lease_token=lease_token,
     ) is not None
+    assert postgres_repo.update_job_progress(
+        job_id, {"completed": 2}, log_message="Processed two frames",
+        worker_id="telemetry-worker", lease_token=lease_token,
+    ) is not None
+    assert postgres_repo.get_job(job_id)["progress"]["completed"] == 2
+    assert postgres_repo.get_job(job_id)["logs_tail"] == []
     postgres_repo.touch_worker("telemetry-worker", status="working", leased_job_id=job_id)
 
     event_types = [row["event_type"] for row in postgres_repo.list_job_events(job_id=job_id)]
     assert "job.progress_updated" in event_types
+    progress_event = next(
+        row for row in postgres_repo.list_job_events(job_id=job_id)
+        if row["event_type"] == "job.progress_updated"
+    )
+    assert progress_event["payload"]["log_message"] == "Processed two frames"
     assert "job.heartbeat" not in event_types
     assert postgres_repo.list_logs(job_id=job_id, event_type="job.progress_updated") == []
     worker_events = postgres_repo.list_job_events(limit=100)
     assert not any(row["event_type"] in {"worker.heartbeat", "worker.touched"} for row in worker_events)
+    with postgres_repo.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) AS total FROM {postgres_repo.schema}.job_events")
+            assert int(cursor.fetchone()["total"]) == 0
+            cursor.execute(f"SELECT count(*) AS total FROM {postgres_repo.schema}.logs")
+            assert int(cursor.fetchone()["total"]) == 0
+            cursor.execute(f"SELECT count(*) AS total FROM {postgres_repo.schema}.processing_jobs")
+            assert int(cursor.fetchone()["total"]) == 1
 
 
 def test_postgres_frame_processing_status_projection_tracks_stage_and_counts(postgres_repo):
@@ -3941,7 +4005,7 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     assert result["tables"]["processing_jobs"] == 1
     assert result["tables"]["worker_sessions"] == 1
     assert result["tables"]["models"] == 1
-    assert result["tables"]["job_events"] >= 1
+    assert result["tables"]["job_events"] == 0
     assert result["exact_counts_collected"] is True
     assert postgres_repo.list_runs() == []
     assert postgres_repo.list_assets() == []
@@ -3949,7 +4013,7 @@ def test_postgres_repository_purge_all_deletes_rows(postgres_repo):
     assert postgres_repo.list_worker_sessions() == []
     assert postgres_repo.list_collections() == []
     assert postgres_repo.list_models() == []
-    assert postgres_repo.list_job_events() == []
+    assert any(event["job_id"] == job_id for event in postgres_repo.list_job_events())
 
 
 def test_postgres_repository_purge_all_can_skip_exact_counts(postgres_repo):

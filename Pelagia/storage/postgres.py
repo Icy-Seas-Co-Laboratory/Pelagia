@@ -18,6 +18,7 @@ from ..utils.serialization import json_ready
 from ..utils.validation import validate_schema_name
 from .blob_store import create_skerrykv_store
 from .count_sampling import count_sample
+from .output import OutputStore
 
 try:
     import psycopg
@@ -164,6 +165,71 @@ class EmbeddingEvidenceContext:
     model_artifact_id: str
 
 
+class _OutputCursor:
+    """Delegate a psycopg cursor while retaining its output transaction."""
+
+    def __init__(self, cursor: Any, connection: "_OutputConnection") -> None:
+        self._cursor = cursor
+        self._output_connection = connection
+
+    def __enter__(self) -> "_OutputCursor":
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool | None:
+        return self._cursor.__exit__(exc_type, exc_value, traceback)
+
+    @property
+    def connection(self) -> "_OutputConnection":
+        return self._output_connection
+
+    def __iter__(self) -> "_OutputCursor":
+        return self
+
+    def __next__(self) -> Any:
+        return next(self._cursor)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class _OutputConnection:
+    """Queue operational output until the associated SQL transaction commits."""
+
+    def __init__(self, connection: Any, repository: "PostgresRepository") -> None:
+        self._connection = connection
+        self._repository = repository
+        self._pending_output: list[tuple[str, dict[str, Any]]] = []
+
+    def cursor(self, *args, **kwargs) -> _OutputCursor:
+        return _OutputCursor(self._connection.cursor(*args, **kwargs), self)
+
+    def queue_output(self, record: dict[str, Any], *, stream: str) -> dict[str, Any]:
+        self._pending_output.append((stream, record))
+        return record
+
+    def commit(self) -> None:
+        self._connection.commit()
+        self.flush_output()
+
+    def rollback(self) -> None:
+        try:
+            self._connection.rollback()
+        finally:
+            self.discard_output()
+
+    def flush_output(self) -> None:
+        pending, self._pending_output = self._pending_output, []
+        for stream, record in pending:
+            self._repository._write_output(record, stream=stream)
+
+    def discard_output(self) -> None:
+        self._pending_output.clear()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 def _initial_job_progress(
     stage: str,
     status: str,
@@ -269,6 +335,20 @@ def _event_message(event_type: str, payload: dict[str, Any]) -> str:
     return event_type.replace(".", " ")
 
 
+def _redact_output_secrets(value: Any) -> Any:
+    """Remove worker claim credentials from diagnostic output recursively."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redact_output_secrets(item)
+            for key, item in value.items()
+            if str(key).lower() != "lease_token"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_output_secrets(item) for item in value]
+    return value
+
+
 def hash_password(password: str, *, iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
     """Hash a password using only stdlib primitives for the initial auth foundation."""
     salt = secrets.token_hex(16)
@@ -339,6 +419,7 @@ class PostgresRepository:
         self.frames = FrameRepository(self)
         self.jobs = JobRepository(self)
         self.telemetry = TelemetryRepository(self)
+        self.output_store = OutputStore(config.logging)
         # Configured by AppContext.  Keeping this injectable lets repository
         # tests use a small in-memory object-store double.
         self.hot_store: Any | None = create_skerrykv_store(config.hot_storage)
@@ -375,10 +456,26 @@ class PostgresRepository:
                 row[payload] = self.hot_store.get_store(str(row[ref]))
         return row
 
+    @contextmanager
     def connect(self):
-        """Borrow a bounded, reusable connection for one repository operation."""
+        """Borrow a connection and publish queued output only after commit."""
 
-        return self._pool.connection()
+        manager = self._pool.connection()
+        raw_connection = manager.__enter__()
+        connection = _OutputConnection(raw_connection, self)
+        try:
+            yield connection
+        except BaseException as exc:
+            connection.discard_output()
+            manager.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            try:
+                manager.__exit__(None, None, None)
+            except BaseException:
+                connection.discard_output()
+                raise
+            connection.flush_output()
 
     @contextmanager
     def _operation_connection(self, connection=None):
@@ -395,6 +492,27 @@ class PostgresRepository:
         """Close this process's connection pool."""
 
         self._pool.close()
+
+    def _write_output(self, record: dict[str, Any], *, stream: str) -> dict[str, Any]:
+        """Best-effort output after a successful database commit."""
+
+        safe_record = {"event_type": record.get("event_type"), "message": "Unable to serialize operational output"}
+        try:
+            safe_record = json_ready(_redact_output_secrets(record))
+            persisted = self.output_store.append(safe_record, stream=stream)
+        except Exception as exc:
+            # Import lazily to keep the repository's storage dependencies free
+            # of observability setup and to avoid recursive handler failures.
+            from ..observability import write_output_fallback
+
+            write_output_fallback(safe_record, exc)
+            return record
+        # Callers of the public append methods historically receive the stored
+        # row. Mutating the queued placeholder preserves that contract once the
+        # surrounding commit has assigned its file-backed identifier.
+        record.clear()
+        record.update(persisted)
+        return record
 
     def ensure_database_exists(self) -> None:
         dsn_fields = self._dsn_fields()
@@ -10195,14 +10313,6 @@ class PostgresRepository:
     ) -> dict[str, Any] | None:
         if (worker_id is None) != (lease_token is None):
             raise ValueError("worker_id and lease_token must be supplied together.")
-        logs_tail = None
-        if log_message:
-            current = self.get_job(job_id)
-            if current is None:
-                return None
-            logs_tail = list(current.get("logs_tail") or [])
-            logs_tail.append(log_message)
-            logs_tail = logs_tail[-20:]
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -10210,7 +10320,6 @@ class PostgresRepository:
                     UPDATE {self.schema}.processing_jobs
                     SET progress = jsonb_set(%s::jsonb, '{{recorded_at}}', to_jsonb(NOW()), true),
                         summary = COALESCE(%s, summary),
-                        logs_tail = COALESCE(%s::jsonb, logs_tail),
                         updated_at = NOW()
                     WHERE id = %s
                       AND (%s::text IS NULL OR (worker_id = %s AND lease_token = %s::uuid AND status IN ('leased', 'working')))
@@ -10219,7 +10328,6 @@ class PostgresRepository:
                     (
                         json.dumps(json_ready(progress)),
                         summary,
-                        None if logs_tail is None else json.dumps(json_ready(logs_tail)),
                         job_id,
                         worker_id,
                         worker_id,
@@ -10236,6 +10344,9 @@ class PostgresRepository:
                             "progress": progress,
                             "summary": summary,
                             "log_message": log_message,
+                            "project_id": row.get("project_id"),
+                            "run_id": row.get("run_id"),
+                            "asset_id": row.get("asset_id"),
                         },
                     )
             connection.commit()
@@ -10264,6 +10375,26 @@ class PostgresRepository:
         duration_ms: float | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if project_id is not None:
+            return self._write_output(
+                self._log_record(
+                    context={
+                        "project_id": str(project_id),
+                        "run_id": None if run_id is None else str(run_id),
+                        "asset_id": None if asset_id is None else str(asset_id),
+                        "job_id": None if job_id is None else str(job_id),
+                    },
+                    event_type=event_type,
+                    message=message,
+                    level=level,
+                    logger=logger,
+                    worker_id=worker_id,
+                    request_id=request_id,
+                    duration_ms=duration_ms,
+                    payload=payload,
+                ),
+                stream="logs",
+            )
         with self.connect() as connection:
             with connection.cursor() as cursor:
                 row = self._append_log(
@@ -10284,6 +10415,78 @@ class PostgresRepository:
             connection.commit()
         return row
 
+    @staticmethod
+    def _log_record(
+        *,
+        context: Mapping[str, str | None],
+        event_type: str,
+        message: str | None,
+        level: str,
+        logger: str,
+        worker_id: str | None,
+        request_id: str | None,
+        duration_ms: float | None,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            **context,
+            "level": str(level).lower(),
+            "logger": str(logger),
+            "event_type": str(event_type),
+            "message": message,
+            "worker_id": None if worker_id is None else str(worker_id),
+            "request_id": request_id,
+            "duration_ms": duration_ms,
+            "payload": json_ready(payload or {}),
+        }
+
+    def _output_context(
+        self,
+        cursor,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        asset_id: str | None = None,
+        job_id: str | None = None,
+    ) -> dict[str, str | None]:
+        """Resolve output ownership inside the caller's transaction."""
+
+        resolved = {
+            "project_id": None if project_id is None else str(project_id),
+            "run_id": None if run_id is None else str(run_id),
+            "asset_id": None if asset_id is None else str(asset_id),
+            "job_id": None if job_id is None else str(job_id),
+        }
+        if job_id is not None and resolved["project_id"] is None:
+            cursor.execute(
+                f"SELECT project_id, run_id, asset_id FROM {self.schema}.processing_jobs WHERE id = %s",
+                (job_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                for key in ("project_id", "run_id", "asset_id"):
+                    if resolved[key] is None and row.get(key) is not None:
+                        resolved[key] = str(row[key])
+        if resolved["project_id"] is None and run_id is not None:
+            cursor.execute(f"SELECT project_id FROM {self.schema}.runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+            if row is not None and row.get("project_id") is not None:
+                resolved["project_id"] = str(row["project_id"])
+        if resolved["project_id"] is None and asset_id is not None:
+            cursor.execute(f"SELECT project_id FROM {self.schema}.raw_assets WHERE id = %s", (asset_id,))
+            row = cursor.fetchone()
+            if row is not None and row.get("project_id") is not None:
+                resolved["project_id"] = str(row["project_id"])
+        return resolved
+
+    def _queue_output(self, cursor, record: dict[str, Any], *, stream: str) -> dict[str, Any]:
+        connection = getattr(cursor, "_output_connection", None)
+        if connection is None:
+            # Repository-owned cursors always carry a transaction queue. This
+            # compatibility path supports narrowly injected cursor doubles.
+            return self._write_output(record, stream=stream)
+        return connection.queue_output(record, stream=stream)
+
     def _append_log(
         self,
         cursor,
@@ -10301,35 +10504,27 @@ class PostgresRepository:
         duration_ms: float | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        resolved_project_id = self._resolve_project_id(
+        context = self._output_context(
+            cursor,
             project_id=project_id,
             run_id=run_id,
             asset_id=asset_id,
             job_id=job_id,
         )
-        cursor.execute(
-            f"""
-            INSERT INTO {self.schema}.logs
-            (project_id, level, logger, event_type, message, run_id, asset_id, job_id, worker_id, request_id, duration_ms, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-            RETURNING *;
-            """,
-            (
-                resolved_project_id,
-                str(level).lower(),
-                logger,
-                event_type,
-                message,
-                run_id,
-                asset_id,
-                job_id,
-                worker_id,
-                request_id,
-                duration_ms,
-                json.dumps(json_ready(payload or {})),
-            ),
+        if context["project_id"] is None:
+            raise ValueError("project_id is required when it cannot be derived from an existing resource.")
+        record = self._log_record(
+            context=context,
+            event_type=event_type,
+            message=message,
+            level=level,
+            logger=logger,
+            worker_id=worker_id,
+            request_id=request_id,
+            duration_ms=duration_ms,
+            payload=payload,
         )
-        return cursor.fetchone()
+        return self._queue_output(cursor, record, stream="logs")
 
     def _append_job_event(
         self,
@@ -10338,51 +10533,26 @@ class PostgresRepository:
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        cursor.execute(
-            f"""
-            INSERT INTO {self.schema}.job_events (job_id, event_type, payload)
-            VALUES (%s, %s, %s::jsonb)
-            RETURNING *;
-            """,
-            (job_id, event_type, json.dumps(json_ready(payload or {}))),
-        )
-        row = cursor.fetchone()
-        if event_type == "job.progress_updated":
-            return row
         log_payload = dict(payload or {})
-        project_id = log_payload.get("project_id")
-        run_id = log_payload.get("run_id")
-        asset_id = log_payload.get("asset_id")
-        worker_id = log_payload.get("worker_id")
-        if job_id is not None and (project_id is None or run_id is None or asset_id is None):
-            cursor.execute(
-                f"""
-                SELECT project_id, run_id, asset_id
-                FROM {self.schema}.processing_jobs
-                WHERE id = %s
-                """,
-                (job_id,),
-            )
-            job_row = cursor.fetchone()
-            if job_row is not None:
-                project_id = project_id or job_row.get("project_id")
-                run_id = run_id or job_row.get("run_id")
-                asset_id = asset_id or job_row.get("asset_id")
-        if project_id is not None:
-            self._append_log(
-                cursor,
-                event_type=event_type,
-                message=_event_message(event_type, log_payload),
-                level=_event_level(event_type),
-                logger="pelagia.jobs",
-                project_id=project_id,
-                run_id=run_id,
-                asset_id=asset_id,
-                job_id=job_id,
-                worker_id=worker_id,
-                payload=log_payload,
-            )
-        return row
+        context = self._output_context(
+            cursor,
+            project_id=log_payload.get("project_id"),
+            run_id=log_payload.get("run_id"),
+            asset_id=log_payload.get("asset_id"),
+            job_id=job_id,
+        )
+        record = {
+            **context,
+            "level": _event_level(event_type),
+            "logger": "pelagia.jobs",
+            "event_type": str(event_type),
+            "message": _event_message(event_type, log_payload),
+            "worker_id": None if log_payload.get("worker_id") is None else str(log_payload["worker_id"]),
+            "request_id": None,
+            "duration_ms": None,
+            "payload": json_ready(log_payload),
+        }
+        return self._queue_output(cursor, record, stream="events")
 
     def _append_worker_event(
         self,
@@ -10404,40 +10574,17 @@ class PostgresRepository:
         job_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        ascending: bool = False,
     ) -> list[dict[str, Any]]:
-        clauses = []
-        params: list[Any] = []
-        joins = ""
-        if project_id:
-            joins = f"LEFT JOIN {self.schema}.processing_jobs jobs ON jobs.id = events.job_id"
-            clauses.append("(jobs.project_id = %s OR (events.job_id IS NULL AND events.payload->>'project_id' = %s))")
-            params.extend([project_id, project_id])
-        if after_id is not None:
-            clauses.append("events.id > %s")
-            params.append(after_id)
-        if job_id:
-            clauses.append("events.job_id = %s")
-            params.append(job_id)
-        if run_id:
-            joins = f"LEFT JOIN {self.schema}.processing_jobs jobs ON jobs.id = events.job_id"
-            clauses.append("jobs.run_id = %s")
-            params.append(run_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.extend([limit, max(0, int(offset))])
-        with self.connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT events.*
-                    FROM {self.schema}.job_events events
-                    {joins}
-                    {where}
-                    ORDER BY events.id DESC
-                    LIMIT %s OFFSET %s
-                    """,
-                    tuple(params),
-                )
-                return cursor.fetchall()
+        return self.output_store.list_job_events(
+            project_id=project_id,
+            after_id=after_id,
+            run_id=run_id,
+            job_id=job_id,
+            limit=limit,
+            offset=max(0, int(offset)),
+            ascending=ascending,
+        )
 
     def list_logs(
         self,
@@ -10456,104 +10603,29 @@ class PostgresRepository:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        clauses = []
-        params: list[Any] = []
-        if project_id:
-            clauses.append("project_id = %s")
-            params.append(project_id)
-        if after_id is not None:
-            clauses.append("id > %s")
-            params.append(after_id)
-        if before_id is not None:
-            clauses.append("id < %s")
-            params.append(before_id)
-        if level:
-            clauses.append("level = %s")
-            params.append(str(level).lower())
-        if event_type:
-            clauses.append("event_type = %s")
-            params.append(event_type)
-        if logger:
-            clauses.append("logger = %s")
-            params.append(logger)
-        if run_id:
-            clauses.append("run_id = %s")
-            params.append(run_id)
-        if asset_id:
-            clauses.append("asset_id = %s")
-            params.append(asset_id)
-        if job_id:
-            clauses.append("job_id = %s")
-            params.append(job_id)
-        if worker_id:
-            clauses.append("worker_id = %s")
-            params.append(worker_id)
-        if request_id:
-            clauses.append("request_id = %s")
-            params.append(request_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.extend([limit, max(0, int(offset))])
-        with self.connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT *
-                    FROM {self.schema}.logs
-                    {where}
-                    ORDER BY id DESC
-                    LIMIT %s OFFSET %s
-                    """,
-                    tuple(params),
-                )
-                return cursor.fetchall()
+        rows = self.output_store.list_logs(
+            project_id=project_id,
+            after_id=after_id,
+            before_id=before_id,
+            level=level,
+            event_type=event_type,
+            logger=logger,
+            run_id=run_id,
+            asset_id=asset_id,
+            job_id=job_id,
+            worker_id=worker_id,
+            request_id=request_id,
+            limit=limit,
+            offset=max(0, int(offset)),
+        )
+        # Projectless worker lifecycle output remains available through the
+        # event journal but was never part of the structured log surface.
+        return [row for row in rows if row.get("stream") != "events" or row.get("project_id") is not None]
 
     def prune_operational_logs(self, *, dry_run: bool = False) -> dict[str, Any]:
-        """Remove expired operational events in small, cross-worker coordinated batches."""
-        logging_config = self.config.logging
-        batch_size = logging_config.cleanup_batch_size
-        high_frequency = "event_type IN ('job.progress_updated', 'job.heartbeat', 'worker.heartbeat', 'worker.touched')"
-        important = "(level IN ('warning', 'error', 'critical') OR event_type = 'jobs.deleted')"
-        rules = (
-            ("job_events_high_frequency", "job_events", high_frequency, logging_config.high_frequency_retention_days),
-            ("job_events_other", "job_events", f"NOT ({high_frequency})", logging_config.job_event_retention_days),
-            ("logs_high_frequency", "logs", f"NOT {important} AND {high_frequency}", logging_config.high_frequency_retention_days),
-            ("logs_routine", "logs", f"NOT {important} AND NOT ({high_frequency})", logging_config.routine_log_retention_days),
-            ("logs_important", "logs", important, logging_config.important_log_retention_days),
-        )
-        result: dict[str, Any] = {"dry_run": dry_run, "acquired": False, "deleted": {}}
-        with self.connect() as connection:
-            with connection.cursor() as cursor:
-                if not dry_run:
-                    cursor.execute(
-                        "SELECT pg_try_advisory_xact_lock(63827, hashtext(%s)) AS acquired",
-                        (self.schema,),
-                    )
-                    if not cursor.fetchone()["acquired"]:
-                        return result
-                result["acquired"] = True
-                for name, table, predicate, days in rules:
-                    cutoff = f"created_at < NOW() - (%s * INTERVAL '1 day') AND {predicate}"
-                    if dry_run:
-                        cursor.execute(f"SELECT count(*) AS total FROM {self.schema}.{table} WHERE {cutoff}", (days,))
-                        result["deleted"][name] = int(cursor.fetchone()["total"])
-                    else:
-                        cursor.execute(
-                            f"""
-                            WITH victims AS (
-                                SELECT id FROM {self.schema}.{table}
-                                WHERE {cutoff}
-                                ORDER BY created_at, id
-                                LIMIT %s
-                                FOR UPDATE SKIP LOCKED
-                            )
-                            DELETE FROM {self.schema}.{table} rows
-                            USING victims WHERE rows.id = victims.id
-                            """,
-                            (days, batch_size),
-                        )
-                        result["deleted"][name] = cursor.rowcount
-            connection.commit()
-        return result
+        """Compress rotated output and remove expired file segments."""
+
+        return self.output_store.prune(dry_run=dry_run)
 
     def set_job_priority(
         self,

@@ -289,6 +289,7 @@ class Worker:
                 self.context.logger.debug(
                     "job.handler_started",
                     "Worker started job handler",
+                    project_id=project_id,
                     job_id=job_id,
                     run_id=run_id,
                     asset_id=asset_id,
@@ -334,6 +335,7 @@ class Worker:
                     self.context.logger.info(
                         "job.handler_completed",
                         "Worker completed job handler",
+                        project_id=project_id,
                         job_id=job_id,
                         run_id=run_id,
                         asset_id=asset_id,
@@ -364,6 +366,7 @@ class Worker:
                     self.context.logger.error(
                         "job.handler_failed",
                         "Worker failed job handler",
+                        project_id=project_id,
                         job_id=job_id,
                         run_id=run_id,
                         asset_id=asset_id,
@@ -432,14 +435,7 @@ class Worker:
                 cleanup_interval = self.context.config.logging.cleanup_interval_seconds
                 if callable(cleanup) and (last_cleanup_at is None or now - last_cleanup_at >= cleanup_interval):
                     try:
-                        startup_cleanup = last_cleanup_at is None
-                        while True:
-                            result = cleanup()
-                            if not startup_cleanup or not isinstance(result, dict):
-                                break
-                            deleted = result.get("deleted", {})
-                            if not result.get("acquired", False) or not any(deleted.values()):
-                                break
+                        cleanup()
                     except Exception:
                         get_core_logger("worker").exception("Operational log cleanup failed")
                     last_cleanup_at = now

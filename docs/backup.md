@@ -20,7 +20,7 @@ Back up all of the following:
 Logs are optional for recovery but useful for support:
 
 ```text
-logs/pelagia.log
+logs/  # JSONL, zstd archives, and hidden journal sequence metadata
 .pelagia/run/
 ```
 
