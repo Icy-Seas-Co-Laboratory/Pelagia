@@ -139,3 +139,92 @@ def test_registry_import_preserves_existing_descriptor_concept(postgres_repo, tm
     with postgres_repo.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT concept_id FROM {postgres_repo.schema}.registry_descriptors WHERE workspace_id=%s", (loaded["workspace_id"],))
         assert [row["concept_id"] for row in cursor.fetchall()] == [concepts[0]]
+
+
+def test_registry_workspace_filters_use_crop_when_bbox_is_absent(postgres_repo, tmp_path):
+    scope, workspace_id, item_id = _workspace(postgres_repo, tmp_path)
+    workspace = RegistryWorkspaceService(postgres_repo, **scope)
+    tag = workspace.add_tag({"name": "marine", "scope": "target_tags"})
+    second_tag = workspace.add_tag({"name": "gelatinous", "scope": "target_tags"})
+    image_tag = workspace.add_tag({"name": "night", "scope": "image_tags"})
+    workspace.set_tag([item_id], tag["tag_id"], True, "curator")
+    workspace.set_tag([item_id], image_tag["tag_id"], True, "curator")
+    label = workspace.add_label({"name": "copepod"})
+    workspace.assign([item_id], label["label_id"], "curator")
+    workspace.review([item_id], "verified", "reviewer")
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"""UPDATE {postgres_repo.schema}.registry_items
+            SET bbox_x=0,bbox_y=0,bbox_w=3,bbox_h=4,
+                crop_bbox_x=0,crop_bbox_y=0,crop_bbox_w=3,crop_bbox_h=4
+            WHERE workspace_id=%s AND item_id=%s""",
+            (workspace_id, item_id),
+        )
+        connection.commit()
+
+    source = tmp_path / "second.sqlite"
+    second_item_id = _dataset(source, payload=b"different")
+    import_sqlite_into_workspace(postgres_repo, source, **scope)
+    workspace.set_tag([second_item_id], second_tag["tag_id"], True, "curator")
+    inference_run_id = str(uuid.uuid4())
+    with postgres_repo.connect() as connection, connection.cursor() as cursor:
+        # All-null geometry is valid for old Registry rows.  The stored image
+        # extent is then the effective ROI geometry.
+        cursor.execute(
+            f"""UPDATE {postgres_repo.schema}.registry_items
+            SET bbox_x=NULL,bbox_y=NULL,bbox_w=NULL,bbox_h=NULL,
+                crop_bbox_x=NULL,crop_bbox_y=NULL,crop_bbox_w=NULL,crop_bbox_h=NULL
+            WHERE workspace_id=%s AND item_id=%s""",
+            (workspace_id, second_item_id),
+        )
+        cursor.execute(
+            f"""INSERT INTO {postgres_repo.schema}.registry_inference_runs
+            (workspace_id,inference_run_id,dataset_fingerprint_sha256,status,created_at)
+            VALUES (%s,%s,'test-fingerprint','succeeded','2026-11-01T00:00:00Z')""",
+            (workspace_id, inference_run_id),
+        )
+        cursor.execute(
+            f"""INSERT INTO {postgres_repo.schema}.registry_model_evidence
+            (workspace_id,evidence_id,inference_run_id,item_id,prediction_confidence,created_at)
+            VALUES (%s,%s,%s,%s,0.6,'2026-11-01T00:00:00Z')""",
+            (workspace_id, str(uuid.uuid4()), inference_run_id, item_id),
+        )
+        connection.commit()
+
+    result = workspace.list_items(
+        limit=10, offset=0, annotation_states=["labeled"], review_states=["verified"],
+        target_tag_ids=[tag["tag_id"]], bbox_area_min=12, bbox_area_max=12,
+        bbox_longest_side_min=4, bbox_aspect_ratio_min=1.3,
+    )
+    assert [item["item_id"] for item in result["items"]] == [item_id]
+    assert workspace.list_items(limit=10, offset=0, annotation_states=[])["total"] == 0
+    assert workspace.list_items(limit=10, offset=0, target_tag_ids=[tag["tag_id"], second_tag["tag_id"]])["total"] == 2
+    assert workspace.list_items(limit=10, offset=0, target_tag_ids=[tag["tag_id"]], image_tag_ids=[image_tag["tag_id"]])["total"] == 1
+    assert workspace.list_items(limit=10, offset=0, bbox_area_min=1, bbox_area_max=1)["items"][0]["item_id"] == second_item_id
+    assert workspace.list_items(limit=10, offset=0, bbox_longest_side_min=4, bbox_longest_side_max=4,
+                                bbox_aspect_ratio_min=4 / 3, bbox_aspect_ratio_max=4 / 3)["total"] == 1
+    evidence = workspace.list_items(limit=10, offset=0, evidence_source=f"registry:{inference_run_id}",
+                                    confidence_min=0.6, confidence_max=0.6)
+    assert [item["item_id"] for item in evidence["items"]] == [item_id]
+    assert workspace.matching_item_ids(workspace_id, target_tag_ids=[tag["tag_id"]]) == [item_id]
+    facets = workspace.filter_facets()
+    assert facets["bbox_area"] == {"min": 1, "max": 12, "count": 2}
+    assert facets["descriptors"]["target_tags"] == [
+        {"tag_id": second_tag["tag_id"], "name": "gelatinous", "item_count": 1},
+        {"tag_id": tag["tag_id"], "name": "marine", "item_count": 1},
+    ]
+    fallback = {"crop_bbox_x": 0, "crop_bbox_y": 0, "crop_bbox_w": 3, "crop_bbox_h": 4, "shape": [4, 3]}
+    RegistryWorkspaceService._attach_geometry(fallback)
+    assert fallback["bbox"] == {"x": 0, "y": 0, "w": 3, "h": 4}
+    with pytest.raises(RegistryTransferError, match="Unknown Registry annotation state"):
+        workspace.list_items(limit=1, offset=0, annotation_states=["other"])
+    with pytest.raises(RegistryTransferError, match="range minimum exceeds maximum"):
+        workspace.list_items(limit=1, offset=0, confidence_min=0.8, confidence_max=0.2)
+    with pytest.raises(RegistryTransferError, match="range is invalid"):
+        workspace.list_items(limit=1, offset=0, bbox_area_min=float("nan"))
+    with pytest.raises(RegistryTransferError, match="range is invalid"):
+        workspace.list_items(limit=1, offset=0, confidence_max=1.1)
+    with pytest.raises(RegistryTransferError, match="workspace was not found"):
+        workspace.matching_item_ids("not-a-uuid")
+    with pytest.raises(RegistryTransferError, match="workspace was not found"):
+        workspace.filter_facets(workspace_id="not-a-uuid")

@@ -2438,3 +2438,30 @@ def test_worker_run_forever_requeues_and_stops_from_event():
     assert repo.touches[0]["status"] == "idle"
     assert repo.touches[-1]["status"] == "stopped"
     assert repo.touches[-1]["shutdown_requested"] is False
+
+
+def test_workspace_transfer_worker_preserves_preview_and_scope(monkeypatch):
+    from Pelagia.services import registry_workspace_transfer
+    from Pelagia.workers.stages.registry_transfer import handle_workspace_transfer
+
+    repo = FakeRepository()
+    context = make_context(repo)
+    seen = {}
+
+    def execute(repository, **kwargs):
+        assert repository is repo
+        seen.update(kwargs)
+        return {"moved_items": 1}
+
+    monkeypatch.setattr(registry_workspace_transfer, "execute_workspace_transfer", execute)
+    job = {"id": "transfer-1", "project_id": "project-1", "payload": {
+        "owner_username": "curator", "source_workspace_id": "source", "destination_workspace_id": "destination",
+        "item_ids": ["roi-1"], "mode": "move", "expected_preview_token": "guard", "duplicate_policy": "skip",
+    }}
+    result = handle_workspace_transfer(job, context)
+    assert result["moved_items"] == 1
+    assert seen["operation_id"] == "transfer-1"
+    assert seen["expected_preview_token"] == "guard"
+    assert seen["project_id"] == "project-1"
+    assert seen["owner_username"] == "curator"
+    assert PipelineStage.REGISTRY_WORKSPACE_TRANSFER in default_handler_registry()._handlers

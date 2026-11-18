@@ -74,3 +74,31 @@ def handle_generate(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
     )
     reporter.finish(message=f"Generated and loaded Registry dataset {destination.name}")
     return {"operation": "registry_generate", **result}
+
+
+def handle_workspace_transfer(job: dict[str, Any], context: AppContext) -> dict[str, Any]:
+    from ...services.registry_workspace_transfer import execute_workspace_transfer
+
+    if context.repository is None:
+        raise RuntimeError("Registry workspace transfers require PostgreSQL")
+    payload = _payload(job)
+    reporter = JobProgressReporter(
+        job, context, stage=PipelineStage.REGISTRY_WORKSPACE_TRANSFER.value,
+        unit="roi", total=max(1, len(payload["item_ids"])), emit_every=1,
+    )
+    reporter.start("Preparing Registry workspace transfer")
+    result = execute_workspace_transfer(
+        context.repository, project_id=str(job["project_id"]),
+        owner_username=str(payload["owner_username"]),
+        source_workspace_id=str(payload["source_workspace_id"]),
+        destination_workspace_id=str(payload["destination_workspace_id"]),
+        item_ids=list(payload["item_ids"]), mode=payload["mode"],
+        expected_preview_token=payload["expected_preview_token"],
+        duplicate_policy=payload["duplicate_policy"], duplicate_actions=payload.get("duplicate_actions", {}),
+        operation_id=str(job["id"]), actor=str(payload["owner_username"]),
+        progress_callback=lambda completed, message: reporter.update(
+            completed, current={"phase": "transfer"}, message=message,
+        ),
+    )
+    reporter.finish(message="Registry workspace transfer completed")
+    return {"operation": "registry_workspace_transfer", **result}

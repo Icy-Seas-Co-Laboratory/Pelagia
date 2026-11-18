@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -104,6 +105,21 @@ class RegistryWorkspaceService:
         if row is None and required:
             raise RegistryTransferError("No Registry dataset is loaded for this project and user")
         return row
+
+    def _workspace_by_id(self, cursor, workspace_id: str) -> dict[str, Any]:
+        try:
+            resolved_id = str(uuid.UUID(str(workspace_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RegistryTransferError("Registry workspace was not found") from exc
+        cursor.execute(
+            f"""SELECT * FROM {self.schema}.registry_workspaces
+            WHERE id=%s AND project_id=%s AND owner_username=%s AND status='loaded'""",
+            (resolved_id, self.project_id, self.owner_username),
+        )
+        workspace = cursor.fetchone()
+        if workspace is None:
+            raise RegistryTransferError("Registry workspace was not found")
+        return workspace
 
     def active_workspace(self) -> dict[str, Any] | None:
         with self.repository.connect() as connection, connection.cursor() as cursor:
@@ -452,19 +468,105 @@ class RegistryWorkspaceService:
 
     def list_items(self, *, limit: int, offset: int, annotation_state: str = "all", review: str = "all",
                    label_ids: list[str] | None = None, search: str | None = None, sort: str = "original",
-                   evidence_source: str | None = None, item_ids: list[str] | None = None, **filters) -> dict[str, Any]:
+                   evidence_source: str | None = None, item_ids: list[str] | None = None,
+                   workspace_id: str | None = None, **filters) -> dict[str, Any]:
+        for minimum_key, maximum_key, floor, ceiling in (
+            ("bbox_area_min", "bbox_area_max", 0, None),
+            ("bbox_longest_side_min", "bbox_longest_side_max", 0, None),
+            ("bbox_aspect_ratio_min", "bbox_aspect_ratio_max", 1, None),
+            ("confidence_min", "confidence_max", 0, 1),
+        ):
+            minimum, maximum = filters.get(minimum_key), filters.get(maximum_key)
+            for value in (minimum, maximum):
+                if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value)
+                                          or value < floor or (ceiling is not None and value > ceiling)):
+                    raise RegistryTransferError(f"{minimum_key.removesuffix('_min')} range is invalid")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise RegistryTransferError(f"{minimum_key.removesuffix('_min')} range minimum exceeds maximum")
         with self.repository.connect() as connection, connection.cursor() as cursor:
-            workspace = self._workspace(cursor); params: list[Any] = [workspace["id"]]; clauses = ["i.workspace_id=%s"]
-            if annotation_state == "labeled": clauses.append("a.annotation_id IS NOT NULL AND a.status IN ('accepted','candidate')")
-            elif annotation_state == "unlabeled": clauses.append("(a.annotation_id IS NULL OR a.status NOT IN ('accepted','candidate'))")
-            if review in {"verified", "rejected", "needs_review"}: clauses.append("r.decision=%s"); params.append(review)
-            elif review == "unreviewed": clauses.append("a.annotation_id IS NOT NULL AND r.decision IS NULL")
+            if workspace_id is None:
+                workspace = self._workspace(cursor)
+            else:
+                workspace = self._workspace_by_id(cursor, workspace_id)
+            params: list[Any] = [workspace["id"]]; clauses = ["i.workspace_id=%s"]
+            # The plural forms support independent state chips.  Keep the original
+            # scalar filters for older clients and links.
+            annotation_states = filters.get("annotation_states")
+            if annotation_states is None:
+                annotation_states = None if annotation_state == "all" else [annotation_state]
+            if annotation_states is not None:
+                annotation_states = set(annotation_states)
+                unknown_annotation_states = annotation_states - {"labeled", "unlabeled"}
+                if unknown_annotation_states:
+                    raise RegistryTransferError("Unknown Registry annotation state")
+                state_clauses: list[str] = []
+                if "labeled" in annotation_states:
+                    state_clauses.append("a.annotation_id IS NOT NULL AND a.status IN ('accepted','candidate')")
+                if "unlabeled" in annotation_states:
+                    state_clauses.append("(a.annotation_id IS NULL OR a.status NOT IN ('accepted','candidate'))")
+                clauses.append("(" + " OR ".join(state_clauses or ["false"]) + ")")
+            review_states = filters.get("review_states")
+            if review_states is None:
+                review_states = None if review == "all" else [review]
+            if review_states is not None:
+                review_states = set(review_states)
+                unknown_review_states = review_states - {"unreviewed", "no_annotation", "verified", "rejected", "needs_review"}
+                if unknown_review_states:
+                    raise RegistryTransferError("Unknown Registry review state")
+                review_clauses: list[str] = []
+                for decision in ("verified", "rejected", "needs_review"):
+                    if decision in review_states:
+                        review_clauses.append("r.decision=%s"); params.append(decision)
+                if "unreviewed" in review_states:
+                    review_clauses.append("a.annotation_id IS NOT NULL AND r.decision IS NULL")
+                if "no_annotation" in review_states:
+                    review_clauses.append("a.annotation_id IS NULL OR a.status NOT IN ('accepted','candidate')")
+                clauses.append("(" + " OR ".join(review_clauses or ["false"]) + ")")
             if label_ids: clauses.append("a.label_id=ANY(%s)"); params.append(label_ids)
             if search: clauses.append("(i.source_key ILIKE %s OR i.item_id ILIKE %s)"); params.extend([f"%{search}%", f"%{search}%"])
             if item_ids is not None:
                 if not item_ids:
                     return {"items": [], "total": 0, "limit": limit, "offset": offset}
                 clauses.append("i.item_id=ANY(%s)"); params.append(item_ids)
+            for scope, tag_ids_key, untagged_key in (
+                ("target", "target_tag_ids", "target_tags_untagged"),
+                ("image", "image_tag_ids", "image_tags_untagged"),
+            ):
+                tag_ids = filters.get(tag_ids_key)
+                include_untagged = bool(filters.get(untagged_key))
+                if tag_ids or include_untagged:
+                    tag_clauses: list[str] = []
+                    if tag_ids:
+                        tag_clauses.append(f"""EXISTS (SELECT 1 FROM {self.schema}.registry_descriptor_annotations filter_tag
+                          JOIN {self.schema}.registry_descriptors filter_descriptor
+                            ON filter_descriptor.workspace_id=filter_tag.workspace_id
+                           AND filter_descriptor.descriptor_id=filter_tag.descriptor_id
+                          WHERE filter_tag.workspace_id=i.workspace_id AND filter_tag.item_id=i.item_id
+                            AND filter_tag.is_current AND filter_tag.status='accepted'
+                            AND filter_descriptor.scope='{scope}' AND filter_tag.descriptor_id=ANY(%s))""")
+                        params.append(tag_ids)
+                    if include_untagged:
+                        tag_clauses.append(f"""NOT EXISTS (SELECT 1 FROM {self.schema}.registry_descriptor_annotations filter_tag
+                          JOIN {self.schema}.registry_descriptors filter_descriptor
+                            ON filter_descriptor.workspace_id=filter_tag.workspace_id
+                           AND filter_descriptor.descriptor_id=filter_tag.descriptor_id
+                          WHERE filter_tag.workspace_id=i.workspace_id AND filter_tag.item_id=i.item_id
+                            AND filter_tag.is_current AND filter_tag.status='accepted'
+                            AND filter_descriptor.scope='{scope}')""")
+                    clauses.append("(" + " OR ".join(tag_clauses) + ")")
+            bbox_width = "coalesce(i.bbox_w,i.crop_bbox_w,nullif(image.shape->>1,'')::int)"
+            bbox_height = "coalesce(i.bbox_h,i.crop_bbox_h,nullif(image.shape->>0,'')::int)"
+            bbox_area = f"(({bbox_width})::bigint*({bbox_height})::bigint)"
+            for key, expression, operator in (
+                ("bbox_area_min", bbox_area, ">="), ("bbox_area_max", bbox_area, "<="),
+                ("bbox_longest_side_min", f"greatest({bbox_width},{bbox_height})", ">="),
+                ("bbox_longest_side_max", f"greatest({bbox_width},{bbox_height})", "<="),
+                ("bbox_aspect_ratio_min", f"greatest({bbox_width},{bbox_height})::double precision / nullif(least({bbox_width},{bbox_height}),0)", ">="),
+                ("bbox_aspect_ratio_max", f"greatest({bbox_width},{bbox_height})::double precision / nullif(least({bbox_width},{bbox_height}),0)", "<="),
+            ):
+                value = filters.get(key)
+                if value is not None:
+                    clauses.append(f"{expression}{operator}%s"); params.append(value)
             if evidence_source:
                 if filters.get("ml_state") == "with": clauses.append("me.item_id IS NOT NULL")
                 elif filters.get("ml_state") == "without": clauses.append("me.item_id IS NULL")
@@ -499,6 +601,10 @@ class RegistryWorkspaceService:
                 AND me.inference_run_id=%s WHERE {where}"""
             cursor.execute("SELECT count(DISTINCT i.item_id) total " + base, params_with_source)
             total = cursor.fetchone()["total"]
+            if filters.get("_ids_only"):
+                cursor.execute("SELECT DISTINCT i.item_id " + base + " ORDER BY i.item_id", params_with_source)
+                return {"items": [{"item_id": row["item_id"]} for row in cursor.fetchall()], "total": total,
+                        "limit": total, "offset": 0}
             cursor.execute(f"""SELECT i.item_id,i.source_key,i.sample_weight,i.metadata,i.updated_at,image.shape,image.encoding,image.media_type,
               i.coordinate_space,i.bbox_x,i.bbox_y,i.bbox_w,i.bbox_h,
               i.crop_bbox_x,i.crop_bbox_y,i.crop_bbox_w,i.crop_bbox_h,i.spatial_metadata,
@@ -517,6 +623,70 @@ class RegistryWorkspaceService:
                 item["pixel_area"] = h * w; item["longest_side"] = max(h, w)
                 self._attach_geometry(item)
             return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    def matching_item_ids(self, workspace_id: str, **filters) -> list[str]:
+        """Resolve a frozen transfer selection without changing the active workspace.
+
+        Transfers store the returned IDs in their preview rather than treating a
+        later, potentially changed gallery filter as their input.
+        """
+        result = self.list_items(limit=1, offset=0, workspace_id=workspace_id,
+                                 _ids_only=True, **filters)
+        return [str(item["item_id"]) for item in result["items"]]
+
+    def filter_facets(self, *, evidence_source: str | None = None,
+                      workspace_id: str | None = None) -> dict[str, Any]:
+        """Return workspace-wide numeric bounds and descriptor chips in use."""
+        with self.repository.connect() as connection, connection.cursor() as cursor:
+            if workspace_id is None:
+                workspace = self._workspace(cursor)
+            else:
+                workspace = self._workspace_by_id(cursor, workspace_id)
+            width = "coalesce(i.bbox_w,i.crop_bbox_w,nullif(image.shape->>1,'')::int)"
+            height = "coalesce(i.bbox_h,i.crop_bbox_h,nullif(image.shape->>0,'')::int)"
+            source_run = evidence_source.removeprefix("registry:") if evidence_source else None
+            cursor.execute(
+                f"""SELECT min((({width})::bigint*({height})::bigint)) bbox_area_min,max((({width})::bigint*({height})::bigint)) bbox_area_max,
+                  count((({width})::bigint*({height})::bigint)) bbox_area_count,
+                  min(greatest({width},{height})) bbox_longest_side_min,
+                  max(greatest({width},{height})) bbox_longest_side_max,
+                  count(greatest({width},{height})) bbox_longest_side_count,
+                  min(greatest({width},{height})::double precision/nullif(least({width},{height}),0)) bbox_aspect_ratio_min,
+                  max(greatest({width},{height})::double precision/nullif(least({width},{height}),0)) bbox_aspect_ratio_max,
+                  count(greatest({width},{height})::double precision/nullif(least({width},{height}),0)) bbox_aspect_ratio_count,
+                  min(me.prediction_confidence) prediction_confidence_min,
+                  max(me.prediction_confidence) prediction_confidence_max,
+                  count(me.prediction_confidence) prediction_confidence_count
+                FROM {self.schema}.registry_items i
+                JOIN {self.schema}.registry_assets image ON image.workspace_id=i.workspace_id AND image.asset_id=i.image_asset_id
+                LEFT JOIN {self.schema}.registry_model_evidence me ON me.workspace_id=i.workspace_id AND me.item_id=i.item_id
+                  AND me.inference_run_id=%s
+                WHERE i.workspace_id=%s""",
+                (source_run, workspace["id"]),
+            )
+            bounds = dict(cursor.fetchone())
+            cursor.execute(
+                f"""SELECT CASE d.scope WHEN 'target' THEN 'target_tags' ELSE 'image_tags' END scope,
+                  d.descriptor_id tag_id,d.name,count(DISTINCT a.item_id) item_count
+                FROM {self.schema}.registry_descriptor_annotations a
+                JOIN {self.schema}.registry_descriptors d
+                  ON d.workspace_id=a.workspace_id AND d.descriptor_id=a.descriptor_id
+                WHERE a.workspace_id=%s AND a.is_current AND a.status='accepted'
+                GROUP BY d.scope,d.descriptor_id,d.name ORDER BY d.scope,d.name""",
+                (workspace["id"],),
+            )
+            descriptors = {"target_tags": [], "image_tags": []}
+            for row in cursor.fetchall():
+                value = dict(row)
+                descriptors[value.pop("scope")].append(value)
+            return {
+                "bbox_area": {"min": bounds["bbox_area_min"], "max": bounds["bbox_area_max"], "count": bounds["bbox_area_count"]},
+                "bbox_longest_side": {"min": bounds["bbox_longest_side_min"], "max": bounds["bbox_longest_side_max"], "count": bounds["bbox_longest_side_count"]},
+                "bbox_aspect_ratio": {"min": bounds["bbox_aspect_ratio_min"], "max": bounds["bbox_aspect_ratio_max"], "count": bounds["bbox_aspect_ratio_count"]},
+                "prediction_confidence": {"min": bounds["prediction_confidence_min"], "max": bounds["prediction_confidence_max"],
+                                          "count": bounds["prediction_confidence_count"]},
+                "descriptors": descriptors,
+            }
 
     @staticmethod
     def _attach_geometry(item: dict[str, Any]) -> None:

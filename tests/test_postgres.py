@@ -554,6 +554,7 @@ def test_packaged_migrations_are_discoverable_and_rendered():
             "0038_object_gc_candidates",
             "0039_frame_refinement_queue_counts",
             "0040_roi_bbox_area_indexes",
+            "0041_registry_workspace_transfer_job",
     ]
     rendered = postgres.render_migration(migrations[0], "pelagia_unit")
     assert "CREATE TABLE IF NOT EXISTS pelagia_unit.frame_processing_status" in rendered

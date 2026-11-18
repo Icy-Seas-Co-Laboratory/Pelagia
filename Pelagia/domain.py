@@ -68,6 +68,7 @@ class PipelineStage(str, Enum):
     REGISTRY_LOAD = "registry_load"
     REGISTRY_EXPORT = "registry_export"
     REGISTRY_GENERATE = "registry_generate"
+    REGISTRY_WORKSPACE_TRANSFER = "registry_workspace_transfer"
     EXPORT_BUNDLE = "export_bundle"
     STORAGE_REENCODE = "storage_reencode"
 

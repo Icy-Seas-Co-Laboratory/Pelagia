@@ -45,6 +45,7 @@ def default_stage_handlers() -> tuple[tuple[PipelineStage, JobHandler], ...]:
         (PipelineStage.REGISTRY_LOAD, registry_transfer.handle_load),
         (PipelineStage.REGISTRY_EXPORT, registry_transfer.handle_export),
         (PipelineStage.REGISTRY_GENERATE, registry_transfer.handle_generate),
+        (PipelineStage.REGISTRY_WORKSPACE_TRANSFER, registry_transfer.handle_workspace_transfer),
         (PipelineStage.EXPORT_BUNDLE, export.handle),
         (PipelineStage.STORAGE_REENCODE, storage_reencode.handle),
     )

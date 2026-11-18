@@ -1260,7 +1260,9 @@ def export_sqlite_workspace(
                 f"UPDATE {schema}.registry_workspaces SET status='exporting' WHERE id=%s",
                 (workspace_id,),
             )
-            if destination == Path(workspace["source_path"]).resolve():
+            if replace_source and not workspace["source_path"]:
+                raise RegistryTransferError("Blank Registry workspaces must be exported to a new SQLite path first")
+            if workspace["source_path"] and destination == Path(workspace["source_path"]).resolve():
                 if not replace_source:
                     raise RegistryTransferError("Replacing the source requires replace_source=true")
                 if not destination.exists() or _sha256(destination) != workspace["source_sha256"]:

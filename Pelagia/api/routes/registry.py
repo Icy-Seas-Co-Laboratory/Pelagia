@@ -52,6 +52,56 @@ if APIRouter is not None:
         duplicate_policy: Literal["skip", "merge"] = "skip"
         duplicate_actions: dict[str, Literal["skip", "merge"]] = Field(default_factory=dict)
 
+    class WorkspaceCreateRequest(BaseModel):
+        name: str = Field(min_length=1, max_length=160)
+        dataset_type: Literal["classification", "mask_refinement"] = "classification"
+        title: str | None = Field(default=None, max_length=300)
+        description: str | None = Field(default=None, max_length=4000)
+        activate: bool = True
+
+    class TransferFilters(BaseModel):
+        model_config = {"extra": "forbid"}
+        annotation_states: list[Literal["labeled", "unlabeled"]] | None = None
+        review_states: list[Literal["verified", "unreviewed", "needs_review", "rejected", "no_annotation"]] | None = None
+        label_ids: list[str] | None = None
+        search: str | None = None
+        evidence_source: str | None = None
+        ml_state: Literal["all", "with", "without"] = "all"
+        confidence_min: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+        confidence_max: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+        knn_similarity_min: float | None = Field(default=None, ge=-1, le=1, allow_inf_nan=False)
+        knn_agreement_min: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+        prototype_similarity_min: float | None = Field(default=None, ge=-1, le=1, allow_inf_nan=False)
+        ml_disagreement: bool = False
+        target_tag_ids: list[str] | None = None
+        image_tag_ids: list[str] | None = None
+        target_tags_untagged: bool = False
+        image_tags_untagged: bool = False
+        bbox_area_min: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+        bbox_area_max: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+        bbox_longest_side_min: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+        bbox_longest_side_max: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+        bbox_aspect_ratio_min: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+        bbox_aspect_ratio_max: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    class WorkspaceTransferPreviewRequest(BaseModel):
+        source_workspace_id: str
+        destination_workspace_id: str
+        mode: Literal["copy", "move"]
+        item_ids: list[str] | None = None
+        filters: TransferFilters | None = None
+
+    DuplicateAction = Literal["skip", "overwrite", "keep_destination_remove_source"]
+
+    class WorkspaceTransferExecuteRequest(BaseModel):
+        source_workspace_id: str
+        destination_workspace_id: str
+        mode: Literal["copy", "move"]
+        item_ids: list[str] = Field(min_length=1)
+        expected_preview_token: str = Field(min_length=1)
+        duplicate_policy: DuplicateAction = "skip"
+        duplicate_actions: dict[str, DuplicateAction] = Field(default_factory=dict)
+
     class LabelCreate(BaseModel):
         name: str = Field(min_length=1, max_length=160)
         display_name: str | None = None
@@ -239,6 +289,66 @@ if APIRouter is not None:
         except KeyError as exc:
             raise HTTPException(404, "Registry workspace was not found") from exc
 
+    @router.post("/workspaces", status_code=201)
+    def create_workspace(request: Request, body: WorkspaceCreateRequest):
+        from ...services.registry_workspace_transfer import create_blank_workspace
+
+        auth = require_project_write(request)
+        try:
+            return as_response(create_blank_workspace(get_repository(request), project_id=str(auth.project_id),
+                owner_username=auth.username, **body.model_dump()))
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+
+    @router.post("/transfers/preview")
+    def preview_transfer(request: Request, body: WorkspaceTransferPreviewRequest):
+        from ...services.registry_workspace_transfer import preview_workspace_transfer
+
+        auth = require_project_write(request)
+        if body.item_ids is not None and body.filters is not None:
+            raise HTTPException(422, "Choose explicit ROI IDs or filters for the transfer selection")
+        try:
+            item_ids = body.item_ids
+            if item_ids is None:
+                item_ids = service(request).matching_item_ids(body.source_workspace_id,
+                    **(body.filters.model_dump(exclude_none=True) if body.filters else {}))
+            result = preview_workspace_transfer(get_repository(request), project_id=str(auth.project_id),
+                owner_username=auth.username, source_workspace_id=body.source_workspace_id,
+                destination_workspace_id=body.destination_workspace_id, item_ids=item_ids, mode=body.mode)
+            return as_response({**result, "item_ids": item_ids,
+                "source_workspace_id": body.source_workspace_id,
+                "destination_workspace_id": body.destination_workspace_id})
+        except KeyError as exc:
+            raise HTTPException(404, "Registry workspace or ROI was not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+
+    @router.post("/transfers/execute", status_code=202)
+    def execute_transfer(request: Request, body: WorkspaceTransferExecuteRequest):
+        from ...services.registry_workspace_transfer import preview_workspace_transfer, validate_transfer_actions
+
+        auth = require_project_write(request)
+        if body.mode == "copy" and "keep_destination_remove_source" in [body.duplicate_policy, *body.duplicate_actions.values()]:
+            raise HTTPException(422, "Removing a source duplicate is only available for moves")
+        try:
+            preview = preview_workspace_transfer(get_repository(request), project_id=str(auth.project_id),
+                owner_username=auth.username, source_workspace_id=body.source_workspace_id,
+                destination_workspace_id=body.destination_workspace_id, item_ids=body.item_ids, mode=body.mode)
+            if preview["preview_token"] != body.expected_preview_token:
+                raise HTTPException(409, "Registry workspace contents changed; preview the transfer again")
+            validate_transfer_actions(preview, body.mode, body.duplicate_policy, body.duplicate_actions)
+        except KeyError as exc:
+            raise HTTPException(404, "Registry workspace or ROI was not found") from exc
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+        job = PipelineService(get_context(request)).queue(
+            PipelineStage.REGISTRY_WORKSPACE_TRANSFER, project_id=str(auth.project_id),
+            payload={**body.model_dump(), "owner_username": auth.username},
+            summary=f"{body.mode.title()} {len(body.item_ids)} Registry ROIs",
+            submitted_by_user_id=auth.user_id, submitted_by_username=auth.username,
+        )
+        return {"job": as_response(job)}
+
     @router.post("/dataset/export", status_code=202)
     def export_dataset(request: Request, body: ExportDatasetRequest):
         auth = require_project_write(request); workspace = service(request, write=True).active_workspace()
@@ -265,15 +375,38 @@ if APIRouter is not None:
     def items(request: Request, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
               annotation_state: str = "all", review: str = "all", label_id: list[str] | None = Query(None),
               search: str | None = None, sort: str = "original", random_seed: str = "registry",
-              evidence_source: str | None = None, ml_state: str = "all", confidence_min: float | None = None,
-              confidence_max: float | None = None, knn_similarity_min: float | None = None,
+              evidence_source: str | None = None, ml_state: str = "all", confidence_min: float | None = Query(None, ge=0, le=1, allow_inf_nan=False),
+              confidence_max: float | None = Query(None, ge=0, le=1, allow_inf_nan=False), knn_similarity_min: float | None = None,
               knn_agreement_min: float | None = None, prototype_similarity_min: float | None = None,
-              ml_disagreement: bool = False):
-        return as_response(service(request).list_items(limit=limit, offset=offset, annotation_state=annotation_state,
+              ml_disagreement: bool = False,
+              annotation_states: list[str] | None = Query(None), review_states: list[str] | None = Query(None),
+              target_tag_id: list[str] | None = Query(None), image_tag_id: list[str] | None = Query(None),
+              target_tags_untagged: bool = False, image_tags_untagged: bool = False,
+              bbox_area_min: float | None = Query(None, ge=0, allow_inf_nan=False), bbox_area_max: float | None = Query(None, ge=0, allow_inf_nan=False),
+              bbox_longest_side_min: float | None = Query(None, ge=0, allow_inf_nan=False), bbox_longest_side_max: float | None = Query(None, ge=0, allow_inf_nan=False),
+              bbox_aspect_ratio_min: float | None = Query(None, ge=0, allow_inf_nan=False), bbox_aspect_ratio_max: float | None = Query(None, ge=0, allow_inf_nan=False)):
+        try:
+            return as_response(service(request).list_items(limit=limit, offset=offset, annotation_state=annotation_state,
             review=review, label_ids=label_id, search=search, sort=sort, evidence_source=evidence_source,
             ml_state=ml_state, confidence_min=confidence_min, confidence_max=confidence_max,
             knn_similarity_min=knn_similarity_min, knn_agreement_min=knn_agreement_min,
-            prototype_similarity_min=prototype_similarity_min, ml_disagreement=ml_disagreement))
+            prototype_similarity_min=prototype_similarity_min, ml_disagreement=ml_disagreement,
+            annotation_states=[] if annotation_states == ["__none__"] else annotation_states,
+            review_states=[] if review_states == ["__none__"] else review_states,
+            target_tag_ids=target_tag_id, image_tag_ids=image_tag_id,
+            target_tags_untagged=target_tags_untagged, image_tags_untagged=image_tags_untagged,
+            bbox_area_min=bbox_area_min, bbox_area_max=bbox_area_max,
+            bbox_longest_side_min=bbox_longest_side_min, bbox_longest_side_max=bbox_longest_side_max,
+            bbox_aspect_ratio_min=bbox_aspect_ratio_min, bbox_aspect_ratio_max=bbox_aspect_ratio_max))
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
+
+    @router.get("/items/facets")
+    def item_filter_facets(request: Request, evidence_source: str | None = None):
+        try:
+            return as_response(service(request).filter_facets(evidence_source=evidence_source))
+        except RegistryTransferError as exc:
+            raise translated_error(exc) from exc
 
     @router.get("/items/{item_id}")
     def item(request: Request, item_id: str):

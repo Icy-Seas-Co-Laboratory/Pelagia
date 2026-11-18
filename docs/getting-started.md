@@ -42,6 +42,40 @@ Registry load/export jobs through `/registry/dataset/open` and
 the generic `/jobs` endpoint rejects these stages to preserve path and ownership
 validation.
 
+Registry can also create an empty PostgreSQL workspace and copy or move selected
+ROIs directly between workspaces in the same project and user scope. A transfer
+preview freezes the selected item IDs and reports matches by ROI UUID, source
+key, or image hash before work is queued. Duplicate actions can skip the source
+ROI, overwrite the destination while retaining its prior state in transfer
+provenance, or, for a move, retain the destination and remove the source
+duplicate. Transfers retain item geometry, assets, annotation and review
+history, masks, descriptors, taxonomy links, and model evidence. Moves commit
+the destination writes and source removals in one PostgreSQL transaction.
+Empty workspaces have no source path until exported; exporting them creates a
+normal portable SQLite revision.
+
+The Registry sidebar has collapsible filter sections. Annotation and review
+states can be enabled independently; enabled states match any state within that
+section, while separate filter sections must all match. Disabling every state
+shows no ROIs. Descriptor chips show only tags assigned in the workspace and
+match any selected tag within each descriptor scope; selecting no tags leaves
+that scope unrestricted. The **Untagged** chip also includes ROIs without tags
+in that scope.
+
+Bounding-box area uses a square-root slider scale and displays area in px².
+When explicit object geometry is absent, size filters silently fall back to
+the stored crop bounds, then image dimensions. Longest-side and aspect-ratio
+ranges are also available; aspect ratio is the longer side divided by the
+shorter side. Prediction confidence uses a 0–100% range for the selected model
+evidence source. Applying a numeric range excludes ROIs missing that value.
+Filter counts and transfer selections cover all matching pages.
+
+API clients create workspaces through `POST /registry/workspaces`, preview
+transfers through `POST /registry/transfers/preview`, and queue them through
+`POST /registry/transfers/execute` with the returned item IDs and preview token.
+The worker rechecks that token before modifying either workspace. Filter facets
+are available through `GET /registry/items/facets`.
+
 In the Registry gallery, open an ROI with its magnifying-glass button to inspect
 the full-resolution image, pixel scale, and measurements. Edit mode lets you
 adjust the object bounding box inside the stored crop. For mask-refinement
@@ -49,7 +83,9 @@ items, the candidate and current masks can be viewed as separate layers; saved
 eraser strokes create a new mask annotation while retaining the candidate mask
 and earlier annotations. Identical mask bytes reuse an existing asset. Image
 inversion changes only the display.
-Run at least one worker with `registry_load,registry_export,registry_generate` capabilities.
+Run at least one worker with
+`registry_load,registry_export,registry_generate,registry_workspace_transfer`
+capabilities.
 
 ### Prerequisites
 

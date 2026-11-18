@@ -6602,3 +6602,69 @@ def test_api_rejects_interchange_paths_outside_import_roots(tmp_path):
     })
     assert response.status_code == 403
     assert not repository.created_jobs
+
+
+def test_registry_filter_routes_forward_plural_states_and_geometry(monkeypatch):
+    from Pelagia.api.routes import registry as registry_routes
+
+    client, _, _ = make_client()
+    seen = {}
+
+    def list_items(self, **kwargs):
+        seen.update(kwargs)
+        return {"items": [], "total": 0}
+
+    monkeypatch.setattr(registry_routes.RegistryWorkspaceService, "list_items", list_items)
+    monkeypatch.setattr(registry_routes.RegistryWorkspaceService, "filter_facets",
+                        lambda self, **kwargs: {"bbox_area": {"min": 4, "max": 100}})
+    response = client.get("/registry/items", params=[
+        ("annotation_states", "__none__"), ("review_states", "verified"),
+        ("review_states", "no_annotation"), ("target_tag_id", "tag-1"),
+        ("bbox_area_min", "4"), ("bbox_area_max", "100"),
+        ("image_tags_untagged", "true"),
+    ])
+    assert response.status_code == 200
+    assert seen["annotation_states"] == []
+    assert seen["review_states"] == ["verified", "no_annotation"]
+    assert seen["target_tag_ids"] == ["tag-1"]
+    assert seen["image_tags_untagged"] is True
+    assert seen["bbox_area_min"] == 4
+    assert client.get("/registry/items/facets").json()["bbox_area"]["max"] == 100
+    assert client.get("/registry/items?bbox_area_min=-1").status_code == 422
+
+
+def test_registry_blank_workspace_and_transfer_routes_freeze_selection(monkeypatch):
+    from Pelagia.api.routes import registry as registry_routes
+    from Pelagia.services import registry_workspace_transfer
+
+    client, repository, _ = make_client()
+    calls = []
+    monkeypatch.setattr(registry_workspace_transfer, "create_blank_workspace",
+                        lambda repo, **kwargs: calls.append(kwargs) or {"workspace_id": "destination"})
+    monkeypatch.setattr(registry_routes.RegistryWorkspaceService, "matching_item_ids",
+                        lambda self, workspace_id, **filters: ["roi-1", "roi-2"])
+
+    def preview(repo, **kwargs):
+        calls.append(kwargs)
+        return {"preview_token": "guard", "total_items": len(kwargs["item_ids"]), "duplicates": []}
+
+    monkeypatch.setattr(registry_workspace_transfer, "preview_workspace_transfer", preview)
+    response = client.post("/registry/workspaces", json={"name": "Blank", "activate": False})
+    assert response.status_code == 201
+    assert calls[-1]["project_id"] == "project-1"
+    assert calls[-1]["owner_username"] == "dev"
+    assert calls[-1]["activate"] is False
+    body = {"source_workspace_id": "source", "destination_workspace_id": "destination", "mode": "move"}
+    response = client.post("/registry/transfers/preview", json={**body, "filters": {"annotation_states": []}})
+    assert response.status_code == 200
+    assert response.json()["item_ids"] == ["roi-1", "roi-2"]
+    execution = {**body, "item_ids": response.json()["item_ids"], "expected_preview_token": "guard"}
+    response = client.post("/registry/transfers/execute", json=execution)
+    assert response.status_code == 202
+    queued = repository.created_jobs[-1]
+    assert queued["stage"] == PipelineStage.REGISTRY_WORKSPACE_TRANSFER
+    assert queued["payload"]["item_ids"] == ["roi-1", "roi-2"]
+    assert queued["payload"]["owner_username"] == "dev"
+    assert client.post("/registry/transfers/execute", json={**execution, "expected_preview_token": "stale"}).status_code == 409
+    assert client.post("/registry/transfers/execute", json={**execution, "mode": "copy", "duplicate_policy": "keep_destination_remove_source"}).status_code == 422
+    assert client.post("/jobs", json={"stage": "registry_workspace_transfer"}).status_code == 403

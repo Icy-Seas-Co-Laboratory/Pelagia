@@ -235,7 +235,7 @@ if APIRouter is not None:
                 status_code=403,
                 detail="Storage re-encoding must be started from project administration.",
             )
-        if body.stage in {PipelineStage.REGISTRY_LOAD, PipelineStage.REGISTRY_EXPORT, PipelineStage.REGISTRY_GENERATE}:
+        if body.stage in {PipelineStage.REGISTRY_LOAD, PipelineStage.REGISTRY_EXPORT, PipelineStage.REGISTRY_GENERATE, PipelineStage.REGISTRY_WORKSPACE_TRANSFER}:
             raise HTTPException(
                 status_code=403,
                 detail="Registry transfers must be started through Registry or curation so paths and workspace ownership are validated.",
